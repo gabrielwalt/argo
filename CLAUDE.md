@@ -4,15 +4,16 @@
 
 ## What this project is
 
-A TypeScript/Node.js argo that connects a local Ollama LLM to real tools (bash, web search, file ops, browser) via a web UI. See README.md for full documentation.
+A safe coding harness for local LLMs running via Ollama. Docker containerisation is the core safety primitive: each workspace gets an isolated container with only the project folder mounted — the agent can execute bash, read and write files, and run Playwright scripts, but cannot reach other projects or the host filesystem outside the mount. The execution environment is JS-native (Node.js + CommonJS `require()`, Playwright, bash) — the same toolchain as the projects the agent works on. A web cockpit streams every agent decision in real time; every session is logged as JSONL + Markdown. Model weights stay on your GPU. See README.md for full documentation.
 
 ## Key commands
 
 ```bash
 # Development (argo code itself)
-pnpm dev                    # standalone server on :3000 with tsx watch (no Docker worker)
+pnpm dev                    # standalone server on :3001 with tsx watch (no Docker worker)
 pnpm build                  # compile TypeScript to dist/
-lsof -ti :3000 | xargs kill -9   # kill stuck server
+lsof -ti :3001 | xargs kill -9   # kill stuck dev server
+lsof -ti :3000 | xargs kill -9   # kill stuck central server
 
 # System-wide argo CLI (production use)
 ./install.sh                # symlinks bin/argo to /usr/local/bin/argo
@@ -29,7 +30,7 @@ docker build -f docker/agent.Dockerfile -t argo:latest .
 
 Three modes controlled by env vars:
 
-**Standalone** (`pnpm dev`, no special env vars) — full server on :3000, serves static files + API. Uses a separate `argo-sandbox` Docker container for bash execution (`docker exec argo-sandbox bash -c ...`). For developing Argo itself.
+**Standalone** (`pnpm dev`, no special env vars) — full server on :3001 (PORT=3001 set in package.json), serves static files + API. Uses a separate `argo-sandbox` Docker container for bash execution (`docker exec argo-sandbox bash -c ...`). For developing Argo itself. Runs on :3001 specifically to avoid conflicting with the `argo` CLI central server on :3000.
 
 **Central** (`CENTRAL_MODE=1`) — workspace manager on :3000. Serves `workspaces.html` at `/`, proxies `/ws/:name/*` to worker containers. Manages Docker lifecycle. Started by `bin/argo`.
 
@@ -113,8 +114,9 @@ Key details:
 
 ## bin/argo
 
-- Uses a symlink-following loop (`while [ -L "$_src" ]`) to find `AGENT_DIR` even when the script is symlinked to `/usr/local/bin/argo`
-- `ensure_central` checks for port conflict before starting: avoids silent failure if a dev server is on 3000
+- Uses a symlink-following loop (`while [ -L "$_src" ]`) to find `ARGO_DIR` even when the script is symlinked to `/usr/local/bin/argo`
+- `ensure_central`: `central_running()` hits `/api/workspaces` which only exists in central mode; if true, reuses the running central server; if port :3000 is taken by something else, checks `/status` (standalone mode) to give a specific "stop pnpm dev" message vs generic "kill it"
+- `cmd_attach`: skips Docker/Ollama/image checks when central is already running; surfaces actual error messages from `/api/attach`
 - Uses `node ... & disown $!` (not nohup) to background the central server
 - JSON manipulation uses Python3 inline (available on macOS) to avoid jq dependency
 

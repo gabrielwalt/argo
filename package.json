@@ -1,9 +1,9 @@
 {
-  "name": "local-agent",
+  "name": "argo",
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "PORT=3001 tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js"
   },

@@ -99,6 +99,17 @@ header::after {
   transition: opacity .15s;
 }
 #nav-home:hover { opacity: .75; }
+/* Boat emoji on send button — filter to solid black silhouette */
+.send-icon { font-size: 17px; filter: brightness(0); line-height: 1; }
+/* Emoji inside gradient link: inline-block breaks parent background-clip, so re-apply gradient clip directly */
+#nav-home .flip-h {
+  background: linear-gradient(90deg, var(--gold) 0%, #f0d478 45%, var(--gold) 90%);
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  animation: gold-shimmer 8s linear infinite;
+}
 .flip-h { display: inline-block; transform: scaleX(-1); }
 
 .nav-sep {
@@ -531,35 +542,34 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   display: flex;
   align-items: center;
   justify-content: center;
-  /* Coin face: radial gold with lighter centre */
-  background: radial-gradient(circle at 38% 35%, #f5de7a 0%, #c9a227 55%, #7a5c0a 100%);
+  /* Gold gradient with highlight band; oversized so the band can travel across */
+  background: linear-gradient(
+    105deg,
+    #c9a227 0%,
+    #e0b830 28%,
+    #f7e27c 45%,
+    #fffde8 50%,
+    #f7e27c 55%,
+    #e0b830 72%,
+    #c9a227 100%
+  );
+  background-size: 300% 100%;
+  background-position: 100% 0;   /* highlight lives off-screen right at rest */
   color: #1a1000;
-  /* Coin rim: outer ring + inset bevel to suggest thickness */
   border: none;
-  box-shadow:
-    0 0 0 2.5px #7a5c0a,          /* outer dark rim */
-    0 0 0 4px #c9a227,            /* gold band */
-    inset 0 1px 2px rgba(255,240,160,.55),  /* top highlight */
-    inset 0 -1px 2px rgba(0,0,0,.35),       /* bottom shadow */
-    0 3px 12px rgba(201,162,39,.35);        /* glow */
-  transition: box-shadow .2s ease, transform .15s ease;
+  box-shadow: 0 2px 8px rgba(201,162,39,.4);
+  /* Leave transition is faster so it snaps back cleanly */
+  transition: background-position .3s ease, box-shadow .3s;
 }
 #send-btn:hover:not(:disabled) {
-  box-shadow:
-    0 0 0 2.5px #7a5c0a,
-    0 0 0 4px #e8c547,
-    inset 0 1px 2px rgba(255,240,160,.55),
-    inset 0 -1px 2px rgba(0,0,0,.35),
-    0 4px 20px rgba(201,162,39,.55);
-  transform: scale(1.1);
+  background-position: 0% 0;    /* highlight sweeps left across the coin */
+  box-shadow: 0 2px 20px rgba(201,162,39,.75);
+  /* Slower on enter so the shine is visible */
+  transition: background-position .6s ease, box-shadow .3s;
 }
 #send-btn:active:not(:disabled) {
-  transform: scale(0.93);
-  box-shadow:
-    0 0 0 2.5px #7a5c0a,
-    0 0 0 4px #c9a227,
-    inset 0 1px 3px rgba(0,0,0,.4),
-    0 1px 6px rgba(201,162,39,.2);
+  transform: scale(0.94);
+  box-shadow: 0 1px 4px rgba(201,162,39,.25);
 }
 
 /* ── Right panel (tabs) ── */

@@ -82,10 +82,16 @@ ensure_image() {
 ensure_central() {
   if central_running; then return; fi
 
-  # Check if something else already owns the port
   if lsof -ti ":${CENTRAL_PORT}" &>/dev/null; then
-    err "Port ${CENTRAL_PORT} is already in use (old dev server?). Kill it first:
+    # Check if it's the Argo standalone dev server (has /status but not /api/workspaces)
+    if curl -sf "http://localhost:${CENTRAL_PORT}/status" &>/dev/null; then
+      err "Argo dev server (pnpm dev) is on port ${CENTRAL_PORT}.
+  Since v0.2, pnpm dev runs on :3001 — restart it, or kill the old instance:
   lsof -ti :${CENTRAL_PORT} | xargs kill -9"
+    else
+      err "Port ${CENTRAL_PORT} is in use by a non-Argo process. Kill it first:
+  lsof -ti :${CENTRAL_PORT} | xargs kill -9"
+    fi
   fi
 
   log "Starting Argo…"
@@ -105,23 +111,33 @@ cmd_attach() {
   workspace="$(cd "$workspace" 2>/dev/null && pwd)" || err "Path not found: $1"
 
   ensure_global_env
-  ensure_docker
-  ensure_ollama
-  ensure_image
+
+  # Skip infrastructure checks when a server is already reachable
+  if ! central_running; then
+    ensure_docker
+    ensure_ollama
+    ensure_image
+  fi
+
   ensure_central
 
   log "Attaching workspace: $workspace"
-  local result
-  result="$(curl -sf -X POST "http://localhost:${CENTRAL_PORT}/api/attach" \
+  local response
+  response="$(curl -s -X POST "http://localhost:${CENTRAL_PORT}/api/attach" \
     -H 'Content-Type: application/json' \
     -d "{\"path\": $(printf '%s' "$workspace" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}" \
-  )" || err "Failed to attach workspace"
+  )" || err "Failed to reach Argo server"
 
-  local url
-  url="$(echo "$result" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["url"])')"
-
-  log "Ready → $url"
-  open "$url"
+  if echo "$response" | python3 -c 'import json,sys; d=json.load(sys.stdin); exit(0 if "url" in d else 1)' 2>/dev/null; then
+    local url
+    url="$(echo "$response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])')"
+    log "Ready → $url"
+    open "$url"
+  else
+    local msg
+    msg="$(echo "$response" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("error","Failed to attach workspace"))' 2>/dev/null || echo "Failed to attach workspace")"
+    err "$msg"
+  fi
 }
 
 cmd_detach() {

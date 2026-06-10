@@ -1,23 +1,20 @@
-# Local Argo
+# Argo
 
-A self-hosted agentic system that runs a local LLM (via Ollama) with real tool execution in an isolated Docker sandbox. Built with TypeScript/Node.js. No cloud required beyond an optional Tavily API key for web search.
-
----
-
-## What it does
-
-- **Reasons** with any locally-pulled Ollama model using native tool-calling
-- **Executes bash** inside an isolated Ubuntu Docker container
-- **Fetches pages** — static via HTTP or fully JS-rendered via Playwright/Chromium
-- **Searches the web** via Tavily API (1,000 free req/month)
-- **Reads and writes files** in a sandboxed workspace directory
-- **Auto-commits** every completed task to git with a model-generated message
-- **Streams everything** to a web UI in real time: thoughts, tool calls, results, diffs
-- **Manages multiple workspaces** — each project folder gets its own argo instance
+A safe coding harness for local LLMs. Model weights stay on your GPU. Code never leaves your machine.
 
 ---
 
-## Architecture
+Local models are on a steep improvement curve. Quantized 14B models already rival hosted models on coding tasks, and that gap will narrow further. The limiting factor is no longer raw capability — it is containment, observability, and tooling. Argo is built around those three constraints.
+
+The core safety primitive is Docker. Each workspace gets an isolated container with only the project folder mounted. The agent can execute bash, read and write files, fetch pages, and run Playwright scripts — but it cannot see other projects, cannot reach host paths outside the mount, and cannot exfiltrate data. The container is the boundary. As models become more capable, that boundary matters more, not less.
+
+The execution environment is JS-native by design. Agents run Node.js + CommonJS `require()`, Playwright, and bash — the same toolchain as the projects they work on. No Python intermediary, no translation layer, no impedance mismatch between what the agent writes and what the codebase expects. The packages the agent can `require()` are the packages a JS developer would actually reach for.
+
+The cockpit metaphor captures the UI intent: the developer stays in the loop. Every agent decision streams to the trace panel in real time — model thoughts, tool calls with arguments, tool results with timing. The file browser, git log, and session log are all live. The developer can read, guide, correct, and revert at every step. The logging layer produces structured JSONL + Markdown for every session, creating a learning flywheel: compare models, tune parameters, iterate on system prompts with actual data.
+
+---
+
+## How it works
 
 Three runtime modes, controlled by environment variables:
 
@@ -25,36 +22,36 @@ Three runtime modes, controlled by environment variables:
 ┌─────────────────────────────────────────────────────────────┐
 │  HOST MACHINE                                               │
 │                                                             │
-│  Ollama daemon :11434   ←── shared by all instances        │
+│  Ollama daemon :11434   ←── shared by all instances         │
 │                                                             │
-│  Central server :3000   ←── started on-demand by CLI       │
+│  Central server :3000   ←── started on-demand by CLI        │
 │  ├── Serves workspaces.html at /                            │
 │  ├── Injects __WS__ context, serves index.html at /ws/:name/│
 │  ├── Proxies /ws/:name/* → worker container                 │
 │  └── Manages Docker lifecycle (attach / detach)             │
 │                                                             │
-│  ~/.config/argo/env     ←── global config (API keys, model)│
-│  ~/.config/argo/workspaces.json  ←── registry             │
+│  ~/.config/argo/env     ←── global config (API keys, model) │
+│  ~/.config/argo/workspaces.json  ←── registry               │
 └──────────────────────┬──────────────────────────────────────┘
                        │ HTTP proxy
          ┌─────────────┴──────────────┐
          │                            │
-┌────────▼───────┐          ┌─────────▼──────┐
-│ argo-test-one │          │ argo-my-blog  │  (one per workspace)
-│ :3101          │          │ :3102          │
-│                │          │                │
+┌────────▼───────┐           ┌────────▼───────┐
+│ argo-test-one  │           │ argo-my-blog   │  (one per workspace)
+│ :3101          │           │ :3102          │
+│                │           │                │
 │ /workspace ←── │vol        │ /workspace ←── │vol
 │   ~/Sources/   │           │   ~/Sources/   │
 │   test/test-one│           │   my-blog      │
 │                │           │                │
 │ /scratch  ←─── │vol        │ /scratch  ←─── │vol
 │   ~/.local/    │           │   ~/.local/    │
-│   share/argo/ │           │   share/argo/ │
+│   share/argo/  │           │   share/argo/  │
 │   scratch/…    │           │   scratch/…    │
 └────────────────┘           └────────────────┘
 ```
 
-**Standalone mode** (`pnpm dev`) — full server on :3000, uses a separate `argo-sandbox` container for bash execution. Used for developing Argo itself.
+**Standalone mode** (`pnpm dev`) — full server on :3001, uses a separate `argo-sandbox` container for bash execution. Used for developing Argo itself.
 
 **Central mode** (`CENTRAL_MODE=1`) — the workspace manager. Started by `bin/argo`.
 
@@ -164,7 +161,7 @@ Used only in standalone `pnpm dev` mode.
 | `OLLAMA_HOST` | `http://localhost:11434` | |
 | `SANDBOX_CONTAINER` | `argo-sandbox` | Container name for standalone mode |
 | `WORKSPACE_PATH` | `./workspace` | |
-| `PORT` | `3000` | |
+| `PORT` | `3001` | |
 
 ---
 
@@ -183,7 +180,7 @@ To add any model: `ollama pull <name>` — appears in the UI immediately without
 
 ---
 
-## Argo tools
+## Agent tools
 
 | Tool | Description | When it's used |
 |---|---|---|
@@ -196,11 +193,11 @@ To add any model: `ollama pull <name>` — appears in the UI immediately without
 
 ### Workspace vs scratch
 
-The argo has two directories:
+The agent has two directories:
 - **`/workspace`** — the project folder (git-tracked, auto-committed after each task)
 - **`/scratch`** — Argo's private working space for scripts, temp files, downloaded data (not committed)
 
-The argo is instructed to keep work-in-progress files in `/scratch` and only write to `/workspace` when modifying the actual project.
+The agent is instructed to keep work-in-progress files in `/scratch` and only write to `/workspace` when modifying the actual project.
 
 ---
 
@@ -243,28 +240,28 @@ For any other package: `npm install <package>` (installs locally in `/workspace`
 
 Served at `http://localhost:3000/ws/{workspace-name}/`.
 
-**Header** — model picker, context usage counter, settings (temperature, top_p, top_k, context window), workspace switcher showing current folder with dropdown to switch between running workspaces.
+**Header** — model picker, context usage counter, settings panel (temperature, top_p, top_k, context window), workspace switcher with dropdown to switch between running workspaces.
 
 **Chat (left)** — conversation with Markdown rendering. "New session" resets history without restarting the server.
 
-**Argo Trace (right)** — live stream of every internal step: iteration counter, model thoughts, tool calls with arguments, tool results with timing, errors. Long items collapse.
+**Agent Trace (right)** — live stream of every internal step: iteration counter, model thoughts, tool calls with full arguments, tool results with timing, errors. Long items collapse. This is the cockpit view — every decision the agent makes is visible as it happens.
 
 **Files (right tab)** — file tree for both `workspace/` and `scratch/`. Click any file to preview its contents. Refreshes automatically after each completed task.
 
-**Session Logs (right tab)** — list of all past sessions. Click any entry to read the full trace as Markdown or JSONL.
+**Session Logs (right tab)** — list of all past sessions. Click any entry to read the full trace as Markdown or JSONL. Sessions accumulate across restarts and are the primary source of data for improving prompts and comparing models.
 
-**Git Log (bottom)** — latest commit shown inline; click to expand older ones. Click "diff" to view exact changes. Auto-updates when the argo commits.
+**Git Log (bottom)** — latest commit shown inline; click to expand older ones. Click "diff" to view exact changes. Auto-updates when the agent commits.
 
 ---
 
-## Developing the argo
+## Developing Argo
 
-Use standalone mode — the argo server runs directly on your Mac with hot-reload:
+Use standalone mode — the server runs directly on your Mac with hot-reload:
 
 ```bash
 cd ~/Sources/Adobe/argo
 pnpm dev
-# → http://localhost:3000 (no workspace sub-path)
+# → http://localhost:3001 (no workspace sub-path)
 ```
 
 This mode uses the original `argo-sandbox` Docker container (from `docker/sandbox.Dockerfile`) for bash execution. Changes to `src/` or `public/` reload automatically.
@@ -373,7 +370,7 @@ Check: `cat ~/.local/share/argo/server.log`
 **Worker container won't start**
 Check: `docker ps -a | grep argo-` and `docker logs argo-{name}`
 
-**Argo outputs JSON text instead of calling tools**
+**Agent outputs JSON text instead of calling tools**
 Switch to `llama3.1:8b` in the model dropdown — most reliable tool-calling.
 
 **`browser_fetch` failing**
@@ -381,7 +378,7 @@ Switch to `llama3.1:8b` in the model dropdown — most reliable tool-calling.
 docker exec argo-{name} node -e "require('playwright'); console.log('ok')"
 ```
 
-**`require('cheerio')` not found in argo script**
+**`require('cheerio')` not found in agent script**
 The script must use CommonJS (`require`), not ESM (`import`). Verify `NODE_PATH` is set: `docker exec argo-{name} printenv NODE_PATH`
 
 **Context window fills up**
@@ -406,7 +403,7 @@ argo/
 ├── src/
 │   ├── index.ts                ← Entry point: central mode or worker/standalone
 │   ├── central.ts              ← Central server: workspace registry, Docker mgmt, proxy
-│   ├── server.ts               ← Worker/standalone: argo API, SSE, git, files endpoints
+│   ├── server.ts               ← Worker/standalone: agent API, SSE, git, files endpoints
 │   ├── agent.ts                ← ReAct loop, Ollama integration, auto-commit
 │   ├── config.ts               ← Env vars, path resolution, mode flags
 │   ├── types.ts                ← Shared TypeScript types + ArgoEvent union
@@ -434,28 +431,35 @@ argo/
 - [ ] Session history persistence across server restarts (currently in-memory only)
 - [ ] Configurable tool output truncation limits
 - [ ] UI: show Tavily usage count / remaining credits
-
-### AEM / EDS domain
-- [ ] AEM-specific tools (EDS publish, import, content fetch)
+- [ ] AEM/EDS-specific tools (EDS publish, import, content fetch)
 - [ ] Custom system prompts per workspace type
-- [ ] Multi-step EDS workflow automation (migrate page from legacy CMS to EDS)
-- [ ] Integration with `aem` CLI tool
-- [ ] Block mapping and component analysis tools
+
+### Next chapter
+
+The containment model and logging infrastructure point toward more ambitious uses once local models are reliably capable enough:
+
+- **Agent memory** — persistent knowledge of the codebase across sessions, built from the structured JSONL logs already being written
+- **Visual trace** — Playwright screenshots streamed into the trace panel so you can see what the agent saw, not just the text it returned
+- **Specialised agent roles** — distinct system prompts and tool subsets for test writer, code reviewer, documenter, and migrator roles
+- **Multi-agent delegation** — multi-workspace support extended to multi-agent workflows: specialised agents running concurrently on different parts of a larger project, coordinated by an orchestrator
+- **MCP integration** — expose Argo workspaces as MCP servers so agents can delegate to each other across tool boundaries
+- **Agent-to-agent communication** — a local message bus for agents to hand off tasks, share results, and build context cooperatively
 
 ---
 
-## Key design decisions
+## Design decisions
 
 | Decision | Reasoning |
 |---|---|
 | Custom ReAct loop over LangChain/Dify | Frameworks break tool-calling with local Ollama models. Direct API is simpler and more predictable. |
 | TypeScript over Python | Consistent with AEM/EDS primary stack (vanilla JS). |
 | Docker for sandbox isolation | Limits blast radius without per-command confirmation prompts. Git in `/workspace` provides rollback. |
-| Two workspace volumes | `/workspace` for project files (committed), `/scratch` for argo working files (never committed). Keeps git history clean. |
-| Central + worker architecture | One argo instance per workspace, isolated state and history. Central server manages routing and Docker lifecycle without Docker-in-Docker. |
+| Two workspace volumes | `/workspace` for project files (committed), `/scratch` for agent working files (never committed). Keeps git history clean. |
+| Central + worker architecture | One agent instance per workspace, isolated state and history. Central server manages routing and Docker lifecycle without Docker-in-Docker. |
 | Ollama on host | GPU/Metal access. Docker on macOS cannot expose the Apple Silicon GPU to containers. |
 | Tavily over DuckDuckGo | DDG rate-limits aggressively. Tavily 1,000 free requests/month is sufficient for typical use. |
-| CJS (`require`) not ESM | `NODE_PATH` resolves CommonJS modules but not ESM imports. Argo-written scripts must use `require()`. |
+| CJS (`require`) not ESM | `NODE_PATH` resolves CommonJS modules but not ESM imports. Agent-written scripts must use `require()`. |
+| JS-native execution over Python | Agents write and run the same JS toolchain as the projects they work on. No translation layer, no impedance mismatch between agent idioms and codebase idioms. |
 | `spawn` + stdin for browser-fetch | Playwright scripts are too complex for shell escaping via `docker exec bash -c`. Piping to `node --input-type=commonjs` via stdin avoids all quoting issues. |
 | SSE over WebSockets | Server-push only. REST handles the other direction. Simpler protocol, better browser debugging. |
 | Vanilla JS frontend | Consistent with AEM/EDS stack. No build step. No framework to keep up to date. |
