@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Argo</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <style>
+    :root {
+      --bg: #090b12; --surface: #111520; --border: #1e2235;
+      --text: #e2e4f0; --muted: #565e7a; --accent: #5b67f5;
+      --gold: #c9a227; --gold-glow: rgba(201, 162, 39, 0.18);
+      --green: #22c55e; --red: #ef4444; --yellow: #eab308;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+    @keyframes gold-shimmer {
+      0%   { background-position: 0% center; }
+      100% { background-position: 200% center; }
+    }
+    @keyframes card-in {
+      from { opacity: 0; transform: translateY(8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      background-image:
+        radial-gradient(ellipse 70% 50% at 10% 0%,  rgba(91, 103, 245, 0.06) 0%, transparent 100%),
+        radial-gradient(ellipse 50% 40% at 90% 100%, rgba(201, 162, 39, 0.04) 0%, transparent 100%);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      min-height: 100vh; padding: 48px 40px;
+    }
+    header { display: flex; align-items: baseline; gap: 16px; margin-bottom: 40px; }
+    h1 {
+      font-size: 20px; font-weight: 600;
+      background: linear-gradient(90deg, var(--gold) 0%, #f0d478 45%, var(--gold) 90%);
+      background-size: 200% auto;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      animation: gold-shimmer 8s linear infinite;
+    }
+    .subtitle { color: var(--muted); font-size: 13px; }
+
+    .workspace-grid { display: flex; flex-direction: column; gap: 10px; max-width: 720px; }
+
+    .workspace-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 16px 20px;
+      display: flex; align-items: center; gap: 16px;
+      transition: border-color .2s, box-shadow .2s;
+      animation: card-in .2s ease-out both;
+    }
+    .workspace-card:hover {
+      border-color: rgba(201, 162, 39, .45);
+      box-shadow: 0 0 20px rgba(201, 162, 39, .06);
+    }
+
+    .ws-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--muted); }
+    .ws-dot.running { background: var(--green); box-shadow: 0 0 5px rgba(34, 197, 94, .5); }
+
+    .ws-info { flex: 1; min-width: 0; }
+    .ws-name { font-size: 14px; font-weight: 600; margin-bottom: 3px; }
+    .ws-path { font-size: 11px; color: var(--muted); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .ws-actions { display: flex; gap: 8px; flex-shrink: 0; }
+    a.ws-open {
+      background: var(--accent); color: #fff; border-radius: 6px;
+      padding: 6px 14px; font-size: 12px; font-weight: 500;
+      text-decoration: none; transition: opacity .15s;
+      position: relative; overflow: hidden;
+    }
+    a.ws-open::after {
+      content: '';
+      position: absolute; inset: 0;
+      background: linear-gradient(105deg, transparent 40%, rgba(255,255,255,.13) 50%, transparent 60%);
+      transform: translateX(-150%);
+      transition: transform .5s ease;
+    }
+    a.ws-open:hover::after { transform: translateX(150%); }
+    a.ws-open.stopped { background: var(--surface); color: var(--muted); border: 1px solid var(--border); pointer-events: none; }
+
+    button.ws-detach {
+      background: none; border: 1px solid var(--border); color: var(--muted);
+      border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer;
+      transition: color .15s, border-color .15s;
+    }
+    button.ws-detach:hover { color: var(--red); border-color: var(--red); }
+
+    .empty-state { color: var(--muted); font-size: 14px; padding: 20px 0; }
+
+    .attach-section { margin-top: 36px; max-width: 720px; }
+    .attach-section h2 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 12px; }
+    .attach-row { display: flex; gap: 10px; }
+    .attach-row input {
+      flex: 1; background: var(--surface); border: 1px solid var(--border);
+      color: var(--text); padding: 10px 14px; border-radius: 6px; font-size: 13px;
+      font-family: var(--font-mono); outline: none; transition: border-color .15s;
+    }
+    .attach-row input:focus { border-color: rgba(201, 162, 39, .45); box-shadow: 0 0 0 2px rgba(201, 162, 39, .07); }
+    .attach-row input::placeholder { color: var(--muted); }
+    .attach-row button {
+      background: var(--accent); color: #fff; border: none; border-radius: 6px;
+      padding: 10px 20px; font-size: 13px; font-weight: 500; cursor: pointer;
+      white-space: nowrap; transition: opacity .15s;
+    }
+    .attach-row button:hover:not(:disabled) { opacity: .85; }
+    .attach-row button:disabled { opacity: .4; cursor: not-allowed; }
+
+    .workspace-card:nth-child(2) { animation-delay: .04s; }
+    .workspace-card:nth-child(3) { animation-delay: .08s; }
+    .workspace-card:nth-child(4) { animation-delay: .12s; }
+    .workspace-card:nth-child(5) { animation-delay: .16s; }
+
+    .error-msg { color: var(--red); font-size: 12px; margin-top: 8px; display: none; }
+    .spinner { color: var(--muted); font-size: 13px; padding: 20px 0; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>⛵ Argo</h1>
+    <span class="subtitle">Navigate your workspaces</span>
+  </header>
+
+  <div id="workspace-grid" class="workspace-grid">
+    <div class="spinner">Loading…</div>
+  </div>
+
+  <div class="attach-section">
+    <h2>Attach workspace</h2>
+    <div class="attach-row">
+      <input id="attach-path" type="text" placeholder="/absolute/path/to/project" autocomplete="off" spellcheck="false">
+      <button id="attach-btn">+ Attach</button>
+    </div>
+    <div id="error-msg" class="error-msg"></div>
+  </div>
+
+  <script>
+    function esc(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    }
+
+    async function loadWorkspaces() {
+      const grid = document.getElementById('workspace-grid')
+      try {
+        const resp = await fetch('/api/workspaces')
+        const list = await resp.json()
+
+        if (!list.length) {
+          grid.innerHTML = '<div class="empty-state">No workspaces attached yet. Add a project folder below.</div>'
+          return
+        }
+
+        grid.innerHTML = list.map(ws => `
+          <div class="workspace-card">
+            <div class="ws-dot ${ws.running ? 'running' : ''}"></div>
+            <div class="ws-info">
+              <div class="ws-name">${esc(ws.name)}</div>
+              <div class="ws-path">${esc(ws.path)}</div>
+            </div>
+            <div class="ws-actions">
+              <a class="ws-open ${ws.running ? '' : 'stopped'}"
+                href="${esc(ws.url)}" target="_blank">
+                ${ws.running ? 'Open →' : 'Stopped'}
+              </a>
+              <button class="ws-detach" data-name="${esc(ws.name)}">Detach</button>
+            </div>
+          </div>
+        `).join('')
+
+        grid.querySelectorAll('.ws-detach').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            if (!confirm(`Detach "${btn.dataset.name}"?`)) return
+            btn.disabled = true
+            await fetch(`/api/detach/${btn.dataset.name}`, { method: 'POST' })
+            loadWorkspaces()
+          })
+        })
+      } catch {
+        grid.innerHTML = '<div class="empty-state">Could not reach server.</div>'
+      }
+    }
+
+    document.getElementById('attach-btn').addEventListener('click', async () => {
+      const input = document.getElementById('attach-path')
+      const btn = document.getElementById('attach-btn')
+      const errEl = document.getElementById('error-msg')
+      const wsPath = input.value.trim()
+      if (!wsPath) return
+
+      errEl.style.display = 'none'
+      btn.textContent = 'Attaching…'
+      btn.disabled = true
+
+      try {
+        const resp = await fetch('/api/attach', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: wsPath }),
+        })
+        const data = await resp.json()
+        if (!resp.ok) throw new Error(data.error)
+        input.value = ''
+        window.open(data.url, '_blank')
+        loadWorkspaces()
+      } catch (err) {
+        errEl.textContent = err.message
+        errEl.style.display = 'block'
+      } finally {
+        btn.textContent = '+ Attach'
+        btn.disabled = false
+      }
+    })
+
+    document.getElementById('attach-path').addEventListener('keydown', e => {
+      if (e.key === 'Enter') document.getElementById('attach-btn').click()
+    })
+
+    loadWorkspaces()
+    setInterval(loadWorkspaces, 5000)
+  </script>
+</body>
+</html>

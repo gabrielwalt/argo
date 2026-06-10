@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve symlink to find the real script location
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ $_src != /* ]] && _src="$_dir/$_src"
+done
+ARGO_DIR="$(cd -P "$(dirname "$_src")/.." && pwd)"
+ARGO_IMAGE="argo:latest"
+CENTRAL_PORT=3000
+CONFIG_DIR="$HOME/.config/argo"
+GLOBAL_ENV="$CONFIG_DIR/env"
+
+# ── Helpers ──────────────────────────────────────────────────────
+
+log()  { echo "▸ $*"; }
+err()  { echo "✖ $*" >&2; exit 1; }
+
+central_running() {
+  curl -sf "http://localhost:${CENTRAL_PORT}/api/workspaces" &>/dev/null
+}
+
+wait_for() {
+  local url="$1" label="$2" tries=0
+  echo -n "  Waiting for ${label}"
+  until curl -sf "$url" &>/dev/null; do
+    tries=$((tries + 1))
+    if [ $tries -gt 30 ]; then echo ""; return 1; fi
+    sleep 1; echo -n "."
+  done
+  echo " ready"
+}
+
+ensure_global_env() {
+  mkdir -p "$CONFIG_DIR"
+  if [ ! -f "$GLOBAL_ENV" ]; then
+    cat > "$GLOBAL_ENV" <<EOF
+# Argo configuration
+# Edit this file to set your API keys and defaults
+
+TAVILY_API_KEY=
+MODEL=qwen2.5-coder:14b
+MAX_ITERATIONS=20
+EOF
+    log "Created config at $GLOBAL_ENV — add your Tavily API key to enable web search"
+  fi
+}
+
+ensure_docker() {
+  if ! docker info &>/dev/null; then
+    log "Starting Docker Desktop…"
+    open -a Docker
+    wait_for "http://localhost/fake" "Docker" 2>/dev/null || true
+    until docker info &>/dev/null; do sleep 2; done
+    log "Docker ready"
+  fi
+}
+
+ensure_ollama() {
+  if ! curl -sf "http://localhost:11434/api/tags" &>/dev/null; then
+    log "Starting Ollama…"
+    if command -v brew &>/dev/null && brew services list | grep -q ollama; then
+      brew services start ollama &>/dev/null || true
+    else
+      nohup ollama serve > "$HOME/.local/share/argo/ollama.log" 2>&1 &
+    fi
+    wait_for "http://localhost:11434/api/tags" "Ollama"
+  fi
+}
+
+ensure_image() {
+  if ! docker image inspect "$ARGO_IMAGE" &>/dev/null; then
+    log "Building Argo image (first run — takes several minutes)…"
+    docker build -f "$ARGO_DIR/docker/agent.Dockerfile" -t "$ARGO_IMAGE" "$ARGO_DIR"
+    log "Image built"
+  fi
+}
+
+ensure_central() {
+  if central_running; then return; fi
+
+  # Check if something else already owns the port
+  if lsof -ti ":${CENTRAL_PORT}" &>/dev/null; then
+    err "Port ${CENTRAL_PORT} is already in use (old dev server?). Kill it first:
+  lsof -ti :${CENTRAL_PORT} | xargs kill -9"
+  fi
+
+  log "Starting Argo…"
+  mkdir -p "$HOME/.local/share/argo"
+  local log_file="$HOME/.local/share/argo/server.log"
+  CENTRAL_MODE=1 AGENT_PROJECT_DIR="$ARGO_DIR" PORT="$CENTRAL_PORT" \
+    node "$ARGO_DIR/dist/index.js" >> "$log_file" 2>&1 &
+  disown $!
+  wait_for "http://localhost:${CENTRAL_PORT}/api/workspaces" "Argo" \
+    || err "Argo failed to start. Check logs: $log_file"
+}
+
+# ── Commands ─────────────────────────────────────────────────────
+
+cmd_attach() {
+  local workspace="${1:-$PWD}"
+  workspace="$(cd "$workspace" 2>/dev/null && pwd)" || err "Path not found: $1"
+
+  ensure_global_env
+  ensure_docker
+  ensure_ollama
+  ensure_image
+  ensure_central
+
+  log "Attaching workspace: $workspace"
+  local result
+  result="$(curl -sf -X POST "http://localhost:${CENTRAL_PORT}/api/attach" \
+    -H 'Content-Type: application/json' \
+    -d "{\"path\": $(printf '%s' "$workspace" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}" \
+  )" || err "Failed to attach workspace"
+
+  local url
+  url="$(echo "$result" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["url"])')"
+
+  log "Ready → $url"
+  open "$url"
+}
+
+cmd_detach() {
+  local workspace="${1:-$PWD}"
+  local name
+  # Accept either a path or a name directly
+  if [ -d "$workspace" ]; then
+    workspace="$(cd "$workspace" && pwd)"
+    # Look up the name from the registry
+    name="$(curl -sf "http://localhost:${CENTRAL_PORT}/api/workspaces" | \
+      python3 -c "import json,sys; ws=json.load(sys.stdin); \
+      match=[w['name'] for w in ws if w['path']=='$workspace']; \
+      print(match[0] if match else '')")"
+    [ -z "$name" ] && err "No workspace attached for: $workspace"
+  else
+    name="$workspace"
+  fi
+
+  central_running || err "Argo is not running"
+  curl -sf -X POST "http://localhost:${CENTRAL_PORT}/api/detach/$name" > /dev/null
+  log "Detached: $name"
+}
+
+cmd_list() {
+  central_running || err "Argo is not running (run 'argo attach' first)"
+  curl -sf "http://localhost:${CENTRAL_PORT}/api/workspaces" | \
+    python3 -c "
+import json, sys
+ws = json.load(sys.stdin)
+if not ws:
+    print('No workspaces attached.')
+else:
+    for w in ws:
+        status = '● running' if w.get('running') else '○ stopped'
+        print(f\"{status}  {w['name']:<30} {w['url']}\")
+        print(f\"{'':>11}  {w['path']}\")
+"
+}
+
+cmd_stop() {
+  central_running || { log "Argo is not running"; exit 0; }
+
+  # Detach all workspaces
+  curl -sf "http://localhost:${CENTRAL_PORT}/api/workspaces" | \
+    python3 -c "import json,sys; [print(w['name']) for w in json.load(sys.stdin)]" | \
+    while read -r name; do
+      curl -sf -X POST "http://localhost:${CENTRAL_PORT}/api/detach/$name" > /dev/null
+      log "Stopped: $name"
+    done
+
+  # Kill central server
+  lsof -ti ":${CENTRAL_PORT}" | xargs kill -9 2>/dev/null || true
+  log "Argo stopped"
+}
+
+cmd_rebuild() {
+  log "Rebuilding Argo image…"
+  docker build -f "$ARGO_DIR/docker/agent.Dockerfile" -t "$ARGO_IMAGE" "$ARGO_DIR"
+  log "Done. Restart any running workspaces to use the new image."
+}
+
+cmd_help() {
+  cat <<EOF
+Usage: argo [command] [path]
+
+Commands:
+  attach [path]   Attach a workspace folder and open Argo (default)
+  detach [path]   Stop Argo for a workspace
+  list            List all attached workspaces
+  stop            Stop all workspaces and the server
+  rebuild         Rebuild the Docker image after code changes
+
+If no command is given, 'attach' is assumed.
+EOF
+}
+
+# ── Dispatch ─────────────────────────────────────────────────────
+
+COMMAND="${1:-attach}"
+
+case "$COMMAND" in
+  attach|a)  shift || true; cmd_attach "$@" ;;
+  detach|d)  shift || true; cmd_detach "$@" ;;
+  list|ls)   cmd_list ;;
+  stop)      cmd_stop ;;
+  rebuild)   cmd_rebuild ;;
+  help|--help|-h) cmd_help ;;
+  # Bare path passed as first arg — treat as attach
+  /*)        cmd_attach "$COMMAND" ;;
+  *)         cmd_attach "$COMMAND" ;;
+esac

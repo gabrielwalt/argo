@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Argo</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+</head>
+<body>
+
+<header>
+  <!-- Breadcrumb: Argo › workspace › session -->
+  <nav id="breadcrumb">
+    <a id="nav-home" href="/" title="All workspaces">⛵ Argo</a>
+
+    <span class="nav-sep" id="sep-ws" style="display:none">›</span>
+    <div class="nav-crumb" id="nav-ws" style="display:none">
+      <button class="nav-crumb-btn" id="ws-btn"><span id="ws-name-label"></span></button>
+      <div class="nav-dropdown" id="ws-dropdown"></div>
+    </div>
+
+    <span class="nav-sep">›</span>
+    <div class="nav-crumb" id="nav-session">
+      <button class="nav-crumb-btn" id="session-btn"><span id="session-label">Now</span></button>
+      <div class="nav-dropdown" id="session-dropdown"></div>
+    </div>
+  </nav>
+
+  <!-- Model + params — applies to next message in current session, no restart needed -->
+  <div id="model-area">
+    <div class="nav-crumb" id="nav-model">
+      <button class="nav-crumb-btn" id="model-btn"><span id="model-label">—</span></button>
+      <div class="nav-dropdown" id="model-dropdown"></div>
+    </div>
+    <span id="token-counter" title="Context tokens used in last model call"></span>
+    <button id="settings-btn" title="Model parameters — applied to next message in current session">⚙</button>
+  </div>
+
+  <div id="status">
+    <div id="status-dot"></div>
+    <span id="status-text">Connecting…</span>
+  </div>
+</header>
+
+<div id="settings-panel">
+  <div class="setting-group">
+    <label for="opt-temperature">Temperature</label>
+    <input type="range" id="opt-temperature" min="0" max="2" step="0.05" value="0.8">
+    <span class="opt-val" id="opt-temperature-val">0.8</span>
+  </div>
+  <div class="setting-group">
+    <label for="opt-top-p">Top P</label>
+    <input type="range" id="opt-top-p" min="0" max="1" step="0.05" value="0.9">
+    <span class="opt-val" id="opt-top-p-val">0.9</span>
+  </div>
+  <div class="setting-group">
+    <label for="opt-top-k">Top K</label>
+    <input type="number" id="opt-top-k" min="0" max="200" value="40">
+  </div>
+  <div class="setting-group">
+    <label for="opt-num-ctx">Context window</label>
+    <select id="opt-num-ctx">
+      <option value="2048">2,048</option>
+      <option value="4096">4,096</option>
+      <option value="8192" selected>8,192</option>
+      <option value="16384">16,384</option>
+      <option value="32768">32,768</option>
+      <option value="65536">65,536</option>
+    </select>
+  </div>
+  <button id="settings-reset">Reset</button>
+</div>
+
+<main>
+  <!-- Chat panel -->
+  <section id="chat-panel">
+    <div id="messages">
+      <div class="message system">Session started. Ask anything.</div>
+    </div>
+
+    <!-- Shown when viewing a past session -->
+    <div id="session-banner">
+      <span id="session-banner-label"></span>
+      <button id="return-btn">↩ Return to now</button>
+    </div>
+
+    <form id="chat-form">
+      <div id="input-wrap">
+        <textarea id="input" placeholder="Ask anything… (Shift+Enter for newline)" rows="3"></textarea>
+        <button id="send-btn" type="submit" title="Send">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13"/>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+          </svg>
+        </button>
+      </div>
+    </form>
+  </section>
+
+  <!-- Right panel with tabs -->
+  <section id="right-panel">
+    <div id="right-tabs">
+      <button class="tab-btn active" data-tab="trace">Agent Trace</button>
+      <button class="tab-btn" data-tab="files">Files</button>
+      <button class="tab-btn" data-tab="logs">Session Logs</button>
+      <span id="iter-label"></span>
+    </div>
+
+    <!-- Trace tab -->
+    <div id="tab-trace" class="tab-content active">
+      <div id="trace">
+        <div class="trace-item iteration">
+          <div class="trace-body" style="color:var(--muted)">Trace will appear here when the agent runs.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Files tab -->
+    <div id="tab-files" class="tab-content">
+      <div id="files-toolbar">
+        <button id="refresh-files">↻ Refresh</button>
+      </div>
+      <div id="files-content">
+        <div class="files-section">
+          <div class="files-section-header">workspace/</div>
+          <div id="files-workspace-tree" class="file-tree"></div>
+        </div>
+        <div class="files-section">
+          <div class="files-section-header">scratch/</div>
+          <div id="files-scratch-tree" class="file-tree"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Logs tab -->
+    <div id="tab-logs" class="tab-content">
+      <div id="logs-toolbar">
+        <button id="refresh-logs">↻ Refresh</button>
+        <span id="logs-count" style="font-size:12px;color:var(--muted)"></span>
+      </div>
+      <div id="logs-list"></div>
+      <div id="log-viewer" style="display:none">
+        <div id="log-viewer-header">
+          <button id="back-to-logs">← Back</button>
+          <span id="log-viewer-title"></span>
+          <div style="margin-left:auto;display:flex;gap:8px">
+            <button class="log-fmt-btn active" data-fmt="md">Markdown</button>
+            <button class="log-fmt-btn" data-fmt="jsonl">JSONL</button>
+          </div>
+        </div>
+        <pre id="log-viewer-content"></pre>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- Git log panel -->
+<div id="git-panel">
+  <div id="git-header">
+    <div id="git-latest"><span style="color:var(--muted);font-size:12px">Loading…</span></div>
+    <button id="refresh-git">↻ Refresh</button>
+  </div>
+  <div id="git-log"></div>
+</div>
+
+<!-- Diff / file preview modal -->
+<div id="diff-modal">
+  <div id="diff-box">
+    <div id="diff-box-header">
+      <span id="diff-title" style="font-family:var(--font-mono);font-size:13px"></span>
+      <button id="close-diff">✕ Close</button>
+    </div>
+    <div id="diff-content"></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
