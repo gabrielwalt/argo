@@ -8,7 +8,7 @@
     :root {
       --bg: #090b12; --surface: #111520; --border: #1e2235;
       --text: #e2e4f0; --muted: #565e7a; --accent: #5b67f5;
-      --gold: #c9a227; --gold-glow: rgba(201, 162, 39, 0.18);
+      --gold: #c9a227; --gold-glow: rgba(201, 162, 39, 0.20);
       --green: #22c55e; --red: #ef4444; --yellow: #eab308;
       --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
     }
@@ -30,7 +30,8 @@
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       min-height: 100vh; padding: 48px 40px;
     }
-    header { display: flex; align-items: baseline; gap: 16px; margin-bottom: 40px; }
+    header { display: flex; align-items: center; gap: 16px; margin-bottom: 40px; }
+    .logo { font-size: 26px; display: inline-block; transform: scaleX(-1); line-height: 1; flex-shrink: 0; filter: sepia(1) saturate(4) hue-rotate(5deg) brightness(1.1); }
     h1 {
       font-size: 20px; font-weight: 600;
       background: linear-gradient(90deg, var(--gold) 0%, #f0d478 45%, var(--gold) 90%);
@@ -91,6 +92,7 @@
 
     .attach-section { margin-top: 36px; max-width: 720px; }
     .attach-section h2 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 12px; }
+
     .attach-row { display: flex; gap: 10px; }
     .attach-row input {
       flex: 1; background: var(--surface); border: 1px solid var(--border);
@@ -112,18 +114,51 @@
     .workspace-card:nth-child(4) { animation-delay: .12s; }
     .workspace-card:nth-child(5) { animation-delay: .16s; }
 
+    .section-header { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 12px; }
+    .recent-section { margin-top: 36px; max-width: 720px; }
+    .recent-card {
+      background: none; border: 1px solid var(--border);
+      border-radius: 10px; padding: 12px 20px;
+      display: flex; align-items: center; gap: 14px;
+      transition: border-color .2s;
+      animation: card-in .2s ease-out both;
+    }
+    .recent-card:hover { border-color: rgba(201,162,39,.45); box-shadow: 0 0 20px rgba(201,162,39,.04); }
+    .recent-info { flex: 1; min-width: 0; }
+    .recent-name { font-size: 13px; font-weight: 500; color: var(--text); margin-bottom: 2px; }
+    .recent-path { font-size: 11px; color: var(--muted); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .7; }
+    .recent-actions { display: flex; gap: 8px; flex-shrink: 0; }
+    button.recent-attach {
+      background: none; border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer;
+      transition: border-color .15s, color .15s;
+    }
+    button.recent-attach:hover { border-color: var(--accent); color: var(--accent); }
+    button.recent-forget {
+      background: none; border: 1px solid transparent; color: var(--muted);
+      border-radius: 6px; padding: 5px 8px; font-size: 12px; cursor: pointer;
+      transition: color .15s, border-color .15s;
+    }
+    button.recent-forget:hover { color: var(--red); border-color: rgba(239,68,68,.3); }
+
     .error-msg { color: var(--red); font-size: 12px; margin-top: 8px; display: none; }
     .spinner { color: var(--muted); font-size: 13px; padding: 20px 0; }
   </style>
 </head>
 <body>
   <header>
-    <h1><span style="display:inline-block;transform:scaleX(-1)">⛵</span> Argo</h1>
+    <span class="logo">⛵</span>
+    <h1>Argo</h1>
     <span class="subtitle">Navigate your workspaces</span>
   </header>
 
   <div id="workspace-grid" class="workspace-grid">
     <div class="spinner">Loading…</div>
+  </div>
+
+  <div id="recent-section" class="recent-section" style="display:none">
+    <div class="section-header">Recent</div>
+    <div id="recent-grid" class="workspace-grid"></div>
   </div>
 
   <div class="attach-section">
@@ -148,36 +183,95 @@
 
         if (!list.length) {
           grid.innerHTML = '<div class="empty-state">No workspaces attached yet. Add a project folder below.</div>'
-          return
-        }
-
-        grid.innerHTML = list.map(ws => `
-          <div class="workspace-card">
-            <div class="ws-dot ${ws.running ? 'running' : ''}"></div>
-            <div class="ws-info">
-              <div class="ws-name">${esc(ws.name)}</div>
-              <div class="ws-path">${esc(ws.path)}</div>
+        } else {
+          grid.innerHTML = list.map(ws => `
+            <div class="workspace-card">
+              <div class="ws-dot ${ws.running ? 'running' : ''}"></div>
+              <div class="ws-info">
+                <div class="ws-name">${esc(ws.name)}</div>
+                <div class="ws-path">${esc(ws.path)}</div>
+              </div>
+              <div class="ws-actions">
+                <a class="ws-open ${ws.running ? '' : 'stopped'}"
+                  href="${esc(ws.url)}">
+                  ${ws.running ? 'Open →' : 'Stopped'}
+                </a>
+                <button class="ws-detach" data-name="${esc(ws.name)}">Detach</button>
+              </div>
             </div>
-            <div class="ws-actions">
-              <a class="ws-open ${ws.running ? '' : 'stopped'}"
-                href="${esc(ws.url)}" target="_blank">
-                ${ws.running ? 'Open →' : 'Stopped'}
-              </a>
-              <button class="ws-detach" data-name="${esc(ws.name)}">Detach</button>
+          `).join('')
+
+          grid.querySelectorAll('.ws-detach').forEach(btn => {
+            btn.addEventListener('click', async () => {
+              if (!confirm(`Detach "${btn.dataset.name}"?`)) return
+              btn.disabled = true
+              await fetch(`/api/detach/${btn.dataset.name}`, { method: 'POST' })
+              loadWorkspaces()
+            })
+          })
+        }
+      } catch {
+        grid.innerHTML = '<div class="empty-state">Could not reach server.</div>'
+      }
+
+      loadRecent()
+    }
+
+    async function loadRecent() {
+      const section = document.getElementById('recent-section')
+      const grid = document.getElementById('recent-grid')
+      try {
+        const list = await fetch('/api/history').then(r => r.json())
+        if (!Array.isArray(list) || !list.length) { section.style.display = 'none'; return }
+        section.style.display = ''
+        grid.innerHTML = list.map((e, i) => `
+          <div class="recent-card" style="animation-delay:${i * 0.04}s">
+            <div class="recent-info">
+              <div class="recent-name">${esc(e.name)}</div>
+              <div class="recent-path">${esc(e.path)}</div>
+            </div>
+            <div class="recent-actions">
+              <button class="recent-attach" data-path="${esc(e.path)}">↩ Attach</button>
+              <button class="recent-forget" data-path="${esc(e.path)}" title="Remove from history">×</button>
             </div>
           </div>
         `).join('')
 
-        grid.querySelectorAll('.ws-detach').forEach(btn => {
+        grid.querySelectorAll('.recent-attach').forEach(btn => {
           btn.addEventListener('click', async () => {
-            if (!confirm(`Detach "${btn.dataset.name}"?`)) return
             btn.disabled = true
-            await fetch(`/api/detach/${btn.dataset.name}`, { method: 'POST' })
-            loadWorkspaces()
+            btn.textContent = '…'
+            try {
+              const resp = await fetch('/api/attach', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: btn.dataset.path }),
+              })
+              const data = await resp.json()
+              if (!resp.ok) throw new Error(data.error)
+              window.location.href = data.url
+              loadWorkspaces()
+            } catch (err) {
+              btn.textContent = '↩ Attach'
+              btn.disabled = false
+              alert(err.message)
+            }
+          })
+        })
+
+        grid.querySelectorAll('.recent-forget').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            await fetch('/api/forget', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: btn.dataset.path }),
+            })
+            btn.closest('.recent-card').remove()
+            if (!grid.children.length) section.style.display = 'none'
           })
         })
       } catch {
-        grid.innerHTML = '<div class="empty-state">Could not reach server.</div>'
+        section.style.display = 'none'
       }
     }
 
@@ -201,7 +295,7 @@
         const data = await resp.json()
         if (!resp.ok) throw new Error(data.error)
         input.value = ''
-        window.open(data.url, '_blank')
+        window.location.href = data.url
         loadWorkspaces()
       } catch (err) {
         errEl.textContent = err.message

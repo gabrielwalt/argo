@@ -4,7 +4,6 @@ const $ = id => document.getElementById(id)
 const API_BASE = window.__WS__ ? `/ws/${window.__WS__}` : ''
 
 const messagesEl = $('messages')
-const traceEl = $('trace')
 const inputEl = $('input')
 const sendBtn = $('send-btn')
 const statusDot = $('status-dot')
@@ -25,7 +24,7 @@ let viewingSession = null  // null = current; object = past session being viewed
 let currentSessionQuery = ''  // first user message of the current session
 
 // ── Model options ────────────────────────────────────────────────
-const DEFAULTS = { temperature: 0.8, top_p: 0.9, top_k: 40, num_ctx: 8192 }
+const DEFAULTS = { temperature: 0.8, top_p: 0.9, top_k: 40, num_ctx: 32768 }
 const modelOpts = { ...DEFAULTS }
 
 function syncSettingsUI() {
@@ -52,14 +51,60 @@ $('settings-reset').addEventListener('click', () => { Object.assign(modelOpts, D
 settingsBtn.addEventListener('click', () => settingsPanel.classList.toggle('open'))
 syncSettingsUI()
 
-function activateTraceTab() {
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'))
-  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'))
-  document.querySelector('[data-tab="trace"]').classList.add('active')
-  $('tab-trace').classList.add('active')
+// ── Inline trace block (in chat) ──────────────────────────────────
+let currentTraceBlock = null
+let traceToolCalls = 0
+let traceStartTime = null
+
+function startTraceBlock(model) {
+  traceToolCalls = 0
+  traceStartTime = Date.now()
+
+  const block = document.createElement('div')
+  block.className = 'trace-block running'
+
+  const toggle = document.createElement('div')
+  toggle.className = 'trace-block-toggle'
+
+  const arrow = document.createElement('span')
+  arrow.className = 'trace-block-arrow'
+  arrow.textContent = '▶'
+
+  const title = document.createElement('span')
+  title.className = 'trace-block-title'
+  title.textContent = `Running · ${model}`
+
+  const meta = document.createElement('span')
+  meta.className = 'trace-block-meta'
+
+  toggle.append(arrow, title, meta)
+  toggle.addEventListener('click', () => {
+    block.classList.toggle('open')
+    arrow.textContent = block.classList.contains('open') ? '▼' : '▶'
+  })
+
+  const items = document.createElement('div')
+  items.className = 'trace-block-items'
+
+  block.append(toggle, items)
+  messagesEl.appendChild(block)
+  messagesEl.scrollTop = messagesEl.scrollHeight
+
+  currentTraceBlock = { el: block, items, title, meta, arrow }
+}
+
+function finalizeTraceBlock() {
+  if (!currentTraceBlock) return
+  const dur = traceStartTime ? ((Date.now() - traceStartTime) / 1000).toFixed(1) : ''
+  currentTraceBlock.title.textContent = 'Agent trace'
+  currentTraceBlock.meta.textContent = `${traceToolCalls} tool${traceToolCalls !== 1 ? 's' : ''} · ${dur}s`
+  currentTraceBlock.el.classList.remove('running')
+  currentTraceBlock = null
 }
 
 let busy = false
+const sendBoat = $('send-boat')
+const sendStop = $('send-stop')
 
 // ── SSE connection ───────────────────────────────────────────────
 const es = new EventSource(`${API_BASE}/events`)
@@ -75,15 +120,14 @@ es.onmessage = (e) => {
 function handleEvent(event) {
   switch (event.type) {
     case 'start':
-      clearTrace()
-      activateTraceTab()
+      startTraceBlock(event.model)
       setStatus('busy', `Running · ${event.model}`)
       tokenCounter.textContent = ''
       tokenCounter.className = ''
       break
 
     case 'iteration':
-      iterLabel.textContent = `iter ${event.current}/${event.max}`
+      iterLabel.textContent = `${event.current}/${event.max}`
       addTraceItem('iteration', null, `── Iteration ${event.current} of ${event.max} ──`, false)
       break
 
@@ -92,6 +136,7 @@ function handleEvent(event) {
       break
 
     case 'tool_call':
+      traceToolCalls++
       addTraceItem('tool-call', `🔧 ${event.tool}`, JSON.stringify(event.args, null, 2), true)
       break
 
@@ -119,10 +164,17 @@ function handleEvent(event) {
 
     case 'done':
       setStatus('ready', 'Ready')
+      finalizeTraceBlock()
       setBusy(false)
       iterLabel.textContent = ''
       refreshGitLog()
-      refreshFilesIfVisible()
+      refreshFiles()
+      break
+
+    case 'compact':
+      addTraceItem('compact', '⚡ Context compacted', event.summary, true)
+      tokenCounter.textContent = 'compacted'
+      tokenCounter.className = 'ctx-ok'
       break
 
     case 'git_commit':
@@ -133,6 +185,7 @@ function handleEvent(event) {
     case 'error':
       addTraceItem('error-item', '⚠ Error', event.message, false)
       setStatus('error', 'Error')
+      finalizeTraceBlock()
       setBusy(false)
       break
   }
@@ -146,17 +199,39 @@ function setStatus(state, text) {
 
 function setBusy(val) {
   busy = val
-  sendBtn.disabled = val
   inputEl.disabled = val
   const sessionBtn = $('session-btn')
   if (sessionBtn) sessionBtn.disabled = val
+
+  if (val) {
+    // Sail the boat away, then swap to stop icon + ring animation
+    sendBtn.classList.add('sailing')
+    setTimeout(() => {
+      sendBtn.classList.remove('sailing')
+      sendBtn.classList.add('working')
+      sendBoat.style.display = 'none'
+      sendStop.style.display = ''
+    }, 450)
+  } else {
+    sendBtn.classList.remove('sailing', 'working')
+    sendBoat.style.display = ''
+    sendStop.style.display = 'none'
+  }
 }
 
-function clearTrace() {
-  traceEl.innerHTML = ''
+async function stopAgent() {
+  try { await fetch(`${API_BASE}/stop`, { method: 'POST' }) } catch { /* ignore */ }
 }
+
+// Stop click: intercept button click when busy to cancel instead of submit
+sendBtn.addEventListener('click', (e) => {
+  if (!busy) return
+  e.preventDefault()
+  stopAgent()
+})
 
 function addTraceItem(className, label, body, collapsible) {
+  if (!currentTraceBlock) return null
   const el = document.createElement('div')
   el.className = `trace-item ${className}`
 
@@ -191,8 +266,8 @@ function addTraceItem(className, label, body, collapsible) {
     el.appendChild(bodyEl)
   }
 
-  traceEl.appendChild(el)
-  traceEl.scrollTop = traceEl.scrollHeight
+  currentTraceBlock.items.appendChild(el)
+  messagesEl.scrollTop = messagesEl.scrollHeight
   return el
 }
 
@@ -263,12 +338,18 @@ async function newSession() {
   await fetch(`${API_BASE}/reset`, { method: 'POST' })
   sessionStartTime = new Date()
   currentSessionQuery = ''
+  currentTraceBlock = null
   updateSessionLabel()
   messagesEl.innerHTML = '<div class="message system">New session started.</div>'
-  clearTrace()
   iterLabel.textContent = ''
   setStatus('ready', 'Ready')
 }
+
+// ── Dropdown mutual exclusion ─────────────────────────────────────
+function closeAllDropdowns() {
+  document.querySelectorAll('.nav-crumb.open').forEach(el => el.classList.remove('open'))
+}
+document.addEventListener('click', closeAllDropdowns)
 
 // ── Model selector ───────────────────────────────────────────────
 function selectModel(name) {
@@ -284,12 +365,18 @@ async function loadModels() {
   const dropdown = $('model-dropdown')
   const navModel = $('nav-model')
 
-  // Toggle open/close
+  // Toggle open/close — position fixed so it's never clipped by a parent overflow
   $('model-btn').addEventListener('click', e => {
     e.stopPropagation()
-    navModel.classList.toggle('open')
+    const wasOpen = navModel.classList.contains('open')
+    closeAllDropdowns()
+    if (!wasOpen) {
+      navModel.classList.add('open')
+      const r = $('model-btn').getBoundingClientRect()
+      dropdown.style.top  = (r.bottom + 6) + 'px'
+      dropdown.style.left = (r.right - 220) + 'px'
+    }
   })
-  document.addEventListener('click', () => navModel.classList.remove('open'))
 
   try {
     const resp = await fetch(`${API_BASE}/models`)
@@ -350,7 +437,7 @@ async function refreshGitLog() {
     gitLog.classList.remove('open')
 
     if (commits.length === 0) {
-      latestEl.innerHTML = '<span style="color:var(--muted)">No commits yet</span>'
+      latestEl.innerHTML = '<span class="muted-sm">No commits yet</span>'
       return
     }
 
@@ -381,7 +468,7 @@ async function refreshGitLog() {
       $('refresh-git').insertAdjacentElement('beforebegin', toggleBtn)
     }
   } catch {
-    latestEl.innerHTML = '<span style="color:var(--muted)">Could not load git log.</span>'
+    latestEl.innerHTML = '<span class="muted-sm">Could not load git log.</span>'
   }
 }
 
@@ -423,9 +510,6 @@ async function refreshFiles() {
   renderTree($('files-scratch-tree'), scratchTree, 'scratch')
 }
 
-function refreshFilesIfVisible() {
-  if ($('tab-files').classList.contains('active')) refreshFiles()
-}
 
 function renderTree(container, nodes, dir) {
   container.innerHTML = ''
@@ -473,7 +557,7 @@ function makeFileNode(node, dir, parentPath) {
     row.className = 'file-row'
     const size = node.size != null ? formatSize(node.size) : ''
     row.innerHTML = `<span class="file-icon">·</span><span class="file-name">${escHtml(node.name)}</span><span class="file-size">${size}</span>`
-    row.addEventListener('click', () => openFilePreview(dir, filePath, node.name))
+    row.addEventListener('click', () => openFileInViewer(dir, filePath, row))
     wrapper.appendChild(row)
   }
 
@@ -486,110 +570,36 @@ function formatSize(bytes) {
   return `${(bytes / 1048576).toFixed(1)}MB`
 }
 
-async function openFilePreview(dir, filePath, name) {
-  diffTitle.textContent = name
-  diffContent.textContent = 'Loading…'
-  diffModal.classList.add('open')
+let activeFileRow = null
+
+async function openFileInViewer(dir, filePath, rowEl) {
+  if (activeFileRow) activeFileRow.classList.remove('active')
+  activeFileRow = rowEl
+  rowEl.classList.add('active')
+
+  const pathEl = $('file-viewer-path')
+  const contentEl = $('file-viewer-content')
+  pathEl.textContent = filePath
+  contentEl.textContent = 'Loading…'
+  contentEl.classList.remove('file-viewer-empty')
+
   try {
     const resp = await fetch(`${API_BASE}/file?dir=${dir}&path=${encodeURIComponent(filePath)}`)
-    diffContent.textContent = await resp.text()
+    contentEl.textContent = await resp.text()
   } catch {
-    diffContent.textContent = 'Failed to load file.'
+    contentEl.textContent = 'Failed to load file.'
   }
 }
+
+$('file-viewer-close').addEventListener('click', () => {
+  if (activeFileRow) { activeFileRow.classList.remove('active'); activeFileRow = null }
+  $('file-viewer-path').textContent = ''
+  $('file-viewer-content').textContent = 'Select a file to view'
+  $('file-viewer-content').classList.add('file-viewer-empty')
+})
 
 $('refresh-files').addEventListener('click', refreshFiles)
 
-// ── Tab switching ─────────────────────────────────────────────────
-document.querySelectorAll('.tab-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    const tab = btn.dataset.tab
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'))
-    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'))
-    btn.classList.add('active')
-    $(`tab-${tab}`).classList.add('active')
-    if (tab === 'logs') refreshLogs()
-    if (tab === 'files') refreshFiles()
-  })
-})
-
-// ── Session logs tab ─────────────────────────────────────────────
-const logsList = $('logs-list')
-const logViewer = $('log-viewer')
-const logsCount = $('logs-count')
-let currentLogFile = null
-let currentFmt = 'md'
-
-async function refreshLogs() {
-  try {
-    const resp = await fetch(`${API_BASE}/logs`)
-    const logs = await resp.json()
-    logsCount.textContent = `${logs.length} session${logs.length !== 1 ? 's' : ''}`
-
-    if (logs.length === 0) {
-      logsList.innerHTML = '<span style="color:var(--muted)">No logs yet. Run a query to generate one.</span>'
-      return
-    }
-
-    logsList.innerHTML = ''
-    logs.forEach(log => {
-      const el = document.createElement('div')
-      el.className = 'log-entry'
-      el.innerHTML = `
-        <span class="log-ts">${formatDate(log.startedAt)}</span>
-        <span class="log-query" title="${escHtml(log.query)}">${escHtml(log.query)}</span>
-        <span class="log-meta">${log.model} · ${log.toolCalls} tools · ${log.durationMs ? (log.durationMs/1000).toFixed(1)+'s' : '—'}</span>
-        <span class="log-status ${log.status}">${log.status}</span>
-      `
-      el.addEventListener('click', () => openLog(log.filename, log.query))
-      logsList.appendChild(el)
-    })
-  } catch {
-    logsList.innerHTML = '<span style="color:var(--muted)">Could not load logs.</span>'
-  }
-}
-
-async function openLog(filename, query) {
-  currentLogFile = filename
-  logsList.parentElement.style.display = 'none'
-  logViewer.style.display = 'flex'
-  $('log-viewer-title').textContent = filename
-  $('log-viewer-content').textContent = 'Loading…'
-  await loadLogContent(filename, currentFmt)
-}
-
-async function loadLogContent(filename, fmt) {
-  try {
-    const resp = await fetch(`${API_BASE}/logs/${filename}?format=${fmt}`)
-    $('log-viewer-content').textContent = await resp.text()
-  } catch {
-    $('log-viewer-content').textContent = 'Failed to load.'
-  }
-}
-
-$('back-to-logs').addEventListener('click', () => {
-  logViewer.style.display = 'none'
-  logsList.parentElement.style.display = 'flex'
-  currentLogFile = null
-})
-
-document.querySelectorAll('.log-fmt-btn').forEach(btn => {
-  btn.addEventListener('click', async () => {
-    currentFmt = btn.dataset.fmt
-    document.querySelectorAll('.log-fmt-btn').forEach(b => b.classList.remove('active'))
-    btn.classList.add('active')
-    if (currentLogFile) await loadLogContent(currentLogFile, currentFmt)
-  })
-})
-
-$('refresh-logs').addEventListener('click', refreshLogs)
-
-es.addEventListener('message', (e) => {
-  const event = JSON.parse(e.data)
-  if (event.type === 'done' && $('tab-logs').classList.contains('active')) {
-    setTimeout(refreshLogs, 500)
-  }
-})
 
 // ── Session switcher (breadcrumb: session crumb) ─────────────────
 
@@ -601,7 +611,8 @@ function updateSessionLabel() {
   const label = $('session-label')
   if (!label) return
   if (viewingSession) {
-    label.textContent = viewingSession.query ? truncateQuery(viewingSession.query) : 'Session'
+    const q = viewingSession.runs?.[viewingSession.runs.length - 1]?.query ?? ''
+    label.textContent = q ? truncateQuery(q) : 'Past session'
   } else {
     label.textContent = currentSessionQuery ? truncateQuery(currentSessionQuery) : 'Session'
   }
@@ -611,63 +622,115 @@ async function refreshSessionDropdown() {
   const dropdown = $('session-dropdown')
   dropdown.innerHTML = ''
 
-  // "New session" action
+  // New session CTA
   const newItem = document.createElement('div')
-  newItem.className = 'nav-drop-item'
-  newItem.style.cssText = 'color:var(--text);gap:10px'
-  newItem.innerHTML = `<span style="color:var(--gold);font-size:11px">✦</span> New session`
+  newItem.className = 'nav-drop-cta'
+  if (busy) newItem.setAttribute('disabled', '')
+  newItem.innerHTML = `<span class="drop-icon">+</span> New session`
   newItem.addEventListener('click', () => {
+    if (busy) return
     $('nav-session').classList.remove('open')
     newSession()
   })
   dropdown.appendChild(newItem)
-
-  const sep0 = document.createElement('div')
-  sep0.className = 'nav-drop-sep'
-  dropdown.appendChild(sep0)
 
   const header = document.createElement('div')
   header.className = 'nav-drop-label'
   header.textContent = 'Sessions'
   dropdown.appendChild(header)
 
-  // Current session entry
+  // Current live session — same format as past sessions: query + Clear
   const currItem = document.createElement('div')
   currItem.className = `nav-drop-item ${!viewingSession ? 'active' : ''}`
-  const msgCount = messagesEl.querySelectorAll('.message.user, .message.assistant').length
-  const currTime = sessionStartTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  currItem.innerHTML = `<span style="flex-shrink:0;color:var(--green);font-size:9px">●</span><span>Now · ${currTime}</span><span style="margin-left:auto;opacity:.5;font-size:11px">${msgCount} msg${msgCount !== 1 ? 's' : ''}</span>`
+  const liveLabel = currentSessionQuery ? truncateQuery(currentSessionQuery, 28) : '(no messages)'
+  currItem.innerHTML = `<span class="drop-text">${escHtml(liveLabel)}</span>`
+  const clearCurrBtn = document.createElement('button')
+  clearCurrBtn.className = 'nav-drop-detach'
+  clearCurrBtn.textContent = 'Clear'
+  clearCurrBtn.addEventListener('click', async (e) => {
+    e.stopPropagation()
+    if (!confirm('Clear current session?')) return
+    $('nav-session').classList.remove('open')
+    try {
+      const st = await fetch(`${API_BASE}/status`).then(r => r.json())
+      if (st.sessionId) await fetch(`${API_BASE}/logs/${st.sessionId}`, { method: 'DELETE' }).catch(() => {})
+    } catch { /* ignore */ }
+    newSession()
+  })
+  currItem.appendChild(clearCurrBtn)
   currItem.addEventListener('click', () => {
     $('nav-session').classList.remove('open')
     if (viewingSession) returnToCurrentSession()
   })
   dropdown.appendChild(currItem)
 
-  // Past sessions from logs
+  // Past sessions — exclude the live session (it's shown as "Now"), each with hover-reveal Clear
   try {
-    const sessions = await fetch(`${API_BASE}/logs`).then(r => r.json())
-    if (sessions.length > 0) {
+    const [sessions, status] = await Promise.all([
+      fetch(`${API_BASE}/logs`).then(r => r.json()),
+      fetch(`${API_BASE}/status`).then(r => r.json()),
+    ])
+    const liveSessionId = status?.sessionId ?? ''
+    // Show all past sessions from the registry — no query requirement.
+    // Sessions without runs are intentionally-created sessions with no messages yet.
+    const pastSessions = Array.isArray(sessions)
+      ? sessions.filter(sg => sg.id !== liveSessionId)
+      : []
+
+    if (pastSessions.length > 0) {
       const sep = document.createElement('div')
       sep.className = 'nav-drop-sep'
       dropdown.appendChild(sep)
 
-      sessions.slice(0, 30).forEach(s => {
+      pastSessions.slice(0, 20).forEach(sg => {
         const item = document.createElement('div')
-        item.className = `nav-drop-item ${viewingSession?.filename === s.filename ? 'active' : ''}`
-        const d = new Date(s.startedAt)
-        const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        const dateStr = isToday(d) ? timeStr : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + timeStr
-        const query = s.query.length > 32 ? s.query.slice(0, 32) + '…' : s.query
-        item.innerHTML = `<span style="flex-shrink:0;color:var(--muted);font-size:11px;min-width:72px">${dateStr}</span><span style="overflow:hidden;text-overflow:ellipsis">${escHtml(query)}</span>`
-        item.title = s.query
+        item.className = `nav-drop-item ${viewingSession?.id === sg.id ? 'active' : ''}`
+        const d = new Date(sg.startedAt)
+        const dateStr = isToday(d)
+          ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
+            d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        const lastQuery = sg.runs?.[sg.runs.length - 1]?.query ?? ''
+        const preview = lastQuery.length > 28 ? lastQuery.slice(0, 28) + '…' : lastQuery
+        item.innerHTML = `<span class="drop-text">${escHtml(preview || '(no messages)')}</span>`
+        item.title = lastQuery
+
+        const clearBtn = document.createElement('button')
+        clearBtn.className = 'nav-drop-detach'
+        clearBtn.textContent = 'Clear'
+        clearBtn.addEventListener('click', async (e) => {
+          e.stopPropagation()
+          if (!confirm('Delete this session?')) return
+          await fetch(`${API_BASE}/logs/${sg.id}`, { method: 'DELETE' }).catch(() => {})
+          if (viewingSession?.id === sg.id) returnToCurrentSession()
+          item.remove()
+        })
+        item.appendChild(clearBtn)
+
         item.addEventListener('click', () => {
           $('nav-session').classList.remove('open')
-          viewSessionEntry(s)
+          viewSession(sg)
         })
         dropdown.appendChild(item)
       })
     }
-  } catch { /* logs endpoint unavailable in some modes */ }
+  } catch { /* logs unavailable */ }
+
+  // Clear all history — always last
+  const endSep = document.createElement('div')
+  endSep.className = 'nav-drop-sep'
+  dropdown.appendChild(endSep)
+
+  const clearAll = document.createElement('div')
+  clearAll.className = 'nav-drop-item nav-drop-item-sm'
+  clearAll.innerHTML = `<span class="drop-icon-dim">⌫</span> Clear all history`
+  clearAll.addEventListener('click', async () => {
+    if (!confirm('Delete all session logs and clear current history?')) return
+    $('nav-session').classList.remove('open')
+    try { await fetch(`${API_BASE}/logs`, { method: 'DELETE' }) } catch { /* standalone */ }
+    newSession()
+  })
+  dropdown.appendChild(clearAll)
 }
 
 function isToday(date) {
@@ -675,38 +738,40 @@ function isToday(date) {
   return date.toDateString() === now.toDateString()
 }
 
-async function viewSessionEntry(session) {
-  viewingSession = session
+async function viewSession(sessionGroup) {
+  viewingSession = sessionGroup
+  currentTraceBlock = null
   updateSessionLabel()
 
-  try {
-    const resp = await fetch(`${API_BASE}/logs/${session.filename}?format=jsonl`)
-    const text = await resp.text()
-    const events = text.trim().split('\n')
-      .map(l => { try { return JSON.parse(l) } catch { return null } })
-      .filter(Boolean)
-    const messages = events.filter(e => e.type === 'message')
+  messagesEl.innerHTML = ''
+  const d = new Date(sessionGroup.startedAt)
+  const dateStr = d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' · ' +
+    d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  addSystemMessage(`Session from ${dateStr}`)
 
-    messagesEl.innerHTML = ''
-    const d = new Date(session.startedAt)
-    const dateStr = (isToday(d) ? '' : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' · ') +
-                    d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    addSystemMessage(`${dateStr} · ${session.model}`)
-    messages.forEach(m => addChatMessage(m.role, m.content))
-
-    // Show banner, hide input form
-    $('session-banner-label').textContent = `Viewing session from ${dateStr}`
-    $('session-banner').classList.add('visible')
-    $('chat-form').style.display = 'none'
-  } catch {
-    addSystemMessage('Could not load session.')
+  for (const run of sessionGroup.runs) {
+    try {
+      const resp = await fetch(`${API_BASE}/logs/${run.filename}?format=jsonl`)
+      const text = await resp.text()
+      for (const line of text.trim().split('\n')) {
+        try {
+          const { event } = JSON.parse(line)
+          if (event.type === 'message') addChatMessage(event.role, event.content)
+        } catch { /* skip */ }
+      }
+    } catch { /* skip failed runs */ }
   }
+
+  $('session-banner-label').textContent = `Viewing past session`
+  $('session-banner').classList.add('visible')
+  $('chat-form').style.display = 'none'
 }
 
 async function returnToCurrentSession() {
   viewingSession = null
-  updateSessionLabel()
   $('session-banner').classList.remove('visible')
+  $('resume-btn').disabled = false
+  $('resume-btn').textContent = '▶ Resume'
   $('chat-form').style.display = ''
 
   // Restore current conversation from server
@@ -717,6 +782,8 @@ async function returnToCurrentSession() {
     if (messages.length === 0) {
       messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
     } else {
+      const firstUser = messages.find(m => m.role === 'user')
+      if (firstUser) currentSessionQuery = firstUser.content
       const userCount = messages.filter(m => m.role === 'user').length
       addSystemMessage(`― ${userCount} message${userCount !== 1 ? 's' : ''} in current session ―`)
       messages.forEach(m => addChatMessage(m.role, m.content))
@@ -724,9 +791,24 @@ async function returnToCurrentSession() {
   } catch {
     messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
   }
+  updateSessionLabel()
 }
 
 $('return-btn').addEventListener('click', returnToCurrentSession)
+
+$('resume-btn').addEventListener('click', async () => {
+  if (!viewingSession) return
+  const btn = $('resume-btn')
+  btn.textContent = '…'
+  btn.disabled = true
+  try {
+    await fetch(`${API_BASE}/resume/${viewingSession.id}`, { method: 'POST' })
+    await returnToCurrentSession()
+  } catch {
+    btn.textContent = '▶ Resume'
+    btn.disabled = false
+  }
+})
 
 // ── Nav init ─────────────────────────────────────────────────────
 async function initNav() {
@@ -738,13 +820,17 @@ async function initNav() {
 
   sessionBtn.addEventListener('click', (e) => {
     e.stopPropagation()
-    if (busy) return
-    const isOpen = navSession.classList.toggle('open')
-    if (isOpen) refreshSessionDropdown()
+    const wasOpen = navSession.classList.contains('open')
+    closeAllDropdowns()
+    if (!wasOpen) {
+      navSession.classList.add('open')
+      const r = sessionBtn.getBoundingClientRect()
+      const dropdown = $('session-dropdown')
+      dropdown.style.top  = (r.bottom + 6) + 'px'
+      dropdown.style.left = r.left + 'px'
+      refreshSessionDropdown()
+    }
   })
-
-  // Close session dropdown on outside click (always)
-  document.addEventListener('click', () => navSession.classList.remove('open'))
 
   // Workspace crumb — only in central/worker mode
   if (!window.__WS__) return
@@ -758,49 +844,24 @@ async function initNav() {
 
   wsBtn.addEventListener('click', (e) => {
     e.stopPropagation()
-    navWs.classList.toggle('open')
+    const wasOpen = navWs.classList.contains('open')
+    closeAllDropdowns()
+    if (!wasOpen) {
+      navWs.classList.add('open')
+      const r = wsBtn.getBoundingClientRect()
+      wsDropdown.style.top  = (r.bottom + 6) + 'px'
+      wsDropdown.style.left = r.left + 'px'
+    }
   })
 
-  // Build workspace dropdown — always render scaffold; populate others from API
+  // Build workspace dropdown — attach form at top, then workspace list
   const wsDropdown = $('ws-dropdown')
   wsDropdown.innerHTML = ''
 
-  const wsLabel = document.createElement('div')
-  wsLabel.className = 'nav-drop-label'
-  wsLabel.textContent = 'Workspaces'
-  wsDropdown.appendChild(wsLabel)
-
-  const currWs = document.createElement('div')
-  currWs.className = 'nav-drop-item active'
-  currWs.innerHTML = `<span style="flex-shrink:0;color:var(--green);font-size:9px">●</span>${escHtml(window.__WS__)}`
-  wsDropdown.appendChild(currWs)
-
-  // Placeholder for other running workspaces (filled by API)
-  const othersContainer = document.createElement('div')
-  wsDropdown.appendChild(othersContainer)
-
-  const sepAll = document.createElement('div')
-  sepAll.className = 'nav-drop-sep'
-  wsDropdown.appendChild(sepAll)
-
-  const allLink = document.createElement('a')
-  allLink.className = 'nav-drop-item'
-  allLink.href = '/'
-  allLink.innerHTML = `<span style="opacity:.5">←</span> All workspaces`
-  wsDropdown.appendChild(allLink)
-
-  const sepAttach = document.createElement('div')
-  sepAttach.className = 'nav-drop-sep'
-  wsDropdown.appendChild(sepAttach)
-
-  const attachLabel = document.createElement('div')
-  attachLabel.className = 'nav-drop-label'
-  attachLabel.textContent = 'Attach folder'
-  wsDropdown.appendChild(attachLabel)
-
+  // Attach form at top
   const attachRow = document.createElement('div')
   attachRow.className = 'nav-drop-attach'
-  attachRow.innerHTML = `<input type="text" placeholder="/path/to/project" spellcheck="false" autocomplete="off"><button type="button">Attach</button>`
+  attachRow.innerHTML = `<input type="text" placeholder="Attach /path/to/folder…" spellcheck="false" autocomplete="off"><button type="button">Attach</button>`
   wsDropdown.appendChild(attachRow)
 
   const attachInput = attachRow.querySelector('input')
@@ -819,13 +880,12 @@ async function initNav() {
       })
       const data = await resp.json()
       if (!resp.ok) throw new Error(data.error ?? 'Failed')
-      window.open(data.url, '_blank')
-      navWs.classList.remove('open')
+      window.location.href = data.url
       attachInput.value = ''
     } catch (err) {
       attachInput.value = ''
       attachInput.placeholder = err.message
-      setTimeout(() => { attachInput.placeholder = '/path/to/project' }, 3000)
+      setTimeout(() => { attachInput.placeholder = 'Attach /path/to/folder…' }, 3000)
     } finally {
       attachBtn.textContent = 'Attach'
       attachBtn.disabled = false
@@ -839,6 +899,33 @@ async function initNav() {
     if (e.key === 'Enter') doAttach()
   })
 
+  const sepAttach = document.createElement('div')
+  sepAttach.className = 'nav-drop-sep'
+  wsDropdown.appendChild(sepAttach)
+
+  const wsLabel = document.createElement('div')
+  wsLabel.className = 'nav-drop-label'
+  wsLabel.textContent = 'Workspaces'
+  wsDropdown.appendChild(wsLabel)
+
+  // Current workspace row with detach button
+  const currWs = document.createElement('div')
+  currWs.className = 'nav-drop-item active'
+  currWs.innerHTML = `<span class="drop-dot">●</span><span>${escHtml(window.__WS__)}</span><button class="nav-drop-detach" type="button">Detach</button>`
+  const currDetach = currWs.querySelector('.nav-drop-detach')
+  currDetach.addEventListener('click', async (e) => {
+    e.stopPropagation()
+    if (!confirm(`Detach "${window.__WS__}" and stop its container?`)) return
+    currDetach.textContent = '…'
+    await fetch(`/api/detach/${window.__WS__}`, { method: 'POST' }).catch(() => {})
+    window.location.href = '/'
+  })
+  wsDropdown.appendChild(currWs)
+
+  // Placeholder for other running workspaces (filled by API)
+  const othersContainer = document.createElement('div')
+  wsDropdown.appendChild(othersContainer)
+
   // Populate other running workspaces from API (best-effort)
   try {
     const workspaces = await fetch('/api/workspaces').then(r => r.json())
@@ -848,17 +935,23 @@ async function initNav() {
       sep.className = 'nav-drop-sep'
       othersContainer.appendChild(sep)
       others.forEach(w => {
-        const a = document.createElement('a')
-        a.className = 'nav-drop-item'
-        a.href = `/ws/${w.name}/`
-        a.textContent = w.name
-        othersContainer.appendChild(a)
+        const row = document.createElement('div')
+        row.className = 'nav-drop-item'
+        row.innerHTML = `<span class="drop-text">${escHtml(w.name)}</span><button class="nav-drop-detach" type="button">Detach</button>`
+        row.addEventListener('click', () => { window.location.href = `/ws/${w.name}/` })
+        const detachBtn = row.querySelector('.nav-drop-detach')
+        detachBtn.addEventListener('click', async (e) => {
+          e.stopPropagation()
+          if (!confirm(`Detach "${w.name}" and stop its container?`)) return
+          detachBtn.textContent = '…'
+          await fetch(`/api/detach/${w.name}`, { method: 'POST' }).catch(() => {})
+          row.remove()
+        })
+        othersContainer.appendChild(row)
       })
     }
   } catch { /* standalone dev — no workspace API */ }
 
-  // Close workspace dropdown on outside click
-  document.addEventListener('click', () => navWs.classList.remove('open'))
 }
 
 // ── Init ─────────────────────────────────────────────────────────
@@ -892,7 +985,37 @@ async function loadHistory() {
   } catch { }
 }
 
+// ── Panel resize ─────────────────────────────────────────────────
+function initResize(handleId, getWidth, cssVar, minPx) {
+  const handle = $(handleId)
+  if (!handle) return
+  handle.addEventListener('mousedown', (e) => {
+    e.preventDefault()
+    handle.classList.add('dragging')
+    const startX = e.clientX
+    const startW = getWidth()
+    const onMove = (ev) => {
+      const w = Math.max(minPx, startW + ev.clientX - startX)
+      document.documentElement.style.setProperty(cssVar, w + 'px')
+    }
+    const onUp = () => {
+      handle.classList.remove('dragging')
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  })
+}
+
 loadModels()
 refreshGitLog()
 loadHistory()
 initNav()
+refreshFiles()
+initResize('panel-resize', () => $('chat-panel').getBoundingClientRect().width, '--chat-width', 240)
+initResize('tree-resize', () => $('file-tree-pane').getBoundingClientRect().width, '--tree-width', 120)

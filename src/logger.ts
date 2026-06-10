@@ -6,6 +6,38 @@ import type { AgentEvent, ModelOptions } from './types.js'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 export const LOGS_DIR = path.join(__dirname, '..', 'logs')
 
+const REGISTRY_FILE = path.join(LOGS_DIR, 'sessions-registry.json')
+
+interface RegistryEntry {
+  id: string
+  startedAt: string
+}
+
+async function readRegistry(): Promise<RegistryEntry[]> {
+  try {
+    return JSON.parse(await fs.readFile(REGISTRY_FILE, 'utf-8'))
+  } catch {
+    return []
+  }
+}
+
+async function writeRegistry(entries: RegistryEntry[]): Promise<void> {
+  await fs.mkdir(LOGS_DIR, { recursive: true })
+  await fs.writeFile(REGISTRY_FILE, JSON.stringify(entries))
+}
+
+export async function registerSession(id: string): Promise<void> {
+  const entries = await readRegistry()
+  if (!entries.some(e => e.id === id)) {
+    entries.unshift({ id, startedAt: new Date().toISOString() })
+    await writeRegistry(entries)
+  }
+}
+
+export async function unregisterSession(id: string): Promise<void> {
+  await writeRegistry((await readRegistry()).filter(e => e.id !== id))
+}
+
 interface LogEntry {
   ts: string
   event: AgentEvent
@@ -21,6 +53,13 @@ export interface LogMeta {
   iterations?: number
   toolCalls: number
   status: 'running' | 'done' | 'error'
+  sessionId?: string
+}
+
+export interface SessionGroup {
+  id: string
+  startedAt: string
+  runs: LogMeta[]
 }
 
 export class SessionLogger {
@@ -29,7 +68,7 @@ export class SessionLogger {
   private filename: string
   private meta: LogMeta
 
-  constructor(query: string, model: string, options: ModelOptions = {}) {
+  constructor(query: string, model: string, options: ModelOptions = {}, sessionId?: string) {
     const slug = query.slice(0, 40).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')
     const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
     this.filename = `${ts}_${slug}`
@@ -41,6 +80,7 @@ export class SessionLogger {
       startedAt: new Date().toISOString(),
       toolCalls: 0,
       status: 'running',
+      ...(sessionId ? { sessionId } : {}),
     }
   }
 
@@ -215,4 +255,79 @@ export async function readLog(filename: string): Promise<{ jsonl: string; md: st
   } catch {
     return null
   }
+}
+
+export async function listSessions(): Promise<SessionGroup[]> {
+  const [logs, registry] = await Promise.all([listLogs(), readRegistry()])
+
+  // Build map from log files (has full run metadata)
+  const map = new Map<string, LogMeta[]>()
+  for (const log of logs) {
+    const sid = log.sessionId ?? 'legacy'
+    if (!map.has(sid)) map.set(sid, [])
+    map.get(sid)!.push(log)
+  }
+
+  // Add registry entries that have no log files (e.g. sessions created but no messages sent)
+  for (const entry of registry) {
+    if (!map.has(entry.id)) map.set(entry.id, [])
+  }
+
+  return Array.from(map.entries())
+    .map(([id, runs]) => {
+      const sorted = runs.slice().sort((a, b) => a.startedAt.localeCompare(b.startedAt))
+      const registryEntry = registry.find(e => e.id === id)
+      const startedAt = sorted[0]?.startedAt ?? registryEntry?.startedAt ?? id
+      return { id, startedAt, runs: sorted }
+    })
+    .sort((a, b) => {
+      const aLast = a.runs[a.runs.length - 1]?.startedAt ?? a.startedAt
+      const bLast = b.runs[b.runs.length - 1]?.startedAt ?? b.startedAt
+      return bLast.localeCompare(aLast)
+    })
+}
+
+export async function deleteAllLogs(): Promise<void> {
+  try {
+    const files = await fs.readdir(LOGS_DIR)
+    await Promise.all(
+      files
+        .filter(f => f.endsWith('.jsonl') || f.endsWith('.md') || f.startsWith('history') || f === 'current-session.txt' || f === 'sessions-registry.json')
+        .map(f => fs.unlink(path.join(LOGS_DIR, f)).catch(() => {}))
+    )
+  } catch { /* dir may not exist */ }
+}
+
+export async function deleteSession(sessionId: string): Promise<void> {
+  const sessions = await listSessions()
+  const session = sessions.find(s => s.id === sessionId)
+  if (!session) return
+  await Promise.all([
+    ...session.runs.flatMap(run => [
+      fs.unlink(path.join(LOGS_DIR, `${run.filename}.jsonl`)).catch(() => {}),
+      fs.unlink(path.join(LOGS_DIR, `${run.filename}.md`)).catch(() => {}),
+    ]),
+    fs.unlink(path.join(LOGS_DIR, `history-${sessionId}.json`)).catch(() => {}),
+    unregisterSession(sessionId),
+  ])
+}
+
+export async function getSessionMessages(sessionId: string): Promise<Array<{ role: string; content: string }>> {
+  const sessions = await listSessions()
+  const session = sessions.find(s => s.id === sessionId)
+  if (!session) return []
+  const messages: Array<{ role: string; content: string }> = []
+  for (const run of session.runs) {
+    const log = await readLog(run.filename)
+    if (!log) continue
+    for (const line of log.jsonl.trim().split('\n')) {
+      try {
+        const { event } = JSON.parse(line)
+        if (event.type === 'message' && event.content) {
+          messages.push({ role: event.role, content: event.content })
+        }
+      } catch { /* skip bad lines */ }
+    }
+  }
+  return messages
 }

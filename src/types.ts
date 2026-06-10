@@ -23,6 +23,7 @@ export type AgentEvent =
   | { type: 'token_usage'; prompt_tokens: number; generated_tokens: number; num_ctx: number }
   | { type: 'done'; content: string }
   | { type: 'git_commit'; hash: string; message: string }
+  | { type: 'compact'; summary: string }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
 

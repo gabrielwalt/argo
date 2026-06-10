@@ -20,6 +20,7 @@ const CONFIG_DIR        = path.join(HOME, '.config', 'argo')
 const SCRATCH_BASE      = path.join(HOME, '.local', 'share', 'argo', 'scratch')
 const LOGS_BASE         = path.join(HOME, '.local', 'share', 'argo', 'logs')
 const REGISTRY_FILE     = path.join(CONFIG_DIR, 'workspaces.json')
+const HISTORY_FILE      = path.join(CONFIG_DIR, 'workspace-history.json')
 const GLOBAL_ENV_FILE   = path.join(CONFIG_DIR, 'env')
 const AGENT_IMAGE       = process.env.AGENT_IMAGE ?? 'argo:latest'
 const CONTAINER_PREFIX  = 'argo-'
@@ -48,6 +49,29 @@ async function saveRegistry(entries: WorkspaceEntry[]): Promise<void> {
   const tmp = `${REGISTRY_FILE}.tmp`
   await fs.writeFile(tmp, JSON.stringify(entries, null, 2))
   await fs.rename(tmp, REGISTRY_FILE)
+}
+
+// ── Workspace history ─────────────────────────────────────────────
+
+interface HistoryEntry { name: string; path: string; lastSeen: string }
+
+async function loadHistory(): Promise<HistoryEntry[]> {
+  try { return JSON.parse(await fs.readFile(HISTORY_FILE, 'utf-8')) } catch { return [] }
+}
+
+async function recordHistory(name: string, absPath: string): Promise<void> {
+  const entries = await loadHistory()
+  const idx = entries.findIndex(e => e.path === absPath)
+  const entry: HistoryEntry = { name, path: absPath, lastSeen: new Date().toISOString() }
+  if (idx >= 0) entries[idx] = entry; else entries.unshift(entry)
+  const trimmed = entries.slice(0, 50)
+  await fs.mkdir(CONFIG_DIR, { recursive: true })
+  await fs.writeFile(HISTORY_FILE, JSON.stringify(trimmed, null, 2))
+}
+
+async function forgetHistory(absPath: string): Promise<void> {
+  const entries = (await loadHistory()).filter(e => e.path !== absPath)
+  await fs.writeFile(HISTORY_FILE, JSON.stringify(entries, null, 2))
 }
 
 // ── Global env ────────────────────────────────────────────────────
@@ -236,7 +260,10 @@ export function startCentral(): void {
   app.use(cors())
   // express.json() is NOT applied globally — it would consume req body before the proxy can pipe it.
   // Apply it only to the /api/* routes that actually need parsed bodies.
-  app.use(express.static(PUBLIC_DIR, { index: false }))
+  app.use(express.static(PUBLIC_DIR, {
+    index: false,
+    setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache'),
+  }))
 
   // Workspace list page
   app.get('/', (_req, res) => res.sendFile(path.join(PUBLIC_DIR, 'workspaces.html')))
@@ -290,6 +317,7 @@ export function startCentral(): void {
         await waitForWorker(existing.port)
         await saveRegistry(registry)
       }
+      await recordHistory(existing.name, absPath)
       res.json({ name: existing.name, url: `http://localhost:${config.port}/ws/${existing.name}/` })
       return
     }
@@ -306,6 +334,7 @@ export function startCentral(): void {
       await waitForWorker(port)
       registry.push(ws)
       await saveRegistry(registry)
+      await recordHistory(name, absPath)
       res.json({ name, url: `http://localhost:${config.port}/ws/${name}/` })
     } catch (err) {
       res.status(500).json({ error: String(err) })
@@ -317,9 +346,29 @@ export function startCentral(): void {
     const registry = await loadRegistry()
     const idx = registry.findIndex(w => w.name === req.params.name)
     if (idx < 0) { res.status(404).json({ error: 'Not found' }); return }
-    await stopWorker(req.params.name)
+    const { name } = req.params
+    await stopWorker(name)
     registry.splice(idx, 1)
     await saveRegistry(registry)
+    await Promise.all([
+      fs.rm(path.join(SCRATCH_BASE, name), { recursive: true, force: true }),
+      fs.rm(path.join(LOGS_BASE, name),    { recursive: true, force: true }),
+    ])
+    res.json({ ok: true })
+  })
+
+  // Recent workspace history (paths not currently active)
+  app.get('/api/history', async (_req, res) => {
+    const [history, registry] = await Promise.all([loadHistory(), loadRegistry()])
+    const activePaths = new Set(registry.map(w => w.path))
+    res.json(history.filter(e => !activePaths.has(e.path)))
+  })
+
+  // Remove a path from history
+  app.post('/api/forget', express.json(), async (req, res) => {
+    const { path: wsPath } = req.body as { path?: string }
+    if (!wsPath) { res.status(400).json({ error: 'path required' }); return }
+    await forgetHistory(path.resolve(wsPath))
     res.json({ ok: true })
   })
 

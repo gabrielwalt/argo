@@ -9,7 +9,7 @@ export const config = {
   model:            process.env.MODEL ?? 'llama3.1:8b',
   ollamaHost:       process.env.OLLAMA_HOST ?? 'http://localhost:11434',
   tavilyKey:        process.env.TAVILY_API_KEY ?? '',
-  maxIterations:    parseInt(process.env.MAX_ITERATIONS ?? '20', 10),
+  maxIterations:    parseInt(process.env.MAX_ITERATIONS ?? '100', 10),
   port:             parseInt(process.env.PORT ?? '3000', 10),
   workspacePath:    inContainer ? '/workspace' : path.resolve(__dirname, '..', process.env.WORKSPACE_PATH ?? './workspace'),
   scratchPath:      inContainer ? '/scratch'   : path.resolve(__dirname, '..', './scratch'),

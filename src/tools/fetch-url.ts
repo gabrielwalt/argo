@@ -18,11 +18,11 @@ export async function fetchUrl(url: string): Promise<ToolResult> {
     if (contentType.includes('text/html')) {
       const root = parse(text)
       root.querySelectorAll('script, style, nav, footer, header').forEach(el => el.remove())
-      const plain = root.text.replace(/\s+/g, ' ').trim().slice(0, 6000)
+      const plain = root.text.replace(/\s+/g, ' ').trim().slice(0, 3000)
       return { output: plain }
     }
 
-    return { output: text.slice(0, 6000) }
+    return { output: text.slice(0, 3000) }
   } catch (err) {
     return { output: '', error: String(err) }
   }

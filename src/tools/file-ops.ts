@@ -4,12 +4,17 @@ import { config } from '../config.js'
 import type { ToolResult } from '../types.js'
 
 function safePath(filePath: string): string {
-  // Strip /workspace/ prefix if model passes absolute container path
-  const relative = filePath.replace(/^\/workspace\/?/, '')
-  const resolved = path.resolve(config.workspacePath, relative)
-  if (!resolved.startsWith(config.workspacePath)) {
-    throw new Error('Path traversal outside workspace not allowed')
+  // /scratch/... paths → resolve against scratchPath
+  if (filePath.startsWith('/scratch')) {
+    const rel = filePath.replace(/^\/scratch\/?/, '')
+    const resolved = path.resolve(config.scratchPath, rel)
+    if (!resolved.startsWith(config.scratchPath)) throw new Error('Path traversal outside scratch not allowed')
+    return resolved
   }
+  // /workspace/... paths (or bare relative paths) → resolve against workspacePath
+  const rel = filePath.replace(/^\/workspace\/?/, '')
+  const resolved = path.resolve(config.workspacePath, rel)
+  if (!resolved.startsWith(config.workspacePath)) throw new Error('Path traversal outside workspace not allowed')
   return resolved
 }
 

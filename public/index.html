@@ -41,6 +41,7 @@
   <div id="status">
     <div id="status-dot"></div>
     <span id="status-text">Connecting…</span>
+    <span id="iter-label"></span>
   </div>
 </header>
 
@@ -64,9 +65,9 @@
     <select id="opt-num-ctx">
       <option value="2048">2,048</option>
       <option value="4096">4,096</option>
-      <option value="8192" selected>8,192</option>
+      <option value="8192">8,192</option>
       <option value="16384">16,384</option>
-      <option value="32768">32,768</option>
+      <option value="32768" selected>32,768</option>
       <option value="65536">65,536</option>
     </select>
   </div>
@@ -83,6 +84,7 @@
     <!-- Shown when viewing a past session -->
     <div id="session-banner">
       <span id="session-banner-label"></span>
+      <button id="resume-btn">▶ Resume</button>
       <button id="return-btn">↩ Return to now</button>
     </div>
 
@@ -90,34 +92,23 @@
       <div id="input-wrap">
         <textarea id="input" placeholder="Ask anything… (Shift+Enter for newline)" rows="3"></textarea>
         <button id="send-btn" type="submit" title="Send">
-          <span class="flip-h send-icon">⛵</span>
+          <span class="flip-h send-icon" id="send-boat">⛵</span>
+          <span class="send-stop" id="send-stop" style="display:none">■</span>
         </button>
       </div>
     </form>
   </section>
 
-  <!-- Right panel with tabs -->
-  <section id="right-panel">
-    <div id="right-tabs">
-      <button class="tab-btn active" data-tab="trace">Agent Trace</button>
-      <button class="tab-btn" data-tab="files">Files</button>
-      <button class="tab-btn" data-tab="logs">Session Logs</button>
-      <span id="iter-label"></span>
-    </div>
+  <!-- Resize handle (chat | files) -->
+  <div id="panel-resize" class="resize-handle"></div>
 
-    <!-- Trace tab -->
-    <div id="tab-trace" class="tab-content active">
-      <div id="trace">
-        <div class="trace-item iteration">
-          <div class="trace-body" style="color:var(--muted)">Trace will appear here when the agent runs.</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Files tab -->
-    <div id="tab-files" class="tab-content">
+  <!-- Files panel -->
+  <section id="files-panel">
+    <!-- File tree pane -->
+    <div id="file-tree-pane">
       <div id="files-toolbar">
-        <button id="refresh-files">↻ Refresh</button>
+        <span class="files-toolbar-label">Files</span>
+        <button id="refresh-files" class="icon-btn" title="Refresh">↻</button>
       </div>
       <div id="files-content">
         <div class="files-section">
@@ -131,24 +122,16 @@
       </div>
     </div>
 
-    <!-- Logs tab -->
-    <div id="tab-logs" class="tab-content">
-      <div id="logs-toolbar">
-        <button id="refresh-logs">↻ Refresh</button>
-        <span id="logs-count" style="font-size:12px;color:var(--muted)"></span>
+    <!-- Resize handle (tree | viewer) -->
+    <div id="tree-resize" class="resize-handle"></div>
+
+    <!-- File viewer -->
+    <div id="file-viewer-pane">
+      <div id="file-viewer-header">
+        <span id="file-viewer-path"></span>
+        <button id="file-viewer-close" class="icon-btn" title="Close">✕</button>
       </div>
-      <div id="logs-list"></div>
-      <div id="log-viewer" style="display:none">
-        <div id="log-viewer-header">
-          <button id="back-to-logs">← Back</button>
-          <span id="log-viewer-title"></span>
-          <div style="margin-left:auto;display:flex;gap:8px">
-            <button class="log-fmt-btn active" data-fmt="md">Markdown</button>
-            <button class="log-fmt-btn" data-fmt="jsonl">JSONL</button>
-          </div>
-        </div>
-        <pre id="log-viewer-content"></pre>
-      </div>
+      <pre id="file-viewer-content" class="file-viewer-empty">Select a file to view</pre>
     </div>
   </section>
 </main>
@@ -156,7 +139,7 @@
 <!-- Git log panel -->
 <div id="git-panel">
   <div id="git-header">
-    <div id="git-latest"><span style="color:var(--muted);font-size:12px">Loading…</span></div>
+    <div id="git-latest"><span class="muted-sm">Loading…</span></div>
     <button id="refresh-git">↻ Refresh</button>
   </div>
   <div id="git-log"></div>
@@ -166,7 +149,7 @@
 <div id="diff-modal">
   <div id="diff-box">
     <div id="diff-box-header">
-      <span id="diff-title" style="font-family:var(--font-mono);font-size:13px"></span>
+      <span id="diff-title" class="diff-title"></span>
       <button id="close-diff">✕ Close</button>
     </div>
     <div id="diff-content"></div>

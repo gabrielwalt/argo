@@ -9,7 +9,7 @@ import { promises as fs } from 'fs'
 import type { Dirent } from 'fs'
 import { config } from './config.js'
 import { Agent } from './agent.js'
-import { listLogs, readLog } from './logger.js'
+import { listLogs, readLog, listSessions, deleteAllLogs, deleteSession, getSessionMessages, registerSession, LOGS_DIR } from './logger.js'
 import type { AgentEvent, ModelOptions } from './types.js'
 
 const execAsync = promisify(exec)
@@ -31,6 +31,13 @@ const agent = new Agent((event: AgentEvent) => {
   bus.emit('agent', event)
 })
 
+const SESSION_ID_FILE = path.join(LOGS_DIR, 'current-session.txt')
+
+function makeSessionId(): string {
+  return new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+}
+
+let currentSessionId = makeSessionId()
 let isBusy = false
 
 // SSE — streams all agent events to connected browsers
@@ -79,10 +86,20 @@ app.get('/history', (req, res) => {
   res.json(agent.getChatHistory())
 })
 
+// Stop current agent run (soft abort — takes effect between iterations)
+app.post('/stop', (_req, res) => {
+  agent.abort()
+  res.json({ ok: true })
+})
+
 // Reset session
 app.post('/reset', (req, res) => {
   if (isBusy) { res.status(409).json({ error: 'Agent is busy' }); return }
   agent.reset()
+  currentSessionId = makeSessionId()
+  agent.setSessionId(currentSessionId)
+  fs.writeFile(SESSION_ID_FILE, currentSessionId, 'utf-8').catch(() => {})
+  registerSession(currentSessionId).catch(() => {})
   res.json({ ok: true })
 })
 
@@ -131,13 +148,49 @@ app.get('/git-diff/:hash', async (req, res) => {
 
 // Health / status
 app.get('/status', (req, res) => {
-  res.json({ busy: isBusy, model: config.model })
+  res.json({ busy: isBusy, model: config.model, sessionId: currentSessionId })
 })
 
 // List all session logs
 app.get('/logs', async (req, res) => {
-  const logs = await listLogs()
-  res.json(logs)
+  const sessions = await listSessions()
+  res.json(sessions)
+})
+
+// Delete a single session's log files
+app.delete('/logs/:sessionId', async (req, res) => {
+  await deleteSession(req.params.sessionId)
+  res.json({ ok: true })
+})
+
+// Delete all logs and reset
+app.delete('/logs', async (req, res) => {
+  if (isBusy) { res.status(409).json({ error: 'Agent is busy' }); return }
+  await deleteAllLogs()
+  agent.reset()
+  currentSessionId = makeSessionId()
+  agent.setSessionId(currentSessionId)
+  fs.writeFile(SESSION_ID_FILE, currentSessionId, 'utf-8').catch(() => {})
+  res.json({ ok: true })
+})
+
+// Resume a past session
+app.post('/resume/:sessionId', async (req, res) => {
+  if (isBusy) { res.status(409).json({ error: 'Agent is busy' }); return }
+  // Save current session history before switching
+  await agent.saveHistory()
+  // Switch session
+  currentSessionId = req.params.sessionId
+  agent.setSessionId(currentSessionId)
+  fs.writeFile(SESSION_ID_FILE, currentSessionId, 'utf-8').catch(() => {})
+  // Load per-session history file if it exists (full fidelity with tool calls),
+  // otherwise reconstruct from log events (user+assistant messages only)
+  await agent.loadPersistedHistory()
+  if (agent.getChatHistory().length === 0) {
+    const messages = await getSessionMessages(req.params.sessionId)
+    if (messages.length > 0) agent.loadHistory(messages)
+  }
+  res.json({ ok: true, count: agent.getChatHistory().length })
 })
 
 // Get a specific log (jsonl or md)
@@ -211,7 +264,18 @@ app.get('/file', async (req, res) => {
 })
 
 export async function startServer() {
-  await agent.loadPersistedHistory()
+  // Initialize session ID before loading history so historyFile points to the right file
+  await fs.mkdir(path.dirname(SESSION_ID_FILE), { recursive: true })
+  try {
+    currentSessionId = (await fs.readFile(SESSION_ID_FILE, 'utf-8')).trim()
+  } catch {
+    await fs.writeFile(SESSION_ID_FILE, currentSessionId, 'utf-8').catch(() => {})
+  }
+  agent.setSessionId(currentSessionId)
+  await Promise.all([
+    agent.loadPersistedHistory(),
+    registerSession(currentSessionId),
+  ])
   app.listen(config.port, () => {
     console.log(`Agent running at http://localhost:${config.port}`)
   })

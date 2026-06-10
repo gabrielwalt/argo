@@ -14,7 +14,7 @@ export async function bash(command: string): Promise<ToolResult> {
 
     const { stdout, stderr } = await execAsync(cmd, {
       timeout: 30_000,
-      ...(config.inContainer ? { cwd: '/workspace' } : {}),
+      ...(config.inContainer ? { cwd: '/scratch' } : {}),
     })
     const output = (stdout + stderr).slice(0, MAX_OUTPUT)
     return { output: output || '(no output)' }

@@ -8,31 +8,58 @@ import { bash } from './tools/bash.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
 import type { AgentEvent, ToolName, ModelOptions } from './types.js'
 
-const SYSTEM_PROMPT = `You are a capable local agent with access to tools. You have a sandbox workspace at /workspace where you can freely create, edit, and delete files.
+const SYSTEM_PROMPT = `You are a capable local agent running in an isolated Ubuntu 24.04 Docker container. The host machine is not accessible.
 
-When given a task:
-- Think step by step and use the appropriate tools
-- Use web_search for current information from the internet
-- Use bash to run shell commands, inspect files, or execute scripts in the sandbox container
-- Use read_file/write_file for direct file access in the workspace
-- Use fetch_url for static pages (fast, no JS execution)
-- Use browser_fetch for JS-rendered pages (SPAs, dynamic content) or when fetch_url returns empty/incomplete content
-- When you have a complete answer or finished the task, respond directly with your final answer — do not call any more tools
+PRECISION
+Never reconstruct exact technical strings from memory. Any identifier, URL, domain, path, package name, flag, or key that must appear in a new script or command must be copied verbatim from the tool result where it appeared — not recalled. When uncertain, re-read the source with a tool call first.
 
-Environment — you are inside an isolated Ubuntu 24.04 Docker container. The host machine is not accessible.
-- /workspace — the project you are working on (git-tracked; auto-committed after each task)
-- /scratch   — your private working directory for scripts, temp files, intermediate data (not git-tracked)
+EFFICIENCY
+Batch over iterate: one script that processes all inputs and prints a concise summary beats many single tool calls.
+Test before bulk: run on one item, verify output, then scale to the full set.
+Return conclusions and file paths only: never raw page or file contents as tool output.
+Multi-line JS: write to /scratch/script.js and run with node. Never use node -e for multi-line code.
 
-CLI tools: bash, curl, wget, git, jq, node, ripgrep (rg), fd, sqlite3, mlr (miller), parallel, tree, file, pv, dig, nc, ping, unzip, zip
+FILESYSTEM
+Two directories exist — do not create them:
+- /scratch: your cwd for every bash command. Use for temp files, internal scripts, intermediate data, or anything the user doesn't need in his workspace.
+- /workspace: the user's project, git-tracked. All output the user expects to see must land here.
+Always use absolute paths as relative paths like "scratch/file" resolve to "/scratch/scratch/file".
+Scripts that produce output that is required in the workspace must set OUTPUT_DIR="/workspace/..." inside the script.
+Before declaring done: if the task produced files, run ls /workspace/ to confirm they are there.
 
-Node.js packages (NODE_PATH is set — use require(), not import; ESM import won't resolve NODE_PATH):
-cheerio, js-yaml, csv-parse, xlsx, pdf-parse, marked, turndown, handlebars, chalk, commander, date-fns, iconv-lite, glob, playwright
-- For anything else: npm install <package>
-- fetch() is available natively — no import needed
-- git is configured as "Local Agent" — commits work in /workspace
+TOOLS
+Invoke tools immediately and directly — never describe plans or write tool calls as JSON/prose first.
+- bash: shell commands, run scripts
+- write_file / read_file: file I/O
+- fetch_url: static pages (fast, no JS)
+- browser_fetch: JS-rendered pages, or when fetch_url returns empty/incomplete content
+- web_search: current information from the internet
+When the task is complete, give the final answer and stop.
 
-Scripting: always write multi-line scripts to a .js file first (write_file), then run: node script.js
-HTML parsing: const $ = cheerio.load(html); $('selector').text(); $('a').attr('href'); $.html(el) to serialize`
+ENVIRONMENT
+CLI: bash, curl, wget, git, jq, node, ripgrep (rg), fd, sqlite3, mlr, parallel, tree, unzip, zip, pv, dig, nc, ping
+Node.js: NODE_PATH is set — always use require(), never import. Pre-installed: cheerio, js-yaml, csv-parse, xlsx, pdf-parse, marked, turndown, handlebars, chalk, commander, date-fns, iconv-lite, glob, playwright. Install others with npm. fetch() is native. git is configured as "Local Agent".
+HTML: const $ = cheerio.load(html); $('sel').text(); $('a').attr('href'); $.html(el)
+`
+
+const COMPACT_THRESHOLD = 0.80  // compact when context is this full
+
+// Parses tool calls that a model wrote as JSON code blocks in its text content
+// instead of using the native tool-calling API (common with smaller models).
+function extractToolCallsFromContent(content: string): Array<{ name: string; arguments: Record<string, unknown> }> {
+  const results: Array<{ name: string; arguments: Record<string, unknown> }> = []
+  // Match ```json ... ``` blocks
+  const blockRe = /```(?:json)?\s*\n([\s\S]*?)\n```/g
+  let m: RegExpExecArray | null
+  while ((m = blockRe.exec(content)) !== null) {
+    try {
+      const obj = JSON.parse(m[1].trim())
+      if (obj && typeof obj.name === 'string' && obj.arguments && typeof obj.arguments === 'object')
+        results.push({ name: obj.name, arguments: obj.arguments })
+    } catch { /* not JSON */ }
+  }
+  return results
+}
 
 // Wraps a promise with a hard timeout; rejects if the promise doesn't resolve in time.
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -48,7 +75,11 @@ export class Agent {
   private history: Message[] = []
   private model: string
   private options: ModelOptions = {}
-  private readonly historyFile = path.join(LOGS_DIR, 'history.json')
+  private sessionId = ''
+  private aborted = false
+  private get historyFile(): string {
+    return path.join(LOGS_DIR, this.sessionId ? `history-${this.sessionId}.json` : 'history.json')
+  }
 
   constructor(
     private emit: (event: AgentEvent) => void,
@@ -58,8 +89,9 @@ export class Agent {
     this.ollama = new Ollama({ host: config.ollamaHost })
   }
 
-  // Load full Ollama message history from disk (called once on server startup).
+  // Load full Ollama message history from disk for the current session.
   async loadPersistedHistory(): Promise<void> {
+    this.history = []  // always reset before loading
     try {
       const raw = await fs.readFile(this.historyFile, 'utf-8')
       const saved = JSON.parse(raw)
@@ -70,6 +102,10 @@ export class Agent {
     } catch {
       // No history file — clean start
     }
+  }
+
+  async saveHistory(): Promise<void> {
+    if (this.history.length > 0) await this.persistHistory()
   }
 
   private async persistHistory(): Promise<void> {
@@ -91,8 +127,85 @@ export class Agent {
     this.options = opts
   }
 
+  setSessionId(id: string) { this.sessionId = id }
+
+  abort() { this.aborted = true }
+
+  // Serialises a slice of history to a compact work log for the compaction summary call.
+  private messagesToText(messages: Message[]): string {
+    const lines: string[] = []
+    for (const msg of messages) {
+      if (msg.role === 'user' && msg.content) {
+        lines.push(`User: ${msg.content.slice(0, 300)}`)
+      } else if (msg.role === 'assistant') {
+        const tc = (msg as { tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> }).tool_calls
+        if (tc?.length) {
+          for (const call of tc) {
+            lines.push(`Called ${call.function.name}(${JSON.stringify(call.function.arguments).slice(0, 120)})`)
+          }
+        } else if (msg.content) {
+          lines.push(`Agent: ${msg.content.slice(0, 300)}`)
+        }
+      } else if (msg.role === 'tool' && msg.content) {
+        lines.push(`Result: ${msg.content.slice(0, 300)}`)
+      }
+    }
+    return lines.join('\n')
+  }
+
+  private async compactHistory(
+    userMessage: string,
+    emitAndLog: (e: AgentEvent) => void
+  ): Promise<void> {
+    // Keep: first message (original user prompt) + last KEEP_RECENT messages verbatim.
+    // Compact: everything in between. This preserves the task goal and the most recent
+    // tool results (exact URLs, paths, errors) which are the most likely to be needed next.
+    const KEEP_RECENT = 8
+    const msgsBefore = this.history.length
+
+    if (msgsBefore <= KEEP_RECENT + 2) return  // nothing meaningful to compact
+
+    const firstMsg = this.history[0]
+    const toCompact = this.history.slice(1, msgsBefore - KEEP_RECENT)
+    const recentMsgs = this.history.slice(-KEEP_RECENT)
+
+    if (toCompact.length === 0) return
+
+    emitAndLog({ type: 'warning', message: `Compacting context: ${msgsBefore} messages → keeping ${KEEP_RECENT} recent verbatim…` })
+
+    const workLog = this.messagesToText(toCompact)
+
+    const summaryResp = await withTimeout(this.ollama.chat({
+      model: this.model,
+      messages: [{
+        role: 'user',
+        content: `Summarize an AI agent's prior work log. Rules:
+- Copy all URLs, file paths, and error messages VERBATIM — never paraphrase or reconstruct them
+- State explicitly what succeeded and what failed
+- Note the current state: which files exist, which are missing
+- Be dense — every sentence must carry unique information
+
+Work log:
+${workLog}`,
+      }],
+      stream: false,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      options: this.options as any,
+    }), 60_000)
+
+    const summary = summaryResp.message.content.trim()
+    this.history = [
+      firstMsg,
+      { role: 'assistant', content: `[Prior work summary]\n\n${summary}` },
+      ...recentMsgs,
+    ]
+    const msgsAfter = this.history.length
+    emitAndLog({ type: 'compact', summary })
+    emitAndLog({ type: 'warning', message: `Context compacted: ${msgsBefore} → ${msgsAfter} messages` })
+  }
+
   async chat(userMessage: string): Promise<string> {
-    const logger = new SessionLogger(userMessage, this.model, this.options)
+    const logger = new SessionLogger(userMessage, this.model, this.options, this.sessionId)
 
     const emitAndLog = (event: AgentEvent) => {
       logger.log(event)
@@ -103,8 +216,18 @@ export class Agent {
     emitAndLog({ type: 'message', role: 'user', content: userMessage })
     emitAndLog({ type: 'start', model: this.model, query: userMessage, options: this.options })
 
+    // Stall detection: track last N tool signatures to catch infinite loops
+    const recentToolSigs: string[] = []
+    const STALL_WINDOW = 4  // identical consecutive signatures = stall
+
     try {
       for (let i = 0; i < config.maxIterations; i++) {
+        if (this.aborted) {
+          this.aborted = false
+          const msg = 'Stopped.'
+          emitAndLog({ type: 'done', content: msg })
+          return msg
+        }
         emitAndLog({ type: 'iteration', current: i + 1, max: config.maxIterations })
 
         emitAndLog({ type: 'ollama_request', iteration: i + 1, message_count: this.history.length + 1, model: this.model })
@@ -119,13 +242,21 @@ export class Agent {
           options: this.options as any,
         }), 120_000)
 
+        const numCtx = this.options.num_ctx ?? 32768
         if (response.prompt_eval_count != null) {
           emitAndLog({
             type: 'token_usage',
             prompt_tokens: response.prompt_eval_count,
             generated_tokens: response.eval_count ?? 0,
-            num_ctx: this.options.num_ctx ?? 8192,
+            num_ctx: numCtx,
           })
+          if (response.prompt_eval_count / numCtx >= COMPACT_THRESHOLD) {
+            try {
+              await this.compactHistory(userMessage, emitAndLog)
+            } catch (err) {
+              emitAndLog({ type: 'warning', message: `Context compaction failed (${err instanceof Error ? err.message : String(err)}) — continuing with full history` })
+            }
+          }
         }
 
         const msg = response.message
@@ -134,7 +265,14 @@ export class Agent {
           emitAndLog({ type: 'thought', content: msg.content })
         }
 
-        if (!msg.tool_calls || msg.tool_calls.length === 0) {
+        // Determine tool calls — native API first, then fallback to JSON parsed from content
+        const nativeCalls = msg.tool_calls ?? []
+        const fallbackCalls = nativeCalls.length === 0 && msg.content
+          ? extractToolCallsFromContent(msg.content)
+          : []
+        const hasCalls = nativeCalls.length > 0 || fallbackCalls.length > 0
+
+        if (!hasCalls) {
           this.history.push(msg)
           emitAndLog({ type: 'message', role: 'assistant', content: msg.content })
           emitAndLog({ type: 'done', content: msg.content })
@@ -144,11 +282,22 @@ export class Agent {
 
         this.history.push(msg)
 
-        for (const toolCall of msg.tool_calls) {
-          const name = toolCall.function.name as ToolName
-          const args = toolCall.function.arguments as Record<string, unknown>
+        const callsToRun = nativeCalls.length > 0
+          ? nativeCalls.map(tc => ({ name: tc.function.name as ToolName, args: tc.function.arguments as Record<string, unknown> }))
+          : fallbackCalls.map(fc => ({ name: fc.name as ToolName, args: fc.arguments }))
 
+        for (const { name, args } of callsToRun) {
           emitAndLog({ type: 'tool_call', tool: name, args })
+
+          // Stall detection: if the same tool+args appear STALL_WINDOW times in a row, abort
+          const sig = `${name}:${JSON.stringify(args)}`
+          recentToolSigs.push(sig)
+          if (recentToolSigs.length > STALL_WINDOW) recentToolSigs.shift()
+          if (recentToolSigs.length === STALL_WINDOW && recentToolSigs.every(s => s === sig)) {
+            const stallMsg = `Stalled: identical tool call repeated ${STALL_WINDOW} times — ${name}(${JSON.stringify(args).slice(0, 80)})`
+            emitAndLog({ type: 'error', message: stallMsg })
+            return stallMsg
+          }
 
           const start = Date.now()
           const result = await executeTool(name, args)
@@ -181,7 +330,12 @@ export class Agent {
 
   reset() {
     this.history = []
-    fs.writeFile(this.historyFile, '[]').catch(() => {})
+    fs.unlink(this.historyFile).catch(() => {})
+  }
+
+  loadHistory(messages: Array<{ role: string; content: string }>) {
+    this.history = messages as Message[]
+    fs.writeFile(this.historyFile, JSON.stringify(this.history)).catch(() => {})
   }
 
   getChatHistory(): Array<{ role: string; content: string }> {
@@ -189,7 +343,7 @@ export class Agent {
       .filter(msg => {
         if (msg.role === 'user') return !!msg.content
         if (msg.role === 'assistant') {
-          const hasToolCalls = (msg as { tool_calls?: unknown[] }).tool_calls?.length ?? 0 > 0
+          const hasToolCalls = ((msg as { tool_calls?: unknown[] }).tool_calls?.length ?? 0) > 0
           return !hasToolCalls && !!msg.content
         }
         return false
@@ -199,6 +353,8 @@ export class Agent {
 
   private async autoCommit(query: string, answer: string, emitAndLog: (e: AgentEvent) => void): Promise<void> {
     try {
+      // Initialise git if workspace isn't tracked yet (idempotent on existing repos)
+      await bash('cd /workspace && git rev-parse --git-dir 2>/dev/null || git init -q')
       const checkResult = await bash('cd /workspace && git status --porcelain 2>/dev/null')
       if (checkResult.error || !checkResult.output.trim()) return
 

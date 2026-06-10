@@ -10,7 +10,7 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'bash',
-      description: 'Execute a bash command in the sandbox container. Working directory is /workspace. Has full access to /workspace contents.',
+      description: 'Execute a bash command in the sandbox container. Working directory is /scratch — all relative paths land here. Use explicit /workspace/... paths only for deliverables.',
       parameters: {
         type: 'object',
         properties: {
@@ -39,11 +39,11 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'read_file',
-      description: 'Read a file from the workspace.',
+      description: 'Read a file. Use /workspace/path for workspace files, /scratch/path for scratch files.',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'File path relative to workspace root' },
+          path: { type: 'string', description: 'Absolute path: /workspace/... or /scratch/...' },
         },
         required: ['path'],
       },
@@ -53,11 +53,11 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'write_file',
-      description: 'Write content to a file in the workspace. Creates parent directories if needed.',
+      description: 'Write a file. Use /scratch/path for scripts and temp files, /workspace/path for final deliverables only. Creates parent directories if needed.',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'File path relative to workspace root' },
+          path: { type: 'string', description: 'Absolute path: /scratch/... or /workspace/...' },
           content: { type: 'string', description: 'Content to write' },
         },
         required: ['path', 'content'],
