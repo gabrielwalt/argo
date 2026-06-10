@@ -99,6 +99,7 @@ header::after {
   transition: opacity .15s;
 }
 #nav-home:hover { opacity: .75; }
+.flip-h { display: inline-block; transform: scaleX(-1); }
 
 .nav-sep {
   color: var(--muted);
@@ -523,29 +524,42 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   position: absolute;
   right: 8px;
   bottom: 8px;
-  width: 36px;
-  height: 36px;
+  width: 38px;
+  height: 38px;
   border-radius: 50%;
   padding: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, #8a6c0c 0%, #c9a227 45%, #e8c547 75%, #b8920e 100%);
-  background-size: 220% 220%;
-  background-position: 0% 0%;
-  color: #1a1100;
-  border: 1px solid rgba(232, 197, 71, .25);
-  box-shadow: 0 1px 10px rgba(201, 162, 39, .2);
-  transition: background-position .45s ease, box-shadow .2s ease, transform .15s ease;
+  /* Coin face: radial gold with lighter centre */
+  background: radial-gradient(circle at 38% 35%, #f5de7a 0%, #c9a227 55%, #7a5c0a 100%);
+  color: #1a1000;
+  /* Coin rim: outer ring + inset bevel to suggest thickness */
+  border: none;
+  box-shadow:
+    0 0 0 2.5px #7a5c0a,          /* outer dark rim */
+    0 0 0 4px #c9a227,            /* gold band */
+    inset 0 1px 2px rgba(255,240,160,.55),  /* top highlight */
+    inset 0 -1px 2px rgba(0,0,0,.35),       /* bottom shadow */
+    0 3px 12px rgba(201,162,39,.35);        /* glow */
+  transition: box-shadow .2s ease, transform .15s ease;
 }
 #send-btn:hover:not(:disabled) {
-  background-position: 100% 100%;
-  box-shadow: 0 2px 16px rgba(201, 162, 39, .4);
-  transform: scale(1.08);
+  box-shadow:
+    0 0 0 2.5px #7a5c0a,
+    0 0 0 4px #e8c547,
+    inset 0 1px 2px rgba(255,240,160,.55),
+    inset 0 -1px 2px rgba(0,0,0,.35),
+    0 4px 20px rgba(201,162,39,.55);
+  transform: scale(1.1);
 }
 #send-btn:active:not(:disabled) {
-  transform: scale(0.94);
-  box-shadow: 0 1px 6px rgba(201, 162, 39, .2);
+  transform: scale(0.93);
+  box-shadow:
+    0 0 0 2.5px #7a5c0a,
+    0 0 0 4px #c9a227,
+    inset 0 1px 3px rgba(0,0,0,.4),
+    0 1px 6px rgba(201,162,39,.2);
 }
 
 /* ── Right panel (tabs) ── */

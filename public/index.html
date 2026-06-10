@@ -13,7 +13,7 @@
 <header>
   <!-- Breadcrumb: Argo › workspace › session -->
   <nav id="breadcrumb">
-    <a id="nav-home" href="/" title="All workspaces">⛵ Argo</a>
+    <a id="nav-home" href="/" title="All workspaces"><span class="flip-h">⛵</span> Argo</a>
 
     <span class="nav-sep" id="sep-ws" style="display:none">›</span>
     <div class="nav-crumb" id="nav-ws" style="display:none">
@@ -90,9 +90,13 @@
       <div id="input-wrap">
         <textarea id="input" placeholder="Ask anything… (Shift+Enter for newline)" rows="3"></textarea>
         <button id="send-btn" type="submit" title="Send">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="22" y1="2" x2="11" y2="13"/>
-            <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+            <!-- Main sail: tall left triangle, mast at x=12 -->
+            <path d="M12 2 L12 16 L3 16 Z"/>
+            <!-- Jib: smaller right triangle -->
+            <path d="M12 6 L12 16 L19 16 Z" opacity="0.65"/>
+            <!-- Hull: bow angled right -->
+            <path d="M1 17.5 L23 17.5 L20 21 L4 21 Z"/>
           </svg>
         </button>
       </div>
