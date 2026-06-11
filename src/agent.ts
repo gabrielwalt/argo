@@ -14,8 +14,8 @@ PRECISION
 Never reconstruct exact technical strings from memory. Any identifier, URL, domain, path, package name, flag, or key that must appear in a new script or command must be copied verbatim from the tool result where it appeared — not recalled. When uncertain, re-read the source with a tool call first.
 
 EFFICIENCY
-Batch over iterate: one script that processes all inputs and prints a concise summary beats many single tool calls.
-Test before bulk: run on one item, verify output, then scale to the full set.
+Never call the same tool more than twice in a row with similar inputs — write a script instead. Fetching 10 pages one by one, running the same command on multiple files, processing a list item by item: all of these must be a script, not repeated tool calls.
+Test before bulk: run the script on one item first, verify the output is correct, then scale to the full set.
 Return conclusions and file paths only: never raw page or file contents as tool output.
 Multi-line JS: write to /scratch/script.js and run with node. Never use node -e for multi-line code.
 
@@ -25,7 +25,7 @@ Two directories exist — do not create them:
 - /workspace: the user's project, git-tracked. All output the user expects to see must land here.
 Always use absolute paths as relative paths like "scratch/file" resolve to "/scratch/scratch/file".
 Scripts that produce output that is required in the workspace must set OUTPUT_DIR="/workspace/..." inside the script.
-Before declaring done: if the task produced files, run ls /workspace/ to confirm they are there.
+Before declaring done: re-read the original request, verify every item is addressed, and if the task produced files run ls /workspace/ to confirm they are there.
 
 TOOLS
 Invoke tools immediately and directly — never describe plans or write tool calls as JSON/prose first.
@@ -33,7 +33,7 @@ Invoke tools immediately and directly — never describe plans or write tool cal
 - write_file / read_file: file I/O
 - fetch_url: static pages (fast, no JS)
 - browser_fetch: JS-rendered pages, or when fetch_url returns empty/incomplete content
-- web_search: current information from the internet
+- web_search: find information you don't already have (facts, docs, unknown URLs). Never use it when you already have the URL — use fetch_url or browser_fetch directly instead.
 When the task is complete, give the final answer and stop.
 
 ENVIRONMENT
@@ -216,10 +216,6 @@ ${workLog}`,
     emitAndLog({ type: 'message', role: 'user', content: userMessage })
     emitAndLog({ type: 'start', model: this.model, query: userMessage, options: this.options })
 
-    // Stall detection: track last N tool signatures to catch infinite loops
-    const recentToolSigs: string[] = []
-    const STALL_WINDOW = 4  // identical consecutive signatures = stall
-
     try {
       for (let i = 0; i < config.maxIterations; i++) {
         if (this.aborted) {
@@ -288,16 +284,6 @@ ${workLog}`,
 
         for (const { name, args } of callsToRun) {
           emitAndLog({ type: 'tool_call', tool: name, args })
-
-          // Stall detection: if the same tool+args appear STALL_WINDOW times in a row, abort
-          const sig = `${name}:${JSON.stringify(args)}`
-          recentToolSigs.push(sig)
-          if (recentToolSigs.length > STALL_WINDOW) recentToolSigs.shift()
-          if (recentToolSigs.length === STALL_WINDOW && recentToolSigs.every(s => s === sig)) {
-            const stallMsg = `Stalled: identical tool call repeated ${STALL_WINDOW} times — ${name}(${JSON.stringify(args).slice(0, 80)})`
-            emitAndLog({ type: 'error', message: stallMsg })
-            return stallMsg
-          }
 
           const start = Date.now()
           const result = await executeTool(name, args)

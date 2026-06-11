@@ -67,10 +67,10 @@ A conversation between user and agent. All runs between two `POST /reset` calls 
 One invocation of `agent.chat(userMessage)`. The user types a message, the agent loops until it has a final answer or hits the iteration limit, and one JSONL + MD log pair is written. Multiple runs belong to the same session and their messages accumulate in `history.json`. Runs are an internal implementation detail — never surfaced directly in the UI.
 
 **Agent loop (ReAct)**
-The core processing pattern inside a run: the LLM is given the full system prompt + history and produces either (a) a final text answer (no tool calls) or (b) a thought + one or more tool calls. Tool results are appended to history and the loop repeats. Maximum 20 iterations per run.
+The core processing pattern inside a run: the LLM is given the full system prompt + history and produces either (a) a final text answer (no tool calls) or (b) a thought + one or more tool calls. Tool results are appended to history and the loop repeats. Up to `MAX_ITERATIONS` per run (default: 1000).
 
 **Iteration**
-One pass through the ReAct loop: one Ollama API call + zero-or-more tool executions. Iteration `N/20` is shown in the status bar while the agent works. Each iteration appends to the Ollama message history.
+One pass through the ReAct loop: one Ollama API call + zero-or-more tool executions. Iteration `N` is shown in the status bar while the agent works. Each iteration appends to the Ollama message history.
 
 **Thought**
 The LLM's text content in a response that appears alongside or before tool calls — its visible reasoning. Shown as a collapsed trace item. Some models emit thoughts before every tool call; others only when they need to plan.
@@ -270,7 +270,7 @@ logger.flush() at end         writes .jsonl + .md to logs/
 - `config.inContainer` — true when `RUNNING_IN_CONTAINER=1`; changes bash execution path
 - `config.workerMode` — true when `WORKER_MODE=1`; disables static file serving
 - `MODEL` — default Ollama model
-- `MAX_ITERATIONS` — currently 20
+- `MAX_ITERATIONS` — default 1000
 - `SANDBOX_CONTAINER` — standalone mode only; must match the running docker container name
 
 ## The central server (src/central.ts)
@@ -294,7 +294,10 @@ Key details:
 ## Common debugging
 
 **Argo not calling tools / outputting JSON as text**
-→ Switch to `llama3.1:8b`. Some models don't reliably use the native tool-calling API.
+→ Switch to `qwen3.6:latest` — the only model validated for agentic use in Argo. See README Models table for full findings per model.
+
+**Agent writes scripts but doesn't run them / declares done on empty output / poor multi-step reasoning**
+→ Model capability issue. Gemma3/4 models cannot follow the ReAct loop — they lose cause-and-effect across iterations and ignore the system prompt. `gemma3:12b` returns a hard Ollama error ("does not support tools"). Use `qwen3.6:latest`.
 
 **bash tool returning empty output**
 → Standalone: check `docker ps` — container may be stopped. Run `docker start argo-sandbox`.

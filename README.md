@@ -71,7 +71,7 @@ Three runtime modes, controlled by environment variables:
 
 - **macOS** with Docker Desktop
 - **Ollama** installed: [ollama.com](https://ollama.com)
-- At least one model pulled: `ollama pull qwen2.5-coder:14b`
+- At least one model pulled: `ollama pull qwen3.6:latest`
 - **Node.js v22** via nvm: `nvm install 22 && nvm use 22`
 - **pnpm**: `npm i -g pnpm`
 - Optional: **Tavily API key** for web search — free tier at [tavily.com](https://tavily.com)
@@ -101,24 +101,62 @@ The Docker image is built automatically on first use (takes ~5 minutes — downl
 
 ---
 
-## Daily use
+## Running Argo
+
+### Before you start
+
+Two services must be running on your Mac before launching Argo:
+
+1. **Docker Desktop** — must be open. The `argo` CLI checks this and exits early if Docker isn't responding.
+2. **Ollama** — must be serving. Either open the Ollama menu-bar app or run `ollama serve` in a terminal. Verify with `ollama list`.
+
+### Start
 
 ```bash
-# Attach any project folder and open Argo
+# Attach a project folder and open the UI
 argo ~/Sources/my-project
 
-# From inside the project folder
-cd ~/Sources/my-project
-argo
+# Or from inside the project folder
+cd ~/Sources/my-project && argo
+```
 
-# List all attached workspaces
+This starts the central server on port 3000 (if not already running), creates a Docker worker container for the project, and opens `http://localhost:3000/ws/my-project/` in your browser.
+
+The Docker image is built automatically on first use — this takes ~5 minutes (downloads Chromium for Playwright). Subsequent starts are instant.
+
+### Add another folder
+
+While the central server is already running, just run `argo` again for the new path:
+
+```bash
+argo ~/Sources/another-project
+```
+
+Each folder gets its own isolated container and URL. Switch between them at `http://localhost:3000/` or via the workspace switcher in the UI.
+
+### List running workspaces
+
+```bash
 argo list
+```
 
-# Stop everything when done
+### Stop
+
+```bash
+# Stop all workers and the central server
 argo stop
 ```
 
-Argo opens at `http://localhost:3000/ws/{name}/`. The workspace list is at `http://localhost:3000/`.
+Individual workspaces can also be stopped from the workspace list at `http://localhost:3000/`.
+
+### Alternative: standalone dev mode
+
+```bash
+pnpm dev
+# → http://localhost:3001
+```
+
+Runs a single server on port 3001 with hot-reload — no workspace sub-path, no per-workspace containers. Uses a shared `argo-sandbox` container for bash. Use this when developing Argo itself, not for regular agent work. Port 3001 is intentional so it doesn't conflict with the `argo` CLI on port 3000.
 
 ### Rollback workspace changes
 
@@ -140,15 +178,15 @@ Created automatically on first `argo attach`. Edit to set your API key and defau
 
 ```bash
 TAVILY_API_KEY=tvly-your-key-here
-MODEL=qwen2.5-coder:14b
-MAX_ITERATIONS=20
+MODEL=qwen3.6:latest
+MAX_ITERATIONS=1000
 ```
 
 | Variable | Default | Description |
 |---|---|---|
 | `TAVILY_API_KEY` | *(empty)* | Web search — free tier at tavily.com |
-| `MODEL` | `qwen2.5-coder:14b` | Default Ollama model |
-| `MAX_ITERATIONS` | `20` | Max tool-call rounds per query before giving up |
+| `MODEL` | `qwen3.6:latest` | Default Ollama model |
+| `MAX_ITERATIONS` | `1000` | Max tool-call rounds per query before giving up |
 
 ### Dev-only: `.env` (project root)
 
@@ -169,12 +207,16 @@ Used only in standalone `pnpm dev` mode.
 
 Any model pulled via `ollama pull` appears in the UI dropdown automatically.
 
-| Model | Size | Notes |
-|---|---|---|
-| `qwen2.5-coder:14b` | 9.0 GB | **Recommended.** Strong at code and tool-calling. |
-| `llama3.1:8b` | 4.9 GB | Most reliable tool-calling. Good fallback. |
-| `gemma3:12b` | 8.1 GB | Good reasoning, weaker tool-calling. |
-| `qwen2.5:14b` | 9.0 GB | Strong general tasks. |
+**Use `qwen3.6:latest` for all agentic work.** It is the only model validated to reliably call tools, follow multi-step ReAct loops, and deliver output to `/workspace`. The others are listed for reference; the UI marks validated models with 🔧 and non-functional ones with ⚠️.
+
+| Model | Size | Agentic use | Notes |
+|---|---|---|---|
+| `qwen3.6:latest` 🔧 | 23 GB | ✅ **Recommended** | Only model validated end-to-end. Reliable tool calls, strong ReAct reasoning, handles multi-step tasks with compaction. Requires ~24 GB RAM. |
+| `qwen2.5-coder:14b` | 9.0 GB | ⚠️ Partial | Tool calling works but reasoning is weaker. Prone to hallucinating exact strings (URLs, paths) from memory. Usable for simple, single-step tasks. |
+| `llama3.1:8b` | 4.9 GB | ⚠️ Partial | Most consistent tool-call API compatibility of the smaller models. Reasoning depth is limited; struggles with multi-step tasks. Best option on memory-constrained machines. |
+| `mistral:latest` | 4.4 GB | ❓ Untested | Not tested in Argo. Tool-calling support unknown. |
+| `gemma4:latest` ⚠️ | 9.6 GB | ❌ Fails | Technically emits tool calls but cannot follow the ReAct loop across iterations — declares done on empty output, ignores prior tool results, never delivers files. |
+| `gemma3:12b` ⚠️ | 8.1 GB | ❌ Broken | Ollama returns a hard `"does not support tools"` error. The container hangs until the 120 s timeout. Do not use. |
 
 To add any model: `ollama pull <name>` — appears in the UI immediately without restart.
 
@@ -371,7 +413,7 @@ Check: `cat ~/.local/share/argo/server.log`
 Check: `docker ps -a | grep argo-` and `docker logs argo-{name}`
 
 **Agent outputs JSON text instead of calling tools**
-Switch to `llama3.1:8b` in the model dropdown — most reliable tool-calling.
+Switch to `qwen3.6:latest` — the only model validated for agentic use in Argo (see [Models](#models)).
 
 **`browser_fetch` failing**
 ```bash

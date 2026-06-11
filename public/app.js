@@ -127,8 +127,8 @@ function handleEvent(event) {
       break
 
     case 'iteration':
-      iterLabel.textContent = `${event.current}/${event.max}`
-      addTraceItem('iteration', null, `── Iteration ${event.current} of ${event.max} ──`, false)
+      iterLabel.textContent = `${event.current}`
+      addTraceItem('iteration', null, `── Iteration ${event.current} ──`, false)
       break
 
     case 'thought':
@@ -386,7 +386,9 @@ async function loadModels() {
       const item = document.createElement('div')
       item.className = 'nav-drop-item'
       item.dataset.model = name
-      item.textContent = name
+      const toolBadge = name.startsWith('qwen3') ? ' <span class="model-tool-badge" title="Validated for tool use">🔧</span>' : ''
+      const noToolBadge = (name.startsWith('gemma') ) ? ' <span class="model-tool-badge" title="No tool support — will not work in Argo">⚠️</span>' : ''
+      item.innerHTML = `${escHtml(name)}${toolBadge}${noToolBadge}`
       item.addEventListener('click', () => {
         selectModel(name)
         navModel.classList.remove('open')
