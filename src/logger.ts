@@ -146,6 +146,11 @@ export class SessionLogger {
       const time = ts.slice(11, 23)
 
       switch (event.type) {
+        case 'start':
+          lines.push(`*Run started · \`${event.model}\`*`)
+          lines.push(``)
+          break
+
         case 'message':
           if (event.role === 'user') {
             lines.push(`## 💬 User`)
@@ -172,6 +177,13 @@ export class SessionLogger {
           lines.push(`*→ Ollama · ${event.message_count} msgs in context · \`${event.model}\`*`)
           lines.push(``)
           break
+
+        case 'token_usage': {
+          const pct = Math.round(event.prompt_tokens / event.num_ctx * 100)
+          lines.push(`*Context: ${event.prompt_tokens.toLocaleString()} prompt + ${event.generated_tokens.toLocaleString()} generated / ${event.num_ctx.toLocaleString()} ctx (${pct}%)*`)
+          lines.push(``)
+          break
+        }
 
         case 'thought':
           lines.push(`**💭 Thought** \`${time}\``)
@@ -205,6 +217,14 @@ export class SessionLogger {
           lines.push(``)
           break
 
+        case 'done':
+          // An aborted run emits only 'done' (see agent.ts's abort branch) — no
+          // 'message' event precedes it — so this is sometimes the only place
+          // the outcome appears at all, not just a duplicate of 'message'.
+          lines.push(`*Run finished* — ${event.content}`)
+          lines.push(``)
+          break
+
         case 'error':
           lines.push(`**⚠️ Error**`)
           lines.push(``)
@@ -232,6 +252,14 @@ export class SessionLogger {
           lines.push(`\`\`\``)
           lines.push(``)
           break
+
+        default: {
+          // Compile-time guard: a new AgentEvent variant without a case above
+          // fails the build here instead of silently vanishing from the .md
+          // trace while still appearing in the .jsonl.
+          const _exhaustive: never = event
+          void _exhaustive
+        }
       }
     }
 
