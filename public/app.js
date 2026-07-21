@@ -170,8 +170,6 @@ function handleEvent(event) {
       currentRunModel = event.model
       startTraceBlock(event.model)
       setStatus('busy', `Running · ${event.model}`)
-      tokenCounter.textContent = ''
-      tokenCounter.className = ''
       break
 
     case 'iteration':

@@ -352,9 +352,21 @@ export function startCentral(): void {
     const existing = registry.find(w => w.path === absPath)
     if (existing) {
       if (!(await isContainerRunning(existing.name))) {
-        existing.containerId = await startWorker(existing)
-        await waitForWorker(existing.port)
-        await saveRegistry(registry)
+        // The registry's stored port can be stale (e.g. left over from a crash,
+        // or — as observed — collided with another entry's port). Re-verify it's
+        // actually free before trying to bind it again, rather than letting
+        // `docker run` fail and, previously, crash the whole central process.
+        if (!(await isPortFree(existing.port))) {
+          existing.port = await findFreePort()
+        }
+        try {
+          existing.containerId = await startWorker(existing)
+          await waitForWorker(existing.port)
+          await saveRegistry(registry)
+        } catch (err) {
+          res.status(500).json({ error: String(err) })
+          return
+        }
       }
       await recordHistory(existing.name, absPath)
       res.json({ name: existing.name, url: `http://localhost:${config.port}/ws/${existing.name}/` })
@@ -416,8 +428,16 @@ export function startCentral(): void {
     proxyToWorker(req, res, ws.port)
   })
 
-  app.listen(config.port, () => {
+  const server = app.listen(config.port, () => {
     console.log(`Argo at http://localhost:${config.port}`)
+  })
+
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Argo is already running on port ${config.port}`)
+      process.exit(1)
+    }
+    throw err
   })
 
   Promise.all([checkOllama(), checkDocker()]).then(([ollama, docker]) => {
