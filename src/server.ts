@@ -104,6 +104,19 @@ app.post('/stop', (_req, res) => {
   res.json({ ok: true })
 })
 
+// Manually trigger compaction (only between turns — compaction only makes
+// sense on settled history, not mid-run)
+app.post('/compact-now', async (_req, res) => {
+  if (isBusy) { res.status(409).json({ error: 'Agent is busy' }); return }
+  isBusy = true
+  try {
+    const result = await agent.compactNow()
+    res.json(result)
+  } finally {
+    isBusy = false
+  }
+})
+
 // Reset session
 app.post('/reset', (req, res) => {
   if (isBusy) { res.status(409).json({ error: 'Agent is busy' }); return }

@@ -200,6 +200,30 @@ export class Agent {
 
   abort() { this.aborted = true }
 
+  // Lets the user force compaction between turns (server.ts's POST /compact-now,
+  // guarded the same way /reset is — only when the agent isn't mid-run). Reuses
+  // compactHistory exactly as the automatic 66.7%-threshold path does: the most
+  // recent message and a bounded antecedent survive verbatim, only older
+  // material gets folded into CompactionState. Writes its own tiny run-shaped
+  // log (JSONL/MD pair) so the manual trigger is traceable the same way an
+  // automatic compaction is — see Phase 7's logging audit.
+  async compactNow(): Promise<{ compacted: boolean }> {
+    if (this.history.length === 0) return { compacted: false }
+    const logger = new SessionLogger('Manual context compaction', this.model, this.options, this.sessionId)
+    const emitAndLog = (event: AgentEvent) => {
+      logger.log(event)
+      this.emit(event)
+    }
+    try {
+      const currentRunStart = this.history.length - 1
+      const result = await this.compactHistory(currentRunStart, 0, emitAndLog, true)
+      if (result.compacted) await this.persistHistory()
+      return { compacted: result.compacted }
+    } finally {
+      await logger.flush()
+    }
+  }
+
   // Splits history around the active run (see compaction.ts:splitForCompaction),
   // folds the "prior" portion into persisted structured state — updated, then
   // validated against its own source rather than trusted blindly — and
@@ -211,14 +235,17 @@ export class Agent {
   private async compactHistory(
     currentRunStart: number,
     contextUsagePct: number,
-    emitAndLog: (e: AgentEvent) => void
-  ): Promise<number> {
+    emitAndLog: (e: AgentEvent) => void,
+    manual = false,
+  ): Promise<{ newRunStart: number; compacted: boolean }> {
     const msgsBefore = this.history.length
     const split = splitForCompaction(this.history, currentRunStart)
 
-    if (split.prior.length === 0 && split.activeMiddle.length === 0) return currentRunStart
+    if (split.prior.length === 0 && split.activeMiddle.length === 0) {
+      return { newRunStart: currentRunStart, compacted: false }
+    }
 
-    emitAndLog({ type: 'compact_start', messageCount: msgsBefore, contextUsagePct })
+    emitAndLog({ type: 'compact_start', messageCount: msgsBefore, contextUsagePct, manual })
 
     let validated = false
     if (split.prior.length > 0) {
@@ -269,9 +296,10 @@ export class Agent {
       contextUsagePct,
       rangeDescription,
       validated,
+      manual,
     })
 
-    return newRunStart
+    return { newRunStart, compacted: true }
   }
 
   async chat(userMessage: string): Promise<string> {
@@ -327,7 +355,8 @@ export class Agent {
           const usagePct = (response.prompt_eval_count + config.compactGenerationReserve) / numCtx
           if (usagePct >= config.compactThreshold) {
             try {
-              currentRunStart = await this.compactHistory(currentRunStart, usagePct, emitAndLog)
+              const result = await this.compactHistory(currentRunStart, usagePct, emitAndLog)
+              currentRunStart = result.newRunStart
             } catch (err) {
               emitAndLog({ type: 'warning', message: `Context compaction failed (${err instanceof Error ? err.message : String(err)}) — continuing with full history` })
             }

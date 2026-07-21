@@ -327,10 +327,12 @@ header::after {
   border: 1px solid var(--border);
   color: var(--muted);
   display: none;
+  cursor: pointer;
 }
 #token-counter.ctx-ok     { display: inline; color: var(--muted);  border-color: var(--border); }
 #token-counter.ctx-warn   { display: inline; color: var(--yellow); border-color: var(--yellow); }
 #token-counter.ctx-danger { display: inline; color: var(--red);    border-color: var(--red); }
+#token-counter:hover      { border-color: var(--gold); }
 
 #settings-btn {
   background: none;

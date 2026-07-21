@@ -230,7 +230,11 @@ function handleEvent(event) {
       break
 
     case 'compact':
-      setStatus('busy', `Running · ${currentRunModel}`)
+      // A manually triggered compaction (see #token-counter's click handler)
+      // has no run following it to eventually fire 'done' and restore status —
+      // reflect that here instead of leaving the dot stuck on "Running".
+      if (event.manual) setStatus('ready', 'Ready')
+      else setStatus('busy', `Running · ${currentRunModel}`)
       addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
       tokenCounter.textContent = 'compacted'
       tokenCounter.className = 'ctx-ok'
@@ -285,6 +289,18 @@ function setBusy(val) {
 async function stopAgent() {
   try { await fetch(`${API_BASE}/stop`, { method: 'POST' }) } catch { /* ignore */ }
 }
+
+tokenCounter.addEventListener('click', async () => {
+  if (busy) return
+  try {
+    const resp = await fetch(`${API_BASE}/compact-now`, { method: 'POST' })
+    const result = await resp.json()
+    if (!resp.ok) { showToast(result.error || 'Failed to compact'); return }
+    if (!result.compacted) showToast('Nothing to compact yet')
+  } catch {
+    showToast('Failed to compact')
+  }
+})
 
 // Stop click: intercept button click when busy to cancel instead of submit
 sendBtn.addEventListener('click', (e) => {
