@@ -11,6 +11,8 @@ import { config } from './config.js'
 import { Agent } from './agent.js'
 import { listLogs, readLog, listSessions, deleteAllLogs, deleteSession, getSessionMessages, registerSession, LOGS_DIR } from './logger.js'
 import type { AgentEvent, ModelOptions } from './types.js'
+import { checkEnvironment, logEnvironment, type EnvCheck } from './health.js'
+import { installAuth } from './auth.js'
 
 const execAsync = promisify(exec)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -21,6 +23,10 @@ bus.setMaxListeners(50)
 
 app.use(cors())
 app.use(express.json())
+
+// Worker mode is only reachable through central's proxy, which is the one
+// place the password gate needs to be enforced — see installAuth in central.ts.
+if (!config.inContainer) installAuth(app)
 
 // Static files only in standalone dev mode (not when proxied by central server)
 if (!config.workerMode) {
@@ -39,6 +45,7 @@ function makeSessionId(): string {
 
 let currentSessionId = makeSessionId()
 let isBusy = false
+let envStatus: EnvCheck | null = null
 
 // SSE — streams all agent events to connected browsers
 app.get('/events', (req, res) => {
@@ -65,6 +72,10 @@ app.post('/chat', async (req, res) => {
   const { message, model, options } = req.body as { message: string; model?: string; options?: ModelOptions }
   if (!message?.trim()) {
     res.status(400).json({ error: 'message required' })
+    return
+  }
+  if (!config.workspacePath) {
+    res.status(400).json({ error: 'No workspace mounted' })
     return
   }
 
@@ -148,7 +159,33 @@ app.get('/git-diff/:hash', async (req, res) => {
 
 // Health / status
 app.get('/status', (req, res) => {
-  res.json({ busy: isBusy, model: config.model, sessionId: currentSessionId })
+  res.json({
+    busy: isBusy,
+    model: config.model,
+    sessionId: currentSessionId,
+    workspacePath: config.workspacePath || null,
+    env: envStatus,
+  })
+})
+
+// Mount a workspace folder — standalone dev mode only (worker mode always
+// has a fixed /workspace mount, set at container creation).
+app.post('/api/workspace', express.json(), async (req, res) => {
+  if (config.inContainer) { res.status(403).json({ error: 'Workspace is fixed in worker mode' }); return }
+  const { path: wsPath } = req.body as { path?: string }
+  if (!wsPath) { res.status(400).json({ error: 'path required' }); return }
+
+  const absPath = path.resolve(wsPath)
+  try {
+    const stat = await fs.stat(absPath)
+    if (!stat.isDirectory()) { res.status(400).json({ error: `Not a directory: ${absPath}` }); return }
+  } catch {
+    res.status(400).json({ error: `Path not found: ${absPath}` })
+    return
+  }
+
+  config.workspacePath = absPath
+  res.json({ ok: true, workspacePath: absPath })
 })
 
 // List all session logs
@@ -279,4 +316,7 @@ export async function startServer() {
   app.listen(config.port, () => {
     console.log(`Agent running at http://localhost:${config.port}`)
   })
+
+  envStatus = await checkEnvironment()
+  logEnvironment(config.workerMode ? 'worker' : 'standalone', envStatus)
 }

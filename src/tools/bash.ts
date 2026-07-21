@@ -1,20 +1,39 @@
-import { exec } from 'child_process'
+import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { config } from '../config.js'
 import type { ToolResult } from '../types.js'
 
-const execAsync = promisify(exec)
+const execFileAsync = promisify(execFile)
 const MAX_OUTPUT = 4000
 
-export async function bash(command: string): Promise<ToolResult> {
-  try {
-    const cmd = config.inContainer
-      ? `bash -c ${JSON.stringify(command)}`
-      : `docker exec ${config.sandboxContainer} bash -c ${JSON.stringify(command)}`
+// The only two working directories bash may start in. Not a security boundary
+// (the container is — see CLAUDE.md's Zero trust section) — this just keeps
+// the model's choice structured (an enum field) instead of a free-form shell
+// idiom ("cd /workspace && ...") it has to remember to type correctly every
+// time. Anything else supplied falls back to the default, it never lets the
+// model set an arbitrary cwd.
+const ALLOWED_CWD = new Set(['/workspace', '/scratch'])
 
-    const { stdout, stderr } = await execAsync(cmd, {
+export async function bash(command: string, cwd?: string): Promise<ToolResult> {
+  const resolvedCwd = cwd && ALLOWED_CWD.has(cwd) ? cwd : '/scratch'
+  try {
+    // execFile (argv array, no shell) — not exec (a single command string).
+    // exec() always runs its string through an *additional* shell (`/bin/sh -c`)
+    // before the command even reaches the `bash -c` below. That extra shell
+    // does not treat JSON.stringify's `\n` escapes as newlines (POSIX double
+    // quotes don't), so multi-line commands arrived as literal backslash-n and
+    // got corrupted mid-token — and it still expands `$VAR`/`$(...)` inside
+    // double quotes, so variables and substitutions were evaluated twice, once
+    // by the wrong shell in the wrong environment (e.g. TMPDIR=$(mktemp -d)
+    // silently returning empty). execFile hands `command` to `bash -c` as one
+    // argv element, byte-for-byte, with no intermediate shell at all.
+    const [file, args]: [string, string[]] = config.inContainer
+      ? ['bash', ['-c', command]]
+      : ['docker', ['exec', '-w', resolvedCwd, config.sandboxContainer, 'bash', '-c', command]]
+
+    const { stdout, stderr } = await execFileAsync(file, args, {
       timeout: 30_000,
-      ...(config.inContainer ? { cwd: '/scratch' } : {}),
+      ...(config.inContainer ? { cwd: resolvedCwd } : {}),
     })
     const output = (stdout + stderr).slice(0, MAX_OUTPUT)
     return { output: output || '(no output)' }

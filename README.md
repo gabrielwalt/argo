@@ -1,12 +1,12 @@
 # Argo
 
-A safe coding harness for local LLMs. Model weights stay on your GPU. Code never leaves your machine.
+A coding harness for local LLMs. Model weights stay on your GPU — inference never leaves your machine, though the agent itself has normal internet access (bash, fetch tools) the same way a developer's terminal would.
 
 ---
 
 Local models are on a steep improvement curve. Quantized 14B models already rival hosted models on coding tasks, and that gap will narrow further. The limiting factor is no longer raw capability — it is containment, observability, and tooling. Argo is built around those three constraints.
 
-The core safety primitive is Docker. Each workspace gets an isolated container with only the project folder mounted. The agent can execute bash, read and write files, fetch pages, and run Playwright scripts — but it cannot see other projects, cannot reach host paths outside the mount, and cannot exfiltrate data. The container is the boundary. As models become more capable, that boundary matters more, not less.
+Docker covers the main containment concern. Each workspace gets an isolated container with only the project folder mounted. The agent can execute bash, read and write files, fetch pages, and run Playwright scripts — but it cannot see other projects or reach host paths outside the mount. It's a filesystem boundary, not a network or resource one: containers keep normal outbound internet access and no CPU/memory caps, and nothing stops the agent from reading and transmitting whatever secrets already live inside the mounted project itself (that's unavoidable for a tool that needs to read a codebase to work on it). Argo's own operational secrets (API keys) are held separately and never handed to the container — see the zero-trust section in CLAUDE.md.
 
 The execution environment is JS-native by design. Agents run Node.js + CommonJS `require()`, Playwright, and bash — the same toolchain as the projects they work on. No Python intermediary, no translation layer, no impedance mismatch between what the agent writes and what the codebase expects. The packages the agent can `require()` are the packages a JS developer would actually reach for.
 

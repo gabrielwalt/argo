@@ -7,7 +7,11 @@ import { promisify } from 'util'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { promises as fs } from 'fs'
+import crypto from 'crypto'
 import { config } from './config.js'
+import { checkOllama, checkDocker, logEnvironment } from './health.js'
+import { installAuth } from './auth.js'
+import { tavilySearchWithKey } from './tools/web-search.js'
 import type { Request, Response } from 'express'
 
 const execAsync = promisify(exec)
@@ -26,6 +30,16 @@ const AGENT_IMAGE       = process.env.AGENT_IMAGE ?? 'argo:latest'
 const CONTAINER_PREFIX  = 'argo-'
 const PORT_START        = 3101
 const PORT_END          = 3199
+
+// Authorizes worker → central calls for tools that need secrets central holds
+// (see startWorker below). Not a user-facing secret — its only power is
+// "may invoke central's /internal/* proxy routes", something the agent's
+// tools can already do anyway; it just keeps real credentials out of containers.
+const internalToken = crypto.randomBytes(24).toString('hex')
+
+// Env vars whose name looks secret-shaped never get injected into a worker
+// container's environment — see startWorker.
+const SECRET_KEY_PATTERN = /(KEY|TOKEN|SECRET|PASSWORD)/i
 
 interface WorkspaceEntry {
   name: string
@@ -136,7 +150,9 @@ async function startWorker(ws: WorkspaceEntry): Promise<string> {
     'run', '-d',
     '--name', `${CONTAINER_PREFIX}${ws.name}`,
     '--rm',
-    '-p', `${ws.port}:3000`,
+    // Bound to localhost only — reachable exclusively through central's proxy,
+    // which is the one place the password gate is enforced.
+    '-p', `127.0.0.1:${ws.port}:3000`,
     '-v', `${ws.path}:/workspace`,
     '-v', `${scratchDir}:/scratch`,
     '-v', `${logsDir}:/app/logs`,
@@ -144,9 +160,15 @@ async function startWorker(ws: WorkspaceEntry): Promise<string> {
     '-e', 'RUNNING_IN_CONTAINER=1',
     '-e', 'WORKER_MODE=1',
     '-e', `OLLAMA_HOST=http://host.docker.internal:11434`,
+    '-e', `ARGO_CENTRAL_URL=http://host.docker.internal:${config.port}`,
+    '-e', `ARGO_INTERNAL_TOKEN=${internalToken}`,
   ]
 
+  // Secret-shaped values (API keys, tokens, passwords) never enter the container's
+  // env — the agent's bash tool would be able to read and exfiltrate them there.
+  // Tools that need them (web_search) call back through /internal/* instead.
   for (const [k, v] of Object.entries(envVars)) {
+    if (SECRET_KEY_PATTERN.test(k)) continue
     args.push('-e', `${k}=${v}`)
   }
 
@@ -258,6 +280,7 @@ export function startCentral(): void {
   const app = express()
   app.set('strict routing', true)   // /ws/:name ≠ /ws/:name/ — prevents redirect loops
   app.use(cors())
+  installAuth(app)
   // express.json() is NOT applied globally — it would consume req body before the proxy can pipe it.
   // Apply it only to the /api/* routes that actually need parsed bodies.
   app.use(express.static(PUBLIC_DIR, {
@@ -283,6 +306,21 @@ export function startCentral(): void {
     } catch {
       res.status(500).send('UI unavailable')
     }
+  })
+
+  // Shadow proxy: workers call this instead of holding the Tavily key themselves.
+  // Guarded by internalToken, not the user password — see comment at its definition.
+  app.post('/internal/web-search', express.json(), async (req, res) => {
+    if (req.headers['x-argo-internal-token'] !== internalToken) {
+      res.status(403).json({ error: 'Forbidden' })
+      return
+    }
+    const { query, maxResults } = req.body as { query?: string; maxResults?: number }
+    if (!query) { res.status(400).json({ error: 'query required' }); return }
+
+    const envVars = await loadGlobalEnv()
+    if (!envVars.TAVILY_API_KEY) { res.json({ output: '', error: 'not_configured' }); return }
+    res.json(await tavilySearchWithKey(envVars.TAVILY_API_KEY, query, maxResults ?? 5))
   })
 
   // List workspaces
@@ -382,5 +420,9 @@ export function startCentral(): void {
 
   app.listen(config.port, () => {
     console.log(`Argo at http://localhost:${config.port}`)
+  })
+
+  Promise.all([checkOllama(), checkDocker()]).then(([ollama, docker]) => {
+    logEnvironment('central', { ollama, docker })
   })
 }

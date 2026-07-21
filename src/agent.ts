@@ -7,6 +7,17 @@ import { toolDefinitions, executeTool } from './tools/index.js'
 import { bash } from './tools/bash.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
 import type { AgentEvent, ToolName, ModelOptions } from './types.js'
+import {
+  type CompactionState,
+  emptyCompactionState,
+  coerceCompactionState,
+  renderCompactionState,
+  messagesToText,
+  splitForCompaction,
+  updateCompactionState,
+  validateCompactionState,
+  summarizeActiveMiddle,
+} from './compaction.js'
 
 const SYSTEM_PROMPT = `You are a capable local agent running in an isolated Ubuntu 24.04 Docker container. The host machine is not accessible.
 
@@ -17,14 +28,14 @@ EFFICIENCY
 Never call the same tool more than twice in a row with similar inputs — write a script instead. Fetching 10 pages one by one, running the same command on multiple files, processing a list item by item: all of these must be a script, not repeated tool calls.
 Test before bulk: run the script on one item first, verify the output is correct, then scale to the full set.
 Return conclusions and file paths only: never raw page or file contents as tool output.
-Multi-line JS: write to /scratch/script.js and run with node. Never use node -e for multi-line code.
+Multi-line JS: prefer writing to /scratch/script.js and running with node — easier to inspect and rerun than an inline command. Multi-line node -e now works correctly too; use it for anything short-lived that doesn't need to be rerun.
 
 FILESYSTEM
-Two directories exist — do not create them:
-- /scratch: your cwd for every bash command. Use for temp files, internal scripts, intermediate data, or anything the user doesn't need in his workspace.
-- /workspace: the user's project, git-tracked. All output the user expects to see must land here.
-Always use absolute paths as relative paths like "scratch/file" resolve to "/scratch/scratch/file".
-Scripts that produce output that is required in the workspace must set OUTPUT_DIR="/workspace/..." inside the script.
+/workspace is the project you are working on — the git-tracked repository, and the only place autoCommit() operates. /scratch is your private workbench for temp files, throwaway scripts, and intermediate data — it is inside the same isolated container as /workspace, not outside it or less trusted; it just isn't the deliverable location, so it's never committed and the user never sees it. These two are your workspace model — other container paths exist but nothing about your work belongs there. Do not create either directory.
+Commands about the project itself (npm test, npm run <script>, node <project file>, git, etc.) need cwd set to /workspace on the bash call — they assume the project root and fail otherwise. Do not prefix commands with "cd /workspace &&"; use the tool's cwd argument instead. Leave cwd unset (or /scratch) for scratch scripts.
+A script in /scratch that needs to import or require project code must reference it as /workspace/... — a relative import like './src/foo.js' resolves against /scratch, not the project, because that script's own cwd is wherever it was invoked from, not the project root.
+Always use absolute paths — a relative path like "scratch/file" resolves to "/scratch/scratch/file", not /scratch/file.
+Scripts that produce output required in the workspace must set OUTPUT_DIR="/workspace/..." inside the script.
 Before declaring done: re-read the original request, verify every item is addressed, and if the task produced files run ls /workspace/ to confirm they are there.
 
 TOOLS
@@ -36,13 +47,14 @@ Invoke tools immediately and directly — never describe plans or write tool cal
 - web_search: find information you don't already have (facts, docs, unknown URLs). Never use it when you already have the URL — use fetch_url or browser_fetch directly instead.
 When the task is complete, give the final answer and stop.
 
+CURRENCY
+Training data has a cutoff and goes stale. For anything that can change over time — current events, sports/election results, standings, prices, versions, "latest"/"current"/"who holds the record" claims — verify with web_search before answering, even when you're confident you already know the answer. Report what the sources say, not what memory says.
+
 ENVIRONMENT
 CLI: bash, curl, wget, git, jq, node, ripgrep (rg), fd, sqlite3, mlr, parallel, tree, unzip, zip, pv, dig, nc, ping
 Node.js: NODE_PATH is set — always use require(), never import. Pre-installed: cheerio, js-yaml, csv-parse, xlsx, pdf-parse, marked, turndown, handlebars, chalk, commander, date-fns, iconv-lite, glob, playwright. Install others with npm. fetch() is native. git is configured as "Local Agent".
 HTML: const $ = cheerio.load(html); $('sel').text(); $('a').attr('href'); $.html(el)
 `
-
-const COMPACT_THRESHOLD = 0.80  // compact when context is this full
 
 // Parses tool calls that a model wrote as JSON code blocks in its text content
 // instead of using the native tool-calling API (common with smaller models).
@@ -77,8 +89,13 @@ export class Agent {
   private options: ModelOptions = {}
   private sessionId = ''
   private aborted = false
+  // Persisted structured memory that survives across compactions — see compaction.ts.
+  private compactionState: CompactionState = emptyCompactionState()
   private get historyFile(): string {
     return path.join(LOGS_DIR, this.sessionId ? `history-${this.sessionId}.json` : 'history.json')
+  }
+  private get compactionStateFile(): string {
+    return path.join(LOGS_DIR, this.sessionId ? `compaction-${this.sessionId}.json` : 'compaction.json')
   }
 
   constructor(
@@ -92,6 +109,7 @@ export class Agent {
   // Load full Ollama message history from disk for the current session.
   async loadPersistedHistory(): Promise<void> {
     this.history = []  // always reset before loading
+    this.compactionState = emptyCompactionState()
     try {
       const raw = await fs.readFile(this.historyFile, 'utf-8')
       const saved = JSON.parse(raw)
@@ -101,6 +119,21 @@ export class Agent {
       }
     } catch {
       // No history file — clean start
+    }
+    try {
+      const raw = await fs.readFile(this.compactionStateFile, 'utf-8')
+      this.compactionState = coerceCompactionState(JSON.parse(raw), emptyCompactionState())
+    } catch {
+      // No prior compaction state — clean start
+    }
+  }
+
+  private async persistCompactionState(): Promise<void> {
+    try {
+      await fs.mkdir(path.dirname(this.compactionStateFile), { recursive: true })
+      await fs.writeFile(this.compactionStateFile, JSON.stringify(this.compactionState))
+    } catch (err) {
+      console.error('[compaction] Failed to persist state:', err)
     }
   }
 
@@ -131,77 +164,78 @@ export class Agent {
 
   abort() { this.aborted = true }
 
-  // Serialises a slice of history to a compact work log for the compaction summary call.
-  private messagesToText(messages: Message[]): string {
-    const lines: string[] = []
-    for (const msg of messages) {
-      if (msg.role === 'user' && msg.content) {
-        lines.push(`User: ${msg.content.slice(0, 300)}`)
-      } else if (msg.role === 'assistant') {
-        const tc = (msg as { tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> }).tool_calls
-        if (tc?.length) {
-          for (const call of tc) {
-            lines.push(`Called ${call.function.name}(${JSON.stringify(call.function.arguments).slice(0, 120)})`)
-          }
-        } else if (msg.content) {
-          lines.push(`Agent: ${msg.content.slice(0, 300)}`)
-        }
-      } else if (msg.role === 'tool' && msg.content) {
-        lines.push(`Result: ${msg.content.slice(0, 300)}`)
-      }
-    }
-    return lines.join('\n')
-  }
-
+  // Splits history around the active run (see compaction.ts:splitForCompaction),
+  // folds the "prior" portion into persisted structured state — updated, then
+  // validated against its own source rather than trusted blindly — and
+  // separately compresses the active run's own middle iterations if it has
+  // grown long. The active prompt, the antecedent turn, and a recent verbatim
+  // tail are never touched. Returns the active prompt's new index, since an
+  // earlier compaction within the same run invalidates whatever index the
+  // caller was tracking.
   private async compactHistory(
-    userMessage: string,
+    currentRunStart: number,
+    contextUsagePct: number,
     emitAndLog: (e: AgentEvent) => void
-  ): Promise<void> {
-    // Keep: first message (original user prompt) + last KEEP_RECENT messages verbatim.
-    // Compact: everything in between. This preserves the task goal and the most recent
-    // tool results (exact URLs, paths, errors) which are the most likely to be needed next.
-    const KEEP_RECENT = 8
+  ): Promise<number> {
     const msgsBefore = this.history.length
+    const split = splitForCompaction(this.history, currentRunStart)
 
-    if (msgsBefore <= KEEP_RECENT + 2) return  // nothing meaningful to compact
+    if (split.prior.length === 0 && split.activeMiddle.length === 0) return currentRunStart
 
-    const firstMsg = this.history[0]
-    const toCompact = this.history.slice(1, msgsBefore - KEEP_RECENT)
-    const recentMsgs = this.history.slice(-KEEP_RECENT)
+    emitAndLog({ type: 'compact_start', messageCount: msgsBefore, contextUsagePct })
 
-    if (toCompact.length === 0) return
+    let validated = false
+    if (split.prior.length > 0) {
+      const draft = await withTimeout(
+        updateCompactionState(this.ollama, this.model, this.options, this.compactionState, split.prior),
+        60_000,
+      )
+      const sourceWorkLog = messagesToText(split.prior)
+      const result = await withTimeout(
+        validateCompactionState(this.ollama, this.model, this.options, sourceWorkLog, draft),
+        60_000,
+      )
+      this.compactionState = result.state
+      validated = true
+    }
 
-    emitAndLog({ type: 'warning', message: `Compacting context: ${msgsBefore} messages → keeping ${KEEP_RECENT} recent verbatim…` })
+    const activeWorkingState = split.activeMiddle.length > 0
+      ? await withTimeout(summarizeActiveMiddle(this.ollama, this.model, this.options, split.activeMiddle), 60_000)
+      : ''
 
-    const workLog = this.messagesToText(toCompact)
+    const priorMessage: Message = { role: 'assistant', content: renderCompactionState(this.compactionState) }
+    const activeStateMessages: Message[] = activeWorkingState
+      ? [{ role: 'assistant', content: `ACTIVE WORKING STATE (current task, in progress — compressed from earlier iterations of this same turn)\n\n${activeWorkingState}` }]
+      : []
 
-    const summaryResp = await withTimeout(this.ollama.chat({
-      model: this.model,
-      messages: [{
-        role: 'user',
-        content: `Summarize an AI agent's prior work log. Rules:
-- Copy all URLs, file paths, and error messages VERBATIM — never paraphrase or reconstruct them
-- State explicitly what succeeded and what failed
-- Note the current state: which files exist, which are missing
-- Be dense — every sentence must carry unique information
-
-Work log:
-${workLog}`,
-      }],
-      stream: false,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      options: this.options as any,
-    }), 60_000)
-
-    const summary = summaryResp.message.content.trim()
     this.history = [
-      firstMsg,
-      { role: 'assistant', content: `[Prior work summary]\n\n${summary}` },
-      ...recentMsgs,
+      priorMessage,
+      ...split.antecedent,
+      split.currentPrompt,
+      ...activeStateMessages,
+      ...split.activeTail,
     ]
+
+    const newRunStart = 1 + split.antecedent.length
     const msgsAfter = this.history.length
-    emitAndLog({ type: 'compact', summary })
-    emitAndLog({ type: 'warning', message: `Context compacted: ${msgsBefore} → ${msgsAfter} messages` })
+
+    await this.persistCompactionState()
+
+    const rangeDescription = `folded ${split.prior.length} prior message(s) into structured state`
+      + (split.activeMiddle.length > 0 ? `, summarized ${split.activeMiddle.length} active-run message(s)` : '')
+      + `, kept ${split.antecedent.length} antecedent + current prompt + ${split.activeTail.length} recent verbatim`
+
+    emitAndLog({
+      type: 'compact',
+      summary: renderCompactionState(this.compactionState),
+      messagesBefore: msgsBefore,
+      messagesAfter: msgsAfter,
+      contextUsagePct,
+      rangeDescription,
+      validated,
+    })
+
+    return newRunStart
   }
 
   async chat(userMessage: string): Promise<string> {
@@ -213,6 +247,11 @@ ${workLog}`,
     }
 
     this.history.push({ role: 'user', content: userMessage })
+    // The index of the message that started this run — compactHistory() always
+    // keeps history[currentRunStart] verbatim, however many iterations follow it.
+    // Reassigned (not recomputed) after each compaction, since compaction replaces
+    // `this.history` wholesale and returns the prompt's new position in it.
+    let currentRunStart = this.history.length - 1
     emitAndLog({ type: 'message', role: 'user', content: userMessage })
     emitAndLog({ type: 'start', model: this.model, query: userMessage, options: this.options })
 
@@ -246,9 +285,13 @@ ${workLog}`,
             generated_tokens: response.eval_count ?? 0,
             num_ctx: numCtx,
           })
-          if (response.prompt_eval_count / numCtx >= COMPACT_THRESHOLD) {
+          // Reserve headroom for the *next* generation, not just the input consumed so
+          // far — a response near num_predict's limit can still overflow num_ctx even
+          // when prompt_eval_count alone looks comfortably under the threshold.
+          const usagePct = (response.prompt_eval_count + config.compactGenerationReserve) / numCtx
+          if (usagePct >= config.compactThreshold) {
             try {
-              await this.compactHistory(userMessage, emitAndLog)
+              currentRunStart = await this.compactHistory(currentRunStart, usagePct, emitAndLog)
             } catch (err) {
               emitAndLog({ type: 'warning', message: `Context compaction failed (${err instanceof Error ? err.message : String(err)}) — continuing with full history` })
             }
@@ -316,11 +359,14 @@ ${workLog}`,
 
   reset() {
     this.history = []
+    this.compactionState = emptyCompactionState()
     fs.unlink(this.historyFile).catch(() => {})
+    fs.unlink(this.compactionStateFile).catch(() => {})
   }
 
   loadHistory(messages: Array<{ role: string; content: string }>) {
     this.history = messages as Message[]
+    this.compactionState = emptyCompactionState()
     fs.writeFile(this.historyFile, JSON.stringify(this.history)).catch(() => {})
   }
 

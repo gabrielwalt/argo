@@ -18,6 +18,40 @@ const tokenCounter = $('token-counter')
 const settingsBtn = $('settings-btn')
 const settingsPanel = $('settings-panel')
 
+// ── Confirm dialog / toast — replace native confirm()/alert() ────
+function confirmDialog(message) {
+  return new Promise(resolve => {
+    const modal = $('confirm-modal')
+    const okBtn = $('confirm-ok')
+    const cancelBtn = $('confirm-cancel')
+    $('confirm-message').textContent = message
+    modal.classList.add('open')
+    function cleanup(result) {
+      modal.classList.remove('open')
+      okBtn.removeEventListener('click', onOk)
+      cancelBtn.removeEventListener('click', onCancel)
+      resolve(result)
+    }
+    function onOk() { cleanup(true) }
+    function onCancel() { cleanup(false) }
+    okBtn.addEventListener('click', onOk)
+    cancelBtn.addEventListener('click', onCancel)
+  })
+}
+
+function showToast(message) {
+  const container = $('toast-container')
+  const toast = document.createElement('div')
+  toast.className = 'toast'
+  toast.textContent = message
+  container.appendChild(toast)
+  requestAnimationFrame(() => toast.classList.add('visible'))
+  setTimeout(() => {
+    toast.classList.remove('visible')
+    setTimeout(() => toast.remove(), 200)
+  }, 4000)
+}
+
 // ── Session state ────────────────────────────────────────────────
 let sessionStartTime = new Date()
 let viewingSession = null  // null = current; object = past session being viewed
@@ -103,6 +137,7 @@ function finalizeTraceBlock() {
 }
 
 let busy = false
+let currentRunModel = ''
 const sendBoat = $('send-boat')
 const sendStop = $('send-stop')
 
@@ -120,6 +155,7 @@ es.onmessage = (e) => {
 function handleEvent(event) {
   switch (event.type) {
     case 'start':
+      currentRunModel = event.model
       startTraceBlock(event.model)
       setStatus('busy', `Running · ${event.model}`)
       tokenCounter.textContent = ''
@@ -129,6 +165,9 @@ function handleEvent(event) {
     case 'iteration':
       iterLabel.textContent = `${event.current}`
       addTraceItem('iteration', null, `── Iteration ${event.current} ──`, false)
+      // Safety net: if compaction failed last iteration, only a 'warning' fires
+      // (no 'compact'), so this is what clears "Compacting context…" from the status bar.
+      setStatus('busy', `Running · ${currentRunModel}`)
       break
 
     case 'thought':
@@ -171,10 +210,22 @@ function handleEvent(event) {
       refreshFiles()
       break
 
+    case 'compact_start':
+      // Compaction involves separate LLM calls (update + validate) that can take
+      // up to a couple minutes total — without this the run just looks stalled.
+      setStatus('busy', 'Compacting context…')
+      addTraceItem('compact', '📦 Compacting context', `${event.messageCount} messages, ${Math.round(event.contextUsagePct * 100)}% context — updating working memory…`, false)
+      break
+
     case 'compact':
-      addTraceItem('compact', '⚡ Context compacted', event.summary, true)
+      setStatus('busy', `Running · ${currentRunModel}`)
+      addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
       tokenCounter.textContent = 'compacted'
       tokenCounter.className = 'ctx-ok'
+      break
+
+    case 'warning':
+      addTraceItem('warning', '⚠ Warning', event.message, false)
       break
 
     case 'git_commit':
@@ -209,13 +260,13 @@ function setBusy(val) {
     setTimeout(() => {
       sendBtn.classList.remove('sailing')
       sendBtn.classList.add('working')
-      sendBoat.style.display = 'none'
-      sendStop.style.display = ''
+      sendBoat.classList.add('hidden')
+      sendStop.classList.remove('hidden')
     }, 450)
   } else {
     sendBtn.classList.remove('sailing', 'working')
-    sendBoat.style.display = ''
-    sendStop.style.display = 'none'
+    sendBoat.classList.remove('hidden')
+    sendStop.classList.add('hidden')
   }
 }
 
@@ -280,6 +331,29 @@ function addChatMessage(role, content) {
   el.className = `message ${role} md`
   el.innerHTML = renderMarkdown(content)
   el.querySelectorAll('a').forEach(a => a.setAttribute('target', '_blank'))
+
+  if (role === 'assistant') {
+    const copyBtn = document.createElement('button')
+    copyBtn.className = 'msg-copy-btn'
+    copyBtn.type = 'button'
+    copyBtn.textContent = '⧉ Copy'
+    copyBtn.addEventListener('click', async () => {
+      clearTimeout(copyBtn._resetTimer)
+      try {
+        await navigator.clipboard.writeText(content)
+        copyBtn.textContent = '✓ Copied'
+        copyBtn.classList.add('copied')
+      } catch {
+        copyBtn.textContent = '✕ Failed'
+      }
+      copyBtn._resetTimer = setTimeout(() => {
+        copyBtn.textContent = '⧉ Copy'
+        copyBtn.classList.remove('copied')
+      }, 1500)
+    })
+    el.appendChild(copyBtn)
+  }
+
   messagesEl.appendChild(el)
   messagesEl.scrollTop = messagesEl.scrollHeight
 }
@@ -330,6 +404,20 @@ inputEl.addEventListener('keydown', (e) => {
     e.preventDefault()
     $('chat-form').dispatchEvent(new Event('submit'))
   }
+})
+
+// Rich text (Google Docs, web pages, email, etc.) always carries a text/html
+// clipboard entry alongside plain text — convert that to Markdown instead of
+// pasting formatted junk into the textarea. Plain-text-only clipboards (no
+// text/html present) fall through to the browser's normal paste.
+const turndownService = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' })
+inputEl.addEventListener('paste', (e) => {
+  const html = e.clipboardData?.getData('text/html')
+  if (!html) return
+  e.preventDefault()
+  const markdown = turndownService.turndown(html).trim()
+  inputEl.setRangeText(markdown, inputEl.selectionStart, inputEl.selectionEnd, 'end')
+  inputEl.dispatchEvent(new Event('input', { bubbles: true }))
 })
 
 // ── New session (called from session dropdown) ───────────────────
@@ -574,6 +662,47 @@ function formatSize(bytes) {
 
 let activeFileRow = null
 
+const LANG_BY_EXT = {
+  js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
+  ts: 'typescript', tsx: 'typescript',
+  py: 'python', rb: 'ruby', go: 'go', rs: 'rust', java: 'java',
+  c: 'c', h: 'c', cpp: 'cpp', cc: 'cpp', hpp: 'cpp',
+  cs: 'csharp', php: 'php', swift: 'swift', kt: 'kotlin',
+  sh: 'bash', bash: 'bash', zsh: 'bash',
+  json: 'json', yaml: 'yaml', yml: 'yaml', toml: 'ini',
+  html: 'xml', htm: 'xml', xml: 'xml', svg: 'xml',
+  css: 'css', scss: 'scss', less: 'less',
+  md: 'markdown', sql: 'sql',
+  makefile: 'makefile', dockerfile: 'dockerfile',
+  graphql: 'graphql', proto: 'protobuf',
+}
+
+function detectLanguage(filePath) {
+  const name = filePath.split('/').pop().toLowerCase()
+  if (name === 'dockerfile' || name === 'makefile') return name
+  const ext = name.includes('.') ? name.split('.').pop() : ''
+  return LANG_BY_EXT[ext] ?? null
+}
+
+// Highlight per-line rather than the whole file at once — hljs's HTML output
+// can leave a span open across a newline, which would corrupt the markup if
+// split afterward. Per-line loses a little context (e.g. multi-line strings
+// may highlight inconsistently) but is simple and always well-formed, and each
+// line becomes its own flex row so the line-number counter lines up exactly
+// even when a long line wraps to multiple visual rows.
+function renderHighlightedCode(text, language) {
+  const canHighlight = language && typeof hljs !== 'undefined' && hljs.getLanguage(language)
+  return text.split('\n').map(line => {
+    let html
+    try {
+      html = canHighlight ? hljs.highlight(line, { language, ignoreIllegals: true }).value : escHtml(line)
+    } catch {
+      html = escHtml(line)
+    }
+    return `<div class="code-line">${html}</div>`
+  }).join('')
+}
+
 async function openFileInViewer(dir, filePath, rowEl) {
   if (activeFileRow) activeFileRow.classList.remove('active')
   activeFileRow = rowEl
@@ -587,7 +716,8 @@ async function openFileInViewer(dir, filePath, rowEl) {
 
   try {
     const resp = await fetch(`${API_BASE}/file?dir=${dir}&path=${encodeURIComponent(filePath)}`)
-    contentEl.textContent = await resp.text()
+    const text = await resp.text()
+    contentEl.innerHTML = renderHighlightedCode(text, detectLanguage(filePath))
   } catch {
     contentEl.textContent = 'Failed to load file.'
   }
@@ -651,7 +781,7 @@ async function refreshSessionDropdown() {
   clearCurrBtn.textContent = 'Clear'
   clearCurrBtn.addEventListener('click', async (e) => {
     e.stopPropagation()
-    if (!confirm('Clear current session?')) return
+    if (!(await confirmDialog('Clear current session?'))) return
     $('nav-session').classList.remove('open')
     try {
       const st = await fetch(`${API_BASE}/status`).then(r => r.json())
@@ -702,7 +832,7 @@ async function refreshSessionDropdown() {
         clearBtn.textContent = 'Clear'
         clearBtn.addEventListener('click', async (e) => {
           e.stopPropagation()
-          if (!confirm('Delete this session?')) return
+          if (!(await confirmDialog('Delete this session?'))) return
           await fetch(`${API_BASE}/logs/${sg.id}`, { method: 'DELETE' }).catch(() => {})
           if (viewingSession?.id === sg.id) returnToCurrentSession()
           item.remove()
@@ -727,7 +857,7 @@ async function refreshSessionDropdown() {
   clearAll.className = 'nav-drop-item nav-drop-item-sm'
   clearAll.innerHTML = `<span class="drop-icon-dim">⌫</span> Clear all history`
   clearAll.addEventListener('click', async () => {
-    if (!confirm('Delete all session logs and clear current history?')) return
+    if (!(await confirmDialog('Delete all session logs and clear current history?'))) return
     $('nav-session').classList.remove('open')
     try { await fetch(`${API_BASE}/logs`, { method: 'DELETE' }) } catch { /* standalone */ }
     newSession()
@@ -917,7 +1047,7 @@ async function initNav() {
   const currDetach = currWs.querySelector('.nav-drop-detach')
   currDetach.addEventListener('click', async (e) => {
     e.stopPropagation()
-    if (!confirm(`Detach "${window.__WS__}" and stop its container?`)) return
+    if (!(await confirmDialog(`Detach "${window.__WS__}" and stop its container?`))) return
     currDetach.textContent = '…'
     await fetch(`/api/detach/${window.__WS__}`, { method: 'POST' }).catch(() => {})
     window.location.href = '/'
@@ -928,10 +1058,11 @@ async function initNav() {
   const othersContainer = document.createElement('div')
   wsDropdown.appendChild(othersContainer)
 
-  // Populate other running workspaces from API (best-effort)
+  // Populate other workspaces from API (best-effort) — includes stopped ones,
+  // which get started on click rather than being unreachable from here.
   try {
     const workspaces = await fetch('/api/workspaces').then(r => r.json())
-    const others = workspaces.filter(w => w.name !== window.__WS__ && w.running)
+    const others = workspaces.filter(w => w.name !== window.__WS__)
     if (others.length > 0) {
       const sep = document.createElement('div')
       sep.className = 'nav-drop-sep'
@@ -939,12 +1070,29 @@ async function initNav() {
       others.forEach(w => {
         const row = document.createElement('div')
         row.className = 'nav-drop-item'
-        row.innerHTML = `<span class="drop-text">${escHtml(w.name)}</span><button class="nav-drop-detach" type="button">Detach</button>`
-        row.addEventListener('click', () => { window.location.href = `/ws/${w.name}/` })
+        const dotClass = w.running ? 'drop-dot' : 'drop-dot stopped'
+        row.innerHTML = `<span class="${dotClass}">●</span><span class="drop-text">${escHtml(w.name)}</span><button class="nav-drop-detach" type="button">Detach</button>`
+        row.addEventListener('click', async () => {
+          if (w.running) { window.location.href = `/ws/${w.name}/`; return }
+          row.querySelector('.drop-text').textContent = 'Starting…'
+          try {
+            const resp = await fetch('/api/attach', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: w.path }),
+            })
+            const data = await resp.json()
+            if (!resp.ok) throw new Error(data.error)
+            window.location.href = data.url
+          } catch (err) {
+            row.querySelector('.drop-text').textContent = w.name
+            showToast(err.message || 'Failed to start workspace')
+          }
+        })
         const detachBtn = row.querySelector('.nav-drop-detach')
         detachBtn.addEventListener('click', async (e) => {
           e.stopPropagation()
-          if (!confirm(`Detach "${w.name}" and stop its container?`)) return
+          if (!(await confirmDialog(`Detach "${w.name}" and stop its container?`))) return
           detachBtn.textContent = '…'
           await fetch(`/api/detach/${w.name}`, { method: 'POST' }).catch(() => {})
           row.remove()
@@ -1014,10 +1162,62 @@ function initResize(handleId, getWidth, cssVar, minPx) {
   })
 }
 
-loadModels()
-refreshGitLog()
-loadHistory()
-initNav()
-refreshFiles()
-initResize('panel-resize', () => $('chat-panel').getBoundingClientRect().width, '--chat-width', 240)
-initResize('tree-resize', () => $('file-tree-pane').getBoundingClientRect().width, '--tree-width', 120)
+// ── Workspace gate (standalone mode only — central/worker always has one) ──
+function showNoWorkspaceScreen() {
+  document.querySelector('header').classList.add('hidden')
+  document.querySelector('main').classList.add('hidden')
+  $('no-workspace-screen').classList.remove('hidden')
+}
+
+function showEnvBanner(env) {
+  if (!env) return
+  const missing = []
+  if (!env.ollama) missing.push('Ollama is not running')
+  if (!env.docker) missing.push('Docker is not running')
+  if (!env.git) missing.push('git was not found')
+  if (missing.length === 0) return
+  $('env-banner').textContent = `⚠ ${missing.join(' · ')}`
+  $('env-banner').classList.remove('hidden')
+}
+
+$('no-workspace-btn').addEventListener('click', async () => {
+  const input = $('no-workspace-path')
+  const btn = $('no-workspace-btn')
+  const errEl = $('no-workspace-error')
+  const p = input.value.trim()
+  if (!p) return
+  btn.disabled = true
+  errEl.textContent = ''
+  try {
+    const resp = await fetch(`${API_BASE}/api/workspace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: p }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) { errEl.textContent = data.error || 'Failed to mount folder'; btn.disabled = false; return }
+    location.reload()
+  } catch {
+    errEl.textContent = 'Failed to reach Argo server'
+    btn.disabled = false
+  }
+})
+$('no-workspace-path').addEventListener('keydown', e => {
+  if (e.key === 'Enter') $('no-workspace-btn').click()
+})
+
+async function boot() {
+  const status = await fetch(`${API_BASE}/status`).then(r => r.json()).catch(() => ({}))
+  showEnvBanner(status.env)
+  if (!window.__WS__ && !status.workspacePath) { showNoWorkspaceScreen(); return }
+
+  loadModels()
+  refreshGitLog()
+  loadHistory()
+  initNav()
+  refreshFiles()
+  initResize('panel-resize', () => $('chat-panel').getBoundingClientRect().width, '--chat-width', 240)
+  initResize('tree-resize', () => $('file-tree-pane').getBoundingClientRect().width, '--tree-width', 120)
+}
+
+boot()

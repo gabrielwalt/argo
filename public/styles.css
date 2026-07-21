@@ -98,9 +98,14 @@ header::after {
   -webkit-text-fill-color: transparent;
   background-clip: text;
   animation: gold-shimmer 8s linear infinite;
-  transition: filter .3s ease;
 }
-#nav-home:hover { filter: brightness(1.25) drop-shadow(0 0 8px rgba(201,162,39,.35)); }
+.wordmark, #nav-home .flip-h { transition: filter .3s ease; }
+/* Split per element on purpose: filter on #nav-home itself would flatten the
+   whole subtree (boat + text) into one layer before applying drop-shadow,
+   which duplicates the boat's own opaque glyph shape into a visible ghost
+   copy. Text can take the glow; the boat only gets a plain brightness lift. */
+#nav-home:hover .wordmark { filter: brightness(1.25) drop-shadow(0 0 4px rgba(201,162,39,.4)); }
+#nav-home:hover .flip-h   { filter: brightness(1.25); }
 /* Boat emoji on send button — filter to solid black silhouette */
 .send-icon { font-size: 17px; filter: brightness(0); line-height: 1; transition: opacity .2s ease; }
 
@@ -477,7 +482,28 @@ main {
   background: var(--surface);
   border: 1px solid var(--border);
   align-self: flex-start;
+  position: relative;
 }
+
+.msg-copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .15s, color .15s, border-color .15s;
+}
+.message.assistant:hover .msg-copy-btn,
+.msg-copy-btn:focus-visible { opacity: 1; }
+.msg-copy-btn:hover { color: var(--text); border-color: var(--text); }
+.msg-copy-btn.copied { color: var(--green); border-color: var(--green); opacity: 1; }
 
 .message.system {
   background: transparent;
@@ -660,7 +686,11 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   animation: ring-pulse 1.8s ease-out infinite;
   cursor: pointer;
 }
-.send-stop { font-size: 16px; color: #1a1000; line-height: 1; display: flex; align-items: center; justify-content: center; }
+/* A drawn square, not the "■" glyph — unicode square glyphs sit off-center
+   within their own character box in most fonts, which threw off centering
+   inside the round button no matter how the flex container was tuned. A
+   fixed-size box centers exactly, regardless of font metrics. */
+.send-stop { width: 12px; height: 12px; background: #1a1000; border-radius: 2px; }
 
 /* ── Resize handles ── */
 .resize-handle {
@@ -741,6 +771,7 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .trace-item.git              { border-left-color: var(--gold);   color: var(--gold); }
 .trace-item.compact          { border-left-color: var(--accent); color: var(--accent); }
 .trace-item.error-item       { border-left-color: var(--red);    color: #fca5a5; }
+.trace-item.warning          { border-left-color: var(--yellow); color: var(--yellow); }
 
 .trace-label { font-weight: 700; margin-bottom: 3px; display: flex; align-items: center; gap: 6px; }
 .trace-duration { margin-left: auto; font-weight: 400; opacity: .6; font-size: 10px; }
@@ -968,11 +999,32 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.6;
-  white-space: pre;
-  word-break: normal;
+  white-space: normal;
   color: var(--text);
   margin: 0;
   tab-size: 2;
+  counter-reset: line;
+}
+
+/* Each source line is its own flex row: the ::before counter is the line-number
+   gutter, the highlighted code is the other flex item. Wrapping a long line to
+   several visual rows still shows one line number, since the counter belongs
+   to the whole div, not to a visual row. */
+.code-line {
+  display: flex;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.code-line::before {
+  counter-increment: line;
+  content: counter(line);
+  flex-shrink: 0;
+  width: 3em;
+  margin-right: 16px;
+  text-align: right;
+  color: var(--muted);
+  opacity: .5;
+  user-select: none;
 }
 
 .file-viewer-empty { color: var(--muted) !important; white-space: normal !important; font-size: 12px; }
@@ -984,11 +1036,75 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 
 /* Dropdown row sub-elements */
 .drop-dot   { flex-shrink: 0; font-size: 9px; color: var(--green); }
+.drop-dot.stopped { color: var(--muted); }
 .drop-date  { flex-shrink: 0; color: var(--muted); font-size: 11px; min-width: 72px; }
 .drop-text  { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .drop-count { margin-left: auto; opacity: .5; font-size: 11px; }
 .drop-icon  { font-size: 15px; line-height: 1; }
 .drop-icon-dim { opacity: .4; font-size: 13px; }
+
+/* ── Confirm dialog (replaces native confirm()) ── */
+#confirm-modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.75);
+  z-index: 300;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(3px);
+}
+#confirm-modal.open { display: flex; }
+#confirm-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: 320px;
+  max-width: 90vw;
+  padding: 20px;
+  box-shadow: 0 24px 64px rgba(0,0,0,.7);
+}
+#confirm-message { font-size: 13px; color: var(--text); line-height: 1.5; margin-bottom: 20px; }
+#confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+#confirm-actions button {
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--muted);
+  transition: border-color .15s, color .15s, filter .15s;
+}
+#confirm-cancel:hover { color: var(--text); border-color: var(--text); }
+#confirm-ok { background: var(--red); border-color: var(--red); color: #fff; }
+#confirm-ok:hover { filter: brightness(1.15); }
+
+/* ── Toast notifications (replaces native alert()) ── */
+#toast-container {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 400;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.toast {
+  background: var(--surface);
+  border: 1px solid var(--red);
+  color: var(--text);
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 12px;
+  max-width: 320px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity .2s ease, transform .2s ease;
+}
+.toast.visible { opacity: 1; transform: translateY(0); }
 
 /* ── Diff modal ── */
 #diff-modal {
@@ -1036,3 +1152,96 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 #diff-content .meta { color: var(--muted); }
 
 #close-diff { background: none; border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; }
+
+/* !important is deliberate: this is a force-hide utility class and must always
+   win regardless of an element's own ID-selector specificity (e.g. #no-workspace-screen
+   sets its own `display: flex` — without !important, that ID rule outranks this class
+   and the element never actually hides). */
+.hidden { display: none !important; }
+
+/* ── No-workspace screen ─────────────────────────────────────────── */
+
+#no-workspace-screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+}
+
+#no-workspace-card {
+  max-width: 480px;
+  width: 100%;
+  text-align: center;
+}
+
+#no-workspace-logo {
+  display: inline-block;
+  font-size: 40px;
+  line-height: 1;
+  margin-bottom: 20px;
+  filter: sepia(1) saturate(4) hue-rotate(5deg) brightness(1.1);
+}
+
+#no-workspace-card h1 {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+#no-workspace-card p {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 24px;
+}
+
+#no-workspace-row { display: flex; gap: 8px; }
+
+#no-workspace-row input {
+  flex: 1;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: var(--font-mono);
+  outline: none;
+  transition: border-color .15s;
+}
+#no-workspace-row input:focus { border-color: rgba(201, 162, 39, .45); box-shadow: 0 0 0 2px rgba(201, 162, 39, .07); }
+#no-workspace-row input::placeholder { color: var(--muted); }
+
+#no-workspace-btn {
+  background: var(--gold);
+  color: var(--bg);
+  border: none;
+  border-radius: 6px;
+  padding: 10px 20px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: filter .15s;
+}
+#no-workspace-btn:hover:not(:disabled) { filter: brightness(1.15); }
+#no-workspace-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+#no-workspace-error {
+  margin-top: 16px;
+  margin-bottom: 0;
+  color: var(--red);
+  font-size: 12px;
+  min-height: 16px;
+}
+
+/* ── Environment warning banner ──────────────────────────────────── */
+
+#env-banner {
+  padding: 8px 20px;
+  background: rgba(239, 68, 68, .08);
+  border-bottom: 1px solid rgba(239, 68, 68, .3);
+  color: var(--red);
+  font-size: 12px;
+  text-align: center;
+}

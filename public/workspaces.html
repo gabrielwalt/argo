@@ -79,7 +79,8 @@
       transition: transform .5s ease;
     }
     a.ws-open:hover::after { transform: translateX(150%); }
-    a.ws-open.stopped { background: var(--surface); color: var(--muted); border: 1px solid var(--border); pointer-events: none; }
+    a.ws-open.stopped { background: var(--surface); color: var(--muted); border: 1px solid var(--border); cursor: pointer; }
+    a.ws-open.stopped:hover { border-color: rgba(201,162,39,.45); color: var(--gold); }
 
     button.ws-detach {
       background: none; border: 1px solid var(--border); color: var(--muted);
@@ -101,12 +102,14 @@
     }
     .attach-row input:focus { border-color: rgba(201, 162, 39, .45); box-shadow: 0 0 0 2px rgba(201, 162, 39, .07); }
     .attach-row input::placeholder { color: var(--muted); }
+    /* Primary action on this page — DESIGN.md's own archetype table names
+       "Attach" as the gold-fill primary button; it had drifted to indigo. */
     .attach-row button {
-      background: var(--accent); color: #fff; border: none; border-radius: 6px;
-      padding: 10px 20px; font-size: 13px; font-weight: 500; cursor: pointer;
-      white-space: nowrap; transition: opacity .15s;
+      background: var(--gold); color: var(--bg); border: none; border-radius: 6px;
+      padding: 10px 20px; font-size: 13px; font-weight: 600; cursor: pointer;
+      white-space: nowrap; transition: filter .15s;
     }
-    .attach-row button:hover:not(:disabled) { opacity: .85; }
+    .attach-row button:hover:not(:disabled) { filter: brightness(1.15); }
     .attach-row button:disabled { opacity: .4; cursor: not-allowed; }
 
     .workspace-card:nth-child(2) { animation-delay: .04s; }
@@ -133,16 +136,47 @@
       border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer;
       transition: border-color .15s, color .15s;
     }
-    button.recent-attach:hover { border-color: var(--accent); color: var(--accent); }
+    button.recent-attach:hover { border-color: rgba(201,162,39,.45); color: var(--gold); }
     button.recent-forget {
       background: none; border: 1px solid transparent; color: var(--muted);
-      border-radius: 6px; padding: 5px 8px; font-size: 12px; cursor: pointer;
+      border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer;
       transition: color .15s, border-color .15s;
     }
     button.recent-forget:hover { color: var(--red); border-color: rgba(239,68,68,.3); }
 
     .error-msg { color: var(--red); font-size: 12px; margin-top: 8px; display: none; }
     .spinner { color: var(--muted); font-size: 13px; padding: 20px 0; }
+
+    /* ── Confirm dialog (replaces native confirm()) ── */
+    #confirm-modal {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,.75);
+      z-index: 300; align-items: center; justify-content: center; backdrop-filter: blur(3px);
+    }
+    #confirm-modal.open { display: flex; }
+    #confirm-box {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+      width: 320px; max-width: 90vw; padding: 20px; box-shadow: 0 24px 64px rgba(0,0,0,.7);
+    }
+    #confirm-message { font-size: 13px; color: var(--text); line-height: 1.5; margin-bottom: 20px; }
+    #confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+    #confirm-actions button {
+      padding: 8px 16px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer;
+      border: 1px solid var(--border); background: none; color: var(--muted);
+      transition: border-color .15s, color .15s, filter .15s;
+    }
+    #confirm-cancel:hover { color: var(--text); border-color: var(--text); }
+    #confirm-ok { background: var(--red); border-color: var(--red); color: #fff; }
+    #confirm-ok:hover { filter: brightness(1.15); }
+
+    /* ── Toast notifications (replaces native alert()) ── */
+    #toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 400; display: flex; flex-direction: column; gap: 8px; }
+    .toast {
+      background: var(--surface); border: 1px solid var(--red); color: var(--text);
+      padding: 10px 16px; border-radius: 6px; font-size: 12px; max-width: 320px;
+      box-shadow: 0 8px 24px rgba(0,0,0,.4); opacity: 0; transform: translateY(8px);
+      transition: opacity .2s ease, transform .2s ease;
+    }
+    .toast.visible { opacity: 1; transform: translateY(0); }
   </style>
 </head>
 <body>
@@ -170,16 +204,69 @@
     <div id="error-msg" class="error-msg"></div>
   </div>
 
+  <div id="confirm-modal">
+    <div id="confirm-box">
+      <div id="confirm-message"></div>
+      <div id="confirm-actions">
+        <button id="confirm-cancel" type="button">✕ Cancel</button>
+        <button id="confirm-ok" type="button">✓ Confirm</button>
+      </div>
+    </div>
+  </div>
+  <div id="toast-container"></div>
+
   <script>
+    function confirmDialog(message) {
+      return new Promise(resolve => {
+        const modal = document.getElementById('confirm-modal')
+        const okBtn = document.getElementById('confirm-ok')
+        const cancelBtn = document.getElementById('confirm-cancel')
+        document.getElementById('confirm-message').textContent = message
+        modal.classList.add('open')
+        function cleanup(result) {
+          modal.classList.remove('open')
+          okBtn.removeEventListener('click', onOk)
+          cancelBtn.removeEventListener('click', onCancel)
+          resolve(result)
+        }
+        function onOk() { cleanup(true) }
+        function onCancel() { cleanup(false) }
+        okBtn.addEventListener('click', onOk)
+        cancelBtn.addEventListener('click', onCancel)
+      })
+    }
+
+    function showToast(message) {
+      const container = document.getElementById('toast-container')
+      const toast = document.createElement('div')
+      toast.className = 'toast'
+      toast.textContent = message
+      container.appendChild(toast)
+      requestAnimationFrame(() => toast.classList.add('visible'))
+      setTimeout(() => {
+        toast.classList.remove('visible')
+        setTimeout(() => toast.remove(), 200)
+      }, 4000)
+    }
+
     function esc(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     }
+
+    let lastWorkspacesSig = null
 
     async function loadWorkspaces() {
       const grid = document.getElementById('workspace-grid')
       try {
         const resp = await fetch('/api/workspaces')
         const list = await resp.json()
+
+        // Skip the rebuild entirely when nothing changed — innerHTML replacement
+        // re-triggers card-in on every card, which is what caused the flash on
+        // every 5s poll even when the workspace list was identical.
+        const sig = JSON.stringify(list)
+        if (sig === lastWorkspacesSig) { loadRecent(); return }
+        lastWorkspacesSig = sig
 
         if (!list.length) {
           grid.innerHTML = '<div class="empty-state">No workspaces attached yet. Add a project folder below.</div>'
@@ -193,17 +280,39 @@
               </div>
               <div class="ws-actions">
                 <a class="ws-open ${ws.running ? '' : 'stopped'}"
-                  href="${esc(ws.url)}">
-                  ${ws.running ? 'Open →' : 'Stopped'}
+                  href="${ws.running ? esc(ws.url) : '#'}"
+                  data-path="${esc(ws.path)}">
+                  ${ws.running ? '→ Open' : '▶ Start'}
                 </a>
-                <button class="ws-detach" data-name="${esc(ws.name)}">Detach</button>
+                <button class="ws-detach" data-name="${esc(ws.name)}">⏏ Detach</button>
               </div>
             </div>
           `).join('')
 
+          grid.querySelectorAll('a.ws-open.stopped').forEach(link => {
+            link.addEventListener('click', async (e) => {
+              e.preventDefault()
+              const original = link.textContent
+              link.textContent = 'Starting…'
+              try {
+                const resp = await fetch('/api/attach', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ path: link.dataset.path }),
+                })
+                const data = await resp.json()
+                if (!resp.ok) throw new Error(data.error)
+                window.location.href = data.url
+              } catch (err) {
+                link.textContent = original
+                showToast(err.message || 'Failed to start workspace')
+              }
+            })
+          })
+
           grid.querySelectorAll('.ws-detach').forEach(btn => {
             btn.addEventListener('click', async () => {
-              if (!confirm(`Detach "${btn.dataset.name}"?`)) return
+              if (!(await confirmDialog(`Detach "${btn.dataset.name}"?`))) return
               btn.disabled = true
               await fetch(`/api/detach/${btn.dataset.name}`, { method: 'POST' })
               loadWorkspaces()
@@ -217,13 +326,20 @@
       loadRecent()
     }
 
+    let lastRecentSig = null
+
     async function loadRecent() {
       const section = document.getElementById('recent-section')
       const grid = document.getElementById('recent-grid')
       try {
         const list = await fetch('/api/history').then(r => r.json())
-        if (!Array.isArray(list) || !list.length) { section.style.display = 'none'; return }
+        if (!Array.isArray(list) || !list.length) { section.style.display = 'none'; lastRecentSig = null; return }
         section.style.display = ''
+
+        const sig = JSON.stringify(list)
+        if (sig === lastRecentSig) return
+        lastRecentSig = sig
+
         grid.innerHTML = list.map((e, i) => `
           <div class="recent-card" style="animation-delay:${i * 0.04}s">
             <div class="recent-info">
@@ -232,7 +348,7 @@
             </div>
             <div class="recent-actions">
               <button class="recent-attach" data-path="${esc(e.path)}">↩ Attach</button>
-              <button class="recent-forget" data-path="${esc(e.path)}" title="Remove from history">×</button>
+              <button class="recent-forget" data-path="${esc(e.path)}" title="Remove from history">× Forget</button>
             </div>
           </div>
         `).join('')
@@ -254,7 +370,7 @@
             } catch (err) {
               btn.textContent = '↩ Attach'
               btn.disabled = false
-              alert(err.message)
+              showToast(err.message)
             }
           })
         })

@@ -2,6 +2,12 @@
 
 **Governing principle:** Simplicity is elegant and the ultimate sophistication. Every line of code and every visual effect must earn its place. No unnecessary abstractions, no gratuitous animations, no layers of indirection. When in doubt, do less.
 
+**Lean by default:** Prefer the option with the smallest resource footprint (memory, running processes, dependencies, disk) whenever it doesn't sacrifice a capability Argo actually needs. Before adding a persistent process, a new heavyweight dependency, or a standing container, check for a lighter path first (on-demand launch instead of always-on, a narrower tool instead of a general-purpose one). When leanness would cost real capability (e.g. dropping Docker/Playwright for something that can't spawn real processes or run native code), keep the capability — lean is a tiebreaker between equally-capable options, not a reason to regress functionality. A lighter, non-Docker sandboxing approach was researched in depth and deliberately deferred — see `SANDBOXING-ALTERNATIVES.md` before re-litigating this from scratch.
+
+**Zero trust toward the LLM:** The agent itself is treated as untrusted code, not a collaborator with implicit access. Two concrete rules follow: (1) it should never be able to reach anything on the host beyond its own mounted folder — this is what Docker's filesystem scoping is for, and it only covers the container's own execution; it does not and cannot protect secrets that already live inside the mounted project itself (a `.env` file in the user's repo, credentials the agent needs to read to do its job). (2) it should never hold Argo's own operational secrets (API keys) directly — those stay in central's process memory, and tools that need them (`web_search`) call a shadow proxy (`/internal/*` on central) instead of receiving the raw key. The agent can still trigger the *action* (a search); it just never sees or can exfiltrate the *credential*. See `src/health.ts`, `src/auth.ts`, and the `SECRET_KEY_PATTERN` filter in `central.ts`'s `startWorker`.
+
+**The security boundary is the container, not `/workspace`.** `write_file`/`read_file`'s workspace/scratch restriction (`file-ops.ts`) is a *workflow* rule — keep the agent's structured file tools predictable and its disposable work out of the user's deliverable — not a second security layer. `bash` is intentionally unrestricted within the container (that's the entire point of a general-purpose shell tool), and any file reachable via `bash` is reachable regardless of what `write_file`/`read_file` claim to forbid. This was verified directly (live container inspection + empirical testing, not assumed): only three bind mounts exist (`/workspace`, `/scratch`, `/app/logs`), no docker socket, no SSH keys, no host root. One real inconsistency was found and fixed: `path.resolve()` is lexical and doesn't follow symlinks, so a symlink created inside `/workspace`/`/scratch` (trivial via `bash`) pointing elsewhere used to let `write_file`/`read_file` silently read/write through it, bypassing their own stated restriction — `safePath()` now also re-resolves through `fs.realpath` and checks the *real* path. This didn't cross the actual (container) boundary — `bash` already had equal-or-greater reach — but it meant the two file tools' own guarantee wasn't consistently true. Regression tests: `src/tools/file-ops.test.ts`.
+
 **Living documentation:** Keep every `.md` file in this project current. After any work session where new decisions, patterns, or lessons emerged, update the relevant file immediately — never defer. Include only what has lasting value; prune stale content ruthlessly. A good test: "Will this matter in 3 months?" If yes, capture it. If no, cut it.
 
 **Debug in the browser:** Use the Claude Preview MCP (`preview_start`, `preview_screenshot`, `preview_click`, `preview_eval`) for real browser testing when: (a) the user explicitly asks for it, (b) a complex UI change was implemented and confidence in immediate correctness is low, or (c) the user is reporting the same issue a second time. For straightforward fixes, read the code and ship — no browser verification needed. When testing is warranted, the workflow is: reproduce first → confirm root cause with eval/screenshot → fix → verify before declaring done. Launch config: `~/.claude/launch.json` (port 3001 standalone, or `http://localhost:3000/ws/{name}/` for the real worker).
@@ -27,7 +33,7 @@ A Node.js process (`src/server.ts`) running *inside* a Docker container, one per
 The isolation primitive. Each workspace attachment creates a dedicated Ubuntu 24.04 container with exactly two mounts: `/workspace` (the user's project) and `/scratch` (agent working space). The container can reach Ollama on the host via the Docker host gateway, but cannot reach any other host filesystem path, other containers, or the internet unless tools explicitly fetch resources.
 
 **Ollama**
-The local LLM inference server. Runs on the host (not inside a container). Exposes an HTTP API that workers call to generate responses. Manages model weights on the GPU. Argo is model-agnostic — any model available in Ollama can be selected per session.
+The local LLM inference server. Runs on the host (not inside a container). Exposes an HTTP API that workers call to generate responses. Manages model weights on the GPU. Argo's *architecture* is model-agnostic — it talks to Ollama's generic chat API, not to a specific model. Whether a given model actually works well is a separate question: the ReAct loop needs a model tuned for structured, multi-turn tool-calling, and most local models aren't there yet (see Common debugging). That's a model-maturity gap the field is closing, not a hidden dependency Argo's design has on one model.
 
 ### Storage layer
 
@@ -35,7 +41,7 @@ The local LLM inference server. Runs on the host (not inside a container). Expos
 A host filesystem directory that the user has chosen to work on. Mounted read/write into the container at `/workspace`. Always a git repository (initialised on first attach if needed). This is the user's deliverable space: only files the user explicitly asked for as output belong here. The agent treats it like a clean codebase.
 
 **Scratch**
-A per-workspace temporary directory, stored at `~/.local/share/argo/scratch/{name}/` on the host and mounted at `/scratch` inside the container. The agent's private working space: scripts, intermediate data, downloaded assets, experiments, debug output, installers. Not git-tracked. Ephemeral by design — the user does not care about its contents.
+A per-workspace temporary directory, stored at `~/.local/share/argo/scratch/{name}/` on the host and mounted at `/scratch` inside the container. The agent's private working space: scripts, intermediate data, downloaded assets, experiments, debug output, installers. Not git-tracked. Ephemeral by design — the user does not care about its contents. `/scratch` is inside the same sandboxed container as `/workspace`, not a lesser-trust or outside-the-sandbox area — the distinction is deliverable-vs-disposable, not secure-vs-insecure. The real security boundary is the container itself (see Zero trust toward the LLM). The `bash` tool's `cwd` parameter accepts either `/workspace` or `/scratch` (default `/scratch`) — use `/workspace` for anything operating on the project itself (`npm test`, `git`, `node <project file>`); don't build a `cd /workspace &&` prefix by hand.
 
 **Git tracking**
 The workspace is always git-tracked. `autoCommit()` initialises a git repo if the folder isn't tracked yet (`git init`), then commits all changes after every successful run. Every run that touches `/workspace` files ends with an `Agent:` prefixed commit. This is a core architectural guarantee — every change is auditable.
@@ -79,10 +85,10 @@ The LLM's text content in a response that appears alongside or before tool calls
 A named capability the agent can invoke. Each tool is defined in `src/tools/` and registered in `src/tools/index.ts`. Available tools: `bash`, `write_file`, `read_file`, `fetch_url`, `browser_fetch`, `web_search`. Every tool returns `{ output: string, error?: string }` — they never throw. `write_file` and `read_file` accept both `/workspace/...` and `/scratch/...` absolute paths.
 
 **Context window**
-The LLM's token budget for one Ollama call (the full history + system prompt + tool definitions). Configured via `num_ctx` (default 32,768). Shown as a token counter in the header. When usage reaches 80%, compaction is triggered automatically.
+The LLM's token budget for one Ollama call (the full history + system prompt + tool definitions). Configured via `num_ctx` (default 32,768). Shown as a token counter in the header. Compaction triggers at `config.compactThreshold` (default 66.7%) of `(prompt_tokens + config.compactGenerationReserve)` — the reserve accounts for the *next* response, not just what's already consumed. Both are env-configurable (`COMPACT_THRESHOLD`, `COMPACT_GENERATION_RESERVE`).
 
 **Compaction**
-An automatic mechanism that fires when the context window is 80%+ full. A separate single-turn LLM call summarises the entire history into 3–6 sentences; the history is then replaced with `[user: original prompt, assistant: [summary]]`. The agent continues from the summary without losing the thread. The compact event is shown in the trace block.
+Structured, not a single free-form summary — see `src/compaction.ts`. Three things are always kept verbatim regardless of how long the run has gone: the message that started the *current* run (`history[currentRunStart]`, tracked through the run and not confused with `history[0]`, which is just the session's first-ever message), the antecedent turn immediately before it (bounded lookback, `MAX_ANTECEDENT_SEARCH`, for referential prompts like "fix that"), and a recent verbatim tail of the active run's own iterations (`KEEP_ACTIVE_TAIL`). Everything else is folded into a persisted `CompactionState` (`compaction-{sessionId}.json`, alongside `history-{sessionId}.json`) with explicit categories — USER REQUIREMENTS, VERIFIED FACTS, DECISIONS MADE, CHANGES MADE, TESTS/VERIFICATION, OPEN QUESTIONS, HYPOTHESES, FAILED ATTEMPTS, INVALIDATED CONCLUSIONS — updated incrementally each compaction (new material folds into the existing structured state; a later compaction never re-summarizes an earlier summary as if it were undifferentiated raw text). A second LLM call validates the update against its own source material before it's accepted, specifically checking for unsupported claims, hypotheses promoted to facts, and dropped requirements — this exists because a real session produced exactly that failure (a compacted summary asserted `nextId()` returned `NaN` for negative/float IDs; the agent's own tool results earlier in the same work log showed finite values — the model fabricated the generalization, the source didn't contain it). Regression suite, including that fixture: `src/compaction.test.ts`. The `compact_start`/`compact` SSE events carry before/after message counts, context-usage%, and whether validation ran; both are logged to the MD trace and shown in the UI trace block, and `compact_start` also updates the status bar for the duration of the (~1-2 model calls, can take a while) compaction itself.
 
 **Model**
 The Ollama model identifier (e.g. `qwen3.6:latest`, `llama3.1:8b`). Selected per session in the breadcrumb model picker. Applied on every Ollama API call within that session. Changing the model mid-session takes effect on the next run.
@@ -157,12 +163,17 @@ These are standing requirements captured from user feedback. Treat them as bindi
 - Hover on cards always uses gold border tint, never indigo/accent.
 - See `DESIGN.md` for the full design system reference.
 
+**No native browser dialogs**
+- Never use `confirm()` or `alert()` — they look out of place next to the rest of the UI. Use `confirmDialog(message)` (returns a `Promise<boolean>`, resolves on Cancel/Confirm) for destructive-action confirmations, and `showToast(message)` for transient error/status messages instead of `alert()`.
+- Both are defined per-page: in `app.js` for `index.html` (worker/standalone), and inline in `workspaces.html`'s own `<script>` block, since that page is fully self-contained (own `<style>`, no shared JS file). Keep both copies in sync if the component changes.
+- Markup: `#confirm-modal`/`#confirm-box` and `#toast-container` — present in both `index.html` and `workspaces.html`.
+
 **How to capture future requirements**
 - Whenever the user gives UI/UX feedback that implies a lasting rule, add it to this section immediately — before implementing the feature.
 
 ## What this project is
 
-A safe coding harness for local LLMs running via Ollama. Docker containerisation is the core safety primitive: each workspace gets an isolated container with only the project folder mounted — the agent can execute bash, read and write files, and run Playwright scripts, but cannot reach other projects or the host filesystem outside the mount. The execution environment is JS-native (Node.js + CommonJS `require()`, Playwright, bash) — the same toolchain as the projects the agent works on. A web cockpit streams every agent decision in real time; every session is logged as JSONL + Markdown. Model weights stay on your GPU. See README.md for full documentation.
+A coding harness for local LLMs running via Ollama. Docker containerisation covers the main containment concern: each workspace gets an isolated container with only the project folder mounted — the agent can execute bash, read and write files, and run Playwright scripts, but cannot reach other projects or the host filesystem outside the mount. It does not cover everything: containers get full outbound network access (no `--network` restriction) and no CPU/memory limits, so it stops the agent from touching the rest of the host, not from running up the network or the machine's resources. A password gate (`src/auth.ts`) protects the web UI itself, since central listens on all interfaces, not just localhost. The execution environment is JS-native (Node.js + CommonJS `require()`, Playwright, bash) — the same toolchain as the projects the agent works on. A web cockpit streams every agent decision in real time; every session is logged as JSONL + Markdown. Model weights stay on your GPU. See README.md for full documentation.
 
 ## Key commands
 
@@ -188,13 +199,31 @@ docker build -f docker/agent.Dockerfile -t argo:latest .
 
 Three modes controlled by env vars:
 
-**Standalone** (`pnpm dev`, no special env vars) — full server on :3001 (PORT=3001 set in package.json), serves static files + API. Uses a separate `argo-sandbox` Docker container for bash execution (`docker exec argo-sandbox bash -c ...`). For developing Argo itself. Runs on :3001 specifically to avoid conflicting with the `argo` CLI central server on :3000.
+**Standalone** (`pnpm dev`) — full server on :3001 (PORT=3001 set in package.json), serves static files + API. Uses a separate `argo-sandbox` Docker container for bash execution (`docker exec argo-sandbox bash -c ...`). For developing Argo itself. Runs on :3001 specifically to avoid conflicting with the `argo` CLI central server on :3000. `WORKSPACE_PATH` is optional — there is no default `./workspace` fallback; if unset, the browser shows a "no workspace mounted" screen (`#no-workspace-screen` in `public/index.html`) with a path input that calls `POST /api/workspace` to mount a folder at runtime (no restart needed — `config.workspacePath` is mutated directly).
 
 **Central** (`CENTRAL_MODE=1`) — workspace manager on :3000. Serves `workspaces.html` at `/`, proxies `/ws/:name/*` to worker containers. Manages Docker lifecycle. Started by `bin/argo`.
 
 **Worker** (`WORKER_MODE=1 RUNNING_IN_CONTAINER=1`) — API-only server inside a Docker container. No static file serving. Bash runs locally (no docker exec — the code is already inside the container). One container per attached workspace.
 
-Flow: `bin/argo attach /path` → ensures Docker/Ollama running → ensures image built → starts central server → POST `/api/attach` → central starts worker container → opens browser at `localhost:3000/ws/{name}/`.
+Flow: `bin/argo attach /path` → ensures git/Docker/Ollama present → ensures image built → starts central server → POST `/api/attach` → central starts worker container → opens browser at `localhost:3000/ws/{name}/`.
+
+## Startup checks
+
+`src/health.ts` (`checkOllama`, `checkDocker`, `checkGit`, `checkEnvironment`) verifies the runtime dependencies Argo has no fallback for. `checkGit` shells out through whichever path `bash.ts` would use (in-container `git --version`, or `docker exec {sandboxContainer} git --version` on the host), so it reflects the actual execution environment, not just the host.
+
+- `bin/argo`'s `cmd_attach` calls `ensure_git`/`ensure_docker`/`ensure_ollama` before starting central (CLI pre-flight, skipped if central is already running).
+- `startServer()` (standalone + worker) runs `checkEnvironment()` after `app.listen` and logs `✓`/`✗` per dependency; results are exposed on `GET /status` as `env: { ollama, docker, git }` so the frontend can show `#env-banner`.
+- `startCentral()` runs `checkOllama`/`checkDocker` the same way (git isn't central's concern — it never executes commands itself, only proxies to workers).
+- These are warnings, not hard failures — a check failing doesn't stop the server, since the dependency may come up moments later (e.g. Docker Desktop still starting). The one hard stop is `bin/argo`'s CLI pre-flight, which does `exit 1` before central ever starts.
+
+## Auth (`src/auth.ts`)
+
+Argo's web UI is password-gated because central listens on all interfaces, not just localhost — see "What this project is". `installAuth(app)` wraps every route after it in `requireAuth`, except `/login` and `/internal/*` (a separate, non-user-facing gate — see Zero trust toward the LLM).
+
+- Password defaults to `unacroquetta` (`config.password`, overridable via `ARGO_PASSWORD` in `~/.config/argo/env`). This is a shared-password gate, not real per-user auth — anyone who reads this file or the source default knows it. It's meant to keep casual LAN traffic out, not to withstand a determined attacker.
+- Browser auth is a cookie (`argo_auth`, `sha256(password)`, `httpOnly`, `sameSite=strict`) set by `POST /login`. `GET` requests without it redirect to `/login?next=<original path>` and back on success — don't drop the `next` param when touching this flow, it's what makes login not maroon you on the home screen.
+- `bin/argo`'s CLI has no browser session, so it sends the password as an `X-Argo-Password` header instead (`acurl` wrapper) — `requireAuth` accepts either. `ensure_central` sources `~/.config/argo/env` into central's process env before launching it, which is also how `ARGO_PASSWORD` (and in principle other global settings) actually reach central's own `config` — `loadGlobalEnv()` alone only re-reads that file for worker container injection, not for central's own process.
+- `installAuth` is called unconditionally in `central.ts`, and only when `!config.inContainer` in `server.ts` — worker mode is reached exclusively through central's proxy (its own Docker-published port is bound to `127.0.0.1`, see `startWorker`), so it doesn't need its own copy of the password to check against.
 
 ## How to add a new tool
 
@@ -232,12 +261,12 @@ tsx watch reloads automatically in `pnpm dev` — no restart needed. Run `argo r
 ## The bash tool pattern
 
 `bash.ts` checks `config.inContainer`:
-- **In container** (worker mode): `bash -c <JSON.stringify(command)>` with `cwd: '/workspace'`
-- **On host** (standalone mode): `docker exec argo-sandbox bash -c <JSON.stringify(command)>`
+- **In container** (worker mode): `execFile('bash', ['-c', command], { cwd: '/scratch' })`
+- **On host** (standalone mode): `execFile('docker', ['exec', sandboxContainer, 'bash', '-c', command])`
 
-`JSON.stringify` handles all quoting/escaping. 30s timeout.
+Uses `execFile` with an argv array — **not** `exec` with a single command string. `exec()` always runs its string through an *additional*, unintended shell (`/bin/sh -c`) before the command reaches the `bash -c` above. Multi-line commands used to be built via `` `bash -c ${JSON.stringify(command)}` `` passed to `exec()`; that extra outer shell doesn't treat JSON's `\n` escapes as newlines (POSIX double quotes don't recognize that escape) and still expands `$VAR`/`$(...)` inside double quotes — so every multi-line command (heredocs, `for` loops, multi-line `node -e`) arrived corrupted, and variables/substitutions could silently evaluate twice in the wrong shell/environment (e.g. `TMPDIR=$(mktemp -d)` reading back empty). `execFile` hands `command` to the inner `bash -c` as one argv element, byte-for-byte, with no intermediate shell at all. Regression tests: `src/tools/bash.test.ts` (`pnpm test`) — requires a running sandbox container (defaults to `argo-test-one`, override via `TEST_SANDBOX_CONTAINER`).
 
-For multi-line JS scripts, the model uses `write_file` with a `/scratch/...` path, then runs it with `node`. Both `write_file` and `read_file` accept `/workspace/...` and `/scratch/...` absolute paths. Inline `node -e "..."` breaks with complex multi-line code.
+For multi-line JS scripts, the model uses `write_file` with a `/scratch/...` path, then runs it with `node`. Both `write_file` and `read_file` accept `/workspace/...` and `/scratch/...` absolute paths. Inline multi-line `node -e "..."` now works correctly (see above) but writing to `/scratch/script.js` is still preferred for anything non-trivial — easier to inspect/rerun.
 
 `browser-fetch.ts` uses `spawn` with stdin instead of `exec` — it generates a CJS script with URL/waitFor JSON-embedded and pipes it to `node --input-type=commonjs` (either locally or via `docker exec -i`) to avoid all quoting/escaping issues.
 
@@ -293,6 +322,9 @@ Key details:
 
 ## Common debugging
 
+**`argo attach` behaves like an old version — bugs long since fixed still reproduce**
+→ `bin/argo`'s CLI flow runs `dist/index.js` (compiled) and `argo:latest` (a prebuilt Docker image) — neither updates automatically when `src/` changes. `pnpm dev` (tsx watch) is the only path that reflects source instantly; central/worker mode does not. After any change that matters for real usage, run `pnpm build` and `docker build -f docker/agent.Dockerfile -t argo:latest .` (or `argo rebuild` for just the image) before testing through the actual `argo` CLI — otherwise you're debugging against stale code and won't find anything.
+
 **Argo not calling tools / outputting JSON as text**
 → Switch to `qwen3.6:latest` — the only model validated for agentic use in Argo. See README Models table for full findings per model.
 
@@ -334,10 +366,12 @@ Key details:
 | `src/index.ts` | Entry point — routes to central, worker, or standalone |
 | `src/central.ts` | Central server: registry, Docker lifecycle, HTTP proxy |
 | `src/agent.ts` | ReAct loop + system prompt + auto-commit logic |
+| `src/compaction.ts` | Structured context compaction — state model, split logic, update/validate LLM calls |
 | `src/tools/index.ts` | Tool registry — add new tools here |
 | `src/server.ts` | All HTTP routes + SSE (worker/standalone) |
 | `src/logger.ts` | Session log writing + `listSessions()`, `deleteAllLogs()`, `getSessionMessages()` |
 | `src/config.ts` | All env vars + mode flags |
+| `src/health.ts` | Ollama/Docker/git startup checks |
 | `docker/agent.Dockerfile` | Multi-stage: TS builder (node:22-alpine) + Ubuntu runtime |
 | `docker/sandbox.Dockerfile` | Legacy — used only with `pnpm dev` standalone mode |
 | `public/app.js` | All frontend logic |

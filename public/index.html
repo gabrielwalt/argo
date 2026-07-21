@@ -7,13 +7,16 @@
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/turndown@7/dist/turndown.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js"></script>
 </head>
 <body>
 
 <header>
   <!-- Breadcrumb: Argo › workspace › session -->
   <nav id="breadcrumb">
-    <a id="nav-home" href="/" title="All workspaces"><span class="flip-h">⛵</span> Argo</a>
+    <a id="nav-home" href="/" title="All workspaces"><span class="flip-h">⛵</span><span class="wordmark"> Argo</span></a>
 
     <span class="nav-sep" id="sep-ws" style="display:none">›</span>
     <div class="nav-crumb" id="nav-ws" style="display:none">
@@ -44,6 +47,8 @@
     <span id="iter-label"></span>
   </div>
 </header>
+
+<div id="env-banner" class="hidden"></div>
 
 <div id="settings-panel">
   <div class="setting-group">
@@ -93,7 +98,7 @@
         <textarea id="input" placeholder="Ask anything… (Shift+Enter for newline)" rows="3"></textarea>
         <button id="send-btn" type="submit" title="Send">
           <span class="flip-h send-icon" id="send-boat">⛵</span>
-          <span class="send-stop" id="send-stop" style="display:none">■</span>
+          <span class="send-stop hidden" id="send-stop"></span>
         </button>
       </div>
     </form>
@@ -145,6 +150,20 @@
   <div id="git-log"></div>
 </div>
 
+<!-- Confirmation dialog — replaces native confirm() -->
+<div id="confirm-modal">
+  <div id="confirm-box">
+    <div id="confirm-message"></div>
+    <div id="confirm-actions">
+      <button id="confirm-cancel" type="button">✕ Cancel</button>
+      <button id="confirm-ok" type="button">✓ Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast notifications — replaces native alert() -->
+<div id="toast-container"></div>
+
 <!-- Diff / file preview modal -->
 <div id="diff-modal">
   <div id="diff-box">
@@ -153,6 +172,20 @@
       <button id="close-diff">✕ Close</button>
     </div>
     <div id="diff-content"></div>
+  </div>
+</div>
+
+<!-- Shown in standalone mode when no workspace folder has been mounted yet -->
+<div id="no-workspace-screen" class="hidden">
+  <div id="no-workspace-card">
+    <span class="flip-h" id="no-workspace-logo">⛵</span>
+    <h1>No workspace mounted</h1>
+    <p>Point Argo at a project folder to start working.</p>
+    <div id="no-workspace-row">
+      <input id="no-workspace-path" type="text" placeholder="/absolute/path/to/project" autocomplete="off" spellcheck="false">
+      <button id="no-workspace-btn">Mount folder</button>
+    </div>
+    <p id="no-workspace-error"></p>
   </div>
 </div>
 

@@ -216,6 +216,22 @@ export class SessionLogger {
           lines.push(`**⚡ Warning** ${event.message}`)
           lines.push(``)
           break
+
+        case 'compact_start':
+          lines.push(`**📦 Compacting context** \`${time}\` — ${event.messageCount} messages, ${(event.contextUsagePct * 100).toFixed(0)}% context (incl. generation reserve)`)
+          lines.push(``)
+          break
+
+        case 'compact':
+          lines.push(`**📦 Context compacted** \`${time}\` — ${event.messagesBefore} → ${event.messagesAfter} messages, was ${(event.contextUsagePct * 100).toFixed(0)}% context, validation pass ${event.validated ? 'ran' : 'skipped (nothing to fold in)'}`)
+          lines.push(``)
+          lines.push(`${event.rangeDescription}`)
+          lines.push(``)
+          lines.push(`\`\`\``)
+          lines.push(event.summary)
+          lines.push(`\`\`\``)
+          lines.push(``)
+          break
       }
     }
 

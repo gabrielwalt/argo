@@ -19,14 +19,22 @@ GLOBAL_ENV="$CONFIG_DIR/env"
 log()  { echo "▸ $*"; }
 err()  { echo "✖ $*" >&2; exit 1; }
 
+# Every call below hits central's password-gated API — send the password as a
+# header so the CLI (which has no browser session/cookie) still gets through.
+acurl() {
+  local pw
+  pw="$(grep -m1 '^ARGO_PASSWORD=' "$GLOBAL_ENV" 2>/dev/null | cut -d= -f2-)"
+  if [ -n "$pw" ]; then curl -H "X-Argo-Password: $pw" "$@"; else curl "$@"; fi
+}
+
 central_running() {
-  curl -sf "http://localhost:${CENTRAL_PORT}/api/workspaces" &>/dev/null
+  acurl -sf "http://localhost:${CENTRAL_PORT}/api/workspaces" &>/dev/null
 }
 
 wait_for() {
   local url="$1" label="$2" tries=0
   echo -n "  Waiting for ${label}"
-  until curl -sf "$url" &>/dev/null; do
+  until acurl -sf "$url" &>/dev/null; do
     tries=$((tries + 1))
     if [ $tries -gt 30 ]; then echo ""; return 1; fi
     sleep 1; echo -n "."
@@ -44,8 +52,23 @@ ensure_global_env() {
 TAVILY_API_KEY=
 MODEL=qwen2.5-coder:14b
 MAX_ITERATIONS=20
+
+# Password for Argo's web UI. This is a shared-password gate, not a real
+# per-user auth system — anyone who reads this file (or the source default)
+# knows it. Change it if that's not an acceptable bar for your setup.
+ARGO_PASSWORD=unacroquetta
 EOF
     log "Created config at $GLOBAL_ENV — add your Tavily API key to enable web search"
+  elif ! grep -q '^ARGO_PASSWORD=' "$GLOBAL_ENV"; then
+    # Migrate existing configs from before the password gate existed.
+    cat >> "$GLOBAL_ENV" <<EOF
+
+# Password for Argo's web UI. This is a shared-password gate, not a real
+# per-user auth system — anyone who reads this file (or the source default)
+# knows it. Change it if that's not an acceptable bar for your setup.
+ARGO_PASSWORD=unacroquetta
+EOF
+    log "Added ARGO_PASSWORD to $GLOBAL_ENV (new in this version — set required for the CLI to reach Argo)"
   fi
 }
 
@@ -57,6 +80,10 @@ ensure_docker() {
     until docker info &>/dev/null; do sleep 2; done
     log "Docker ready"
   fi
+}
+
+ensure_git() {
+  command -v git &>/dev/null || err "git is required but not found. Install it and try again."
 }
 
 ensure_ollama() {
@@ -84,7 +111,7 @@ ensure_central() {
 
   if lsof -ti ":${CENTRAL_PORT}" &>/dev/null; then
     # Check if it's the Argo standalone dev server (has /status but not /api/workspaces)
-    if curl -sf "http://localhost:${CENTRAL_PORT}/status" &>/dev/null; then
+    if acurl -sf "http://localhost:${CENTRAL_PORT}/status" &>/dev/null; then
       err "Argo dev server (pnpm dev) is on port ${CENTRAL_PORT}.
   Since v0.2, pnpm dev runs on :3001 — restart it, or kill the old instance:
   lsof -ti :${CENTRAL_PORT} | xargs kill -9"
@@ -97,8 +124,16 @@ ensure_central() {
   log "Starting Argo…"
   mkdir -p "$HOME/.local/share/argo"
   local log_file="$HOME/.local/share/argo/server.log"
-  CENTRAL_MODE=1 AGENT_PROJECT_DIR="$ARGO_DIR" PORT="$CENTRAL_PORT" \
-    node "$ARGO_DIR/dist/index.js" >> "$log_file" 2>&1 &
+  # Source the global config (ARGO_PASSWORD, etc.) into central's own process env —
+  # loadGlobalEnv() in central.ts only re-reads this file for worker container injection,
+  # not for central's own config, so central needs it passed in directly.
+  (
+    set -a
+    [ -f "$GLOBAL_ENV" ] && source "$GLOBAL_ENV"
+    set +a
+    CENTRAL_MODE=1 AGENT_PROJECT_DIR="$ARGO_DIR" PORT="$CENTRAL_PORT" \
+      exec node "$ARGO_DIR/dist/index.js" >> "$log_file" 2>&1
+  ) &
   disown $!
   wait_for "http://localhost:${CENTRAL_PORT}/api/workspaces" "Argo" \
     || err "Argo failed to start. Check logs: $log_file"
@@ -114,6 +149,7 @@ cmd_attach() {
 
   # Skip infrastructure checks when a server is already reachable
   if ! central_running; then
+    ensure_git
     ensure_docker
     ensure_ollama
     ensure_image
@@ -123,7 +159,7 @@ cmd_attach() {
 
   log "Attaching workspace: $workspace"
   local response
-  response="$(curl -s -X POST "http://localhost:${CENTRAL_PORT}/api/attach" \
+  response="$(acurl -s -X POST "http://localhost:${CENTRAL_PORT}/api/attach" \
     -H 'Content-Type: application/json' \
     -d "{\"path\": $(printf '%s' "$workspace" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}" \
   )" || err "Failed to reach Argo server"
@@ -147,7 +183,7 @@ cmd_detach() {
   if [ -d "$workspace" ]; then
     workspace="$(cd "$workspace" && pwd)"
     # Look up the name from the registry
-    name="$(curl -sf "http://localhost:${CENTRAL_PORT}/api/workspaces" | \
+    name="$(acurl -sf "http://localhost:${CENTRAL_PORT}/api/workspaces" | \
       python3 -c "import json,sys; ws=json.load(sys.stdin); \
       match=[w['name'] for w in ws if w['path']=='$workspace']; \
       print(match[0] if match else '')")"
@@ -157,13 +193,13 @@ cmd_detach() {
   fi
 
   central_running || err "Argo is not running"
-  curl -sf -X POST "http://localhost:${CENTRAL_PORT}/api/detach/$name" > /dev/null
+  acurl -sf -X POST "http://localhost:${CENTRAL_PORT}/api/detach/$name" > /dev/null
   log "Detached: $name"
 }
 
 cmd_list() {
   central_running || err "Argo is not running (run 'argo attach' first)"
-  curl -sf "http://localhost:${CENTRAL_PORT}/api/workspaces" | \
+  acurl -sf "http://localhost:${CENTRAL_PORT}/api/workspaces" | \
     python3 -c "
 import json, sys
 ws = json.load(sys.stdin)
@@ -181,10 +217,10 @@ cmd_stop() {
   central_running || { log "Argo is not running"; exit 0; }
 
   # Detach all workspaces
-  curl -sf "http://localhost:${CENTRAL_PORT}/api/workspaces" | \
+  acurl -sf "http://localhost:${CENTRAL_PORT}/api/workspaces" | \
     python3 -c "import json,sys; [print(w['name']) for w in json.load(sys.stdin)]" | \
     while read -r name; do
-      curl -sf -X POST "http://localhost:${CENTRAL_PORT}/api/detach/$name" > /dev/null
+      acurl -sf -X POST "http://localhost:${CENTRAL_PORT}/api/detach/$name" > /dev/null
       log "Stopped: $name"
     done
 

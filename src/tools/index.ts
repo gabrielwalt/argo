@@ -10,11 +10,12 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'bash',
-      description: 'Execute a bash command in the sandbox container. Working directory is /scratch — all relative paths land here. Use explicit /workspace/... paths only for deliverables.',
+      description: 'Execute a bash command in the sandbox container. Both /workspace (the project) and /scratch (your private, disposable workbench) are inside the same isolated container — /scratch is not outside the sandbox, it is just not the deliverable location. Set cwd to /workspace for anything about the project itself (npm test, npm run <script>, git, node <project file>) — do not prefix commands with "cd /workspace &&". Omit cwd (or set /scratch) for temporary scripts and scratch work.',
       parameters: {
         type: 'object',
         properties: {
           command: { type: 'string', description: 'The bash command to run' },
+          cwd: { type: 'string', enum: ['/workspace', '/scratch'], description: 'Working directory. Default /scratch. Use /workspace for anything operating on the project itself.' },
         },
         required: ['command'],
       },
@@ -98,7 +99,7 @@ export const toolDefinitions = [
 export async function executeTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
   switch (name as ToolName) {
     case 'bash':
-      return bash(args.command as string)
+      return bash(args.command as string, args.cwd as string | undefined)
     case 'web_search':
       return webSearch(args.query as string, args.max_results as number | undefined)
     case 'read_file':

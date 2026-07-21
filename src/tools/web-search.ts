@@ -7,11 +7,11 @@ interface TavilyResult {
   content: string
 }
 
-async function tavilySearch(query: string, maxResults: number): Promise<ToolResult> {
+export async function tavilySearchWithKey(apiKey: string, query: string, maxResults: number): Promise<ToolResult> {
   const resp = await fetch('https://api.tavily.com/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ api_key: config.tavilyKey, query, max_results: maxResults }),
+    body: JSON.stringify({ api_key: apiKey, query, max_results: maxResults }),
   })
   if (!resp.ok) return { output: '', error: `Tavily error: ${resp.status} ${resp.statusText}` }
   const data = await resp.json() as { results?: TavilyResult[] }
@@ -31,6 +31,14 @@ async function ddgSearch(query: string, maxResults: number): Promise<ToolResult>
   })
   if (!resp.ok) return { output: '', error: `DDG error: ${resp.status}` }
   const html = await resp.text()
+
+  // DDG serves a bot-challenge page (CAPTCHA) instead of results when it decides
+  // the request looks automated — this now happens on effectively every request
+  // regardless of User-Agent. Report it as an error rather than "no results" —
+  // otherwise the model can't tell "genuinely nothing found" from "search is broken."
+  if (html.includes('anomaly-modal') || html.includes('challenge-form')) {
+    return { output: '', error: 'DDG returned a bot-challenge page (no results available). Configure TAVILY_API_KEY for reliable web search.' }
+  }
 
   // Extract results from DDG HTML via regex — avoids a cheerio dep in the server
   const results: { title: string; url: string; snippet: string }[] = []
@@ -62,9 +70,28 @@ async function ddgSearch(query: string, maxResults: number): Promise<ToolResult>
   }
 }
 
+// In-container calls proxy Tavily through central instead of holding the key
+// themselves — see the SECRET_KEY_PATTERN filter in central.ts's startWorker.
+async function proxiedSearch(query: string, maxResults: number): Promise<ToolResult> {
+  const resp = await fetch(`${config.centralUrl}/internal/web-search`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Argo-Internal-Token': config.internalToken },
+    body: JSON.stringify({ query, maxResults }),
+  })
+  if (!resp.ok) return { output: '', error: `Search proxy error: ${resp.status}` }
+  return await resp.json() as ToolResult
+}
+
 export async function webSearch(query: string, maxResults = 5): Promise<ToolResult> {
   try {
-    if (config.tavilyKey) return await tavilySearch(query, maxResults)
+    if (config.inContainer) {
+      if (config.centralUrl && config.internalToken) {
+        const proxied = await proxiedSearch(query, maxResults)
+        if (!proxied.error) return proxied
+      }
+      return await ddgSearch(query, maxResults)
+    }
+    if (config.tavilyKey) return await tavilySearchWithKey(config.tavilyKey, query, maxResults)
     return await ddgSearch(query, maxResults)
   } catch (err) {
     return { output: '', error: String(err) }
