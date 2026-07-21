@@ -7,16 +7,13 @@ import { truncateOutput } from './truncate.js'
 const execFileAsync = promisify(execFile)
 const MAX_OUTPUT = 4000
 
-// The only two working directories bash may start in. Not a security boundary
-// (the container is — see CLAUDE.md's Zero trust section) — this just keeps
-// the model's choice structured (an enum field) instead of a free-form shell
-// idiom ("cd /workspace && ...") it has to remember to type correctly every
-// time. Anything else supplied falls back to the default, it never lets the
-// model set an arbitrary cwd.
-const ALLOWED_CWD = new Set(['/workspace', '/scratch'])
-
 export async function bash(command: string, cwd?: string): Promise<ToolResult> {
-  const resolvedCwd = cwd && ALLOWED_CWD.has(cwd) ? cwd : '/scratch'
+  // The container is the security boundary (see CLAUDE.md's Zero trust
+  // section), not any particular path within it — so cwd accepts any
+  // absolute path, not just an enum. Defaults to /workspace, the one
+  // directory that's actually special (the user's project); this just spares
+  // the model from typing "cd /workspace && ..." for the common case.
+  const resolvedCwd = cwd && cwd.startsWith('/') ? cwd : '/workspace'
   try {
     // execFile (argv array, no shell) — not exec (a single command string).
     // exec() always runs its string through an *additional* shell (`/bin/sh -c`)

@@ -44,10 +44,9 @@ Three runtime modes, controlled by environment variables:
 │   ~/Sources/   │           │   ~/Sources/   │
 │   test/test-one│           │   my-blog      │
 │                │           │                │
-│ /scratch  ←─── │vol        │ /scratch  ←─── │vol
-│   ~/.local/    │           │   ~/.local/    │
-│   share/argo/  │           │   share/argo/  │
-│   scratch/…    │           │   scratch/…    │
+│ (everything    │           │ (everything    │
+│  else: ordinary│           │  else: ordinary│
+│  container fs) │           │  container fs) │
 └────────────────┘           └────────────────┘
 ```
 
@@ -61,9 +60,10 @@ Three runtime modes, controlled by environment variables:
 
 | Mount | Source on host | Purpose |
 |---|---|---|
-| `/workspace` | The project folder you attached | Git-tracked project files |
-| `/scratch` | `~/.local/share/argo/scratch/{name}/` | Argo working dir: scripts, temp files, intermediate data |
+| `/workspace` | The project folder you attached | Git-tracked project files — the only mount that matters to the agent |
 | `/app/logs` | `~/.local/share/argo/logs/{name}/` | Session logs (JSONL + Markdown) |
+
+Everything else in the container (`/tmp`, the home directory, etc.) is ordinary, ephemeral filesystem — no host mount, no cleanup needed, since the container already runs with `--rm`.
 
 ---
 
@@ -230,16 +230,14 @@ To add any model: `ollama pull <name>` — appears in the UI immediately without
 | `web_search` | Search via Tavily API | Current information not in training data |
 | `fetch_url` | HTTP GET + HTML strip. Fast (~100–300ms), no JS | Static pages, APIs, documentation |
 | `browser_fetch` | Playwright/Chromium. Full JS execution (~3–5s) | SPAs, dynamic content, pages where fetch_url returns empty |
-| `read_file` | Read a file from `/workspace` | Inspecting files directly |
-| `write_file` | Write a file to `/workspace` | Saving scripts or results to the project |
+| `read_file` | Read a file at any absolute path in the container | Inspecting files directly |
+| `write_file` | Write a file at any absolute path in the container | Saving scripts or results |
 
-### Workspace vs scratch
+### The filesystem model
 
-The agent has two directories:
-- **`/workspace`** — the project folder (git-tracked, auto-committed after each task)
-- **`/scratch`** — Argo's private working space for scripts, temp files, downloaded data (not committed)
+The container is the agent's entire working environment. `/workspace` is the one special directory: the project folder, git-tracked and auto-committed after each task. Everywhere else (`/tmp`, the home directory, wherever) is ordinary, disposable filesystem — freely usable for scripts, downloads, and intermediate work, with nothing to clean up since the container itself is ephemeral.
 
-The agent is instructed to keep work-in-progress files in `/scratch` and only write to `/workspace` when modifying the actual project.
+The agent is instructed to keep work-in-progress files outside `/workspace` and only write there when modifying the actual project.
 
 ---
 
@@ -288,7 +286,7 @@ Served at `http://localhost:3000/ws/{workspace-name}/`.
 
 **Agent Trace (right)** — live stream of every internal step: iteration counter, model thoughts, tool calls with full arguments, tool results with timing, errors. Long items collapse. This is the cockpit view — every decision the agent makes is visible as it happens.
 
-**Files (right tab)** — file tree for both `workspace/` and `scratch/`. Click any file to preview its contents. Refreshes automatically after each completed task.
+**Files (right tab)** — a single file tree rooted at the container's filesystem, with `/workspace` expanded and labeled by default. Click any file to preview its contents. Refreshes automatically after each completed task.
 
 **Session Logs (right tab)** — list of all past sessions. Click any entry to read the full trace as Markdown or JSONL. Sessions accumulate across restarts and are the primary source of data for improving prompts and comparing models.
 
@@ -496,7 +494,7 @@ The containment model and logging infrastructure point toward more ambitious use
 | Custom ReAct loop over LangChain/Dify | Frameworks break tool-calling with local Ollama models. Direct API is simpler and more predictable. |
 | TypeScript over Python | Consistent with AEM/EDS primary stack (vanilla JS). |
 | Docker for sandbox isolation | Limits blast radius without per-command confirmation prompts. Git in `/workspace` provides rollback. |
-| Two workspace volumes | `/workspace` for project files (committed), `/scratch` for agent working files (never committed). Keeps git history clean. |
+| Single `/workspace` mount | Only project files (committed) get a host mount. Everywhere else in the container is ordinary, ephemeral filesystem — no second special-cased directory needed to keep git history clean, since only `/workspace` is ever auto-committed. |
 | Central + worker architecture | One agent instance per workspace, isolated state and history. Central server manages routing and Docker lifecycle without Docker-in-Docker. |
 | Ollama on host | GPU/Metal access. Docker on macOS cannot expose the Apple Silicon GPU to containers. |
 | Tavily over DuckDuckGo | DDG rate-limits aggressively. Tavily 1,000 free requests/month is sufficient for typical use. |

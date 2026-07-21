@@ -259,32 +259,51 @@ app.get('/logs/:filename', async (req, res) => {
 })
 
 // ── File browser ─────────────────────────────────────────────────
+// A single tree rooted at the container's real filesystem (worker/production
+// mode) or the mounted workspace directory (standalone dev mode, where there
+// is no broader container to browse — see CLAUDE.md's filesystem-model
+// notes). /workspace is the only directory the frontend treats specially
+// (expanded and labeled by default); everything else is ordinary filesystem,
+// listed one level at a time so browsing the real root never means eagerly
+// walking the whole container up front.
 
 interface FileEntry {
   name: string
   type: 'file' | 'dir'
   size?: number
-  children?: FileEntry[]
 }
 
 const SKIP = new Set(['node_modules', '.git'])
+// Only excluded at the true filesystem root — virtual/pseudo filesystems with
+// no meaningful content to browse (huge or synthetic on every read).
+const ROOT_SKIP = new Set(['proc', 'sys', 'dev', 'run'])
 
-async function buildTree(dir: string, depth = 0): Promise<FileEntry[]> {
-  if (depth > 5) return []
+function browseRoot(): string {
+  return config.inContainer ? '/' : (config.workspacePath || '/')
+}
+
+// Both endpoints take the same ?path=, relative to browseRoot() (root itself
+// if omitted), and confine resolution to that root the same way.
+function resolveBrowsePath(root: string, rawPath: unknown): string {
+  const rel = ((rawPath as string) ?? '').replace(/\.\./g, '').replace(/^\/+/, '')
+  return path.join(root, rel)
+}
+
+async function listDir(absDir: string, isRoot: boolean): Promise<FileEntry[]> {
   let entries: Dirent[]
   try {
-    entries = await fs.readdir(dir, { withFileTypes: true })
+    entries = await fs.readdir(absDir, { withFileTypes: true })
   } catch {
     return []
   }
   const result: FileEntry[] = []
   for (const entry of entries) {
     if (SKIP.has(entry.name)) continue
-    const full = path.join(dir, entry.name)
+    if (isRoot && ROOT_SKIP.has(entry.name)) continue
     if (entry.isDirectory()) {
-      result.push({ name: entry.name, type: 'dir', children: await buildTree(full, depth + 1) })
+      result.push({ name: entry.name, type: 'dir' })
     } else {
-      const stat = await fs.stat(full).catch(() => null)
+      const stat = await fs.stat(path.join(absDir, entry.name)).catch(() => null)
       result.push({ name: entry.name, type: 'file', size: stat?.size })
     }
   }
@@ -294,17 +313,18 @@ async function buildTree(dir: string, depth = 0): Promise<FileEntry[]> {
   })
 }
 
-// Directory tree — ?dir=workspace|scratch
+// One directory level — ?path=relative/path (root itself if omitted)
 app.get('/files', async (req, res) => {
-  const root = req.query.dir === 'scratch' ? config.scratchPath : config.workspacePath
-  res.json(await buildTree(root))
+  const root = browseRoot()
+  const target = resolveBrowsePath(root, req.query.path)
+  if (!target.startsWith(root)) { res.status(403).json([]); return }
+  res.json(await listDir(target, target === root))
 })
 
-// File content — ?dir=workspace|scratch&path=relative/path
+// File content — ?path=relative/path
 app.get('/file', async (req, res) => {
-  const root = req.query.dir === 'scratch' ? config.scratchPath : config.workspacePath
-  const rel = ((req.query.path as string) ?? '').replace(/\.\./g, '').replace(/^\//, '')
-  const full = path.join(root, rel)
+  const root = browseRoot()
+  const full = resolveBrowsePath(root, req.query.path)
   if (!full.startsWith(root)) { res.status(403).send('Forbidden'); return }
   try {
     const content = await fs.readFile(full, 'utf-8')

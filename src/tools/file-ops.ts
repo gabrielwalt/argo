@@ -5,8 +5,8 @@ import type { ToolResult } from '../types.js'
 import { truncateOutput } from './truncate.js'
 
 // path.resolve() is purely lexical — it does not follow symlinks. A symlink
-// created inside /workspace or /scratch pointing elsewhere (trivially doable
-// via the unrestricted `bash` tool: `ln -s /etc /workspace/x`) would pass the
+// created inside /workspace pointing elsewhere (trivially doable via the
+// unrestricted `bash` tool: `ln -s /etc /workspace/x`) would pass the
 // lexical check below, then fs.readFile/writeFile would follow it for real.
 // This does not cross the actual security boundary (the container — see
 // CLAUDE.md's Zero trust section; bash already has unrestricted access to
@@ -40,26 +40,26 @@ async function realpathBoundary(resolved: string, root: string): Promise<string>
 }
 
 async function safePath(filePath: string): Promise<string> {
-  // /scratch/... paths → resolve against scratchPath
-  if (filePath.startsWith('/scratch')) {
-    const rel = filePath.replace(/^\/scratch\/?/, '')
-    const resolved = path.resolve(config.scratchPath, rel)
-    // Exact-match or path-separator boundary, not a bare prefix — otherwise a
-    // sibling directory like /scratch-evil would incorrectly pass a plain
-    // .startsWith(config.scratchPath) check.
-    if (resolved !== config.scratchPath && !resolved.startsWith(config.scratchPath + path.sep)) {
-      throw new Error('Path traversal outside scratch not allowed')
+  // /workspace is the only path whose confinement matters — it's the user's
+  // git-tracked deliverable, not a security boundary (the container already
+  // is one — see CLAUDE.md's Zero trust section; bash has unrestricted reach
+  // regardless) but a workflow guarantee: a write must land inside the real
+  // repo, not silently escape it via ../ or (trivially, via bash) a symlink.
+  // Exact match or a real path-separator boundary, not a bare .startsWith —
+  // otherwise "/workspace-evil/..." would incorrectly match this branch too.
+  if (filePath === '/workspace' || filePath.startsWith('/workspace/')) {
+    if (!config.workspacePath) throw new Error('No workspace mounted')
+    const rel = filePath.replace(/^\/workspace\/?/, '')
+    const resolved = path.resolve(config.workspacePath, rel)
+    if (resolved !== config.workspacePath && !resolved.startsWith(config.workspacePath + path.sep)) {
+      throw new Error('Path traversal outside workspace not allowed')
     }
-    return realpathBoundary(resolved, config.scratchPath)
+    return realpathBoundary(resolved, config.workspacePath)
   }
-  // /workspace/... paths (or bare relative paths) → resolve against workspacePath
-  if (!config.workspacePath) throw new Error('No workspace mounted')
-  const rel = filePath.replace(/^\/workspace\/?/, '')
-  const resolved = path.resolve(config.workspacePath, rel)
-  if (resolved !== config.workspacePath && !resolved.startsWith(config.workspacePath + path.sep)) {
-    throw new Error('Path traversal outside workspace not allowed')
-  }
-  return realpathBoundary(resolved, config.workspacePath)
+  // Anywhere else in the container is ordinary, unmanaged filesystem — bash
+  // already has unrestricted reach here, so rejecting it bought nothing but
+  // confusion. No confinement, just normal path resolution.
+  return path.resolve(filePath)
 }
 
 export async function readFile(filePath: string): Promise<ToolResult> {

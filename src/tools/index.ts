@@ -10,12 +10,12 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'bash',
-      description: 'Execute a bash command in the sandbox container. Both /workspace (the project) and /scratch (your private, disposable workbench) are inside the same isolated container — /scratch is not outside the sandbox, it is just not the deliverable location. Set cwd to /workspace for anything about the project itself (npm test, npm run <script>, git, node <project file>) — do not prefix commands with "cd /workspace &&". Omit cwd (or set /scratch) for temporary scripts and scratch work.',
+      description: 'Execute a bash command in the sandbox container. The whole container is your working environment — /workspace is the one special directory: the user\'s project, git-tracked, auto-committed. Everything else (/tmp, your home directory, wherever) is ordinary, disposable filesystem, freely usable for scripts and temporary work. Do not prefix commands with "cd /workspace &&" — use cwd instead.',
       parameters: {
         type: 'object',
         properties: {
           command: { type: 'string', description: 'The bash command to run' },
-          cwd: { type: 'string', enum: ['/workspace', '/scratch'], description: 'Working directory. Default /scratch. Use /workspace for anything operating on the project itself.' },
+          cwd: { type: 'string', description: 'Working directory, any absolute path. Default /workspace.' },
         },
         required: ['command'],
       },
@@ -40,11 +40,11 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'read_file',
-      description: 'Read a file. Use /workspace/path for workspace files, /scratch/path for scratch files.',
+      description: 'Read a file. Any absolute path in the container works; use /workspace/path for the project.',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Absolute path: /workspace/... or /scratch/...' },
+          path: { type: 'string', description: 'Absolute path, e.g. /workspace/... or /tmp/...' },
         },
         required: ['path'],
       },
@@ -54,11 +54,11 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'write_file',
-      description: 'Write a file. Use /scratch/path for scripts and temp files, /workspace/path for final deliverables only. Creates parent directories if needed.',
+      description: 'Write a file. Any absolute path in the container works; use /workspace/path only for intentional project deliverables. Creates parent directories if needed.',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Absolute path: /scratch/... or /workspace/...' },
+          path: { type: 'string', description: 'Absolute path, e.g. /workspace/... or /tmp/...' },
           content: { type: 'string', description: 'Content to write' },
         },
         required: ['path', 'content'],

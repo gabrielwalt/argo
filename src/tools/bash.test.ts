@@ -5,11 +5,10 @@ import { bash } from './bash.js'
 
 // Exercise the real docker-exec branch (config.inContainer stays false, as it
 // is on any host running these tests) against a running sandbox container.
-// The in-container branch hardcodes cwd '/scratch', which only exists inside
-// the real Argo container — but the bug these regress (exec() routing the
-// command through an extra, unintended shell) affects both branches
-// identically, since docker exec just prepends more argv elements ahead of
-// the same `bash -c <command>` invocation.
+// The bug these regress (exec() routing the command through an extra,
+// unintended shell) affects both branches identically, since docker exec
+// just prepends more argv elements ahead of the same `bash -c <command>`
+// invocation.
 config.sandboxContainer = process.env.TEST_SANDBOX_CONTAINER ?? 'argo-test-one'
 
 test('command substitution and variable assignment survive intact', async () => {
@@ -60,16 +59,22 @@ test('cwd: /workspace runs project commands against the project root', async () 
   assert.equal(result.output.trim(), '/workspace')
 })
 
-test('cwd: omitted defaults to /scratch (keeps disposable work out of git by default)', async () => {
+test('cwd: omitted defaults to /workspace', async () => {
   const result = await bash('pwd')
   assert.equal(result.error, undefined)
-  assert.equal(result.output.trim(), '/scratch')
+  assert.equal(result.output.trim(), '/workspace')
 })
 
-test('cwd: a value outside the allowed set falls back to /scratch, never passed through', async () => {
+test('cwd: any absolute path is accepted, not just an enum of two', async () => {
   const result = await bash('pwd', '/etc')
   assert.equal(result.error, undefined)
-  assert.equal(result.output.trim(), '/scratch')
+  assert.equal(result.output.trim(), '/etc')
+})
+
+test('cwd: a non-absolute value falls back to /workspace', async () => {
+  const result = await bash('pwd', 'not-a-path')
+  assert.equal(result.error, undefined)
+  assert.equal(result.output.trim(), '/workspace')
 })
 
 test('output over MAX_OUTPUT keeps a verbatim tail, not just the head', async () => {

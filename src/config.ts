@@ -12,7 +12,6 @@ export const config = {
   maxIterations:    parseInt(process.env.MAX_ITERATIONS ?? '1000', 10),
   port:             parseInt(process.env.PORT ?? '3000', 10),
   workspacePath:    inContainer ? '/workspace' : (process.env.WORKSPACE_PATH ? path.resolve(__dirname, '..', process.env.WORKSPACE_PATH) : ''),
-  scratchPath:      inContainer ? '/scratch'   : path.resolve(__dirname, '..', './scratch'),
   sandboxContainer: process.env.SANDBOX_CONTAINER ?? 'argo-sandbox',
   workerMode:       process.env.WORKER_MODE === '1',
   inContainer,

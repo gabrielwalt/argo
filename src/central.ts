@@ -21,7 +21,6 @@ const AGENT_PROJECT_DIR = process.env.AGENT_PROJECT_DIR ?? path.resolve(__dirnam
 const PUBLIC_DIR        = path.join(AGENT_PROJECT_DIR, 'public')
 const HOME              = process.env.HOME ?? '/tmp'
 const CONFIG_DIR        = path.join(HOME, '.config', 'argo')
-const SCRATCH_BASE      = path.join(HOME, '.local', 'share', 'argo', 'scratch')
 const LOGS_BASE         = path.join(HOME, '.local', 'share', 'argo', 'logs')
 const REGISTRY_FILE     = path.join(CONFIG_DIR, 'workspaces.json')
 const HISTORY_FILE      = path.join(CONFIG_DIR, 'workspace-history.json')
@@ -139,10 +138,8 @@ async function isContainerRunning(name: string): Promise<boolean> {
 }
 
 async function startWorker(ws: WorkspaceEntry): Promise<string> {
-  const scratchDir = path.join(SCRATCH_BASE, ws.name)
-  const logsDir    = path.join(LOGS_BASE, ws.name)
-  await fs.mkdir(scratchDir, { recursive: true })
-  await fs.mkdir(logsDir,    { recursive: true })
+  const logsDir = path.join(LOGS_BASE, ws.name)
+  await fs.mkdir(logsDir, { recursive: true })
 
   const envVars = await loadGlobalEnv()
 
@@ -153,8 +150,12 @@ async function startWorker(ws: WorkspaceEntry): Promise<string> {
     // Bound to localhost only — reachable exclusively through central's proxy,
     // which is the one place the password gate is enforced.
     '-p', `127.0.0.1:${ws.port}:3000`,
+    // /workspace is the only special mount — the user's project, git-tracked
+    // and auto-committed. Everything else in the container (including
+    // /scratch, if the image still has one) is ordinary, ephemeral
+    // filesystem that goes away with the container (--rm above) — nothing
+    // outside /workspace needs its own host-persisted mount.
     '-v', `${ws.path}:/workspace`,
-    '-v', `${scratchDir}:/scratch`,
     '-v', `${logsDir}:/app/logs`,
     '--add-host=host.docker.internal:host-gateway',
     '-e', 'RUNNING_IN_CONTAINER=1',
@@ -388,10 +389,7 @@ export function startCentral(): void {
     await stopWorker(name)
     registry.splice(idx, 1)
     await saveRegistry(registry)
-    await Promise.all([
-      fs.rm(path.join(SCRATCH_BASE, name), { recursive: true, force: true }),
-      fs.rm(path.join(LOGS_BASE, name),    { recursive: true, force: true }),
-    ])
+    await fs.rm(path.join(LOGS_BASE, name), { recursive: true, force: true })
     res.json({ ok: true })
   })
 

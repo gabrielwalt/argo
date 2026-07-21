@@ -62,9 +62,6 @@ RUN git config --global user.email "agent@local" \
   && git config --global user.name "Local Agent" \
   && git config --global init.defaultBranch main
 
-# Scratch dir
-RUN mkdir -p /scratch
-
 ENV RUNNING_IN_CONTAINER=1
 ENV WORKER_MODE=1
 ENV PORT=3000

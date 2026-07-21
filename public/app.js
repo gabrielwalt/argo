@@ -619,29 +619,35 @@ $('close-diff').addEventListener('click', () => diffModal.classList.remove('open
 diffModal.addEventListener('click', (e) => { if (e.target === diffModal) diffModal.classList.remove('open') })
 
 // ── Files tab ────────────────────────────────────────────────────
-async function refreshFiles() {
-  const [wsTree, scratchTree] = await Promise.all([
-    fetch(`${API_BASE}/files?dir=workspace`).then(r => r.json()).catch(() => []),
-    fetch(`${API_BASE}/files?dir=scratch`).then(r => r.json()).catch(() => []),
-  ])
-  renderTree($('files-workspace-tree'), wsTree, 'workspace')
-  renderTree($('files-scratch-tree'), scratchTree, 'scratch')
+// A single tree rooted at the container's real filesystem (or the mounted
+// workspace directory in standalone dev mode, which has no broader container
+// to browse) — /workspace is the only directory treated specially (expanded
+// and labeled by default). Directories load their children lazily on first
+// expand rather than eagerly walking the whole tree up front, since the root
+// can now be the entire container filesystem.
+async function fetchDirChildren(relPath) {
+  const qs = relPath ? `?path=${encodeURIComponent(relPath)}` : ''
+  return fetch(`${API_BASE}/files${qs}`).then(r => r.json()).catch(() => [])
 }
 
-
-function renderTree(container, nodes, dir) {
+async function refreshFiles() {
+  const container = $('files-tree')
   container.innerHTML = ''
-  if (!nodes.length) {
+  const rootNodes = await fetchDirChildren('')
+  if (!rootNodes.length) {
     const el = document.createElement('div')
     el.className = 'file-empty'
     el.textContent = '(empty)'
     container.appendChild(el)
     return
   }
-  for (const node of nodes) container.appendChild(makeFileNode(node, dir, ''))
+  for (const node of rootNodes) {
+    const isProject = node.type === 'dir' && node.name === 'workspace'
+    container.appendChild(await makeFileNode(node, '', isProject))
+  }
 }
 
-function makeFileNode(node, dir, parentPath) {
+async function makeFileNode(node, parentPath, forceOpen = false) {
   const filePath = parentPath ? `${parentPath}/${node.name}` : node.name
   const wrapper = document.createElement('div')
 
@@ -649,33 +655,50 @@ function makeFileNode(node, dir, parentPath) {
     wrapper.className = 'file-node dir'
     const row = document.createElement('div')
     row.className = 'file-row'
-    row.innerHTML = `<span class="file-icon">▶</span><span class="file-name">${escHtml(node.name)}/</span>`
+    const label = filePath === 'workspace' ? 'workspace/ (project)' : `${node.name}/`
+    row.innerHTML = `<span class="file-icon">▶</span><span class="file-name">${escHtml(label)}</span>`
 
     const children = document.createElement('div')
     children.className = 'file-children'
-    if (node.children?.length) {
-      node.children.forEach(child => children.appendChild(makeFileNode(child, dir, filePath)))
-    } else {
-      const empty = document.createElement('div')
-      empty.className = 'file-empty'
-      empty.textContent = '(empty)'
-      children.appendChild(empty)
+    let loaded = false
+
+    async function loadChildren() {
+      if (loaded) return
+      loaded = true
+      const childNodes = await fetchDirChildren(filePath)
+      children.innerHTML = ''
+      if (!childNodes.length) {
+        const empty = document.createElement('div')
+        empty.className = 'file-empty'
+        empty.textContent = '(empty)'
+        children.appendChild(empty)
+        return
+      }
+      for (const child of childNodes) children.appendChild(await makeFileNode(child, filePath))
     }
 
-    row.addEventListener('click', () => {
-      wrapper.classList.toggle('open')
-      row.querySelector('.file-icon').textContent = wrapper.classList.contains('open') ? '▼' : '▶'
+    row.addEventListener('click', async () => {
+      const opening = !wrapper.classList.contains('open')
+      if (opening) await loadChildren()
+      wrapper.classList.toggle('open', opening)
+      row.querySelector('.file-icon').textContent = opening ? '▼' : '▶'
     })
 
     wrapper.appendChild(row)
     wrapper.appendChild(children)
+
+    if (forceOpen) {
+      await loadChildren()
+      wrapper.classList.add('open')
+      row.querySelector('.file-icon').textContent = '▼'
+    }
   } else {
     wrapper.className = 'file-node file'
     const row = document.createElement('div')
     row.className = 'file-row'
     const size = node.size != null ? formatSize(node.size) : ''
     row.innerHTML = `<span class="file-icon">·</span><span class="file-name">${escHtml(node.name)}</span><span class="file-size">${size}</span>`
-    row.addEventListener('click', () => openFileInViewer(dir, filePath, row))
+    row.addEventListener('click', () => openFileInViewer(filePath, row))
     wrapper.appendChild(row)
   }
 
@@ -731,19 +754,19 @@ function renderHighlightedCode(text, language) {
   }).join('')
 }
 
-async function openFileInViewer(dir, filePath, rowEl) {
+async function openFileInViewer(filePath, rowEl) {
   if (activeFileRow) activeFileRow.classList.remove('active')
   activeFileRow = rowEl
   rowEl.classList.add('active')
 
   const pathEl = $('file-viewer-path')
   const contentEl = $('file-viewer-content')
-  pathEl.textContent = filePath
+  pathEl.textContent = `/${filePath}`
   contentEl.textContent = 'Loading…'
   contentEl.classList.remove('file-viewer-empty')
 
   try {
-    const resp = await fetch(`${API_BASE}/file?dir=${dir}&path=${encodeURIComponent(filePath)}`)
+    const resp = await fetch(`${API_BASE}/file?path=${encodeURIComponent(filePath)}`)
     const text = await resp.text()
     contentEl.innerHTML = renderHighlightedCode(text, detectLanguage(filePath))
   } catch {
