@@ -69,7 +69,7 @@ app.post('/chat', async (req, res) => {
     return
   }
 
-  const { message, model, options } = req.body as { message: string; model?: string; options?: ModelOptions }
+  const { message, model, options, maxIterations } = req.body as { message: string; model?: string; options?: ModelOptions; maxIterations?: number }
   if (!message?.trim()) {
     res.status(400).json({ error: 'message required' })
     return
@@ -81,6 +81,7 @@ app.post('/chat', async (req, res) => {
 
   if (model) agent.setModel(model)
   if (options) agent.setOptions(options)
+  if (maxIterations != null) agent.setMaxIterations(maxIterations)
 
   isBusy = true
   res.json({ ok: true })

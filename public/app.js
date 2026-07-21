@@ -60,6 +60,8 @@ let currentSessionQuery = ''  // first user message of the current session
 // ── Model options ────────────────────────────────────────────────
 const DEFAULTS = { temperature: 0.8, top_p: 0.9, top_k: 40, num_ctx: 32768 }
 const modelOpts = { ...DEFAULTS }
+const MAX_ITERATIONS_DEFAULT = 1000
+let maxIterations = MAX_ITERATIONS_DEFAULT
 
 function syncSettingsUI() {
   $('opt-temperature').value = modelOpts.temperature
@@ -68,6 +70,8 @@ function syncSettingsUI() {
   $('opt-top-p-val').textContent = modelOpts.top_p.toFixed(2)
   $('opt-top-k').value = modelOpts.top_k
   $('opt-num-ctx').value = modelOpts.num_ctx
+  $('opt-max-iterations').value = maxIterations
+  $('opt-max-iterations-val').textContent = maxIterations
 }
 
 $('opt-temperature').addEventListener('input', e => {
@@ -80,7 +84,15 @@ $('opt-top-p').addEventListener('input', e => {
 })
 $('opt-top-k').addEventListener('change', e => { modelOpts.top_k = parseInt(e.target.value, 10) })
 $('opt-num-ctx').addEventListener('change', e => { modelOpts.num_ctx = parseInt(e.target.value, 10) })
-$('settings-reset').addEventListener('click', () => { Object.assign(modelOpts, DEFAULTS); syncSettingsUI() })
+$('opt-max-iterations').addEventListener('input', e => {
+  maxIterations = parseInt(e.target.value, 10)
+  $('opt-max-iterations-val').textContent = maxIterations
+})
+$('settings-reset').addEventListener('click', () => {
+  Object.assign(modelOpts, DEFAULTS)
+  maxIterations = MAX_ITERATIONS_DEFAULT
+  syncSettingsUI()
+})
 
 settingsBtn.addEventListener('click', () => settingsPanel.classList.toggle('open'))
 syncSettingsUI()
@@ -386,7 +398,7 @@ $('chat-form').addEventListener('submit', async (e) => {
     const resp = await fetch(`${API_BASE}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, model: selectedModel, options: modelOpts }),
+      body: JSON.stringify({ message, model: selectedModel, options: modelOpts, maxIterations }),
     })
     if (!resp.ok) {
       const err = await resp.json()

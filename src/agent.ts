@@ -87,6 +87,7 @@ export class Agent {
   private history: Message[] = []
   private model: string
   private options: ModelOptions = {}
+  private maxIterations: number = config.maxIterations
   private sessionId = ''
   private aborted = false
   // Persisted structured memory that survives across compactions — see compaction.ts.
@@ -158,6 +159,14 @@ export class Agent {
 
   setOptions(opts: ModelOptions) {
     this.options = opts
+  }
+
+  setMaxIterations(n: number) {
+    this.maxIterations = Math.min(1000, Math.max(10, Math.trunc(n)))
+  }
+
+  getMaxIterations(): number {
+    return this.maxIterations
   }
 
   setSessionId(id: string) { this.sessionId = id }
@@ -256,14 +265,14 @@ export class Agent {
     emitAndLog({ type: 'start', model: this.model, query: userMessage, options: this.options })
 
     try {
-      for (let i = 0; i < config.maxIterations; i++) {
+      for (let i = 0; i < this.maxIterations; i++) {
         if (this.aborted) {
           this.aborted = false
           const msg = 'Stopped.'
           emitAndLog({ type: 'done', content: msg })
           return msg
         }
-        emitAndLog({ type: 'iteration', current: i + 1, max: config.maxIterations })
+        emitAndLog({ type: 'iteration', current: i + 1, max: this.maxIterations })
 
         emitAndLog({ type: 'ollama_request', iteration: i + 1, message_count: this.history.length + 1, model: this.model })
 
@@ -349,7 +358,7 @@ export class Agent {
         }
       }
 
-      const errMsg = `Reached maximum iterations (${config.maxIterations}) without a final answer.`
+      const errMsg = `Reached maximum iterations (${this.maxIterations}) without a final answer.`
       emitAndLog({ type: 'error', message: errMsg })
       return errMsg
     } finally {

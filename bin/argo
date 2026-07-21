@@ -50,8 +50,8 @@ ensure_global_env() {
 # Edit this file to set your API keys and defaults
 
 TAVILY_API_KEY=
-MODEL=qwen2.5-coder:14b
-MAX_ITERATIONS=20
+MODEL=qwen3.6:latest
+MAX_ITERATIONS=1000
 
 # Password for Argo's web UI. This is a shared-password gate, not a real
 # per-user auth system — anyone who reads this file (or the source default)

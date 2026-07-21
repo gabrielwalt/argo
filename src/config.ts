@@ -6,7 +6,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const inContainer = process.env.RUNNING_IN_CONTAINER === '1'
 
 export const config = {
-  model:            process.env.MODEL ?? 'llama3.1:8b',
+  model:            process.env.MODEL ?? 'qwen3.6:latest',
   ollamaHost:       process.env.OLLAMA_HOST ?? 'http://localhost:11434',
   tavilyKey:        process.env.TAVILY_API_KEY ?? '',
   maxIterations:    parseInt(process.env.MAX_ITERATIONS ?? '1000', 10),
