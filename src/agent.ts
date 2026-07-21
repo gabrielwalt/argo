@@ -87,6 +87,28 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer!))
 }
 
+// Turns `git status --porcelain` lines ("XY path" or "XY a -> b" for renames)
+// into a plain list of affected paths, for the no-LLM fallback commit message.
+export function parseChangedFiles(porcelainStatus: string): string[] {
+  // Each line is "XY path" — two status chars (which may themselves be
+  // spaces, e.g. " M", "??") then a space then the path. Trimming the whole
+  // line first would eat a leading status-code space and shift the slice
+  // into the filename, so only trim() for the blank-line check, never before
+  // slicing off the fixed-width prefix.
+  return porcelainStatus
+    .split('\n')
+    .filter(line => line.trim().length > 0)
+    .map(line => line.slice(3).trim().split(' -> ').pop()!.trim())
+}
+
+// Used when the commit-message LLM call errors or times out — a commit
+// should still happen even when the summarizer is slow/unavailable.
+export function buildFallbackCommitMessage(changedFiles: string[]): string {
+  if (changedFiles.length === 0) return 'Agent: update workspace'
+  if (changedFiles.length <= 3) return `Agent: update ${changedFiles.join(', ')}`.slice(0, 72)
+  return `Agent: update ${changedFiles.length} files`
+}
+
 export class Agent {
   private ollama: Ollama
   private history: Message[] = []
@@ -329,7 +351,7 @@ export class Agent {
           this.history.push(msg)
           emitAndLog({ type: 'message', role: 'assistant', content: msg.content })
           emitAndLog({ type: 'done', content: msg.content })
-          await this.autoCommit(userMessage, msg.content, emitAndLog)
+          await this.autoCommit(emitAndLog)
           return msg.content
         }
 
@@ -397,33 +419,64 @@ export class Agent {
       .map(msg => ({ role: msg.role, content: msg.content ?? '' }))
   }
 
-  private async autoCommit(query: string, answer: string, emitAndLog: (e: AgentEvent) => void): Promise<void> {
+  // Wraps bash() with the same tool_call/tool_result tracing the main loop
+  // uses, so autoCommit's own commands show up in the JSONL/Markdown trace
+  // instead of being invisible — this is what let the phantom/orphaned/
+  // mislabeled commit bugs go unnoticed in real session logs.
+  private async tracedBash(command: string, emitAndLog: (e: AgentEvent) => void) {
+    emitAndLog({ type: 'tool_call', tool: 'bash', args: { command, cwd: '/workspace' } })
+    const start = Date.now()
+    const result = await bash(command, '/workspace')
+    emitAndLog({ type: 'tool_result', tool: 'bash', output: result.output, error: result.error, duration_ms: Date.now() - start })
+    return result
+  }
+
+  private async autoCommit(emitAndLog: (e: AgentEvent) => void): Promise<void> {
     try {
       // Initialise git if workspace isn't tracked yet (idempotent on existing repos)
-      await bash('cd /workspace && git rev-parse --git-dir 2>/dev/null || git init -q')
-      const checkResult = await bash('cd /workspace && git status --porcelain 2>/dev/null')
+      await this.tracedBash('git rev-parse --git-dir 2>/dev/null || git init -q', emitAndLog)
+      const checkResult = await this.tracedBash('git status --porcelain 2>/dev/null', emitAndLog)
       if (checkResult.error || !checkResult.output.trim()) return
+      const changedFiles = parseChangedFiles(checkResult.output)
 
-      const summaryResp = await withTimeout(this.ollama.chat({
-        model: this.model,
-        messages: [{
-          role: 'user',
-          content: `Write a git commit message (max 60 chars) describing what was accomplished.\nTask: "${query.slice(0, 150)}"\nWork done: "${answer.slice(0, 400)}"\nReply with the commit message only — no quotes, no "Agent:" prefix.`,
-        }],
-      }), 30_000)
-      const summary = summaryResp.message.content.trim().replace(/^["']|["']$/g, '').slice(0, 60)
+      const beforeHead = (await this.tracedBash('git rev-parse HEAD 2>/dev/null', emitAndLog)).output.trim()
+
+      await this.tracedBash('git add -A', emitAndLog)
+
+      // Base the message on the actual diff, not the turn's query/answer prose —
+      // that decoupled the message from *which* turn happens to successfully
+      // commit, which previously produced messages that didn't match the diff.
+      const statResult = await this.tracedBash('git diff --cached --stat', emitAndLog)
+      let message: string
+      try {
+        const summaryResp = await withTimeout(this.ollama.chat({
+          model: this.model,
+          messages: [{
+            role: 'user',
+            content: `Write a git commit message (max 60 chars) summarizing this diff.\n${statResult.output.slice(0, 2000)}\nReply with the commit message only — no quotes, no "Agent:" prefix.`,
+          }],
+        }), 30_000)
+        const summary = summaryResp.message.content.trim().replace(/^["']|["']$/g, '').slice(0, 60)
+        message = `Agent: ${summary}`
+      } catch (err) {
+        emitAndLog({ type: 'warning', message: `Auto-commit: message generation failed (${err instanceof Error ? err.message : String(err)}) — using file-list summary` })
+        message = buildFallbackCommitMessage(changedFiles)
+      }
 
       // Single-quote the message so the shell never interprets its contents;
       // escape any literal single quotes within the string using the '\'' technique.
-      const safeMsg = `Agent: ${summary}`.replace(/'/g, "'\\''")
-      await bash(`cd /workspace && git add -A && git commit -m '${safeMsg}'`)
+      const safeMsg = message.replace(/'/g, "'\\''")
+      await this.tracedBash(`git commit -m '${safeMsg}'`, emitAndLog)
 
-      const logResult = await bash('cd /workspace && git log -1 --format="%h %s" 2>/dev/null')
+      const afterHead = (await this.tracedBash('git rev-parse HEAD 2>/dev/null', emitAndLog)).output.trim()
+      if (!afterHead || afterHead === beforeHead) return  // commit didn't actually happen — nothing new to report
+
+      const logResult = await this.tracedBash('git log -1 --format="%h %s" 2>/dev/null', emitAndLog)
       if (!logResult.error && logResult.output.trim()) {
         const spaceIdx = logResult.output.indexOf(' ')
         const hash = logResult.output.slice(0, spaceIdx).trim()
-        const message = logResult.output.slice(spaceIdx + 1).trim()
-        emitAndLog({ type: 'git_commit', hash, message })
+        const commitMessage = logResult.output.slice(spaceIdx + 1).trim()
+        emitAndLog({ type: 'git_commit', hash, message: commitMessage })
       }
     } catch (err) {
       emitAndLog({ type: 'warning', message: `Auto-commit failed: ${err instanceof Error ? err.message : String(err)}` })
