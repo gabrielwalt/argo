@@ -17,7 +17,7 @@ import { installAuth } from './auth.js'
 const execAsync = promisify(exec)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-const app = express()
+export const app = express()
 const bus = new EventEmitter()
 bus.setMaxListeners(50)
 

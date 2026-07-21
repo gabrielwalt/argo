@@ -41,19 +41,23 @@ export function emptyCompactionState(): CompactionState {
   }
 }
 
-function isNonEmptyStringArray(v: unknown): v is string[] {
+// Deliberately accepts an empty array here — `[]` is how the model clears a
+// category on purpose (e.g. every open hypothesis got resolved), and must be
+// distinguished from a missing/wrong-typed field, which is the actual
+// malformed-response case `pick()` below falls back to the old value for.
+function isStringArray(v: unknown): v is string[] {
   return Array.isArray(v) && v.every(x => typeof x === 'string')
 }
 
 // Defensive parse — an LLM asked for JSON can still return a malformed or
-// partial shape. Anything missing/wrong-typed falls back to empty rather
-// than throwing, so a bad model response degrades to "nothing new folded
-// in" instead of crashing the run.
+// partial shape. Anything missing/wrong-typed falls back to the existing
+// value rather than throwing, so a bad model response degrades to "nothing
+// new folded in" instead of crashing the run or silently losing state.
 export function coerceCompactionState(raw: unknown, fallback: CompactionState): CompactionState {
   if (!raw || typeof raw !== 'object') return fallback
   const r = raw as Record<string, unknown>
   const pick = (key: keyof CompactionState): string[] =>
-    isNonEmptyStringArray(r[key]) ? (r[key] as string[]) : (fallback[key] as string[])
+    isStringArray(r[key]) ? (r[key] as string[]) : (fallback[key] as string[])
   return {
     projectCapsule: typeof r.projectCapsule === 'string' ? r.projectCapsule : fallback.projectCapsule,
     userRequirements: pick('userRequirements'),

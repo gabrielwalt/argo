@@ -232,7 +232,7 @@ function deriveUniqueName(absPath: string, taken: Set<string>): string {
 // Hop-by-hop headers must not be forwarded by proxies (RFC 2616)
 const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate'])
 
-function proxyToWorker(req: Request, res: Response, port: number): void {
+export function proxyToWorker(req: Request, res: Response, port: number): void {
   // Strip hop-by-hop headers; disable compression so we can pipe raw bytes
   const fwdHeaders: Record<string, string | string[] | undefined> = {}
   for (const [k, v] of Object.entries(req.headers)) {

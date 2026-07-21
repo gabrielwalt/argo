@@ -122,6 +122,25 @@ test('coerceCompactionState falls back gracefully on malformed model output', ()
   assert.deepEqual(partial.hypotheses, fallback.hypotheses)
 })
 
+test('coerceCompactionState distinguishes an intentionally-cleared field from a missing one', () => {
+  // A category the model has explicitly resolved (e.g. every open hypothesis
+  // got answered) must actually clear — an update mechanism that can only
+  // ever grow a field, never empty it, would let stale/superseded entries
+  // (an old hypothesis, a since-answered open question) persist forever
+  // across every future compaction. A field the model's response simply
+  // didn't include is the opposite case and must keep the old value instead
+  // of being silently wiped.
+  const fallback = emptyCompactionState()
+  fallback.hypotheses = ['old hypothesis that has since been resolved']
+  fallback.openQuestions = ['old open question']
+
+  const cleared = coerceCompactionState({ hypotheses: [] }, fallback)
+  assert.deepEqual(cleared.hypotheses, [])
+  // openQuestions wasn't in this update at all — must still fall back, not
+  // also be wiped just because a sibling field was legitimately emptied.
+  assert.deepEqual(cleared.openQuestions, fallback.openQuestions)
+})
+
 test('renderCompactionState keeps categories visually and textually separate', () => {
   const state: CompactionState = {
     ...emptyCompactionState(),
