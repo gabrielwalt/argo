@@ -434,14 +434,29 @@ inputEl.addEventListener('keydown', (e) => {
   }
 })
 
-// Rich text (Google Docs, web pages, email, etc.) always carries a text/html
-// clipboard entry alongside plain text — convert that to Markdown instead of
-// pasting formatted junk into the textarea. Plain-text-only clipboards (no
-// text/html present) fall through to the browser's normal paste.
+// Rich text (Google Docs, web pages, email, etc.) carries a text/html
+// clipboard entry with real semantic formatting — convert that to Markdown
+// instead of pasting formatted junk into the textarea. But a text/html entry
+// alone isn't a reliable "this is rich text" signal: code editors, terminals,
+// and plenty of plain-text apps also attach an incidental text/html entry
+// purely for font/color styling (e.g. "<span style="color:#d4d4d4">const x
+// = 1</span>") with no real structure — converting *that* through Turndown
+// just re-escapes ordinary characters (_, *, [, etc.) for no reason. Only
+// treat the clipboard as rich text if the HTML actually contains a tag that
+// represents real formatting a user would want preserved as Markdown.
+const RICH_HTML_TAGS = /<(b|strong|i|em|a\s|a>|ul|ol|li|h[1-6]|blockquote|table|s|strike|del)\b/i
 const turndownService = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' })
+// Turndown's default escape() backslash-escapes markdown-special characters
+// (_, *, `, [, ], leading -/+/#/>/digit.) in every plain text node — correct
+// for producing byte-perfect Markdown source, but this textarea is a chat
+// prompt, not a markdown file: escaping a variable name like "my_var" into
+// "my\_var" sends literal backslashes to both the display and the LLM.
+// Disabling it keeps the *structural* conversion (bold, links, lists)
+// without mangling ordinary prose.
+turndownService.escape = string => string
 inputEl.addEventListener('paste', (e) => {
   const html = e.clipboardData?.getData('text/html')
-  if (!html) return
+  if (!html || !RICH_HTML_TAGS.test(html)) return  // let the browser's normal plain-text paste happen
   e.preventDefault()
   const markdown = turndownService.turndown(html).trim()
   inputEl.setRangeText(markdown, inputEl.selectionStart, inputEl.selectionEnd, 'end')
@@ -750,7 +765,16 @@ function renderHighlightedCode(text, language) {
     } catch {
       html = escHtml(line)
     }
-    return `<div class="code-line">${html}</div>`
+    // hljs output for one line is often several sibling nodes (a span per
+    // token, plus plain text runs between them) — dropped directly into
+    // .code-line (a flex container), every one of those top-level nodes
+    // becomes its own independent flex item that wraps on its own, breaking
+    // continuous text flow apart wherever a line has more than one token
+    // (e.g. an inline code span splits the line's text across two
+    // independently-wrapping boxes). Wrapping them in one child element
+    // keeps the whole line's content as a single flex item that wraps as
+    // one continuous unit, like a plain-text line already does.
+    return `<div class="code-line"><span class="code-content">${html}</span></div>`
   }).join('')
 }
 

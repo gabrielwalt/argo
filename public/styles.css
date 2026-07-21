@@ -1004,9 +1004,13 @@ button:disabled { opacity: .35; cursor: not-allowed; }
    to the whole div, not to a visual row. */
 .code-line {
   display: flex;
+  text-align: left;
+}
+.code-content {
+  flex: 1;
+  min-width: 0; /* allow a flex item to actually wrap/shrink instead of overflowing */
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  text-align: left;
 }
 .code-line::before {
   counter-increment: line;

@@ -4,7 +4,7 @@ import { promises as fs } from 'fs'
 import path from 'path'
 import { config } from './config.js'
 import { toolDefinitions, executeTool } from './tools/index.js'
-import { bash } from './tools/bash.js'
+import { bash, NO_OUTPUT } from './tools/bash.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
 import type { AgentEvent, ToolName, ModelOptions } from './types.js'
 import {
@@ -28,6 +28,7 @@ REASONING
 For concurrency, derive the valid serial orderings before calling an observed result a race or lost update — it is only a defect if no valid ordering explains it or an invariant is violated.
 Before claiming a regression, show a concrete case where old and new behavior differ and the new result violates a requirement or invariant; a difference alone is not a regression.
 Label evidence by how it was obtained: verified (you ran it and checked the output), reproduced (the experiment directly exercised the claimed mechanism), inferred, hypothesized, or untested. Do not present a weaker label as a stronger one.
+When the user states an explicit constraint (e.g. "do not modify any files," "read-only," "do not commit"), it overrides any other part of the same request that could imply a conflicting action. If a task could be satisfied by either a mutating or a non-mutating action, choose the non-mutating one. If no non-mutating option exists, say so explicitly instead of proceeding anyway.
 
 EFFICIENCY
 Never call the same tool more than twice in a row with similar inputs — write a script instead. Fetching 10 pages one by one, running the same command on multiple files, processing a list item by item: all of these must be a script, not repeated tool calls.
@@ -89,6 +90,13 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 // Turns `git status --porcelain` lines ("XY path" or "XY a -> b" for renames)
 // into a plain list of affected paths, for the no-LLM fallback commit message.
+// bash() returns the NO_OUTPUT sentinel (not '') for genuinely empty stdout —
+// a clean `git status --porcelain` must be recognized as clean either way.
+export function isCleanStatus(output: string): boolean {
+  const trimmed = output.trim()
+  return trimmed === '' || trimmed === NO_OUTPUT
+}
+
 export function parseChangedFiles(porcelainStatus: string): string[] {
   // Each line is "XY path" — two status chars (which may themselves be
   // spaces, e.g. " M", "??") then a space then the path. Trimming the whole
@@ -251,19 +259,19 @@ export class Agent {
     if (split.prior.length > 0) {
       const draft = await withTimeout(
         updateCompactionState(this.ollama, this.model, this.options, this.compactionState, split.prior),
-        60_000,
+        config.compactTimeoutMs,
       )
       const sourceWorkLog = messagesToText(split.prior)
       const result = await withTimeout(
         validateCompactionState(this.ollama, this.model, this.options, sourceWorkLog, draft),
-        60_000,
+        config.compactTimeoutMs,
       )
       this.compactionState = result.state
       validated = true
     }
 
     const activeWorkingState = split.activeMiddle.length > 0
-      ? await withTimeout(summarizeActiveMiddle(this.ollama, this.model, this.options, split.activeMiddle), 60_000)
+      ? await withTimeout(summarizeActiveMiddle(this.ollama, this.model, this.options, split.activeMiddle), config.compactTimeoutMs)
       : ''
 
     const priorMessage: Message = { role: 'assistant', content: renderCompactionState(this.compactionState) }
@@ -358,6 +366,15 @@ export class Agent {
               const result = await this.compactHistory(currentRunStart, usagePct, emitAndLog)
               currentRunStart = result.newRunStart
             } catch (err) {
+              // Deliberately falls through to the next normal iteration rather than
+              // blocking on a synchronous compaction retry: a hard block risks the
+              // loop getting stuck retrying compaction forever if it's failing for a
+              // structural reason (not just slow model latency), with no forward
+              // progress and no way for the user to see a real answer. Letting the
+              // iteration continue does mean usagePct can only climb further before
+              // the next attempt — accepted here since raising compactTimeoutMs
+              // above is the primary fix for the actual observed failure mode
+              // (timeout, not a structural error).
               emitAndLog({ type: 'warning', message: `Context compaction failed (${err instanceof Error ? err.message : String(err)}) — continuing with full history` })
             }
           }
@@ -465,7 +482,7 @@ export class Agent {
       // Initialise git if workspace isn't tracked yet (idempotent on existing repos)
       await this.tracedBash('git rev-parse --git-dir 2>/dev/null || git init -q', emitAndLog)
       const checkResult = await this.tracedBash('git status --porcelain 2>/dev/null', emitAndLog)
-      if (checkResult.error || !checkResult.output.trim()) return
+      if (checkResult.error || isCleanStatus(checkResult.output)) return
       const changedFiles = parseChangedFiles(checkResult.output)
 
       const beforeHead = (await this.tracedBash('git rev-parse HEAD 2>/dev/null', emitAndLog)).output.trim()

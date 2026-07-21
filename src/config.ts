@@ -22,4 +22,8 @@ export const config = {
   // not just when the input alone is already close to full.
   compactThreshold:        parseFloat(process.env.COMPACT_THRESHOLD ?? '0.667'),
   compactGenerationReserve: parseInt(process.env.COMPACT_GENERATION_RESERVE ?? '2048', 10),
+  // Compaction sub-calls are triggered specifically when history has grown
+  // large, so they typically summarize more content than an ordinary chat
+  // iteration (120s) — give them more room, not less.
+  compactTimeoutMs:        parseInt(process.env.COMPACT_TIMEOUT_MS ?? '180000', 10),
 }

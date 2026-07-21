@@ -290,7 +290,7 @@ Served at `http://localhost:3000/ws/{workspace-name}/`.
 
 **Session Logs (right tab)** — list of all past sessions. Click any entry to read the full trace as Markdown or JSONL. Sessions accumulate across restarts and are the primary source of data for improving prompts and comparing models.
 
-**Git Log (bottom)** — latest commit shown inline; click to expand older ones. Click "diff" to view exact changes. Auto-updates when the agent commits.
+**Git Log (bottom)** — latest commit shown inline; click to expand older ones. Click "diff" to view exact changes. Auto-updates when the agent commits. Commit messages summarize whatever is dirty in `/workspace` at commit time (`git diff --cached --stat`), not a strict authorship guarantee — if a file changed outside the agent's own tool calls (e.g. a human edit between turns), it's swept into the same commit and message.
 
 ---
 

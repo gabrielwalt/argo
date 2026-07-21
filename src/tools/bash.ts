@@ -7,6 +7,12 @@ import { truncateOutput } from './truncate.js'
 const execFileAsync = promisify(execFile)
 const MAX_OUTPUT = 4000
 
+// Explicit marker for genuinely empty stdout — both the UI and the model read
+// result.output directly and benefit from a visible marker instead of blank
+// text. Callers that need to detect "no output" programmatically (rather than
+// just displaying it) should compare against this constant, not against ''.
+export const NO_OUTPUT = '(no output)'
+
 export async function bash(command: string, cwd?: string): Promise<ToolResult> {
   // The container is the security boundary (see CLAUDE.md's Zero trust
   // section), not any particular path within it — so cwd accepts any
@@ -34,7 +40,7 @@ export async function bash(command: string, cwd?: string): Promise<ToolResult> {
       ...(config.inContainer ? { cwd: resolvedCwd } : {}),
     })
     const output = truncateOutput(stdout + stderr, MAX_OUTPUT)
-    return { output: output || '(no output)' }
+    return { output: output || NO_OUTPUT }
   } catch (err: unknown) {
     const e = err as { stderr?: string; stdout?: string; message?: string }
     const output = truncateOutput(((e.stderr ?? '') + (e.stdout ?? '')) || (e.message ?? 'Unknown error'), MAX_OUTPUT)

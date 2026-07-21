@@ -4,7 +4,8 @@ import fs from 'fs/promises'
 import { config } from './config.js'
 import { LOGS_DIR } from './logger.js'
 import type { AgentEvent } from './types.js'
-import { Agent, parseChangedFiles, buildFallbackCommitMessage } from './agent.js'
+import { Agent, parseChangedFiles, buildFallbackCommitMessage, isCleanStatus } from './agent.js'
+import { NO_OUTPUT } from './tools/bash.js'
 
 test('setMaxIterations clamps out-of-range values into [10, 1000]', () => {
   const agent = new Agent(() => {})
@@ -38,6 +39,13 @@ test('buildFallbackCommitMessage falls back to a count when there are many files
 
 test('buildFallbackCommitMessage handles no changed files', () => {
   assert.equal(buildFallbackCommitMessage([]), 'Agent: update workspace')
+})
+
+test('isCleanStatus treats bash\'s NO_OUTPUT sentinel the same as a genuinely blank status', () => {
+  assert.equal(isCleanStatus(''), true)
+  assert.equal(isCleanStatus('\n  \n'), true)
+  assert.equal(isCleanStatus(NO_OUTPUT), true)
+  assert.equal(isCleanStatus(' M src/agent.ts\n'), false)
 })
 
 // ── compactNow() — the manual trigger must reuse the same underlying
