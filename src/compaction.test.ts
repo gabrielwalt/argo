@@ -240,13 +240,16 @@ test('regression fixture: nextId() negative/float IDs must not be summarized as 
   const { state } = await validateCompactionState(ollama, TEST_MODEL, NO_OPTS, messagesToText(raw), draft)
   const rendered = renderCompactionState(state).toLowerCase()
 
-  // The false claim reads like "negative/float ids ... nan" WITHOUT a negation
-  // in the same clause — phrasings like "do not produce nan" or "only returns
-  // nan when the id is missing" mention the same words but are the correct,
-  // ground-truth statement, so they must not trip this check.
+  // The false claim reads like "negative/float ids ... nan" with no indication
+  // that the true cause (a missing/absent id) is what actually produces nan.
+  // The model rephrases the correct statement in varied ways each run ("only
+  // when missing", "exclusively when it lacks an id", "does not produce nan"),
+  // so instead of chasing an ever-growing list of negation synonyms, anchor on
+  // the substantive true cause (missing/lacks/absent) as well as plain negation
+  // — any correct phrasing must reference one or the other in the same clause.
   const clauses = rendered.split(/[.\n]/)
   const falseClause = clauses.find(c =>
-    /\bnan\b/.test(c) && /(negative|float)/.test(c) && !/\b(not|n't|never|without|only)\b/.test(c)
+    /\bnan\b/.test(c) && /(negative|float)/.test(c) && !/\b(missing|lacks?|absent|not|n't|never|without)\b/.test(c)
   )
   assert.equal(falseClause, undefined, `false claim reproduced: "${falseClause}"\nfull state:\n${rendered}`)
   // The true, verified fact should still be present in some form.
