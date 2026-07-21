@@ -71,3 +71,9 @@ test('cwd: a value outside the allowed set falls back to /scratch, never passed 
   assert.equal(result.error, undefined)
   assert.equal(result.output.trim(), '/scratch')
 })
+
+test('output over MAX_OUTPUT keeps a verbatim tail, not just the head', async () => {
+  const result = await bash('node -e "process.stdout.write(\'x\'.repeat(5000) + \'TAIL_MARKER_9f3a\')"')
+  assert.equal(result.error, undefined)
+  assert.match(result.output, /TAIL_MARKER_9f3a$/)
+})

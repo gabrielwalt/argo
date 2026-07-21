@@ -2,6 +2,7 @@ import fs from 'fs/promises'
 import path from 'path'
 import { config } from '../config.js'
 import type { ToolResult } from '../types.js'
+import { truncateOutput } from './truncate.js'
 
 // path.resolve() is purely lexical — it does not follow symlinks. A symlink
 // created inside /workspace or /scratch pointing elsewhere (trivially doable
@@ -65,7 +66,7 @@ export async function readFile(filePath: string): Promise<ToolResult> {
   try {
     const abs = await safePath(filePath)
     const content = await fs.readFile(abs, 'utf-8')
-    return { output: content.slice(0, 8000) }
+    return { output: truncateOutput(content, 8000) }
   } catch (err) {
     return { output: '', error: String(err) }
   }

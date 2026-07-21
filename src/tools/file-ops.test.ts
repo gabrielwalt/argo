@@ -85,3 +85,11 @@ test('a sibling directory sharing the root as a string prefix is not treated as 
     await fs.rm(evilSibling, { recursive: true, force: true })
   }
 })
+
+test('readFile output over the 8000-char cap keeps a verbatim tail, not just the head', async () => {
+  const content = 'y'.repeat(9000) + 'TAIL_MARKER_7c1d'
+  const w = await writeFile('/workspace/big.txt', content)
+  assert.equal(w.error, undefined)
+  const r = await readFile('/workspace/big.txt')
+  assert.match(r.output, /TAIL_MARKER_7c1d$/)
+})

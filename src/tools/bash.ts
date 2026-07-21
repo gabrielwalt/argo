@@ -2,6 +2,7 @@ import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { config } from '../config.js'
 import type { ToolResult } from '../types.js'
+import { truncateOutput } from './truncate.js'
 
 const execFileAsync = promisify(execFile)
 const MAX_OUTPUT = 4000
@@ -35,11 +36,11 @@ export async function bash(command: string, cwd?: string): Promise<ToolResult> {
       timeout: 30_000,
       ...(config.inContainer ? { cwd: resolvedCwd } : {}),
     })
-    const output = (stdout + stderr).slice(0, MAX_OUTPUT)
+    const output = truncateOutput(stdout + stderr, MAX_OUTPUT)
     return { output: output || '(no output)' }
   } catch (err: unknown) {
     const e = err as { stderr?: string; stdout?: string; message?: string }
-    const output = (((e.stderr ?? '') + (e.stdout ?? '')) || (e.message ?? 'Unknown error')).slice(0, MAX_OUTPUT)
+    const output = truncateOutput(((e.stderr ?? '') + (e.stdout ?? '')) || (e.message ?? 'Unknown error'), MAX_OUTPUT)
     return { output, error: 'Command failed' }
   }
 }
