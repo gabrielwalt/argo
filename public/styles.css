@@ -1000,6 +1000,7 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   font-size: 12px;
   line-height: 1.6;
   white-space: normal;
+  text-align: left;
   color: var(--text);
   margin: 0;
   tab-size: 2;
@@ -1014,6 +1015,7 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   display: flex;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  text-align: left;
 }
 .code-line::before {
   counter-increment: line;
