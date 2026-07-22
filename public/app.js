@@ -444,7 +444,7 @@ $('chat-form').addEventListener('submit', async (e) => {
 })
 
 inputEl.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey && !e.altKey) {
+  if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
     $('chat-form').dispatchEvent(new Event('submit'))
   }
