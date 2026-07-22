@@ -57,6 +57,10 @@ let sessionStartTime = new Date()
 let viewingSession = null  // null = current; object = past session being viewed
 let currentSessionQuery = ''  // first user message of the current session
 
+// -- Live session DOM cache (preserves trace blocks & messages across switches) --
+let liveDOMCache = null          // innerHTML of messagesEl while viewing a past session
+let liveMsgCache = []            // serial message objects for diffing on return
+
 // ── Model options ────────────────────────────────────────────────
 const DEFAULTS = { temperature: 0.8, top_p: 0.9, top_k: 40, num_ctx: 65536 }
 const modelOpts = { ...DEFAULTS }
@@ -398,6 +402,8 @@ function addChatMessage(role, content) {
     el.appendChild(copyBtn)
   }
 
+  // Cache live message for session-switch persistence
+  if (!viewingSession) liveMsgCache.push({ role, content })
   messagesEl.appendChild(el)
   messagesEl.scrollTop = messagesEl.scrollHeight
 }
@@ -406,6 +412,8 @@ function addSystemMessage(text) {
   const el = document.createElement('div')
   el.className = 'message system'
   el.textContent = text
+  // Cache system message for session-switch persistence
+  if (!viewingSession) liveMsgCache.push({ role: "system", content: text })
   messagesEl.appendChild(el)
   messagesEl.scrollTop = messagesEl.scrollHeight
 }
@@ -488,6 +496,9 @@ async function newSession() {
   currentTraceBlock = null
   updateSessionLabel()
   messagesEl.innerHTML = '<div class="message system">New session started.</div>'
+  // Clear caches on new session
+  liveDOMCache = null
+  liveMsgCache = []
   iterLabel.textContent = ''
   setStatus('ready', 'Ready')
 }
@@ -966,6 +977,8 @@ async function viewSession(sessionGroup) {
   currentTraceBlock = null
   updateSessionLabel()
 
+  // Cache live DOM before switching to past session
+  liveDOMCache = messagesEl.innerHTML
   messagesEl.innerHTML = ''
   const d = new Date(sessionGroup.startedAt)
   const dateStr = d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' · ' +
@@ -997,22 +1010,36 @@ async function returnToCurrentSession() {
   $('resume-btn').textContent = '▶ Resume'
   $('chat-form').style.display = ''
 
-  // Restore current conversation from server
-  messagesEl.innerHTML = ''
-  try {
-    const resp = await fetch(`${API_BASE}/history`)
-    const messages = await resp.json()
-    if (messages.length === 0) {
-      messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
-    } else {
-      const firstUser = messages.find(m => m.role === 'user')
-      if (firstUser) currentSessionQuery = firstUser.content
-      const userCount = messages.filter(m => m.role === 'user').length
-      addSystemMessage(`― ${userCount} message${userCount !== 1 ? 's' : ''} in current session ―`)
-      messages.forEach(m => addChatMessage(m.role, m.content))
+  // Restore from live DOM cache first (preserves trace blocks, tool calls, etc.)
+  if (liveDOMCache) {
+    messagesEl.innerHTML = liveDOMCache
+    // Diff against server for any new messages since cache
+    if (liveMsgCache.length > 0) {
+      const existingContent = messagesEl.innerHTML
+      let lastCachedIdx = liveMsgCache.findIndex(m => 
+        existingContent.includes(`class="message ${m.role}"`) || true)
+      for (let k = Math.max(0, lastCachedIdx); k < liveMsgCache.length; k++) {
+        const m = liveMsgCache[k]
+        if (!existingContent.includes(m.content)) addChatMessage(m.role, m.content)
+      }
     }
-  } catch {
-    messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
+  } else {
+    messagesEl.innerHTML = ''
+    try {
+      const resp = await fetch(`${API_BASE}/history`)
+      const messages = await resp.json()
+      if (messages.length === 0) {
+        messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
+      } else {
+        const firstUser = messages.find(m => m.role === 'user')
+        if (firstUser) currentSessionQuery = firstUser.content
+        const userCount = messages.filter(m => m.role === 'user').length
+        addSystemMessage(`\u2014 ${userCount} message${userCount !== 1 ? 's' : ''} in current session \u2014`)
+        messages.forEach(m => addChatMessage(m.role, m.content))
+      }
+    } catch {
+      messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
+    }
   }
   updateSessionLabel()
 }
@@ -1164,6 +1191,8 @@ async function initNav() {
         const dotClass = w.running ? 'drop-dot' : 'drop-dot stopped'
         row.innerHTML = `<span class="${dotClass}">●</span><span class="drop-text">${escHtml(w.name)}</span><button class="nav-drop-detach" type="button">Detach</button>`
         row.addEventListener('click', async () => {
+// Save live DOM to sessionStorage before navigating away
+try { sessionStorage.setItem("liveDOMCache", messagesEl.innerHTML); sessionStorage.setItem("liveMsgCache", JSON.stringify(liveMsgCache)); } catch {}
           if (w.running) { window.location.href = `/ws/${w.name}/`; return }
           row.querySelector('.drop-text').textContent = 'Starting…'
           try {
@@ -1196,6 +1225,18 @@ async function initNav() {
 }
 
 // ── Init ─────────────────────────────────────────────────────────
+
+// Restore cached live session DOM from sessionStorage (workspace switch recovery)
+try {
+  const savedDOM = sessionStorage.getItem("liveDOMCache")
+  if (savedDOM && !window.__WS__) {
+    messagesEl.innerHTML = savedDOM
+    const savedMsgs = sessionStorage.getItem("liveMsgCache")
+    if (savedMsgs) liveMsgCache = JSON.parse(savedMsgs)
+    addSystemMessage('Restored from cached session')
+  }
+} catch {}
+
 function escHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
