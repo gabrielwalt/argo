@@ -401,7 +401,13 @@ export function startCentral(): void {
     await stopWorker(name)
     registry.splice(idx, 1)
     await saveRegistry(registry)
-    await fs.rm(path.join(LOGS_BASE, name), { recursive: true, force: true })
+    // Detach stops and forgets the *registry entry* — it must not also destroy the
+    // run history. `argo stop` detaches every workspace to pause the whole system,
+    // not to make anyone forget it; logs are the project's own stated audit trail
+    // ("every run is logged... a core architectural guarantee") and are cheap to
+    // keep. Intentional history deletion already has its own path: the per-session
+    // "Clear" action in the UI. Re-attaching the same path later reuses the same
+    // logsDir (see startWorker), so nothing here needs the directory pre-cleared.
     res.json({ ok: true })
   })
 

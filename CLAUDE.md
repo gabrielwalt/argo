@@ -94,7 +94,7 @@ Structured, not a single free-form summary — see `src/compaction.ts`. Three th
 The Ollama model identifier (e.g. `qwen3.6:latest`, `llama3.1:8b`). Selected per session in the breadcrumb model picker. Applied on every Ollama API call within that session. Changing the model mid-session takes effect on the next run.
 
 **Model options**
-Per-session sampling parameters: `temperature`, `top_p`, `top_k`, `num_ctx`. Configured in the settings panel (⚙). Applied to all Ollama calls in the session. Defaults are `temp=0.8, top_p=0.9, top_k=40, ctx=32768`.
+Per-session sampling parameters: `temperature`, `top_p`, `top_k`, `num_ctx`. Configured in the settings panel (⚙). Applied to all Ollama calls in the session. Defaults are `temp=0.8, top_p=0.9, top_k=40, ctx=65536`.
 
 ### UI / streaming layer
 

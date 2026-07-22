@@ -21,6 +21,18 @@ export const app = express()
 const bus = new EventEmitter()
 bus.setMaxListeners(50)
 
+// Last-resort net: this worker process is the container's only process (--rm),
+// so an uncaught error here doesn't just fail one request — it kills the whole
+// container, silently, with no way to recover its logs afterward. agent.chat()
+// now catches its own failures (see agent.ts), but this covers anything else
+// that might still slip through uncaught.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (worker process would otherwise have crashed):', reason)
+})
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (worker process would otherwise have crashed):', err)
+})
+
 app.use(cors())
 app.use(express.json())
 

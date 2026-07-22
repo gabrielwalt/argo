@@ -1,10 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'fs/promises'
+import os from 'os'
+import path from 'path'
 import { config } from './config.js'
 import { LOGS_DIR } from './logger.js'
 import type { AgentEvent } from './types.js'
-import { Agent, parseChangedFiles, buildFallbackCommitMessage, isCleanStatus } from './agent.js'
+import { Agent, parseChangedFiles, buildFallbackCommitMessage, isCleanStatus, loadProjectContext } from './agent.js'
 import { NO_OUTPUT } from './tools/bash.js'
 
 test('setMaxIterations clamps out-of-range values into [10, 1000]', () => {
@@ -99,5 +101,52 @@ test('compactNow folds prior history and marks the emitted events manual, same s
         Promise.all(files.filter(f => f.includes('manual-context-compaction')).map(f => fs.unlink(`${LOGS_DIR}/${f}`).catch(() => {})))
       ).catch(() => {}),
     ])
+  }
+})
+
+test('loadProjectContext: neither AGENTS.md nor MEMORY.md present returns empty string, no behavior change', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'argo-project-context-'))
+  try {
+    assert.equal(await loadProjectContext(dir), '')
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('loadProjectContext: only one of the two files present includes just that one, clearly labeled', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'argo-project-context-'))
+  try {
+    await fs.writeFile(path.join(dir, 'AGENTS.md'), 'Use pnpm, not npm.')
+    const result = await loadProjectContext(dir)
+    assert.match(result, /AGENTS\.md \(project instructions\)/)
+    assert.match(result, /Use pnpm, not npm\./)
+    assert.doesNotMatch(result, /MEMORY\.md/)
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('loadProjectContext: both files present are both included, each clearly labeled', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'argo-project-context-'))
+  try {
+    await fs.writeFile(path.join(dir, 'AGENTS.md'), 'Project instructions content.')
+    await fs.writeFile(path.join(dir, 'MEMORY.md'), 'Durable memory content.')
+    const result = await loadProjectContext(dir)
+    assert.match(result, /AGENTS\.md \(project instructions\)[\s\S]*Project instructions content\./)
+    assert.match(result, /MEMORY\.md \(durable project memory\)[\s\S]*Durable memory content\./)
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('loadProjectContext: an oversized MEMORY.md is truncated, not sent in full', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'argo-project-context-'))
+  try {
+    await fs.writeFile(path.join(dir, 'MEMORY.md'), 'x'.repeat(20_000))
+    const result = await loadProjectContext(dir)
+    assert.ok(result.length < 20_000)
+    assert.match(result, /chars omitted/)
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true })
   }
 })

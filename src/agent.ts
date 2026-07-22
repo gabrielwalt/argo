@@ -5,6 +5,7 @@ import path from 'path'
 import { config } from './config.js'
 import { toolDefinitions, executeTool } from './tools/index.js'
 import { bash, NO_OUTPUT } from './tools/bash.js'
+import { truncateOutput } from './tools/truncate.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
 import type { AgentEvent, ToolName, ModelOptions } from './types.js'
 import {
@@ -33,6 +34,7 @@ When the user states an explicit constraint (e.g. "do not modify any files," "re
 EFFICIENCY
 Never call the same tool more than twice in a row with similar inputs — write a script instead. Fetching 10 pages one by one, running the same command on multiple files, processing a list item by item: all of these must be a script, not repeated tool calls.
 Test before bulk: run the script on one item first, verify the output is correct, then scale to the full set.
+When editing the same file repeatedly across many iterations, don't match a multi-line block by reusing a string you remember from earlier — re-read the exact current lines immediately before each edit. A remembered block silently no-ops or partially matches once the file has drifted, corrupting structure instead of failing loudly.
 Return conclusions and file paths only: never raw page or file contents as tool output.
 Multi-line JS: prefer writing to a script file (e.g. /tmp/script.js) and running with node — easier to inspect and rerun than an inline command. Multi-line node -e now works correctly too; use it for anything short-lived that doesn't need to be rerun.
 
@@ -44,6 +46,9 @@ Always use absolute paths.
 Scripts that produce output required in the workspace must write directly to /workspace/... (e.g. via an OUTPUT_DIR env var) — don't assume the script's own cwd is the project root.
 Before declaring done: re-read the original request, verify every item is addressed, and if the task produced files run ls /workspace/ to confirm they are there.
 
+MEMORY
+/workspace/AGENTS.md (if present) is project-level instructions, already loaded below — don't rewrite it unless explicitly asked to do so. /workspace/MEMORY.md (if present) is durable project memory, don't re-derive what it already states. After completing a task, update MEMORY.md only when you learned something durable and reusable across sessions: an architecture fact, a convention, a decision, a recurring pitfall. Never record one-off task state, debugging detail, or anything derivable by rereading the code. Update the relevant point in place — don't append duplicates. Use terse bullet points and one-liners; MEMORY is always loaded into context, so brevity saves tokens. If MEMORY.md grows large, move a section into memory/<topic>.md and leave a one-line pointer to it in MEMORY.md, so you know it exists without needing it loaded every run.
+
 TOOLS
 Invoke tools immediately and directly — never describe plans or write tool calls as JSON/prose first.
 - bash: shell commands, run scripts
@@ -51,6 +56,7 @@ Invoke tools immediately and directly — never describe plans or write tool cal
 - fetch_url: static pages (fast, no JS)
 - browser_fetch: JS-rendered pages, or when fetch_url returns empty/incomplete content
 - web_search: find information you don't already have (facts, docs, unknown URLs). Never use it when you already have the URL — use fetch_url or browser_fetch directly instead.
+A tool's stated hard limits (timeouts, size caps) are enforced by the harness itself — wrapping a call in your own retry/timeout/backoff logic cannot extend one; only an explicit override parameter, where the tool's own description offers one, has any effect.
 When the task is complete, give the final answer and stop.
 
 CURRENCY
@@ -88,6 +94,30 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer!))
 }
 
+// Compaction sub-calls can legitimately take over a minute (see config.compactTimeoutMs) —
+// without a periodic signal, "is it hung or just slow?" is unanswerable from the UI alone.
+// Emits a compact_progress tick every 15s while the call is in flight, and labels the
+// eventual timeout error with which step it was (update/validate/summarize), since all
+// three share the same generic "did not respond" message otherwise.
+async function withCompactHeartbeat<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  step: string,
+  emitAndLog: (e: AgentEvent) => void,
+): Promise<T> {
+  const start = Date.now()
+  const interval = setInterval(() => {
+    emitAndLog({ type: 'compact_progress', step, elapsedMs: Date.now() - start, timeoutMs })
+  }, 15_000)
+  try {
+    return await withTimeout(promise, timeoutMs)
+  } catch (err) {
+    throw new Error(`[${step}] ${err instanceof Error ? err.message : String(err)}`)
+  } finally {
+    clearInterval(interval)
+  }
+}
+
 // Turns `git status --porcelain` lines ("XY path" or "XY a -> b" for renames)
 // into a plain list of affected paths, for the no-LLM fallback commit message.
 // bash() returns the NO_OUTPUT sentinel (not '') for genuinely empty stdout —
@@ -115,6 +145,39 @@ export function buildFallbackCommitMessage(changedFiles: string[]): string {
   if (changedFiles.length === 0) return 'Agent: update workspace'
   if (changedFiles.length <= 3) return `Agent: update ${changedFiles.join(', ')}`.slice(0, 72)
   return `Agent: update ${changedFiles.length} files`
+}
+
+// Same cap as read_file's own truncation (file-ops.ts) — these are the same
+// kind of content (a file the agent would otherwise have to read_file itself),
+// just auto-loaded instead of requiring a tool call. Missing files are not an
+// error — most projects won't have either yet, and behavior is then unchanged.
+const PROJECT_CONTEXT_CHAR_CAP = 8000
+
+async function readProjectContextFile(absPath: string): Promise<string | null> {
+  try {
+    return truncateOutput(await fs.readFile(absPath, 'utf-8'), PROJECT_CONTEXT_CHAR_CAP)
+  } catch {
+    return null
+  }
+}
+
+// Loads AGENTS.md (human-authored project instructions) and MEMORY.md
+// (agent-maintained durable memory) from the workspace root once per run,
+// fresh each time so an update made earlier in the same session is visible on
+// the next run. Deliberately not re-read on every iteration within a run: the
+// model may edit MEMORY.md mid-run, and re-reading per-iteration would make
+// the system message inconsistent across a single run's own iterations.
+// workspaceRoot defaults to the real mount; overridable only so tests don't
+// need an actual /workspace on the host running them.
+export async function loadProjectContext(workspaceRoot = '/workspace'): Promise<string> {
+  const [agentsMd, memoryMd] = await Promise.all([
+    readProjectContextFile(path.join(workspaceRoot, 'AGENTS.md')),
+    readProjectContextFile(path.join(workspaceRoot, 'MEMORY.md')),
+  ])
+  const sections: string[] = []
+  if (agentsMd) sections.push(`--- /workspace/AGENTS.md (project instructions) ---\n${agentsMd}`)
+  if (memoryMd) sections.push(`--- /workspace/MEMORY.md (durable project memory) ---\n${memoryMd}`)
+  return sections.join('\n\n')
 }
 
 export class Agent {
@@ -257,21 +320,30 @@ export class Agent {
 
     let validated = false
     if (split.prior.length > 0) {
-      const draft = await withTimeout(
+      const draft = await withCompactHeartbeat(
         updateCompactionState(this.ollama, this.model, this.options, this.compactionState, split.prior),
         config.compactTimeoutMs,
+        'updating working memory',
+        emitAndLog,
       )
       const sourceWorkLog = messagesToText(split.prior)
-      const result = await withTimeout(
+      const result = await withCompactHeartbeat(
         validateCompactionState(this.ollama, this.model, this.options, sourceWorkLog, draft),
         config.compactTimeoutMs,
+        'validating update',
+        emitAndLog,
       )
       this.compactionState = result.state
       validated = true
     }
 
     const activeWorkingState = split.activeMiddle.length > 0
-      ? await withTimeout(summarizeActiveMiddle(this.ollama, this.model, this.options, split.activeMiddle), config.compactTimeoutMs)
+      ? await withCompactHeartbeat(
+          summarizeActiveMiddle(this.ollama, this.model, this.options, split.activeMiddle),
+          config.compactTimeoutMs,
+          'summarizing active run',
+          emitAndLog,
+        )
       : ''
 
     const priorMessage: Message = { role: 'assistant', content: renderCompactionState(this.compactionState) }
@@ -299,6 +371,7 @@ export class Agent {
     emitAndLog({
       type: 'compact',
       summary: renderCompactionState(this.compactionState),
+      ...(activeWorkingState ? { activeWorkingStateSummary: activeWorkingState } : {}),
       messagesBefore: msgsBefore,
       messagesAfter: msgsAfter,
       contextUsagePct,
@@ -327,6 +400,9 @@ export class Agent {
     emitAndLog({ type: 'message', role: 'user', content: userMessage })
     emitAndLog({ type: 'start', model: this.model, query: userMessage, options: this.options })
 
+    const projectContext = await loadProjectContext()
+    const systemPrompt = projectContext ? `${SYSTEM_PROMPT}\n\n${projectContext}` : SYSTEM_PROMPT
+
     try {
       for (let i = 0; i < this.maxIterations; i++) {
         if (this.aborted) {
@@ -341,15 +417,15 @@ export class Agent {
 
         const response = await withTimeout(this.ollama.chat({
           model: this.model,
-          messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...this.history],
+          messages: [{ role: 'system', content: systemPrompt }, ...this.history],
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           tools: toolDefinitions as any[],
           stream: false,
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           options: this.options as any,
-        }), 120_000)
+        }), config.chatTimeoutMs)
 
-        const numCtx = this.options.num_ctx ?? 32768
+        const numCtx = this.options.num_ctx ?? 65536
         if (response.prompt_eval_count != null) {
           emitAndLog({
             type: 'token_usage',
@@ -434,6 +510,18 @@ export class Agent {
       const errMsg = `Reached maximum iterations (${this.maxIterations}) without a final answer.`
       emitAndLog({ type: 'error', message: errMsg })
       return errMsg
+    } catch (err) {
+      // Nothing above this catches a failure from the main per-iteration
+      // ollama.chat() call (e.g. its own withTimeout rejecting) — uncaught, it
+      // used to propagate straight out of chat() and become an unhandled
+      // rejection in server.ts's /chat route (which only has a `finally`),
+      // crashing the whole worker process and taking the container down with it.
+      // Confirmed via a real incident: a run left hanging after a host
+      // sleep/wake produced a run log with no 'error'/'done' event, and the
+      // --rm'd container was later found gone with no way to recover its logs.
+      const message = `Unexpected error: ${err instanceof Error ? err.message : String(err)}`
+      emitAndLog({ type: 'error', message })
+      return message
     } finally {
       await Promise.all([logger.flush(), this.persistHistory()])
     }

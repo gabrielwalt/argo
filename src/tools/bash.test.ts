@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { config } from '../config.js'
-import { bash } from './bash.js'
+import { bash, resolveTimeoutMs } from './bash.js'
 
 // Exercise the real docker-exec branch (config.inContainer stays false, as it
 // is on any host running these tests) against a running sandbox container.
@@ -81,4 +81,57 @@ test('output over MAX_OUTPUT keeps a verbatim tail, not just the head', async ()
   const result = await bash('node -e "process.stdout.write(\'x\'.repeat(5000) + \'TAIL_MARKER_9f3a\')"')
   assert.equal(result.error, undefined)
   assert.match(result.output, /TAIL_MARKER_9f3a$/)
+})
+
+// resolveTimeoutMs is pure (no process spawned) — cheap to exercise every
+// default/override/cap combination directly rather than waiting out real timeouts.
+test('resolveTimeoutMs: plain commands default to 30s', () => {
+  assert.equal(resolveTimeoutMs('echo hi'), 30_000)
+})
+
+test('resolveTimeoutMs: a command mentioning Playwright/Chromium gets a 120s default, unasked', () => {
+  assert.equal(resolveTimeoutMs('node -e "require(\'playwright\')"'), 120_000)
+  assert.equal(resolveTimeoutMs('node -e "chromium.launch()"'), 120_000)
+})
+
+test('resolveTimeoutMs: an explicit request is honored for a plain command', () => {
+  assert.equal(resolveTimeoutMs('echo hi', 60_000), 60_000)
+})
+
+test('resolveTimeoutMs: an explicit request is capped at 180s even for Playwright', () => {
+  assert.equal(resolveTimeoutMs('require("playwright")', 10_000_000), 180_000)
+})
+
+test('resolveTimeoutMs: a zero or negative request falls back to the default instead of failing instantly', () => {
+  assert.equal(resolveTimeoutMs('echo hi', 0), 30_000)
+  assert.equal(resolveTimeoutMs('echo hi', -5), 30_000)
+})
+
+test('a real timeout is reported distinctly from a real command failure', async () => {
+  // execFile's timeout kills the *direct* child with SIGTERM. In-container
+  // (production — see config.inContainer in bash.ts) that child is `bash`
+  // itself, which dies by signal and is correctly detected as killed below.
+  // Through the docker-exec dev-mode wrapper the direct child is instead the
+  // `docker` CLI, which was observed to catch SIGTERM and exit 0 on its own
+  // (confirmed directly: child 'exit' fired with code 0, signal null, ~300ms
+  // in) — Node then sees a clean exit, not a kill, and the call silently
+  // "succeeds" with whatever was buffered while the real command keeps
+  // running detached inside the sandbox container. That's a real gap, but
+  // specific to Argo's own dev-mode tooling, not to any real workspace (which
+  // always runs the in-container branch) — flip to that branch here to
+  // exercise the path that actually matters, then restore it.
+  const wasInContainer = config.inContainer
+  config.inContainer = true
+  try {
+    // cwd defaults to /workspace, which only exists inside a real container —
+    // this test runs directly on the host (see comment above), so it needs an
+    // explicit cwd that actually exists here.
+    const timedOut = await bash('sleep 5', '/tmp', 300)
+    assert.equal(timedOut.error, 'Command timed out after 0.3s')
+
+    const failed = await bash('exit 1', '/tmp')
+    assert.equal(failed.error, 'Command failed')
+  } finally {
+    config.inContainer = wasInContainer
+  }
 })

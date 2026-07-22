@@ -24,9 +24,17 @@ export type AgentEvent =
   | { type: 'done'; content: string }
   | { type: 'git_commit'; hash: string; message: string }
   | { type: 'compact_start'; messageCount: number; contextUsagePct: number; manual?: boolean }
+  | { type: 'compact_progress'; step: string; elapsedMs: number; timeoutMs: number }
   | {
       type: 'compact'
       summary: string
+      // summarizeActiveMiddle's own output — unlike `summary` (the structured,
+      // validated CompactionState), this is a single unvalidated LLM pass, and on
+      // a run with repeated same-run compactions it re-summarizes its own prior
+      // output each time. Previously this was folded straight into history with
+      // no record anywhere of what it actually said — logged here so a run's
+      // active-state summary is auditable, not just trusted.
+      activeWorkingStateSummary?: string
       messagesBefore: number
       messagesAfter: number
       contextUsagePct: number

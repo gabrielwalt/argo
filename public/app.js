@@ -58,7 +58,7 @@ let viewingSession = null  // null = current; object = past session being viewed
 let currentSessionQuery = ''  // first user message of the current session
 
 // ── Model options ────────────────────────────────────────────────
-const DEFAULTS = { temperature: 0.8, top_p: 0.9, top_k: 40, num_ctx: 32768 }
+const DEFAULTS = { temperature: 0.8, top_p: 0.9, top_k: 40, num_ctx: 65536 }
 const modelOpts = { ...DEFAULTS }
 const MAX_ITERATIONS_DEFAULT = 1000
 let maxIterations = MAX_ITERATIONS_DEFAULT
@@ -227,13 +227,23 @@ function handleEvent(event) {
       addTraceItem('compact', '📦 Compacting context', `${event.messageCount} messages, ${Math.round(event.contextUsagePct * 100)}% context — updating working memory…`, false)
       break
 
+    case 'compact_progress': {
+      // Periodic proof-of-life from a still-running compaction sub-call (see
+      // withCompactHeartbeat in agent.ts) — this is what tells you it's actually
+      // working and not just hung, since compact_start only fires once at the start.
+      const elapsedS = Math.round(event.elapsedMs / 1000)
+      const timeoutS = Math.round(event.timeoutMs / 1000)
+      setStatus('busy', `Compacting context… ${event.step} (${elapsedS}s / ${timeoutS}s)`)
+      break
+    }
+
     case 'compact':
       // A manually triggered compaction (see #token-counter's click handler)
       // has no run following it to eventually fire 'done' and restore status —
       // reflect that here instead of leaving the dot stuck on "Running".
       if (event.manual) setStatus('ready', 'Ready')
       else setStatus('busy', `Running · ${currentRunModel}`)
-      addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
+      addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}${event.activeWorkingStateSummary ? `\n\n--- Active working state (unvalidated) ---\n${event.activeWorkingStateSummary}` : ''}`, true)
       tokenCounter.textContent = 'compacted'
       tokenCounter.className = 'ctx-ok'
       break
@@ -281,10 +291,17 @@ function setBusy(val) {
     sendBtn.classList.remove('sailing', 'working')
     sendBoat.classList.remove('hidden')
     sendStop.classList.add('hidden')
+    stopRequested = false
   }
 }
 
+let stopRequested = false
+
 async function stopAgent() {
+  // Abort only takes effect once the current model/tool call finishes, which can
+  // take a while — without this the click looks like it did nothing in the meantime.
+  stopRequested = true
+  setStatus('busy', 'Stopping…')
   try { await fetch(`${API_BASE}/stop`, { method: 'POST' }) } catch { /* ignore */ }
 }
 
@@ -304,6 +321,7 @@ tokenCounter.addEventListener('click', async () => {
 sendBtn.addEventListener('click', (e) => {
   if (!busy) return
   e.preventDefault()
+  if (stopRequested) return
   stopAgent()
 })
 

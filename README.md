@@ -239,6 +239,15 @@ The container is the agent's entire working environment. `/workspace` is the one
 
 The agent is instructed to keep work-in-progress files outside `/workspace` and only write there when modifying the actual project.
 
+### Project memory
+
+Two optional, plain-Markdown files at the project root, auto-loaded (fresh, once per run) and appended to the system prompt if present — no embeddings, no database, no daemon:
+
+- **`AGENTS.md`** — human-authored project instructions (conventions, non-obvious constraints). The agent treats this as read-only, the same way it treats this project's own `CLAUDE.md`.
+- **`MEMORY.md`** — agent-maintained durable memory: architecture facts, conventions, decisions, recurring pitfalls. The agent is instructed to update it conservatively (durable, reusable facts only — never one-off task state or debugging detail), in place rather than by appending, and to split a section out to `memory/<topic>.md` (with a one-line pointer left in `MEMORY.md`) if it grows large — so detail stays available on demand without bloating every run's context.
+
+Both files live inside `/workspace` like any other project file, so they're versioned and auto-committed the same way code changes are — visible and git-diffable, not a hidden side channel. Each is capped at 8,000 characters on load (same as `read_file`'s own truncation) — see `loadProjectContext()` in `src/agent.ts`.
+
 ---
 
 ## Sandbox environment

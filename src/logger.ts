@@ -242,6 +242,11 @@ export class SessionLogger {
           lines.push(``)
           break
 
+        case 'compact_progress':
+          lines.push(`*…still compacting* \`${time}\` — ${event.step} (${Math.round(event.elapsedMs / 1000)}s / ${Math.round(event.timeoutMs / 1000)}s)`)
+          lines.push(``)
+          break
+
         case 'compact':
           lines.push(`**📦 Context compacted** \`${time}\` — ${event.messagesBefore} → ${event.messagesAfter} messages, was ${(event.contextUsagePct * 100).toFixed(0)}% context, validation pass ${event.validated ? 'ran' : 'skipped (nothing to fold in)'}`)
           lines.push(``)
@@ -251,6 +256,14 @@ export class SessionLogger {
           lines.push(event.summary)
           lines.push(`\`\`\``)
           lines.push(``)
+          if (event.activeWorkingStateSummary) {
+            lines.push(`*Active working state (unvalidated, single-pass summary of the current run's own progress):*`)
+            lines.push(``)
+            lines.push(`\`\`\``)
+            lines.push(event.activeWorkingStateSummary)
+            lines.push(`\`\`\``)
+            lines.push(``)
+          }
           break
 
         default: {

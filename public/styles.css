@@ -946,9 +946,9 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   display: none;
   padding-left: 12px;
   border-left: 1px solid rgba(30,34,53,.9);
-  /* Matches .file-row's own padding-left (8px) + half of .file-icon's width (10px)
-     so the guide line continues straight down from the arrow's horizontal center. */
-  margin-left: 13px;
+  /* Matches .file-row's own padding-left (8px) + half of .file-icon's width (10px),
+     shifted 2px further left per visual check against actual glyph rendering. */
+  margin-left: 11px;
 }
 .file-node.dir.open > .file-children { display: block; }
 .file-empty { color: var(--muted); font-size: 11px; padding: 2px 8px; }

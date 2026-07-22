@@ -10,12 +10,13 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'bash',
-      description: 'Execute a bash command in the sandbox container. The whole container is your working environment — /workspace is the one special directory: the user\'s project, git-tracked, auto-committed. Everything else (/tmp, your home directory, wherever) is ordinary, disposable filesystem, freely usable for scripts and temporary work. Do not prefix commands with "cd /workspace &&" — use cwd instead.',
+      description: 'Execute a bash command in the sandbox container. The whole container is your working environment — /workspace is the one special directory: the user\'s project, git-tracked, auto-committed. Only write test/scratch/verification files (via redirection, heredoc, sed, etc. — not just write_file) under /workspace if they are an intentional project deliverable; anything temporary goes in /tmp or elsewhere, the same rule as write_file, regardless of which tool you use to create the file. Everything outside /workspace is ordinary, disposable filesystem, freely usable for scripts and temporary work. Do not prefix commands with "cd /workspace &&" — use cwd instead. Commands are killed after 30s by default (120s automatically for anything mentioning Playwright/Chromium) — if a command times out, that is reported explicitly as a timeout, not a generic failure; if you know a command needs more real time than that (e.g. waiting out many simulation frames), pass timeout_ms instead of adding longer waits inside the command.',
       parameters: {
         type: 'object',
         properties: {
           command: { type: 'string', description: 'The bash command to run' },
           cwd: { type: 'string', description: 'Working directory, any absolute path. Default /workspace.' },
+          timeout_ms: { type: 'number', description: 'Override the default kill timeout in milliseconds, for a command you know legitimately needs more time. Capped at 180000 (3 minutes).' },
         },
         required: ['command'],
       },
@@ -99,7 +100,7 @@ export const toolDefinitions = [
 export async function executeTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
   switch (name as ToolName) {
     case 'bash':
-      return bash(args.command as string, args.cwd as string | undefined)
+      return bash(args.command as string, args.cwd as string | undefined, args.timeout_ms as number | undefined)
     case 'web_search':
       return webSearch(args.query as string, args.max_results as number | undefined)
     case 'read_file':

@@ -125,7 +125,15 @@ export function messagesToText(messages: Message[]): string {
   const lines: string[] = []
   for (const msg of messages) {
     if (msg.role === 'user' && msg.content) {
-      lines.push(`User: ${msg.content.slice(0, 300)}`)
+      // User content is the actual source of userRequirements — unlike tool
+      // output, there's no verbose/low-signal preamble to skip, so it must go
+      // in whole. A 300-char cap here once silently dropped a detailed
+      // multi-step prompt down to its first sentence and a half before
+      // compaction ever saw it, permanently losing requirements from
+      // persisted state (confirmed via a real session: userRequirements only
+      // captured the pre-cutoff fragment, and compaction's own openQuestions
+      // flagged the truncation as if it were something the user did).
+      lines.push(`User: ${msg.content}`)
     } else if (msg.role === 'assistant') {
       const tc = (msg as { tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> }).tool_calls
       if (tc?.length) {
@@ -133,7 +141,7 @@ export function messagesToText(messages: Message[]): string {
           lines.push(`Called ${call.function.name}(${JSON.stringify(call.function.arguments).slice(0, 120)})`)
         }
       } else if (msg.content) {
-        lines.push(`Agent: ${msg.content.slice(0, 300)}`)
+        lines.push(`Agent: ${msg.content}`)
       }
     } else if (msg.role === 'tool' && msg.content) {
       lines.push(`Result: ${collapseVerboseOutput(msg.content)}`)
