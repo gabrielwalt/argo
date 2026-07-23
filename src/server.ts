@@ -45,8 +45,11 @@ if (!config.workerMode) {
   app.use(express.static(path.join(__dirname, '..', 'public')))
 }
 
-const agent = new Agent((event: AgentEvent) => {
-  bus.emit('agent', event)
+const agent = new Agent((event: AgentEvent, seq?: number) => {
+  // Forward the per-run seq alongside the event so the browser can dedupe
+  // replayed (persisted) events against this live SSE stream at the reconnect
+  // boundary — the JSONL replay (readLogEvents) carries the same __seq.
+  bus.emit('agent', typeof seq === 'number' ? { ...event, __seq: seq } : event)
 })
 
 const SESSION_ID_FILE = path.join(LOGS_DIR, 'current-session.txt')

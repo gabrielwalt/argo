@@ -58,8 +58,17 @@ let viewingSession = null  // null = current; object = past session being viewed
 let currentSessionQuery = ''  // first user message of the current session
 
 // ── Structured-event replay state ───────────────────────────
-let eventSeqs = new Set();     // seq numbers seen during current view
-let pendingEvents = [];
+// The live SSE connection is the ONLY live delivery; the per-run JSONL logs are
+// the canonical trace. On (re)entering the live view we replay persisted events,
+// so live events arriving during that async replay are buffered here and flushed
+// afterward. Dedup between replay and live uses each event's per-run `__seq`
+// (the server attaches it to both the JSONL replay responses and the SSE
+// stream): liveRunMaxSeq is the highest seq already rendered for the current
+// run, reset to 0 when a new run's first event (per-run seq === 1) arrives.
+let currentLiveSessionId = ''   // active (live) session id — whose persisted events to replay
+let replaying = true            // true while replaying persisted events (buffer live SSE meanwhile); starts true for the initial page-load replay
+let pendingEvents = []          // live SSE events received while replaying
+let liveRunMaxSeq = 0           // high-water dedup mark for live vs. replayed events (current run)
 
 // ── Model options ────────────────────────────────────────────────
 const DEFAULTS = { temperature: 0.8, top_p: 0.9, top_k: 40, num_ctx: 65536 }
@@ -166,12 +175,69 @@ es.onerror = () => setStatus('error', 'Disconnected — reload page')
 
 es.onmessage = (e) => {
   const event = JSON.parse(e.data)
+  // While replaying persisted events, buffer live events so they render after
+  // the replay (in order, deduped) rather than interleaving with it.
+  if (replaying) { pendingEvents.push(event); return }
+  handleLiveEvent(event)
+}
+
+// A single live SSE event. Dedupes against already-replayed events of the
+// current run via the per-run __seq high-water mark, then renders it through the
+// live path. (While viewing a past session, handleEvent suppresses messagesEl
+// rendering itself — no dedup needed there, and the mark is rebuilt on return.)
+function handleLiveEvent(event) {
+  if (!viewingSession) {
+    const seq = event.__seq
+    // __seq is per-run, so seq === 1 marks the first event of a NEW run (the
+    // user message, which precedes 'start') — reset the mark so the new run's
+    // events aren't mistaken for already-seen ones from a longer previous run.
+    if (seq === 1) liveRunMaxSeq = 0
+    if (typeof seq === 'number') {
+      if (seq <= liveRunMaxSeq) return   // already rendered (via replay or earlier)
+      liveRunMaxSeq = seq
+    }
+  }
   handleEvent(event)
 }
 
+// Replays persisted events for one or more runs (sorted by start time) through
+// the replay render path, in file order — which is already correct order, since
+// each run's JSONL is appended in emission order. Returns the __seq of the last
+// event rendered, i.e. the current run's high-water mark for live dedup.
+async function replaySessionRuns(runs) {
+  let lastSeq = 0
+  const ordered = (runs ?? []).slice().sort((a, b) => a.startedAt.localeCompare(b.startedAt))
+  for (const run of ordered) {
+    try {
+      const resp = await fetch(`${API_BASE}/logs/${encodeURIComponent(run.filename)}`)
+      if (!resp.ok) continue
+      const data = await resp.json()
+      for (const evt of (data.events ?? [])) {
+        if (typeof evt.__seq === 'number') lastSeq = evt.__seq
+        handleEventForSession(evt)
+      }
+    } catch { /* skip unreadable runs */ }
+  }
+  return lastSeq
+}
+
+// Ends a replay: stop buffering, then render everything that streamed in live
+// during the replay, in order and deduped (via handleLiveEvent) against what was
+// just replayed. This is the persisted-replay/SSE boundary — no gaps (buffered
+// events are flushed) and no duplicates (the __seq high-water mark drops any that
+// the replay already covered).
+function finishReplay() {
+  replaying = false
+  const buffered = pendingEvents
+  pendingEvents = []
+  for (const ev of buffered) handleLiveEvent(ev)
+}
+
 function handleEvent(event) {
-  // While viewing a past session, suppress all SSE rendering into messagesEl.
-  // The live session's DOM is preserved by save-on-switch and the debounce timer.
+  // While viewing a past session, suppress all SSE rendering into messagesEl —
+  // only status-bar updates proceed below. Nothing is lost: the live session's
+  // events are persisted to its JSONL and replayed in full on return (see
+  // returnToCurrentSession), so there is no in-memory DOM that needs preserving.
   if (viewingSession) {
     // Still allow status updates to proceed (they don't modify messagesEl)
     if (event.type === 'start') {
@@ -313,6 +379,71 @@ function handleEvent(event) {
   }
 }
 
+// Renders one PERSISTED (replayed) event into the trace/chat. Reuses the same
+// DOM helpers as the live path for identical visual output, but omits every
+// live-only side effect (status bar, busy state, git/file refreshes, iteration
+// and token counters — those reflect a *running* agent, not history). Unlike the
+// live path it also renders user messages: on replay there is no submit handler
+// to have added them optimistically. ollama_request / compact_progress /
+// token_usage are live-only telemetry with nothing to draw into the trace.
+function handleEventForSession(event) {
+  switch (event.type) {
+    case 'start':
+      startTraceBlock(event.model)
+      break
+
+    case 'iteration':
+      addTraceItem('iteration', null, `── Iteration ${event.current} ──`, false)
+      break
+
+    case 'thought':
+      addTraceItem('thought', '💭 Thought', event.content, true)
+      break
+
+    case 'tool_call':
+      traceToolCalls++
+      addTraceItem('tool-call', `🔧 ${event.tool}`, JSON.stringify(event.args, null, 2), true)
+      break
+
+    case 'tool_result': {
+      const isError = !!event.error
+      const label = `📥 Result${event.error ? ' · ERROR' : ''} · ${event.duration_ms}ms`
+      const body = event.error ? `${event.error}\n${event.output}` : event.output
+      addTraceItem(isError ? 'tool-result error' : 'tool-result', label, body, true)
+      break
+    }
+
+    case 'message':
+      addChatMessage(event.role, event.content)
+      break
+
+    case 'compact_start':
+      addTraceItem('compact', '📦 Compacting context', `${event.messageCount} messages, ${Math.round(event.contextUsagePct * 100)}% context — updating working memory…`, false)
+      break
+
+    case 'compact':
+      addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}${event.activeWorkingStateSummary ? `\n\n--- Active working state (unvalidated) ---\n${event.activeWorkingStateSummary}` : ''}`, true)
+      break
+
+    case 'warning':
+      addTraceItem('warning', '⚠ Warning', event.message, false)
+      break
+
+    case 'git_commit':
+      addTraceItem('git', `🔀 Committed`, `${event.hash} — ${event.message}`, false)
+      break
+
+    case 'done':
+      finalizeTraceBlock()
+      break
+
+    case 'error':
+      addTraceItem('error-item', '⚠ Error', event.message, false)
+      finalizeTraceBlock()
+      break
+  }
+}
+
 // ── UI helpers ───────────────────────────────────────────────────
 function setStatus(state, text) {
   statusDot.className = state === 'ready' ? '' : state
@@ -413,6 +544,13 @@ function addTraceItem(className, label, body, collapsible) {
   return el
 }
 
+function renderMarkdown(content) {
+  return marked.parse(content, { breaks: true, gfm: true })
+}
+
+function addChatMessage(role, content) {
+  const el = document.createElement('div')
+  el.className = `message ${role} md`
   el.innerHTML = renderMarkdown(content)
   el.querySelectorAll('a').forEach(a => a.setAttribute('target', '_blank'))
 
@@ -438,11 +576,9 @@ function addTraceItem(className, label, body, collapsible) {
     el.appendChild(copyBtn)
   }
 
-  // Cache live message for session-switch persistence
-  // Track event for structured replay (role+content extracted by SSE handler)
   messagesEl.appendChild(el)
   messagesEl.scrollTop = messagesEl.scrollHeight
-
+}
 
 function addSystemMessage(text) {
   const el = document.createElement('div')
@@ -525,7 +661,15 @@ inputEl.addEventListener('paste', (e) => {
 
 // ── New session (called from session dropdown) ───────────────────
 async function newSession() {
-  if (viewingSession) returnToCurrentSession()
+  // Leave any past-session view directly (no need to replay the old live session
+  // we're about to reset) and clear replay/boundary state for the fresh session.
+  viewingSession = null
+  $('session-banner').classList.remove('visible')
+  $('chat-form').style.display = ''
+  replaying = false
+  pendingEvents = []
+  liveRunMaxSeq = 0
+
   await fetch(`${API_BASE}/reset`, { method: 'POST' })
   sessionStartTime = new Date()
   currentSessionQuery = ''
@@ -535,7 +679,7 @@ async function newSession() {
 
   iterLabel.textContent = ''
   setStatus('ready', 'Ready')
-  // Update live session ID so future DOM lookups use the right key
+  // Track the new live session id so its events are the ones replayed later.
   const st = await fetch(`${API_BASE}/status`).then(r => r.json()).catch(() => ({}))
   currentLiveSessionId = st?.sessionId ?? ''
 }
@@ -1014,33 +1158,14 @@ async function viewSession(sessionGroup) {
   viewingSession = sessionGroup
   currentLiveSessionId = ''
   currentTraceBlock = null
+  messagesEl.innerHTML = ''
   updateSessionLabel()
 
-  // Replay all events from the session's runs in chronological order
-  const runs = sessionGroup.runs.sort((a, b) => a.startedAt.localeCompare(b.startedAt))
-  let allEvents = []
-
-  for (const run of runs) {
-    try {
-      const resp = await fetch(`${API_BASE}/logs/${encodeURIComponent(run.filename)}`)
-      if (!resp.ok) continue
-      const data = await resp.json()
-      if (data.events) {
-        for (const evt of data.events) {
-          allEvents.push({ ts: evt.ts, seq: evt.seq ?? 0, event: evt })
-        }
-      }
-    } catch { /* skip unreadable runs */ }
-  }
-
-  // Sort by timestamp then sequence number for correct ordering
-  allEvents.sort((a, b) => a.ts.localeCompare(b.ts) || a.seq - b.seq)
-
-  // Replay events through the standard rendering path
-  for (const e of allEvents) {
-    eventSeqs.add(e.seq)
-    handleEventForSession(e)
-  }
+  // Replay every run of this past session, in order, through the replay path.
+  // Live SSE for the running session keeps arriving, but handleEvent suppresses
+  // its rendering while viewingSession is set — so there's nothing to dedupe or
+  // buffer here (the live view is rebuilt from scratch on return).
+  await replaySessionRuns(sessionGroup.runs)
 
   $('session-banner-label').textContent = `Viewing past session`
   $('session-banner').classList.add('visible')
@@ -1049,30 +1174,28 @@ async function viewSession(sessionGroup) {
 
 async function returnToCurrentSession() {
   viewingSession = null
-  currentLiveSessionId = envStatus.sessionId ?? ''
+  currentTraceBlock = null
   messagesEl.innerHTML = ''
-  pendingEvents.length = 0
-  eventSeqs.clear()
+  liveRunMaxSeq = 0
+  replaying = true       // buffer live SSE events until the replay below completes
+  pendingEvents = []
 
-  // Reload from the live session's JSONL events
-  if (currentLiveSessionId) {
-    try {
-      const resp = await fetch(`${API_BASE}/logs/${encodeURIComponent(currentLiveSessionId)}`)
-      if (resp.ok) {
-        const data = await resp.json()
-        if (data.events) {
-          for (const evt of data.events) {
-            eventSeqs.add(evt.seq ?? 0)
-            handleEventForSession(evt)
-          }
-        }
-      }
-    } catch {
-      messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
-    }
-  } else {
+  // Resolve the live session id from the server (not a stale client value), then
+  // replay all its persisted runs. Live events that stream in during the replay
+  // are buffered and flushed by finishReplay() at the boundary.
+  try {
+    const status = await fetch(`${API_BASE}/status`).then(r => r.json())
+    currentLiveSessionId = status?.sessionId ?? ''
+    const sessions = await fetch(`${API_BASE}/logs`).then(r => r.json()).catch(() => [])
+    const live = Array.isArray(sessions) ? sessions.find(s => s.id === currentLiveSessionId) : null
+    liveRunMaxSeq = await replaySessionRuns(live?.runs ?? [])
+  } catch { /* leave whatever rendered; the boundary flush still runs below */ }
+
+  finishReplay()
+  if (!messagesEl.children.length) {
     messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
   }
+
   $('session-banner').classList.remove('visible')
   $('resume-btn').disabled = false
   $('resume-btn').textContent = '▶ Resume'
@@ -1277,22 +1400,18 @@ function formatDate(iso) {
   return d.toLocaleDateString()
 }
 
+// Replays the live session's persisted events on page load, so a refresh — even
+// mid-run, even after time with no UI connected (the agent keeps persisting to
+// its JSONL regardless) — restores the full conversation and trace. The
+// replay/live boundary is handled by boot(): `replaying` is true on load, so
+// live SSE events are buffered and flushed once this replay completes.
 async function loadHistory() {
-  // Reload live session from JSONL events on startup
-  if (currentLiveSessionId) {
-    try {
-      const resp = await fetch(`${API_BASE}/logs/${encodeURIComponent(currentLiveSessionId)}`)
-      if (resp.ok) {
-        const data = await resp.json()
-        if (data.events) {
-          for (const evt of data.events) {
-            eventSeqs.add(evt.seq ?? 0)
-            handleEventForSession(evt)
-          }
-        }
-      }
-    } catch { /* no events yet */ }
-  }
+  if (!currentLiveSessionId) return
+  try {
+    const sessions = await fetch(`${API_BASE}/logs`).then(r => r.json()).catch(() => [])
+    const live = Array.isArray(sessions) ? sessions.find(s => s.id === currentLiveSessionId) : null
+    liveRunMaxSeq = await replaySessionRuns(live?.runs ?? [])
+  } catch { /* no events yet */ }
 }
 
 // ── Panel resize ─────────────────────────────────────────────────
@@ -1369,11 +1488,22 @@ $('no-workspace-path').addEventListener('keydown', e => {
 async function boot() {
   const status = await fetch(`${API_BASE}/status`).then(r => r.json()).catch(() => ({}))
   showEnvBanner(status.env)
-  if (!window.__WS__ && !status.workspacePath) { showNoWorkspaceScreen(); return }
+  if (!window.__WS__ && !status.workspacePath) { showNoWorkspaceScreen(); finishReplay(); return }
 
+  currentLiveSessionId = status.sessionId ?? ''
   loadModels()
   refreshGitLog()
-  loadHistory()
+  // Drop the static index.html placeholder before replaying (returnToCurrentSession
+  // and viewSession clear likewise); the empty-session placeholder is re-added below.
+  messagesEl.innerHTML = ''
+  // Replay persisted events first, THEN open the replay/live boundary: `replaying`
+  // is true from module load so any live SSE events that arrived meanwhile are
+  // buffered, and finishReplay() renders them (deduped) once the replay is done.
+  await loadHistory()
+  finishReplay()
+  if (!messagesEl.children.length) {
+    messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
+  }
   initNav()
   refreshFiles()
   initResize('panel-resize', () => $('chat-panel').getBoundingClientRect().width, '--chat-width', 240)

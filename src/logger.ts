@@ -354,16 +354,19 @@ export async function readLog(filename: string): Promise<{ jsonl: string; md: st
   }
 }
 
-export async function readLogEvents(filename: string): Promise<AgentEvent[]> | null {
+export async function readLogEvents(filename: string): Promise<Array<AgentEvent & { __seq: number }> | null> {
   try {
     const content = await fs.readFile(path.join(LOGS_DIR, `${filename}.jsonl`), 'utf-8')
     const lines_arr = content.trim().split('\n').filter(l => l.trim())
-    const events: AgentEvent[] = []
+    const events: Array<AgentEvent & { __seq: number }> = []
     for (const line of lines_arr) {
       const parsed = JSON.parse(line) as LogEntryJson
       // Skip the meta line (not a real event entry for replay purposes)
       if (parsed.event && typeof parsed.event === 'object' && parsed.event.type === '__meta__') continue
-      events.push(parsed.event)
+      // Merge the per-run seq onto the event: the browser dedupes replayed events
+      // against the live SSE stream (which carries the same __seq) at reconnect.
+      // Object.assign is typed to return the intersection, so no cast is needed.
+      events.push(Object.assign({ __seq: parsed.seq }, parsed.event))
     }
     return events
   } catch {

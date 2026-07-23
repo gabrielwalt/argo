@@ -29,35 +29,23 @@
 - `SessionLogger.flush()`: waits for all pending writes, then appends the meta line as the first line of the file.
 - The `.md` trace is generated from the same entries (unchanged).
 
-### Server Routes (`src/server.ts`)
-- **`GET /events`** (existing): SSE endpoint streaming `AgentEvent` objects to connected browsers.
-- **`GET /api/logs/:filename`**: returns raw JSONL content as text/plain for client-side replay.
+### Server Routes (`src/server.ts`) — as implemented
+- **`GET /events`** (SSE): streams each event as `{ ...AgentEvent, __seq }`. The per-run `seq` is attached at the bus boundary in the `Agent` emit callback (the agent passes `logger.getSeq()` as a second arg to its `emit`), so the live stream carries the same `seq` the JSONL persists — this is the dedup key.
+- **`GET /logs/:filename`**: returns `{ events }` for ONE run file — `readLogEvents` parses the run's JSONL, skips the `__meta__` line, and merges the per-run `seq` onto each event as `__seq`. There is NO session-level replay endpoint; the client lists a session's runs via `GET /logs` (`listSessions`, which sorts each session's `runs` by `startedAt`) and fetches each run file in order.
 - All DOM-persistence routes (`/api/dom`, `.argo/dom/`) are removed.
 
-### Client Rendering (`public/app.js`)
-- **Shared rendering path**: `handleEvent(event)` (existing) renders a single event to `messagesEl`. Both live SSE and historical replay call this same function — zero duplication.
-- **Page load / session switch**: fetch the JSONL via `/api/logs/:filename`, parse all lines, call `handleEvent()` for each event in order. Track the max `seq` from the file. Start SSE and deduplicate: skip any SSE event with `seq <= maxSeq`.
-- **Active runs during replay**: since events are written incrementally, the JSONL always contains everything emitted so far (no gap between disk state and what the user has seen via SSE). The SSE deduplication handles the tiny window between reading the file and starting SSE.
-- **Multi-turn sessions**: each turn is a separate run with its own JSONL. The client iterates over runs, replays each in order, tracking max seq across all for SSE deduplication.
-- **Returning from viewing a past session to current live session**: fetch the current session's JSONL (which has incremental writes), replay everything via `handleEvent()`, then start SSE with deduplication. No DOM snapshot needed.
-- **newSession()**: no longer clears any caches — just creates a fresh session and starts rendering from SSE.
+### Client Rendering (`public/app.js`) — as implemented
+- **Two render paths, shared DOM helpers (NOT one shared dispatcher).** The plan was to route live + replay through one `handleEvent`, but they legitimately differ, so replay has its own dispatcher: live `handleEvent(event)` also drives live-only side effects (status bar, busy state, git/file refreshes, iteration/token counters) and does NOT render user messages (the submit handler adds them optimistically); replay `handleEventForSession(event)` omits all those side effects and DOES render user messages (no submit handler on replay). Both call the same DOM builders (`startTraceBlock`/`addTraceItem`/`addChatMessage`/`finalizeTraceBlock`), so visual output matches.
+- **`replaySessionRuns(runs)`**: fetches `GET /logs/:filename` per run (runs sorted by `startedAt`), rendering each run's events in file order via `handleEventForSession`; returns the last `__seq` (the current run's high-water mark).
+- **Page load / return-to-live**: `boot()` sets `currentLiveSessionId` from `/status`, replays the live session's runs (`loadHistory` → `replaySessionRuns`), then `finishReplay()`. `returnToCurrentSession()` does the same on demand.
+- **Viewing a past session**: `viewSession()` clears `messagesEl` and replays that session's runs; live SSE keeps arriving but `handleEvent` suppresses its rendering while `viewingSession` is set, so no dedup/buffering is needed there.
 
-### Deduplication Algorithm
-```
-maxSeq = 0
-for each run in session:
-    lines = await readLogLines(run.filename)
-    for line in lines:
-        if line.seq > maxSeq: maxSeq = line.seq
-        handleEvent(line.event)
-
-// Start SSE
-es.onmessage = (e) => {
-    const event = JSON.parse(e.data)
-    if ('seq' in event && event.seq <= maxSeq) return // dedup
-    handleEvent(event)
-}
-```
+### Replay/live boundary (dedup) — as implemented
+- State: `replaying` (buffer live events while true — starts true for the initial page-load replay), `pendingEvents` (the buffer), `liveRunMaxSeq` (per-run high-water mark).
+- `es.onmessage`: if `replaying`, push to `pendingEvents`; else `handleLiveEvent(event)`.
+- `handleLiveEvent`: when not viewing a past session, dedup by `__seq` — `if (__seq === 1) liveRunMaxSeq = 0` (seq is per-run, so `1` marks a new run's first event, the user message that precedes `start`), then skip if `__seq <= liveRunMaxSeq`, else render and advance the mark.
+- `finishReplay()`: sets `replaying = false`, then flushes `pendingEvents` through `handleLiveEvent` (in order, deduped). This is the boundary: no gaps (buffered events flushed) and no duplicates (`__seq` high-water drops any the replay already covered).
+- Known limitation (verify in a browser): if `EventSource` connects only AFTER the replay snapshot AND an event's async JSONL append lagged past the snapshot, that single event could be missed — a narrow race at the first ms of page load. A perfect fix needs a server "stream since seq X" cursor, which is more than the smallest mechanism.
 
 ### Multi-Workspace / Multi-Session Isolation
 - Each workspace has its own `LOGS_DIR`. The `.jsonl` files live inside each workspace's logs directory — cross-workspace isolation is automatic.

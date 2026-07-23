@@ -219,7 +219,7 @@ export class Agent {
   // without a live model (same rationale as loadProjectContext's workspaceRoot);
   // production always uses the default client.
   constructor(
-    private emit: (event: AgentEvent) => void,
+    private emit: (event: AgentEvent, seq?: number) => void,
     model?: string,
     ollama?: Ollama,
   ) {
@@ -310,7 +310,7 @@ export class Agent {
     const logger = new SessionLogger('Manual context compaction', this.model, this.options, this.sessionId)
     const emitAndLog = (event: AgentEvent) => {
       logger.log(event)
-      this.emit(event)
+      this.emit(event, logger.getSeq())   // seq for UI replay/live dedup (see chat())
     }
     try {
       const currentRunStart = this.history.length - 1
@@ -479,7 +479,11 @@ export class Agent {
 
     const emitAndLog = (event: AgentEvent) => {
       logger.log(event)
-      this.emit(event)
+      // Pass the seq log() just assigned (it pushes synchronously, before its
+      // first await, so getSeq() already reflects this event) so the SSE stream
+      // carries the same per-run seq the JSONL persists — this is what lets the
+      // UI dedupe replayed-vs-live events at the reconnect boundary.
+      this.emit(event, logger.getSeq())
     }
 
     this.history.push({ role: 'user', content: userMessage })

@@ -1,7 +1,7 @@
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'fs/promises'
-import { SessionLogger, readLog, LOGS_DIR } from './logger.js'
+import { SessionLogger, readLog, readLogEvents, LOGS_DIR } from './logger.js'
 import type { AgentEvent } from './types.js'
 
 // Every AgentEvent variant must produce non-empty, type-specific Markdown —
@@ -68,3 +68,31 @@ for (const event of sampleEvents) {
     }
   })
 }
+
+// readLogEvents is the server-side contract the UI's replay + live-dedup depends
+// on: each replayed event must carry the per-run __seq that the live SSE stream
+// also carries, and the __meta__ line must never leak into the event stream.
+test('readLogEvents attaches the per-run __seq to each event and skips the meta line', async () => {
+  const logger = new SessionLogger('logger-test-readlogevents', 'test-model', {})
+  const events: AgentEvent[] = [
+    { type: 'message', role: 'user', content: 'FIRST_MARKER' },
+    { type: 'start', model: 'test-model', query: 'q', options: {} },
+    { type: 'thought', content: 'SECOND_MARKER' },
+    { type: 'done', content: 'THIRD_MARKER' },
+  ]
+  for (const e of events) logger.log(e)
+  await logger.flush()
+  const filename = logger.getFilename()
+  writtenFilenames.push(filename)
+
+  const replayed = await readLogEvents(filename)
+  assert.ok(replayed, 'expected readLogEvents to return events')
+  // Same count/order as logged — and since flush() prepends a __meta__ line to
+  // the file, an equal length proves the meta line was skipped, not replayed.
+  assert.equal(replayed!.length, events.length)
+  assert.deepEqual(replayed!.map(e => e.type), ['message', 'start', 'thought', 'done'])
+  // Per-run seq, 1-based and monotonic — the exact key the browser dedupes on.
+  assert.deepEqual(replayed!.map(e => e.__seq), [1, 2, 3, 4])
+  const first = replayed![0]
+  assert.ok(first.type === 'message' && first.content === 'FIRST_MARKER', 'event content must survive intact')
+})
