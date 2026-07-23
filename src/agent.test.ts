@@ -251,3 +251,95 @@ test('repetition guard: repeating again after the warning ends the run cleanly i
     await cleanupSession(sessionId, 'argo-repetition-guard-case-c')
   }
 })
+
+// ── Single automatic retry of a failed per-iteration Ollama call. The stub's
+// chat() throws on scripted attempts and resolves on others, and reports how
+// many times it was invoked so tests can assert exactly one retry (two calls).
+
+function flakyOllama(behaviors: Array<ScriptedResponse | Error>): { ollama: Ollama; getCalls: () => number } {
+  let i = 0
+  let calls = 0
+  const ollama = {
+    // Repeats the last behavior if invoked beyond the script.
+    chat: async () => {
+      calls++
+      const b = behaviors[Math.min(i++, behaviors.length - 1)]
+      if (b instanceof Error) throw b
+      return b
+    },
+  } as unknown as Ollama
+  return { ollama, getCalls: () => calls }
+}
+
+test('chat retry: a failed per-iteration call is retried once and the run continues', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-chat-retry-a-${Date.now()}`
+  // First chat() call throws (e.g. a timeout / backend parse error); the retry succeeds.
+  const { ollama, getCalls } = flakyOllama([new Error('Ollama did not respond within 180s'), finalAnswer])
+  const agent = new Agent(e => events.push(e), 'test-model', ollama)
+  agent.setSessionId(sessionId)
+  agent.setChatRetryDelayMs(0)  // don't actually wait before retrying, in the test
+  try {
+    const answer = await agent.chat('argo chat retry case a')
+
+    assert.equal(answer, 'Final answer.')            // returns the eventual success, not an error
+    assert.equal(getCalls(), 2)                      // original + exactly one retry
+    assert.equal(warningsMatching(events, /Ollama request failed .* retrying once/).length, 1)
+    assert.equal(events.some(e => e.type === 'error'), false)  // no run-ending error
+  } finally {
+    await cleanupSession(sessionId, 'argo-chat-retry-case-a')
+  }
+})
+
+test('chat retry: if both the call and its retry fail, the outer-catch error behavior is unchanged', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-chat-retry-b-${Date.now()}`
+  // Both the original and the retry throw — no third attempt; the second error propagates.
+  const { ollama, getCalls } = flakyOllama([new Error('boom-1'), new Error('boom-2')])
+  const agent = new Agent(e => events.push(e), 'test-model', ollama)
+  agent.setSessionId(sessionId)
+  agent.setChatRetryDelayMs(0)
+  try {
+    const answer = await agent.chat('argo chat retry case b')
+
+    assert.equal(getCalls(), 2)                       // original + one retry only, then it stops
+    assert.match(answer, /^Unexpected error: boom-2/) // returns the existing outer-catch message
+    const err = events.find((e): e is Extract<AgentEvent, { type: 'error' }> => e.type === 'error')
+    assert.ok(err)
+    assert.match(err.message, /^Unexpected error: boom-2/)  // still emits one error event
+    assert.equal(events.filter(e => e.type === 'error').length, 1)
+    assert.equal(warningsMatching(events, /Ollama request failed .* retrying once/).length, 1)  // first failure warned before retrying
+  } finally {
+    await cleanupSession(sessionId, 'argo-chat-retry-case-b')
+  }
+})
+
+test('chat retry: a stop issued during the retry wait is honored and no retry is attempted', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-chat-retry-c-${Date.now()}`
+  // The first chat() call aborts the run mid-flight, then throws. The retry must
+  // NOT be issued; if it were, chat() would (wrongly) return 'Final answer.'.
+  let agent: Agent
+  let calls = 0
+  const ollama = {
+    chat: async () => {
+      calls++
+      if (calls === 1) { agent.abort(); throw new Error('boom-during-first') }
+      return finalAnswer
+    },
+  } as unknown as Ollama
+  agent = new Agent(e => events.push(e), 'test-model', ollama)
+  agent.setSessionId(sessionId)
+  agent.setChatRetryDelayMs(0)
+  try {
+    const answer = await agent.chat('argo chat retry case c')
+
+    assert.equal(answer, 'Stopped.')                  // honored the abort, did not retry
+    assert.equal(calls, 1)                            // the retry attempt was skipped
+    const done = events.find((e): e is Extract<AgentEvent, { type: 'done' }> => e.type === 'done')
+    assert.equal(done?.content, 'Stopped.')
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-chat-retry-case-c')
+  }
+})

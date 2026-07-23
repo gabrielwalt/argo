@@ -40,4 +40,12 @@ export const config = {
   // crash, thanks to the catch in chat(); the user just got a clean error and
   // had to retry, and the retry answered normally).
   chatTimeoutMs:           parseInt(process.env.CHAT_TIMEOUT_MS ?? '180000', 10),
+  // Delay before the single automatic retry of a failed main per-iteration chat
+  // call (see chatWithRetry in agent.ts). Two real incidents ended a whole run
+  // with no retry: a 180s timeout, and Ollama's Go backend rejecting a malformed
+  // qwen3.6 tool-call ("XML syntax error ... <function> closed by </parameter>").
+  // Since temperature is > 0, re-issuing the identical request has a real chance
+  // of succeeding. This is a brief settle before one retry, not a backoff — only
+  // a single retry is ever attempted, then the existing outer catch takes over.
+  chatRetryDelayMs:        parseInt(process.env.CHAT_RETRY_DELAY_MS ?? '2000', 10),
 }

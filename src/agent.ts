@@ -292,6 +292,11 @@ export class Agent {
 
   abort() { this.aborted = true }
 
+  // Sourced from config so it's env-tunable in production; held as a field only
+  // so tests can drop it to 0 and not wait in real time. See chatWithRetry.
+  private chatRetryDelayMs = config.chatRetryDelayMs
+  setChatRetryDelayMs(ms: number) { this.chatRetryDelayMs = Math.max(0, Math.trunc(ms)) }
+
   // Lets the user force compaction between turns (server.ts's POST /compact-now,
   // guarded the same way /reset is — only when the agent isn't mid-run). Reuses
   // compactHistory exactly as the automatic 66.7%-threshold path does: the most
@@ -404,6 +409,47 @@ export class Agent {
     return { newRunStart, compacted: true }
   }
 
+  // Issues one main per-iteration chat call (system prompt + full history) with
+  // the standard timeout. Extracted only so chatWithRetry can re-issue the
+  // *identical* request on retry without duplicating the argument literal.
+  // Return type is intentionally inferred (Promise<ChatResponse>) to avoid
+  // importing the ollama response type.
+  private chatCall(systemPrompt: string) {
+    return withTimeout(this.ollama.chat({
+      model: this.model,
+      messages: [{ role: 'system', content: systemPrompt }, ...this.history],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      tools: toolDefinitions as any[],
+      stream: false,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      options: this.options as any,
+    }), config.chatTimeoutMs)
+  }
+
+  // The main per-iteration chat call with ONE automatic retry. This is safe to
+  // retry (and only this call — never tool execution): it runs before any tool
+  // has executed this iteration, so nothing has side-effected yet, making it
+  // idempotent from the loop's perspective. A failure here — withTimeout's own
+  // timeout, or a thrown error from the Ollama client (e.g. its Go backend
+  // rejecting a malformed qwen3.6 tool-call as an XML parse error) — used to end
+  // the entire run at the outer catch with no retry and no user action. Since
+  // temperature is > 0 the re-issued identical request has a real chance of
+  // succeeding. Only one retry is attempted: a second failure is rethrown to
+  // chat()'s outer catch (the existing safety net). Returns null iff the user
+  // aborted during the retry wait, so the caller stops instead of retrying into
+  // a run the user already asked to stop. Return type inferred as
+  // Promise<ChatResponse | null>.
+  private async chatWithRetry(systemPrompt: string, emitAndLog: (e: AgentEvent) => void) {
+    try {
+      return await this.chatCall(systemPrompt)
+    } catch (err) {
+      emitAndLog({ type: 'warning', message: `Ollama request failed (${err instanceof Error ? err.message : String(err)}) — retrying once` })
+      await new Promise(resolve => setTimeout(resolve, this.chatRetryDelayMs))
+      if (this.aborted) return null
+      return await this.chatCall(systemPrompt)
+    }
+  }
+
   async chat(userMessage: string): Promise<string> {
     const logger = new SessionLogger(userMessage, this.model, this.options, this.sessionId)
 
@@ -439,15 +485,16 @@ export class Agent {
 
         emitAndLog({ type: 'ollama_request', iteration: i + 1, message_count: this.history.length + 1, model: this.model })
 
-        const response = await withTimeout(this.ollama.chat({
-          model: this.model,
-          messages: [{ role: 'system', content: systemPrompt }, ...this.history],
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          tools: toolDefinitions as any[],
-          stream: false,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          options: this.options as any,
-        }), config.chatTimeoutMs)
+        const response = await this.chatWithRetry(systemPrompt, emitAndLog)
+        if (response === null) {
+          // The user aborted while chatWithRetry was waiting to retry. Mirror the
+          // top-of-loop stop handling exactly rather than retrying into a run the
+          // user already asked to stop.
+          this.aborted = false
+          const stopped = 'Stopped.'
+          emitAndLog({ type: 'done', content: stopped })
+          return stopped
+        }
 
         const numCtx = this.options.num_ctx ?? 65536
         if (response.prompt_eval_count != null) {
