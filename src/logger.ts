@@ -40,6 +40,7 @@ export async function unregisterSession(id: string): Promise<void> {
 
 interface LogEntry {
   ts: string
+  seq: number
   event: AgentEvent
 }
 
@@ -62,11 +63,19 @@ export interface SessionGroup {
   runs: LogMeta[]
 }
 
+/** Serializable form of a log entry (used when writing JSONL lines). */
+interface LogEntryJson {
+  ts: string
+  seq: number
+  event: AgentEvent
+}
+
 export class SessionLogger {
   private entries: LogEntry[] = []
   private startTs = Date.now()
   private filename: string
   private meta: LogMeta
+  private writeQueue: Promise<void> = Promise.resolve()
 
   constructor(query: string, model: string, options: ModelOptions = {}, sessionId?: string) {
     const slug = query.slice(0, 40).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')
@@ -84,33 +93,66 @@ export class SessionLogger {
     }
   }
 
-  log(event: AgentEvent) {
-    const entry: LogEntry = { ts: new Date().toISOString(), event }
+  /** Current highest sequence number (0 before any events). */
+  getSeq(): number {
+    return this.entries.length > 0
+      ? this.entries[this.entries.length - 1].seq
+      : 0
+  }
+
+  /** Enqueue an event for incremental JSONL write. Returns immediately. */
+  async log(event: AgentEvent): Promise<void> {
+    const seq = this.entries.length + 1
+    const entry: LogEntry = { ts: new Date().toISOString(), seq, event }
     this.entries.push(entry)
 
     if (event.type === 'tool_call') this.meta.toolCalls++
     if (event.type === 'iteration') this.meta.iterations = event.current
     if (event.type === 'done') this.meta.status = 'done'
     if (event.type === 'error') this.meta.status = 'error'
+
+    // Enqueue incremental write in order (serial queue)
+    const line = JSON.stringify(entry) + '\n'
+    this.writeQueue = this.writeQueue.then(() =>
+      fs.appendFile(path.join(LOGS_DIR, `${this.filename}.jsonl`), line, 'utf-8')
+    )
+
+    // Ensure the logs directory exists
+    await fs.mkdir(LOGS_DIR, { recursive: true })
   }
 
+  /** Wait for all pending incremental writes, then append meta line. */
   async flush() {
     this.meta.durationMs = Date.now() - this.startTs
+    await this.writeQueue // wait for all prior writes to complete
     await fs.mkdir(LOGS_DIR, { recursive: true })
 
-    // JSONL: one event per line, easy to grep/parse
-    const jsonl = [
-      JSON.stringify({ ts: this.meta.startedAt, event: { type: '__meta__', ...this.meta } }),
-      ...this.entries.map(e => JSON.stringify(e)),
-    ].join('\n') + '\n'
+    // Write meta as the first line (prepend via read-modify-write)
+    const existingContent = await fs.readFile(path.join(LOGS_DIR, `${this.filename}.jsonl`), 'utf-8')
+    const metaLine = JSON.stringify({ ts: this.meta.startedAt, event: { type: '__meta__', ...this.meta } }) + '\n'
+    await fs.writeFile(path.join(LOGS_DIR, `${this.filename}.jsonl`), metaLine + existingContent, 'utf-8')
 
-    // Markdown: human-readable trace
+    // Markdown: human-readable trace (unchanged)
     const md = this.toMarkdown()
+    await fs.writeFile(path.join(LOGS_DIR, `${this.filename}.md`), md, 'utf-8')
+  }
 
-    await Promise.all([
-      fs.writeFile(path.join(LOGS_DIR, `${this.filename}.jsonl`), jsonl, 'utf-8'),
-      fs.writeFile(path.join(LOGS_DIR, `${this.filename}.md`), md, 'utf-8'),
-    ])
+  /** Read the JSONL file and return parsed events, skipping malformed lines. */
+  async readLogLines(): Promise<LogEntry[]> {
+    try {
+      const content = await fs.readFile(path.join(LOGS_DIR, `${this.filename}.jsonl`), 'utf-8')
+      const lines = content.trim().split('\n').filter(l => l.trim())
+      return lines
+        .map(line => {
+          const parsed = JSON.parse(line) as LogEntryJson
+          // Skip the meta line (not a real event entry for replay purposes)
+          if (parsed.event && typeof parsed.event === 'object' && parsed.event.type === '__meta__') return null
+          return parsed as unknown as LogEntry
+        })
+        .filter((l): l is LogEntry => l !== null)
+    } catch {
+      return []
+    }
   }
 
   private toMarkdown(): string {
@@ -169,18 +211,16 @@ export class SessionLogger {
           currentIter = event.current
           lines.push(`---`)
           lines.push(``)
-          lines.push(`### Iteration ${event.current} / ${event.max}`)
-          lines.push(``)
           break
 
         case 'ollama_request':
-          lines.push(`*→ Ollama · ${event.message_count} msgs in context · \`${event.model}\`*`)
+          lines.push(`*Ollama request · iter \`${event.iteration}\` · ${event.message_count} messages · \`${event.model}\`*`)
           lines.push(``)
           break
 
         case 'token_usage': {
           const pct = Math.round(event.prompt_tokens / event.num_ctx * 100)
-          lines.push(`*Context: ${event.prompt_tokens.toLocaleString()} prompt + ${event.generated_tokens.toLocaleString()} generated / ${event.num_ctx.toLocaleString()} ctx (${pct}%)*`)
+          lines.push(`*Context usage · **${event.prompt_tokens.toLocaleString()}** / ${event.num_ctx.toLocaleString()} ctx (${pct}%)*`)
           lines.push(``)
           break
         }
@@ -314,6 +354,23 @@ export async function readLog(filename: string): Promise<{ jsonl: string; md: st
   }
 }
 
+export async function readLogEvents(filename: string): Promise<AgentEvent[]> | null {
+  try {
+    const content = await fs.readFile(path.join(LOGS_DIR, `${filename}.jsonl`), 'utf-8')
+    const lines_arr = content.trim().split('\n').filter(l => l.trim())
+    const events: AgentEvent[] = []
+    for (const line of lines_arr) {
+      const parsed = JSON.parse(line) as LogEntryJson
+      // Skip the meta line (not a real event entry for replay purposes)
+      if (parsed.event && typeof parsed.event === 'object' && parsed.event.type === '__meta__') continue
+      events.push(parsed.event)
+    }
+    return events
+  } catch {
+    return null
+  }
+}
+
 export async function listSessions(): Promise<SessionGroup[]> {
   const [logs, registry] = await Promise.all([listLogs(), readRegistry()])
 
@@ -379,7 +436,8 @@ export async function getSessionMessages(sessionId: string): Promise<Array<{ rol
     if (!log) continue
     for (const line of log.jsonl.trim().split('\n')) {
       try {
-        const { event } = JSON.parse(line)
+        const parsed = JSON.parse(line) as LogEntryJson
+        const { event } = parsed
         if (event.type === 'message' && event.content) {
           messages.push({ role: event.role, content: event.content })
         }

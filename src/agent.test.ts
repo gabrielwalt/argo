@@ -6,6 +6,7 @@ import path from 'path'
 import { config } from './config.js'
 import { LOGS_DIR } from './logger.js'
 import type { AgentEvent } from './types.js'
+import type { Ollama } from 'ollama'
 import { Agent, parseChangedFiles, buildFallbackCommitMessage, isCleanStatus, loadProjectContext } from './agent.js'
 import { NO_OUTPUT } from './tools/bash.js'
 
@@ -148,5 +149,105 @@ test('loadProjectContext: an oversized MEMORY.md is truncated, not sent in full'
     assert.match(result, /chars omitted/)
   } finally {
     await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+// ── Repetition guard (chat() loop). These drive the loop with a scripted
+// Ollama client (the injectable constructor seam), so they need no live model.
+// read_file on a nonexistent path returns a graceful error result without a
+// container/network, so each "executed" call is deterministic and side-effect-free.
+
+type ScriptedResponse = {
+  message: { role: string; content: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> }
+}
+
+// Returns each response in turn, then repeats the last one indefinitely — so a
+// test can either end the run (final answer as the last element) or exercise a
+// model that never stops repeating (tool call as the last element).
+function scriptedOllama(responses: ScriptedResponse[]): Ollama {
+  let i = 0
+  return {
+    chat: async () => responses[Math.min(i++, responses.length - 1)],
+  } as unknown as Ollama
+}
+
+const REPEAT_ARGS = { path: '/nonexistent-argo-repetition-guard-test' }
+const readCall: ScriptedResponse = {
+  message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'read_file', arguments: REPEAT_ARGS } }] },
+}
+const finalAnswer: ScriptedResponse = { message: { role: 'assistant', content: 'Final answer.' } }
+
+function readResults(events: AgentEvent[]): AgentEvent[] {
+  return events.filter(e => e.type === 'tool_result' && e.tool === 'read_file')
+}
+function warningsMatching(events: AgentEvent[], re: RegExp): AgentEvent[] {
+  return events.filter(e => e.type === 'warning' && re.test(e.message))
+}
+async function cleanupSession(sessionId: string, slug: string): Promise<void> {
+  await Promise.all([
+    fs.unlink(`${LOGS_DIR}/history-${sessionId}.json`).catch(() => {}),
+    fs.unlink(`${LOGS_DIR}/compaction-${sessionId}.json`).catch(() => {}),
+    fs.readdir(LOGS_DIR).then(files =>
+      Promise.all(files.filter(f => f.includes(slug)).map(f => fs.unlink(`${LOGS_DIR}/${f}`).catch(() => {})))
+    ).catch(() => {}),
+  ])
+}
+
+test('repetition guard: a 4th identical tool call is intervened, not executed a 4th time', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-repeat-a-${Date.now()}`
+  // read, read, read, (4th identical read → intervention), then a final answer.
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, readCall, readCall, readCall, finalAnswer]))
+  agent.setSessionId(sessionId)
+  try {
+    await agent.chat('argo repetition guard case a')
+
+    assert.equal(readResults(events).length, 3)  // the 4th identical call was blocked
+    assert.equal(warningsMatching(events, /repeated 3 times with no new information/).length, 1)
+
+    // One warning, then a clean model-produced final answer — not a forced stop.
+    const done = events.find((e): e is Extract<AgentEvent, { type: 'done' }> => e.type === 'done')
+    assert.equal(done?.content, 'Final answer.')
+  } finally {
+    await cleanupSession(sessionId, 'argo-repetition-guard-case-a')
+  }
+})
+
+test('repetition guard: 2 identical calls stay under threshold and do not intervene', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-repeat-b-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, readCall, finalAnswer]))
+  agent.setSessionId(sessionId)
+  try {
+    await agent.chat('argo repetition guard case b')
+
+    assert.equal(readResults(events).length, 2)  // both executed for real
+    assert.equal(warningsMatching(events, /repeated \d+ times with no new information/).length, 0)
+  } finally {
+    await cleanupSession(sessionId, 'argo-repetition-guard-case-b')
+  }
+})
+
+test('repetition guard: repeating again after the warning ends the run cleanly instead of looping', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-repeat-c-${Date.now()}`
+  // The model never stops repeating: readCall is the last element, so it recurs
+  // for every subsequent iteration. Escalation must terminate the run.
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall]))
+  agent.setSessionId(sessionId)
+  agent.setMaxIterations(10)  // safety net: if escalation failed, the run would hit max iterations (an `error`), not hang
+  try {
+    const answer = await agent.chat('argo repetition guard case c')
+
+    assert.equal(readResults(events).length, 3)  // never executed a 4th time
+    assert.equal(warningsMatching(events, /repeated 3 times with no new information/).length, 1)  // first (and only) warning
+    assert.equal(warningsMatching(events, /repeated again after a warning/).length, 1)  // escalation
+
+    // Ended via `done`, not by exhausting iterations.
+    assert.ok(events.some(e => e.type === 'done'))
+    assert.equal(events.some(e => e.type === 'error'), false)
+    assert.match(answer, /even after a warning/)
+  } finally {
+    await cleanupSession(sessionId, 'argo-repetition-guard-case-c')
   }
 })

@@ -9,7 +9,7 @@ import { promises as fs } from 'fs'
 import type { Dirent } from 'fs'
 import { config } from './config.js'
 import { Agent } from './agent.js'
-import { listLogs, readLog, listSessions, deleteAllLogs, deleteSession, getSessionMessages, registerSession, LOGS_DIR } from './logger.js'
+import { listLogs, readLog, readLogEvents, listSessions, deleteAllLogs, deleteSession, getSessionMessages, registerSession, LOGS_DIR } from './logger.js'
 import type { AgentEvent, ModelOptions } from './types.js'
 import { checkEnvironment, logEnvironment, type EnvCheck } from './health.js'
 import { installAuth } from './auth.js'
@@ -110,7 +110,6 @@ app.get('/history', (req, res) => {
   res.json(agent.getChatHistory())
 })
 
-// Stop current agent run (soft abort — takes effect between iterations)
 app.post('/stop', (_req, res) => {
   agent.abort()
   res.json({ ok: true })
@@ -256,18 +255,28 @@ app.post('/resume/:sessionId', async (req, res) => {
   res.json({ ok: true, count: agent.getChatHistory().length })
 })
 
-// Get a specific log (jsonl or md)
+// Get structured events from a log file for replay (returns JSON event array)
 app.get('/logs/:filename', async (req, res) => {
-  const { filename } = req.params
-  if (path.basename(filename) !== filename) { res.status(400).send('Invalid filename'); return }
-  const format = (req.query.format as string) ?? 'md'
-  const log = await readLog(filename)
-  if (!log) { res.status(404).send('Not found'); return }
-  if (format === 'jsonl') {
-    res.type('text/plain').send(log.jsonl)
-  } else {
-    res.type('text/plain').send(log.md)
+  const filename = req.params.filename
+  if (path.basename(filename) !== filename) { res.status(400).json({ error: 'Invalid filename' }); return }
+  const events = await readLogEvents(filename)
+  if (!events) {
+    // Fallback: serve raw JSONL for legacy sessions without event structure
+    try {
+      const log = await readLog(filename)
+      if (!log) { res.status(404).json({ error: 'Log not found' }); return }
+      const lines = log.jsonl.trim().split('\n').filter(l => l.trim())
+      const parsed: Array<Record<string, unknown>> = []
+      for (const line of lines) {
+        try { parsed.push(JSON.parse(line)) } catch {}
+      }
+      res.json({ events: parsed })
+    } catch {
+      res.status(404).json({ error: 'Log not found' })
+    }
+    return
   }
+  res.json({ events })
 })
 
 // ── File browser ─────────────────────────────────────────────────

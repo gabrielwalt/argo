@@ -453,7 +453,7 @@ argo/
 │   ├── index.ts                ← Entry point: central mode or worker/standalone
 │   ├── central.ts              ← Central server: workspace registry, Docker mgmt, proxy
 │   ├── server.ts               ← Worker/standalone: agent API, SSE, git, files endpoints
-│   ├── agent.ts                ← ReAct loop, Ollama integration, auto-commit
+│   ├── agent.ts                ← ReAct loop, Ollama integration, auto-commit, repetition guard
 │   ├── config.ts               ← Env vars, path resolution, mode flags
 │   ├── types.ts                ← Shared TypeScript types + ArgoEvent union
 │   ├── logger.ts               ← Per-session JSONL + Markdown log writer

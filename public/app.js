@@ -57,15 +57,9 @@ let sessionStartTime = new Date()
 let viewingSession = null  // null = current; object = past session being viewed
 let currentSessionQuery = ''  // first user message of the current session
 
-// -- Live session DOM cache (preserves trace blocks & messages across switches) --
-let liveDOMCache = null          // innerHTML of messagesEl while viewing a past session
-let liveMsgCache = []            // serial message objects for diffing on return
-
-// -- Per-session DOM snapshots (trace blocks, tool calls — survives reloads & workspace switches) --
-const sessionDOMMap = {}         // sessionId → DOM innerHTML snapshot
-const sessionMsgMap = {}         // sessionId → message array for server-side diff
-let liveDOMTimer = null          // debounce timer for live DOM persistence
-let currentLiveSessionId = ''    // the active session's ID (for DOM lookups)
+// ── Structured-event replay state ───────────────────────────
+let eventSeqs = new Set<number>();     // seq numbers seen during current view
+let pendingEvents: Array<{ ts: string; seq: number; event: AgentEvent }> = [];
 
 // ── Model options ────────────────────────────────────────────────
 const DEFAULTS = { temperature: 0.8, top_p: 0.9, top_k: 40, num_ctx: 65536 }
@@ -146,13 +140,6 @@ function startTraceBlock(model) {
   messagesEl.appendChild(block)
   messagesEl.scrollTop = messagesEl.scrollHeight
 
-  // Debounced persist of live session DOM while agent is thinking
-  if (!viewingSession && currentLiveSessionId) {
-    clearTimeout(liveDOMTimer)
-    liveDOMTimer = setTimeout(() => {
-      saveSessionDOM(currentLiveSessionId).catch(() => {})
-    }, 2000)
-  }
 
   currentTraceBlock = { el: block, items, title, meta, arrow }
 }
@@ -423,24 +410,9 @@ function addTraceItem(className, label, body, collapsible) {
 
   currentTraceBlock.items.appendChild(el)
   messagesEl.scrollTop = messagesEl.scrollHeight
-
-  // Debounced persist of live session DOM while agent is thinking
-  if (!viewingSession && currentLiveSessionId) {
-    clearTimeout(liveDOMTimer)
-    liveDOMTimer = setTimeout(() => {
-      saveSessionDOM(currentLiveSessionId).catch(() => {})
-    }, 2000)
-  }
   return el
 }
 
-function renderMarkdown(content) {
-  return marked.parse(content, { breaks: true, gfm: true })
-}
-
-function addChatMessage(role, content) {
-  const el = document.createElement('div')
-  el.className = `message ${role} md`
   el.innerHTML = renderMarkdown(content)
   el.querySelectorAll('a').forEach(a => a.setAttribute('target', '_blank'))
 
@@ -467,34 +439,19 @@ function addChatMessage(role, content) {
   }
 
   // Cache live message for session-switch persistence
-  if (!viewingSession) liveMsgCache.push({ role, content })
+  // Track event for structured replay (role+content extracted by SSE handler)
   messagesEl.appendChild(el)
   messagesEl.scrollTop = messagesEl.scrollHeight
 
-  // Debounced persist of live session DOM while agent is thinking
-  if (!viewingSession && currentLiveSessionId) {
-    clearTimeout(liveDOMTimer)
-    liveDOMTimer = setTimeout(() => {
-      saveSessionDOM(currentLiveSessionId).catch(() => {})
-    }, 2000)
-  }
-}
 
 function addSystemMessage(text) {
   const el = document.createElement('div')
   el.className = 'message system'
   el.textContent = text
   // Cache system message for session-switch persistence
-  if (!viewingSession) liveMsgCache.push({ role: "system", content: text })
+  // system messages tracked by SSE event stream
   messagesEl.appendChild(el)
   messagesEl.scrollTop = messagesEl.scrollHeight
-}
-
-// ── Chat form ────────────────────────────────────────────────────
-$('chat-form').addEventListener('submit', async (e) => {
-  e.preventDefault()
-  if (busy || viewingSession) return
-
   const message = inputEl.value.trim()
   if (!message) return
 
@@ -568,12 +525,7 @@ async function newSession() {
   currentTraceBlock = null
   updateSessionLabel()
   messagesEl.innerHTML = '<div class="message system">New session started.</div>'
-  // Clear caches on new session
-  liveDOMCache = null
-  liveMsgCache = []
-  // Clear per-session DOM caches on new session
-  for (const key in sessionDOMMap) delete sessionDOMMap[key]
-  for (const key in sessionMsgMap) delete sessionMsgMap[key]
+
   iterLabel.textContent = ''
   setStatus('ready', 'Ready')
   // Update live session ID so future DOM lookups use the right key
@@ -1053,28 +1005,34 @@ function isToday(date) {
 
 async function viewSession(sessionGroup) {
   viewingSession = sessionGroup
+  currentLiveSessionId = ''
   currentTraceBlock = null
   updateSessionLabel()
 
-  // Save current DOM to server before switching
-  await saveSessionDOM(currentLiveSessionId).catch(() => {})
-  messagesEl.innerHTML = ''
-  const d = new Date(sessionGroup.startedAt)
-  const dateStr = d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' · ' +
-    d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  addSystemMessage(`Session from ${dateStr}`)
+  // Replay all events from the session's runs in chronological order
+  const runs = sessionGroup.runs.sort((a, b) => a.startedAt.localeCompare(b.startedAt))
+  let allEvents: Array<{ ts: string; seq: number; event: AgentEvent }> = []
 
-  for (const run of sessionGroup.runs) {
+  for (const run of runs) {
     try {
-      const resp = await fetch(`${API_BASE}/logs/${run.filename}?format=jsonl`)
-      const text = await resp.text()
-      for (const line of text.trim().split('\n')) {
-        try {
-          const { event } = JSON.parse(line)
-          if (event.type === 'message') addChatMessage(event.role, event.content)
-        } catch { /* skip */ }
+      const resp = await fetch(`${API_BASE}/logs/${encodeURIComponent(run.filename)}`)
+      if (!resp.ok) continue
+      const data = await resp.json()
+      if (data.events) {
+        for (const evt of data.events) {
+          allEvents.push({ ts: evt.ts, seq: evt.seq ?? 0, event: evt })
+        }
       }
-    } catch { /* skip failed runs */ }
+    } catch { /* skip unreadable runs */ }
+  }
+
+  // Sort by timestamp then sequence number for correct ordering
+  allEvents.sort((a, b) => a.ts.localeCompare(b.ts) || a.seq - b.seq)
+
+  // Replay events through the standard rendering path
+  for (const e of allEvents) {
+    eventSeqs.add(e.seq)
+    handleEventForSession(e)
   }
 
   $('session-banner-label').textContent = `Viewing past session`
@@ -1083,25 +1041,37 @@ async function viewSession(sessionGroup) {
 }
 
 async function returnToCurrentSession() {
-  // Save past session DOM to server before switching back
-  if (viewingSession) {
-    await saveSessionDOM(viewingSession.id).catch(() => {})
-  }
-
   viewingSession = null
+  currentLiveSessionId = envStatus.sessionId ?? ''
+  messagesEl.innerHTML = ''
+  pendingEvents.length = 0
+  eventSeqs.clear()
+
+  // Reload from the live session's JSONL events
+  if (currentLiveSessionId) {
+    try {
+      const resp = await fetch(`${API_BASE}/logs/${encodeURIComponent(currentLiveSessionId)}`)
+      if (resp.ok) {
+        const data = await resp.json()
+        if (data.events) {
+          for (const evt of data.events) {
+            eventSeqs.add(evt.seq ?? 0)
+            handleEventForSession(evt)
+          }
+        }
+      }
+    } catch {
+      messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
+    }
+  } else {
+    messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
+  }
   $('session-banner').classList.remove('visible')
   $('resume-btn').disabled = false
   $('resume-btn').textContent = '▶ Resume'
   $('chat-form').style.display = ''
 
-  // Restore from in-memory map first (from earlier saves this session)
-  const storedDOM = sessionDOMMap[currentLiveSessionId]
-  if (storedDOM) {
-    liveMsgCache = [...(sessionMsgMap[currentLiveSessionId] || [])]
-    messagesEl.innerHTML = storedDOM
-  } else {
-    // Load DOM snapshot from server for this session
-    const hasDOM = await loadSessionDOM(currentLiveSessionId)
+
     if (!hasDOM) {
       try {
         const resp = await fetch(`${API_BASE}/history`)
@@ -1270,9 +1240,6 @@ async function initNav() {
         const dotClass = w.running ? 'drop-dot' : 'drop-dot stopped'
         row.innerHTML = `<span class="${dotClass}">●</span><span class="drop-text">${escHtml(w.name)}</span><button class="nav-drop-detach" type="button">Detach</button>`
         row.addEventListener('click', async () => {
-await saveSessionDOM(currentLiveSessionId).catch(() => {})
-// Save live DOM to sessionStorage before navigating away
-try { sessionStorage.setItem("liveDOMCache", messagesEl.innerHTML); sessionStorage.setItem("liveMsgCache", JSON.stringify(liveMsgCache)); } catch {}
           if (w.running) { window.location.href = `/ws/${w.name}/`; return }
           row.querySelector('.drop-text').textContent = 'Starting…'
           try {
@@ -1307,50 +1274,7 @@ try { sessionStorage.setItem("liveDOMCache", messagesEl.innerHTML); sessionStora
 // ── Init ─────────────────────────────────────────────────────────
 
 
-// ── DOM persistence helpers ────────────────────────────────────────────
-// ── Restore DOM for current session from server (called after boot sets currentLiveSessionId) ──
-async function restoreLiveDOM() {
-  if (!currentLiveSessionId) return
-  try {
-    const resp = await fetch(`${API_BASE}/api/dom/${currentLiveSessionId}`).catch(() => ({ ok: false }))
-    if (resp.ok) {
-      messagesEl.innerHTML = await resp.text()
-      sessionDOMMap[currentLiveSessionId] = messagesEl.innerHTML
-      addSystemMessage('Restored from cached session')
-    }
-  } catch {}
-}
 
-async function saveSessionDOM(sessionId) {
-  if (!sessionId || !messagesEl.innerHTML.trim()) return
-  try {
-    const resp = await fetch(`${API_BASE}/api/dom`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId, dom: messagesEl.innerHTML }),
-    })
-    if (resp.ok) {
-      sessionDOMMap[sessionId] = messagesEl.innerHTML
-      sessionMsgMap[sessionId] = [...liveMsgCache]
-    }
-  } catch {}
-}
-
-// ── Load DOM for a past session from server; falls back to current in-memory state ──
-async function loadSessionDOM(sessionId) {
-  // Check in-memory map first (we may have saved it earlier during this page session)
-  if (sessionDOMMap[sessionId]) return true
-
-  try {
-    const resp = await fetch(`${API_BASE}/api/dom/${sessionId}`)
-    if (!resp.ok) return false
-    messagesEl.innerHTML = await resp.text()
-
-    return true
-  } catch {
-    return false
-  }
-}
 
 function escHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -1367,21 +1291,21 @@ function formatDate(iso) {
 }
 
 async function loadHistory() {
-  // Restore cached DOM snapshot for this session (server-side persistence)
-  restoreLiveDOM().catch(() => {})
-  try {
-    const resp = await fetch(`${API_BASE}/history`)
-    const messages = await resp.json()
-    if (!messages.length) return
-    const firstUser = messages.find(m => m.role === 'user')
-    if (firstUser && !currentSessionQuery) {
-      currentSessionQuery = firstUser.content
-      updateSessionLabel()
-    }
-    const userCount = messages.filter(m => m.role === 'user').length
-    addSystemMessage(`― Session restored · ${userCount} message${userCount !== 1 ? 's' : ''} ―`)
-    messages.forEach(m => addChatMessage(m.role, m.content))
-  } catch { }
+  // Reload live session from JSONL events on startup
+  if (currentLiveSessionId) {
+    try {
+      const resp = await fetch(`${API_BASE}/logs/${encodeURIComponent(currentLiveSessionId)}`)
+      if (resp.ok) {
+        const data = await resp.json()
+        if (data.events) {
+          for (const evt of data.events) {
+            eventSeqs.add(evt.seq ?? 0)
+            handleEventForSession(evt)
+          }
+        }
+      }
+    } catch { /* no events yet */ }
+  }
 }
 
 // ── Panel resize ─────────────────────────────────────────────────

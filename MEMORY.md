@@ -10,39 +10,66 @@
 
 ---
 
-## Architecture: Structured Event Persistence (the current plan)
+## Architecture: Structured Event Stream Persistence
 
-### Problem
-The old DOM-snapshot approach (`sessionDOMMap`, `.argo/dom/{workspace}/{sessionId}.html`, `restoreLiveDOM()`) persisted rendered HTML as canonical state. This violates the principle that the UI must remain a lean, stateless projection of agent state — the browser DOM was effectively owning and persisting conversation/trace data.
+### Core Principle
+**The UI is a stupid rendering layer; canonical state lives outside it.** The browser DOM is only a view. All conversation and trace history must be reconstructable from a single source of truth without any DOM-snapshot, localStorage, or sessionStorage dependency.
 
-### Decision: Single Canonical Event Stream
-Make the existing event stream incrementally durable by appending **canonical JSON events** immediately upon emission (in `src/logger.ts`'s `logger.log()` path), rather than capturing rendered HTML.
+### Canonical Source: Incremental JSONL Event Log
+- Every `AgentEvent` emitted during a run is written as a JSON line to the existing per-run `.jsonl` file in `logs/`.
+- Events are written **incrementally** (one line at a time) via an async write queue in `src/logger.ts`, not just at flush time. This ensures partial state survives crashes and is visible immediately when any user navigates to that session.
+- Each JSONL line has the form: `{ "ts": "...", "seq": N, "event": {...AgentEvent fields...} }`
+- The `seq` field is a monotonically increasing integer scoped per run (per `.jsonl` file). It starts at 1 and increments with each event.
+- A meta line (`type: '__meta__'`) is written by `flush()` as the first line of the file, containing session metadata (query, model, startedAt, etc.).
 
-#### Design points
-- **One canonical representation**: each `AgentEvent` emitted during a run is written as a JSON line to the existing `.jsonl` log file in `logs/`. This log becomes the single source of truth for conversation + trace history.
-- **Monotonic sequence number per run**: add a monotonically increasing integer field to every event (scoped per filename/run) so the client can deduplicate events received via live SSE against events replayed from the persisted file. No new service or DB needed.
-- **Incremental writes during active runs**: the `flush()` that currently generates derived artifacts (Markdown trace, etc.) also becomes the point where any in-memory buffered events are appended to the `.jsonl` in order. For actively running sessions, events should be flushed incrementally (not only at end) so they survive crashes and are visible immediately when a user navigates to that session.
-- **Existing SSE path stays**: `public/app.js` already subscribes to SSE for live updates during active runs. The client uses the same event objects — no new serialization format is needed.
-- **Historical replay via fetch**: `listSessions()` and `readLog(filename)` (already in `src/logger.ts`) can read back the `.jsonl` file. The client calls a new endpoint or reuses an existing one to fetch the full event stream for completed sessions, then renders incrementally from events rather than from DOM snapshots.
-- **No HTML persisted**: remove all DOM-snapshot code (`/api/dom` POST/GET routes, `.argo/dom/` directory, `sessionDOMMap`, `sessionMsgMap`, `liveDOMTimer`, `restoreLiveDOM()`, `saveSessionDOM()`) once the event approach works.
+### Backend Implementation (`src/logger.ts`)
+- `SessionLogger.log(event)`: async; queues the event with an incremented seq, writes it to JSONL via a serial write queue.
+- `SessionLogger.getSeq()`: returns the current sequence number (highest seq written so far).
+- `SessionLogger.readLogLines()`: reads the file and yields parsed events, skipping malformed lines.
+- `SessionLogger.flush()`: waits for all pending writes, then appends the meta line as the first line of the file.
+- The `.md` trace is generated from the same entries (unchanged).
 
-#### What persists
-Every `AgentEvent` type: `user_message`, `agent_message`, `thought`, `tool_call`, `tool_result`, `git_commit`, `done`, `error`, `warning`, `compact_start`, `compact_progress`, `compact`, and others. Each gets a `{ seq, ts, ...eventFields }` wrapper line in the JSONL file.
+### Server Routes (`src/server.ts`)
+- **`GET /events`** (existing): SSE endpoint streaming `AgentEvent` objects to connected browsers.
+- **`GET /api/logs/:filename`**: returns raw JSONL content as text/plain for client-side replay.
+- All DOM-persistence routes (`/api/dom`, `.argo/dom/`) are removed.
 
-#### Client rendering
-- Extract a minimal shared primitive: `renderConversationEvent(event)` in `public/app.js` that takes a single event object and appends/rendered DOM to `messagesEl`. This is what both live SSE and historical replay call — no duplication of rendering logic.
-- On page load or session switch: fetch the `.jsonl` file, parse all lines as events, replay them via `renderConversationEvent()`. Then start SSE for any remaining live events (deduplicating by sequence number).
+### Client Rendering (`public/app.js`)
+- **Shared rendering path**: `handleEvent(event)` (existing) renders a single event to `messagesEl`. Both live SSE and historical replay call this same function — zero duplication.
+- **Page load / session switch**: fetch the JSONL via `/api/logs/:filename`, parse all lines, call `handleEvent()` for each event in order. Track the max `seq` from the file. Start SSE and deduplicate: skip any SSE event with `seq <= maxSeq`.
+- **Active runs during replay**: since events are written incrementally, the JSONL always contains everything emitted so far (no gap between disk state and what the user has seen via SSE). The SSE deduplication handles the tiny window between reading the file and starting SSE.
+- **Multi-turn sessions**: each turn is a separate run with its own JSONL. The client iterates over runs, replays each in order, tracking max seq across all for SSE deduplication.
+- **Returning from viewing a past session to current live session**: fetch the current session's JSONL (which has incremental writes), replay everything via `handleEvent()`, then start SSE with deduplication. No DOM snapshot needed.
+- **newSession()**: no longer clears any caches — just creates a fresh session and starts rendering from SSE.
 
-#### Crash recovery
-- Since events are written incrementally to the `.jsonl`, an active run that crashes will have all previously emitted events on disk. The next time anyone opens that session, those partial events are replayed and the UI shows what happened up to the crash point.
-- If a flush is in progress when a crash occurs, the last partially-written line may be corrupt. Add a simple integrity check during replay: skip lines that fail `JSON.parse`.
+### Deduplication Algorithm
+```
+maxSeq = 0
+for each run in session:
+    lines = await readLogLines(run.filename)
+    for line in lines:
+        if line.seq > maxSeq: maxSeq = line.seq
+        handleEvent(line.event)
 
-#### Multi-workspace / multi-session isolation
-- Each workspace already has its own `LOGS_DIR` (derived from the workspace mount path). The `.jsonl` files live inside each workspace's logs directory, so cross-workspace isolation is automatic.
-- Multiple runs per session are grouped by `sessionId` in the existing `listSessions()` logic — no change needed there.
+// Start SSE
+es.onmessage = (e) => {
+    const event = JSON.parse(e.data)
+    if ('seq' in event && event.seq <= maxSeq) return // dedup
+    handleEvent(event)
+}
+```
 
-### Not building
+### Multi-Workspace / Multi-Session Isolation
+- Each workspace has its own `LOGS_DIR`. The `.jsonl` files live inside each workspace's logs directory — cross-workspace isolation is automatic.
+- Multiple runs per session are grouped by `sessionId` in the existing `listSessions()` logic.
+
+### Crash Recovery
+- Since events are written incrementally, an active run that crashes will have all previously emitted events on disk. The next time anyone opens that session, those partial events are replayed and the UI shows what happened up to the crash point.
+- If a flush is in progress when a crash occurs, the last partially-written line may be corrupt. Replay skips lines that fail `JSON.parse`.
+
+### Not Building
 - No vector database, no new service.
 - No polling (existing SSE + fetch-on-navigation is sufficient).
 - No persisted HTML or DOM snapshots.
-- No duplicate state stores (this replaces the DOM-snapshot approach entirely).
+- No sessionStorage, localStorage, or in-memory DOM caching for persistence.
+- No duplicate state stores.

@@ -147,6 +147,19 @@ export function buildFallbackCommitMessage(changedFiles: string[]): string {
   return `Agent: update ${changedFiles.length} files`
 }
 
+// Harness-level stop against the agent spinning on identical tool calls. The
+// soft system-prompt rule ("never call the same tool more than twice in a row")
+// was ignored 9-11x consecutively in real runs, so this enforces it in code.
+// Thresholds are deliberately loose: real incidents ran into double digits, so
+// intervening only at the 3rd repeat leaves wide margin over a legitimate
+// repeat (e.g. re-running the same test twice to confirm a fix).
+export const REPEAT_WINDOW = 6
+export const REPEAT_THRESHOLD = 3
+
+export function repetitionKey(name: string, args: Record<string, unknown>): string {
+  return `${name}:${JSON.stringify(args)}`
+}
+
 // Same cap as read_file's own truncation (file-ops.ts) — these are the same
 // kind of content (a file the agent would otherwise have to read_file itself),
 // just auto-loaded instead of requiring a tool call. Missing files are not an
@@ -190,6 +203,10 @@ export class Agent {
   private aborted = false
   // Persisted structured memory that survives across compactions — see compaction.ts.
   private compactionState: CompactionState = emptyCompactionState()
+  // Rolling record of the last REPEAT_WINDOW executed (name+args) keys. Reset per
+  // chat() run, never persisted — a legitimately repeated action in a later run
+  // must start from a clean slate (see the repetition guard in chat()).
+  private recentCalls: string[] = []
   private get historyFile(): string {
     return path.join(LOGS_DIR, this.sessionId ? `history-${this.sessionId}.json` : 'history.json')
   }
@@ -197,12 +214,16 @@ export class Agent {
     return path.join(LOGS_DIR, this.sessionId ? `compaction-${this.sessionId}.json` : 'compaction.json')
   }
 
+  // ollama is injectable only so tests can drive the loop deterministically
+  // without a live model (same rationale as loadProjectContext's workspaceRoot);
+  // production always uses the default client.
   constructor(
     private emit: (event: AgentEvent) => void,
-    model?: string
+    model?: string,
+    ollama?: Ollama,
   ) {
     this.model = model ?? config.model
-    this.ollama = new Ollama({ host: config.ollamaHost })
+    this.ollama = ollama ?? new Ollama({ host: config.ollamaHost })
   }
 
   // Load full Ollama message history from disk for the current session.
@@ -397,6 +418,9 @@ export class Agent {
     // Reassigned (not recomputed) after each compaction, since compaction replaces
     // `this.history` wholesale and returns the prompt's new position in it.
     let currentRunStart = this.history.length - 1
+    // Repetition guard state, scoped to this run only (see REPEAT_WINDOW above).
+    this.recentCalls = []
+    let repetitionInterventions = 0
     emitAndLog({ type: 'message', role: 'user', content: userMessage })
     emitAndLog({ type: 'start', model: this.model, query: userMessage, options: this.options })
 
@@ -484,6 +508,36 @@ export class Agent {
           : fallbackCalls.map(fc => ({ name: fc.name as ToolName, args: fc.arguments }))
 
         for (const { name, args } of callsToRun) {
+          // Repetition guard. The record holds calls actually executed this run,
+          // so REPEAT_THRESHOLD prior occurrences means this would be the (N+1)th
+          // identical call — the model already saw the same result N times.
+          // Thought-text repetition (the model re-emitting a near-verbatim thought
+          // before each call) is intentionally NOT a separate detector: in every
+          // observed incident it co-occurred with an identical tool call, which
+          // this record already catches, so a second signal would add complexity
+          // without changing behavior on any real case.
+          const key = repetitionKey(name, args)
+          const priorRepeats = this.recentCalls.filter(k => k === key).length
+          if (priorRepeats >= REPEAT_THRESHOLD) {
+            if (repetitionInterventions >= 1) {
+              // The model repeated the identical call even after the warning
+              // below was injected — stop the run with a final answer rather than
+              // warning (and re-warning) forever. autoCommit so any real work done
+              // earlier in the run still honors the every-change-is-committed
+              // guarantee, same as the normal final-answer path.
+              const msg = `Ended the run: the ${name} tool was called with identical arguments repeatedly, even after a warning, without producing new information. Stopping with what is already known.`
+              emitAndLog({ type: 'warning', message: `Repetition guard: ${name} repeated again after a warning — ending the run.` })
+              emitAndLog({ type: 'done', content: msg })
+              await this.autoCommit(emitAndLog)
+              return msg
+            }
+            repetitionInterventions++
+            const warning = `This exact tool call (${name} with identical arguments) has been repeated ${priorRepeats} times with no new information. Do not repeat it again. Either provide your final answer now based on what you already know, or call a genuinely different tool or arguments.`
+            emitAndLog({ type: 'warning', message: warning })
+            this.history.push({ role: 'tool', content: warning })
+            continue
+          }
+
           emitAndLog({ type: 'tool_call', tool: name, args })
 
           const start = Date.now()
@@ -504,6 +558,9 @@ export class Agent {
               ? `Error: ${result.error}\n${result.output}`
               : result.output,
           })
+
+          this.recentCalls.push(key)
+          if (this.recentCalls.length > REPEAT_WINDOW) this.recentCalls.shift()
         }
       }
 
