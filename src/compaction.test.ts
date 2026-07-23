@@ -10,6 +10,8 @@ import {
   splitForCompaction,
   updateCompactionState,
   validateCompactionState,
+  summarizeActiveMiddle,
+  validateActiveSummary,
   messagesToText,
   type CompactionState,
 } from './compaction.js'
@@ -273,4 +275,90 @@ test('regression fixture: nextId() negative/float IDs must not be summarized as 
   assert.equal(falseClause, undefined, `false claim reproduced: "${falseClause}"\nfull state:\n${rendered}`)
   // The true, verified fact should still be present in some form.
   assert.ok(/-2/.test(rendered) || /negative/.test(rendered), `lost the actual verified negative-id result:\n${rendered}`)
+})
+
+// ── Active-summary validation against the authoritative CompactionState ──
+// Reproduces the real incident: summarizeActiveMiddle folded 155 active-run
+// messages in one unvalidated call and produced an active summary describing
+// the DOM-snapshot session-persistence approach (liveDOMCache / saveSessionDOM /
+// restoreLiveDOM) as current work — even though the SAME compaction's validated
+// CompactionState.invalidatedConclusions already recorded that approach as
+// superseded by a structured-event one. The contradiction is only visible
+// against the *state*: the raw active-middle messages legitimately still contain
+// the earlier discussion of the DOM approach (it was invalidated elsewhere,
+// later), so a check against the source messages alone would have passed.
+
+// approach A (superseded) = DOM-snapshot; approach B (current) = structured-event.
+const supersededState: CompactionState = {
+  ...emptyCompactionState(),
+  projectCapsule: 'Argo: a coding-agent harness. Session conversation + trace are persisted so a past session can be reopened and replayed.',
+  decisionsMade: [
+    'Session persistence uses a structured-event-stream approach: append each canonical AgentEvent as a JSON line to the per-run .jsonl and replay those events on load — NOT DOM snapshots.',
+  ],
+  invalidatedConclusions: [
+    'The DOM-snapshot session-persistence approach (liveDOMCache, saveSessionDOM(), restoreLiveDOM(), persisting rendered HTML) was SUPERSEDED by the structured-event-stream approach and must not be used going forward.',
+  ],
+}
+
+// A batch of active-middle messages that — as real conversation would — still
+// contains the earlier, pre-invalidation discussion of the DOM approach. It does
+// NOT itself say the approach was later dropped (that happened elsewhere and is
+// only recorded in the state), so on its own it reads like legitimate history.
+const domApproachActiveMiddle: Message[] = [
+  userMsg('We need session trace persistence: reopening a past session must show its full conversation and trace.'),
+  assistantMsg('One approach: cache the rendered messages DOM in a liveDOMCache and persist it, restoring via restoreLiveDOM() on load. I will sketch saveSessionDOM().'),
+  { role: 'assistant', content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: '/workspace/public/app.js' } } }] } as Message,
+  toolMsg('function renderMessages(){ /* ~200 lines building message + trace DOM */ }'),
+  assistantMsg('Sketching saveSessionDOM(): serialize messagesEl.innerHTML and POST it to /api/dom, then reload it with restoreLiveDOM(). This DOM-snapshot approach persists the rendered HTML directly.'),
+  { role: 'assistant', content: '', tool_calls: [{ function: { name: 'write_file', arguments: { path: '/workspace/public/app.js', content: 'function saveSessionDOM(){ /* persist messagesEl.innerHTML */ }' } } }] } as Message,
+  toolMsg('wrote /workspace/public/app.js'),
+]
+
+// approachA is the set of distinctive, unambiguous identifiers of the superseded
+// approach — concrete symbols, not generic words like "dom"/"persist", so this
+// never false-flags correct text about the structured-event approach B. If any
+// appear, the summary must also carry superseding language: since THIS fixture's
+// only invalidated conclusion is the DOM approach, any such marker here can only
+// refer to it. Checking the whole summary (not per-clause) avoids false failures
+// when a correct summary marks the approach superseded across a sentence break
+// ("...was the earlier sketch. It was later superseded by..."). The genuine bug
+// — approach A presented as the current plan with no superseding framing at all
+// — still fails, because then no marker appears anywhere.
+function assertDomApproachNotCurrent(summary: string) {
+  const s = summary.toLowerCase()
+  const approachA = /savesessiondom|restorelivedom|livedomcache|dom[-\s]?snapshot/
+  const supersededMarker = /supersed|obsolet|invalidat|replac|abandon|deprecat|no longer|instead of|rather than|former|previous|earlier (plan|approach|sketch|idea|attempt)|old approach|not (to )?(be )?used?|do ?n'?t use|do not use|discard|structured[-\s]?event|switch/
+  if (approachA.test(s)) {
+    assert.ok(
+      supersededMarker.test(s),
+      `validated active summary presents the superseded DOM-snapshot approach without marking it superseded:\n${summary}`,
+    )
+  }
+}
+
+test('active summary validation: a summary of legitimate earlier work is not carried forward as current when state marks it superseded (full pipeline)', async (t) => {
+  if (!ollamaAvailable || !modelAvailable) { t.skip(`Ollama/${TEST_MODEL} not available`); return }
+  // The exact pipeline agent.ts runs: summarize the active middle, then validate
+  // that draft against the authoritative CompactionState.
+  const draft = await summarizeActiveMiddle(ollama, TEST_MODEL, NO_OPTS, domApproachActiveMiddle)
+  const { summary } = await validateActiveSummary(
+    ollama, TEST_MODEL, NO_OPTS, draft, messagesToText(domApproachActiveMiddle), supersededState,
+  )
+  assertDomApproachNotCurrent(summary)
+})
+
+test('active summary validation: a draft explicitly presenting the superseded approach as the current plan is corrected against state', async (t) => {
+  if (!ollamaAvailable || !modelAvailable) { t.skip(`Ollama/${TEST_MODEL} not available`); return }
+  // Feed the validator a draft that unambiguously presents approach A as the
+  // current plan (the failure mode itself), so the validator's own behavior is
+  // exercised directly rather than depending on what summarizeActiveMiddle emits.
+  const badDraft = 'Current plan: implement session persistence by caching the rendered DOM in liveDOMCache and persisting it via saveSessionDOM(), then restoring with restoreLiveDOM() on load. Next step: wire saveSessionDOM() into the session switch in /workspace/public/app.js.'
+  const { summary, changed } = await validateActiveSummary(
+    ollama, TEST_MODEL, NO_OPTS, badDraft, messagesToText(domApproachActiveMiddle), supersededState,
+  )
+  assert.ok(changed, `expected the validator to correct a draft that presents the superseded DOM approach as current; it returned the draft unchanged:\n${summary}`)
+  assertDomApproachNotCurrent(summary)
+  // The correction must not nuke the whole summary — the /workspace/public/app.js
+  // path is real, un-superseded context and should survive per the instructions.
+  assert.ok(summary.trim().length > 0, 'validator returned an empty summary instead of a corrected one')
 })

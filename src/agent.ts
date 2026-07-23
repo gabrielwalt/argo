@@ -18,6 +18,7 @@ import {
   updateCompactionState,
   validateCompactionState,
   summarizeActiveMiddle,
+  validateActiveSummary,
 } from './compaction.js'
 
 const SYSTEM_PROMPT = `You are a capable local agent running in an isolated Ubuntu 24.04 Docker container. The host machine is not accessible.
@@ -363,7 +364,7 @@ export class Agent {
       validated = true
     }
 
-    const activeWorkingState = split.activeMiddle.length > 0
+    let activeWorkingState = split.activeMiddle.length > 0
       ? await withCompactHeartbeat(
           summarizeActiveMiddle(this.ollama, this.model, this.options, split.activeMiddle),
           config.compactTimeoutMs,
@@ -371,6 +372,29 @@ export class Agent {
           emitAndLog,
         )
       : ''
+
+    // The active summary was produced in a single unvalidated call and can
+    // re-present something this.compactionState already recorded as invalidated
+    // (a real incident: the superseded DOM-snapshot approach). Validate it
+    // against the just-updated, authoritative state — not just its own source
+    // messages, which may legitimately still contain the earlier discussion.
+    // See compaction.ts:validateActiveSummary.
+    if (activeWorkingState) {
+      const activeResult = await withCompactHeartbeat(
+        validateActiveSummary(
+          this.ollama,
+          this.model,
+          this.options,
+          activeWorkingState,
+          messagesToText(split.activeMiddle),
+          this.compactionState,
+        ),
+        config.compactTimeoutMs,
+        'validating active summary',
+        emitAndLog,
+      )
+      activeWorkingState = activeResult.summary
+    }
 
     const priorMessage: Message = { role: 'assistant', content: renderCompactionState(this.compactionState) }
     const activeStateMessages: Message[] = activeWorkingState

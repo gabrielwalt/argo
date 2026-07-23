@@ -284,10 +284,12 @@ export async function validateCompactionState(
   return { state: corrected, changed: JSON.stringify(corrected) !== JSON.stringify(draft) }
 }
 
-// Lighter-weight than the full state machinery above — the active run's own
-// middle iterations aren't cross-session persistent state, just a running
-// account of the current task, so one plain (but still provenance-aware) pass
-// is enough; no separate validation call for this one.
+// The active run's own middle iterations aren't cross-session persistent state,
+// just a running account of the current task, so summarization is a single
+// plain (but provenance-aware) pass. Its output is then checked by
+// validateActiveSummary (below) against the authoritative CompactionState — see
+// that function's comment for why the second pass must be against the *state*,
+// not just this pass's own source messages.
 export async function summarizeActiveMiddle(
   ollama: Ollama,
   model: string,
@@ -315,4 +317,68 @@ ${workLog}`,
     options: options as any,
   })
   return resp.message.content.trim()
+}
+
+// summarizeActiveMiddle folds the whole active run in one unvalidated call, and
+// in production was seen to re-present an approach the CompactionState's
+// invalidatedConclusions had ALREADY correctly recorded as superseded (the
+// DOM-snapshot session-persistence approach, after it had been replaced by a
+// structured-event one) — the contentless active summary then won in practice
+// because it grounds the very next message. This is the same second-pass check
+// updateCompactionState gets from validateCompactionState, but with a crucial
+// difference: it validates against the authoritative CompactionState, NOT only
+// the summary's own source messages. Checking against the source alone would
+// not catch this class of bug at all — those raw messages may legitimately
+// contain the earlier, pre-invalidation discussion of the old approach, so in
+// isolation the summary looks faithful; the contradiction is only visible
+// against the state, where that approach is already marked superseded. The
+// persisted state is authoritative here (it went through its own validation),
+// so a contradiction is resolved in the state's favor — the offending claim is
+// dropped or explicitly marked superseded, never the whole summary.
+const VALIDATE_ACTIVE_INSTRUCTIONS = `You are checking a DRAFT summary of a coding agent's IN-PROGRESS work on the current task for one specific, high-cost error: presenting an approach, decision, or conclusion as the CURRENT plan when it has already been superseded or decided against.
+
+You are given three things:
+1. AUTHORITATIVE PRIOR WORK STATE — already separately validated; treat it as ground truth. Two of its sections matter most here:
+   - "INVALIDATED OR SUPERSEDED CONCLUSIONS": approaches/conclusions that are NO LONGER current. Nothing listed here may be presented by the draft as the current approach or the work now being done.
+   - "DECISIONS MADE": decisions that stand. The draft must not contradict them.
+2. SOURCE WORK LOG — the raw messages the draft was summarized from. It may LEGITIMATELY contain earlier discussion of an approach that was later superseded elsewhere; that earlier discussion is valid history, but it must not be carried forward as the current direction.
+3. DRAFT ACTIVE SUMMARY — the text to check and, if needed, correct.
+
+Do this:
+- If the draft presents anything the PRIOR WORK STATE marks as invalidated/superseded (or that contradicts a decision) as if it were the current plan or the work now being done, correct it. Either remove that claim, or keep it but explicitly mark it as superseded and name what replaced it (using the PRIOR WORK STATE). The PRIOR WORK STATE wins every time.
+- Change nothing else. Keep everything the draft got right. Preserve exact paths, URLs, commands, and error messages verbatim.
+- Never add information found in neither the source log nor the prior state.
+- Do NOT discard the whole summary; only fix the contradicting parts.
+- If the draft contains no such contradiction, return it exactly as-is.
+
+Reply with ONLY the corrected summary text — plain text, no JSON, no preamble, no commentary.`
+
+export async function validateActiveSummary(
+  ollama: Ollama,
+  model: string,
+  options: ModelOptions,
+  draftSummary: string,
+  sourceWorkLog: string,
+  state: CompactionState,
+): Promise<{ summary: string; changed: boolean }> {
+  // Nothing to check — and nothing the state could contradict — if the active
+  // summary is empty. Mirrors summarizeActiveMiddle's own empty-guard.
+  if (!draftSummary.trim()) return { summary: draftSummary, changed: false }
+  const resp = await ollama.chat({
+    model,
+    stream: false,
+    messages: [{
+      role: 'user',
+      content: `${VALIDATE_ACTIVE_INSTRUCTIONS}\n\nAUTHORITATIVE PRIOR WORK STATE:\n${renderCompactionState(state)}\n\nSOURCE WORK LOG:\n${sourceWorkLog}\n\nDRAFT ACTIVE SUMMARY:\n${draftSummary}`,
+    }],
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    options: options as any,
+  })
+  const corrected = resp.message.content.trim()
+  // A degenerate empty correction must not wipe a good summary. Keeping the
+  // original draft is the safe failure mode: at worst it reintroduces
+  // already-invalidated info, but that same info still sits — contradicted — in
+  // the PRIOR WORK STATE block rendered directly above it in the live context.
+  if (!corrected) return { summary: draftSummary, changed: false }
+  return { summary: corrected, changed: corrected !== draftSummary }
 }
