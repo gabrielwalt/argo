@@ -61,6 +61,12 @@ let currentSessionQuery = ''  // first user message of the current session
 let liveDOMCache = null          // innerHTML of messagesEl while viewing a past session
 let liveMsgCache = []            // serial message objects for diffing on return
 
+// -- Per-session DOM snapshots (trace blocks, tool calls — survives reloads & workspace switches) --
+const sessionDOMMap = {}         // sessionId → DOM innerHTML snapshot
+const sessionMsgMap = {}         // sessionId → message array for server-side diff
+let liveDOMTimer = null          // debounce timer for live DOM persistence
+let currentLiveSessionId = ''    // the active session's ID (for DOM lookups)
+
 // ── Model options ────────────────────────────────────────────────
 const DEFAULTS = { temperature: 0.8, top_p: 0.9, top_k: 40, num_ctx: 65536 }
 const modelOpts = { ...DEFAULTS }
@@ -140,6 +146,14 @@ function startTraceBlock(model) {
   messagesEl.appendChild(block)
   messagesEl.scrollTop = messagesEl.scrollHeight
 
+  // Debounced persist of live session DOM while agent is thinking
+  if (!viewingSession && currentLiveSessionId) {
+    clearTimeout(liveDOMTimer)
+    liveDOMTimer = setTimeout(() => {
+      saveSessionDOM(currentLiveSessionId).catch(() => {})
+    }, 2000)
+  }
+
   currentTraceBlock = { el: block, items, title, meta, arrow }
 }
 
@@ -169,6 +183,49 @@ es.onmessage = (e) => {
 }
 
 function handleEvent(event) {
+  // While viewing a past session, suppress all SSE rendering into messagesEl.
+  // The live session's DOM is preserved by save-on-switch and the debounce timer.
+  if (viewingSession) {
+    // Still allow status updates to proceed (they don't modify messagesEl)
+    if (event.type === 'start') {
+      currentRunModel = event.model
+      setStatus('busy', `Running · ${event.model}`)
+      return
+    }
+    if (event.type === 'iteration') {
+      iterLabel.textContent = `${event.current}`
+      setStatus('busy', `Running · ${currentRunModel}`)
+      return
+    }
+    if (event.type === 'compact_progress') {
+      const elapsedS = Math.round(event.elapsedMs / 1000)
+      const timeoutS = Math.round(event.timeoutMs / 1000)
+      setStatus('busy', `Compacting context… ${event.step} (${elapsedS}s / ${timeoutS}s)`)
+      return
+    }
+    if (event.type === 'token_usage') {
+      const pct = Math.round(event.prompt_tokens / event.num_ctx * 100)
+      tokenCounter.textContent = `${event.prompt_tokens.toLocaleString()} / ${event.num_ctx.toLocaleString()} ctx`
+      tokenCounter.className = pct >= 90 ? 'ctx-danger' : pct >= 70 ? 'ctx-warn' : 'ctx-ok'
+      return
+    }
+    if (event.type === 'done') {
+      setStatus('ready', 'Ready')
+      refreshGitLog()
+      refreshFiles()
+      return
+    }
+    if (event.type === 'compact') {
+      if (event.manual) setStatus('ready', 'Ready')
+      else setStatus('busy', `Running · ${currentRunModel}`)
+      tokenCounter.textContent = 'compacted'
+      tokenCounter.className = 'ctx-ok'
+      return
+    }
+    // All other events (thought, tool_call, tool_result, message, start-without-model, etc.) are suppressed
+    return
+  }
+
   switch (event.type) {
     case 'start':
       currentRunModel = event.model
@@ -202,8 +259,7 @@ function handleEvent(event) {
     }
 
     case 'message':
-      // Only update chat panel if we're viewing the current session
-      if (event.role === 'assistant' && !viewingSession) {
+      if (event.role === 'assistant') {
         addChatMessage('assistant', event.content)
       }
       break
@@ -367,6 +423,14 @@ function addTraceItem(className, label, body, collapsible) {
 
   currentTraceBlock.items.appendChild(el)
   messagesEl.scrollTop = messagesEl.scrollHeight
+
+  // Debounced persist of live session DOM while agent is thinking
+  if (!viewingSession && currentLiveSessionId) {
+    clearTimeout(liveDOMTimer)
+    liveDOMTimer = setTimeout(() => {
+      saveSessionDOM(currentLiveSessionId).catch(() => {})
+    }, 2000)
+  }
   return el
 }
 
@@ -406,6 +470,14 @@ function addChatMessage(role, content) {
   if (!viewingSession) liveMsgCache.push({ role, content })
   messagesEl.appendChild(el)
   messagesEl.scrollTop = messagesEl.scrollHeight
+
+  // Debounced persist of live session DOM while agent is thinking
+  if (!viewingSession && currentLiveSessionId) {
+    clearTimeout(liveDOMTimer)
+    liveDOMTimer = setTimeout(() => {
+      saveSessionDOM(currentLiveSessionId).catch(() => {})
+    }, 2000)
+  }
 }
 
 function addSystemMessage(text) {
@@ -499,8 +571,14 @@ async function newSession() {
   // Clear caches on new session
   liveDOMCache = null
   liveMsgCache = []
+  // Clear per-session DOM caches on new session
+  for (const key in sessionDOMMap) delete sessionDOMMap[key]
+  for (const key in sessionMsgMap) delete sessionMsgMap[key]
   iterLabel.textContent = ''
   setStatus('ready', 'Ready')
+  // Update live session ID so future DOM lookups use the right key
+  const st = await fetch(`${API_BASE}/status`).then(r => r.json()).catch(() => ({}))
+  currentLiveSessionId = st?.sessionId ?? ''
 }
 
 // ── Dropdown mutual exclusion ─────────────────────────────────────
@@ -905,6 +983,7 @@ async function refreshSessionDropdown() {
       fetch(`${API_BASE}/status`).then(r => r.json()),
     ])
     const liveSessionId = status?.sessionId ?? ''
+    currentLiveSessionId = liveSessionId
     // Show all past sessions from the registry — no query requirement.
     // Sessions without runs are intentionally-created sessions with no messages yet.
     const pastSessions = Array.isArray(sessions)
@@ -977,8 +1056,8 @@ async function viewSession(sessionGroup) {
   currentTraceBlock = null
   updateSessionLabel()
 
-  // Cache live DOM before switching to past session
-  liveDOMCache = messagesEl.innerHTML
+  // Save current DOM to server before switching
+  await saveSessionDOM(currentLiveSessionId).catch(() => {})
   messagesEl.innerHTML = ''
   const d = new Date(sessionGroup.startedAt)
   const dateStr = d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' · ' +
@@ -1004,41 +1083,41 @@ async function viewSession(sessionGroup) {
 }
 
 async function returnToCurrentSession() {
+  // Save past session DOM to server before switching back
+  if (viewingSession) {
+    await saveSessionDOM(viewingSession.id).catch(() => {})
+  }
+
   viewingSession = null
   $('session-banner').classList.remove('visible')
   $('resume-btn').disabled = false
   $('resume-btn').textContent = '▶ Resume'
   $('chat-form').style.display = ''
 
-  // Restore from live DOM cache first (preserves trace blocks, tool calls, etc.)
-  if (liveDOMCache) {
-    messagesEl.innerHTML = liveDOMCache
-    // Diff against server for any new messages since cache
-    if (liveMsgCache.length > 0) {
-      const existingContent = messagesEl.innerHTML
-      let lastCachedIdx = liveMsgCache.findIndex(m => 
-        existingContent.includes(`class="message ${m.role}"`) || true)
-      for (let k = Math.max(0, lastCachedIdx); k < liveMsgCache.length; k++) {
-        const m = liveMsgCache[k]
-        if (!existingContent.includes(m.content)) addChatMessage(m.role, m.content)
-      }
-    }
+  // Restore from in-memory map first (from earlier saves this session)
+  const storedDOM = sessionDOMMap[currentLiveSessionId]
+  if (storedDOM) {
+    liveMsgCache = [...(sessionMsgMap[currentLiveSessionId] || [])]
+    messagesEl.innerHTML = storedDOM
   } else {
-    messagesEl.innerHTML = ''
-    try {
-      const resp = await fetch(`${API_BASE}/history`)
-      const messages = await resp.json()
-      if (messages.length === 0) {
+    // Load DOM snapshot from server for this session
+    const hasDOM = await loadSessionDOM(currentLiveSessionId)
+    if (!hasDOM) {
+      try {
+        const resp = await fetch(`${API_BASE}/history`)
+        const messages = await resp.json()
+        if (messages.length === 0) {
+          messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
+        } else {
+          const firstUser = messages.find(m => m.role === 'user')
+          if (firstUser) currentSessionQuery = firstUser.content
+          const userCount = messages.filter(m => m.role === 'user').length
+          addSystemMessage(`\u2014 ${userCount} message${userCount !== 1 ? 's' : ''} in current session \u2014`)
+          messages.forEach(m => addChatMessage(m.role, m.content))
+        }
+      } catch {
         messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
-      } else {
-        const firstUser = messages.find(m => m.role === 'user')
-        if (firstUser) currentSessionQuery = firstUser.content
-        const userCount = messages.filter(m => m.role === 'user').length
-        addSystemMessage(`\u2014 ${userCount} message${userCount !== 1 ? 's' : ''} in current session \u2014`)
-        messages.forEach(m => addChatMessage(m.role, m.content))
       }
-    } catch {
-      messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
     }
   }
   updateSessionLabel()
@@ -1191,6 +1270,7 @@ async function initNav() {
         const dotClass = w.running ? 'drop-dot' : 'drop-dot stopped'
         row.innerHTML = `<span class="${dotClass}">●</span><span class="drop-text">${escHtml(w.name)}</span><button class="nav-drop-detach" type="button">Detach</button>`
         row.addEventListener('click', async () => {
+await saveSessionDOM(currentLiveSessionId).catch(() => {})
 // Save live DOM to sessionStorage before navigating away
 try { sessionStorage.setItem("liveDOMCache", messagesEl.innerHTML); sessionStorage.setItem("liveMsgCache", JSON.stringify(liveMsgCache)); } catch {}
           if (w.running) { window.location.href = `/ws/${w.name}/`; return }
@@ -1226,16 +1306,51 @@ try { sessionStorage.setItem("liveDOMCache", messagesEl.innerHTML); sessionStora
 
 // ── Init ─────────────────────────────────────────────────────────
 
-// Restore cached live session DOM from sessionStorage (workspace switch recovery)
-try {
-  const savedDOM = sessionStorage.getItem("liveDOMCache")
-  if (savedDOM && !window.__WS__) {
-    messagesEl.innerHTML = savedDOM
-    const savedMsgs = sessionStorage.getItem("liveMsgCache")
-    if (savedMsgs) liveMsgCache = JSON.parse(savedMsgs)
-    addSystemMessage('Restored from cached session')
+
+// ── DOM persistence helpers ────────────────────────────────────────────
+// ── Restore DOM for current session from server (called after boot sets currentLiveSessionId) ──
+async function restoreLiveDOM() {
+  if (!currentLiveSessionId) return
+  try {
+    const resp = await fetch(`${API_BASE}/api/dom/${currentLiveSessionId}`).catch(() => ({ ok: false }))
+    if (resp.ok) {
+      messagesEl.innerHTML = await resp.text()
+      sessionDOMMap[currentLiveSessionId] = messagesEl.innerHTML
+      addSystemMessage('Restored from cached session')
+    }
+  } catch {}
+}
+
+async function saveSessionDOM(sessionId) {
+  if (!sessionId || !messagesEl.innerHTML.trim()) return
+  try {
+    const resp = await fetch(`${API_BASE}/api/dom`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, dom: messagesEl.innerHTML }),
+    })
+    if (resp.ok) {
+      sessionDOMMap[sessionId] = messagesEl.innerHTML
+      sessionMsgMap[sessionId] = [...liveMsgCache]
+    }
+  } catch {}
+}
+
+// ── Load DOM for a past session from server; falls back to current in-memory state ──
+async function loadSessionDOM(sessionId) {
+  // Check in-memory map first (we may have saved it earlier during this page session)
+  if (sessionDOMMap[sessionId]) return true
+
+  try {
+    const resp = await fetch(`${API_BASE}/api/dom/${sessionId}`)
+    if (!resp.ok) return false
+    messagesEl.innerHTML = await resp.text()
+
+    return true
+  } catch {
+    return false
   }
-} catch {}
+}
 
 function escHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -1252,6 +1367,8 @@ function formatDate(iso) {
 }
 
 async function loadHistory() {
+  // Restore cached DOM snapshot for this session (server-side persistence)
+  restoreLiveDOM().catch(() => {})
   try {
     const resp = await fetch(`${API_BASE}/history`)
     const messages = await resp.json()
