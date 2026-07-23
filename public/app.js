@@ -58,8 +58,8 @@ let viewingSession = null  // null = current; object = past session being viewed
 let currentSessionQuery = ''  // first user message of the current session
 
 // ── Structured-event replay state ───────────────────────────
-let eventSeqs = new Set<number>();     // seq numbers seen during current view
-let pendingEvents: Array<{ ts: string; seq: number; event: AgentEvent }> = [];
+let eventSeqs = new Set();     // seq numbers seen during current view
+let pendingEvents = [];
 
 // ── Model options ────────────────────────────────────────────────
 const DEFAULTS = { temperature: 0.8, top_p: 0.9, top_k: 40, num_ctx: 65536 }
@@ -452,6 +452,13 @@ function addSystemMessage(text) {
   // system messages tracked by SSE event stream
   messagesEl.appendChild(el)
   messagesEl.scrollTop = messagesEl.scrollHeight
+}
+
+// ── Chat form ────────────────────────────────────────────────────
+$('chat-form').addEventListener('submit', async (e) => {
+  e.preventDefault()
+  if (busy || viewingSession) return
+
   const message = inputEl.value.trim()
   if (!message) return
 
@@ -1011,7 +1018,7 @@ async function viewSession(sessionGroup) {
 
   // Replay all events from the session's runs in chronological order
   const runs = sessionGroup.runs.sort((a, b) => a.startedAt.localeCompare(b.startedAt))
-  let allEvents: Array<{ ts: string; seq: number; event: AgentEvent }> = []
+  let allEvents = []
 
   for (const run of runs) {
     try {
@@ -1070,26 +1077,6 @@ async function returnToCurrentSession() {
   $('resume-btn').disabled = false
   $('resume-btn').textContent = '▶ Resume'
   $('chat-form').style.display = ''
-
-
-    if (!hasDOM) {
-      try {
-        const resp = await fetch(`${API_BASE}/history`)
-        const messages = await resp.json()
-        if (messages.length === 0) {
-          messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
-        } else {
-          const firstUser = messages.find(m => m.role === 'user')
-          if (firstUser) currentSessionQuery = firstUser.content
-          const userCount = messages.filter(m => m.role === 'user').length
-          addSystemMessage(`\u2014 ${userCount} message${userCount !== 1 ? 's' : ''} in current session \u2014`)
-          messages.forEach(m => addChatMessage(m.role, m.content))
-        }
-      } catch {
-        messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
-      }
-    }
-  }
   updateSessionLabel()
 }
 
