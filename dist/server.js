@@ -8,7 +8,7 @@ import { fileURLToPath } from 'url';
 import { promises as fs } from 'fs';
 import { config } from './config.js';
 import { Agent } from './agent.js';
-import { readLog, listSessions, deleteAllLogs, deleteSession, getSessionMessages, registerSession, LOGS_DIR } from './logger.js';
+import { readLog, readLogEvents, listSessions, deleteAllLogs, deleteSession, getSessionMessages, registerSession, LOGS_DIR } from './logger.js';
 import { checkEnvironment, logEnvironment } from './health.js';
 import { installAuth } from './auth.js';
 const execAsync = promisify(exec);
@@ -37,11 +37,13 @@ if (!config.inContainer)
 if (!config.workerMode) {
     app.use(express.static(path.join(__dirname, '..', 'public')));
 }
-const agent = new Agent((event) => {
-    bus.emit('agent', event);
+const agent = new Agent((event, seq) => {
+    // Forward the per-run seq alongside the event so the browser can dedupe
+    // replayed (persisted) events against this live SSE stream at the reconnect
+    // boundary — the JSONL replay (readLogEvents) carries the same __seq.
+    bus.emit('agent', typeof seq === 'number' ? { ...event, __seq: seq } : event);
 });
 const SESSION_ID_FILE = path.join(LOGS_DIR, 'current-session.txt');
-const DOM_DIR = path.join(process.cwd(), '.argo', 'dom');
 function makeSessionId() {
     return new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
 }
@@ -94,7 +96,6 @@ app.post('/chat', async (req, res) => {
 app.get('/history', (req, res) => {
     res.json(agent.getChatHistory());
 });
-// Stop current agent run (soft abort — takes effect between iterations)
 app.post('/stop', (_req, res) => {
     agent.abort();
     res.json({ ok: true });
@@ -250,25 +251,38 @@ app.post('/resume/:sessionId', async (req, res) => {
     }
     res.json({ ok: true, count: agent.getChatHistory().length });
 });
-// Get a specific log (jsonl or md)
+// Get structured events from a log file for replay (returns JSON event array)
 app.get('/logs/:filename', async (req, res) => {
-    const { filename } = req.params;
+    const filename = req.params.filename;
     if (path.basename(filename) !== filename) {
-        res.status(400).send('Invalid filename');
+        res.status(400).json({ error: 'Invalid filename' });
         return;
     }
-    const format = req.query.format ?? 'md';
-    const log = await readLog(filename);
-    if (!log) {
-        res.status(404).send('Not found');
+    const events = await readLogEvents(filename);
+    if (!events) {
+        // Fallback: serve raw JSONL for legacy sessions without event structure
+        try {
+            const log = await readLog(filename);
+            if (!log) {
+                res.status(404).json({ error: 'Log not found' });
+                return;
+            }
+            const lines = log.jsonl.trim().split('\n').filter(l => l.trim());
+            const parsed = [];
+            for (const line of lines) {
+                try {
+                    parsed.push(JSON.parse(line));
+                }
+                catch { }
+            }
+            res.json({ events: parsed });
+        }
+        catch {
+            res.status(404).json({ error: 'Log not found' });
+        }
         return;
     }
-    if (format === 'jsonl') {
-        res.type('text/plain').send(log.jsonl);
-    }
-    else {
-        res.type('text/plain').send(log.md);
-    }
+    res.json({ events });
 });
 const SKIP = new Set(['node_modules', '.git']);
 // Only excluded at the true filesystem root — virtual/pseudo filesystems with
@@ -337,32 +351,6 @@ app.get('/file', async (req, res) => {
         res.status(404).send('Not found');
     }
 });
-
-// ── Per-session DOM snapshots (trace blocks, tool calls — survives reloads) ──
-app.post('/api/dom', express.json(), async (req, res) => {
-    const { sessionId, dom } = req.body;
-    if (!sessionId || !dom) {
-        res.status(400).json({ error: 'sessionId and dom required' });
-        return;
-    }
-    const dir = path.join(DOM_DIR, config.workspaceName);
-    await fs.mkdir(dir, { recursive: true });
-    const file = path.join(dir, `${sessionId}.html`);
-    await fs.writeFile(file, dom, 'utf-8');
-    res.json({ ok: true });
-});
-
-app.get('/api/dom/:sessionId', async (req, res) => {
-    const { sessionId } = req.params;
-    const file = path.join(DOM_DIR, config.workspaceName, `${sessionId}.html`);
-    try {
-        const dom = await fs.readFile(file, 'utf-8');
-        res.type('text/html').send(dom);
-    } catch {
-        res.status(404).json({ error: 'Not found' });
-    }
-});
-
 export async function startServer() {
     // Initialize session ID before loading history so historyFile points to the right file
     await fs.mkdir(path.dirname(SESSION_ID_FILE), { recursive: true });

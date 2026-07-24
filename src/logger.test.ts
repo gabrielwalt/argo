@@ -87,8 +87,8 @@ test('readLogEvents attaches the per-run __seq to each event and skips the meta 
 
   const replayed = await readLogEvents(filename)
   assert.ok(replayed, 'expected readLogEvents to return events')
-  // Same count/order as logged — and since flush() prepends a __meta__ line to
-  // the file, an equal length proves the meta line was skipped, not replayed.
+  // Same count/order as logged — and since the file carries a __meta__ header
+  // line, an equal length proves the meta line was skipped, not replayed.
   assert.equal(replayed!.length, events.length)
   assert.deepEqual(replayed!.map(e => e.type), ['message', 'start', 'thought', 'done'])
   // Per-run seq, 1-based and monotonic — the exact key the browser dedupes on.

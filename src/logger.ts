@@ -76,6 +76,7 @@ export class SessionLogger {
   private filename: string
   private meta: LogMeta
   private writeQueue: Promise<void> = Promise.resolve()
+  private metaWritten = false
 
   constructor(query: string, model: string, options: ModelOptions = {}, sessionId?: string) {
     const slug = query.slice(0, 40).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')
@@ -111,26 +112,52 @@ export class SessionLogger {
     if (event.type === 'done') this.meta.status = 'done'
     if (event.type === 'error') this.meta.status = 'error'
 
-    // Enqueue incremental write in order (serial queue)
+    // Enqueue incremental writes in order (serial queue).
+    const file = path.join(LOGS_DIR, `${this.filename}.jsonl`)
     const line = JSON.stringify(entry) + '\n'
-    this.writeQueue = this.writeQueue.then(() =>
-      fs.appendFile(path.join(LOGS_DIR, `${this.filename}.jsonl`), line, 'utf-8')
-    )
+    // Write the meta line FIRST, before the first event, so a run that never
+    // reaches flush() (still in progress, or crashed) is STILL attributable to
+    // its session — listLogs() reads sessionId/filename from line 0, so without
+    // this the run's sessionId is unknown and it gets mis-grouped as 'legacy'
+    // and lost from its session's replay. flush() rewrites this line 0 in place
+    // with the final status/duration.
+    if (!this.metaWritten) {
+      this.metaWritten = true
+      this.writeQueue = this.writeQueue
+        .then(() => fs.mkdir(LOGS_DIR, { recursive: true }))
+        .then(() => fs.appendFile(file, this.metaEntry() + '\n', 'utf-8'))
+    }
+    this.writeQueue = this.writeQueue.then(() => fs.appendFile(file, line, 'utf-8'))
 
     // Ensure the logs directory exists
     await fs.mkdir(LOGS_DIR, { recursive: true })
   }
 
-  /** Wait for all pending incremental writes, then append meta line. */
+  /** The `__meta__` header line (no trailing newline) — written up front by
+   *  log() and rewritten with final values by flush(). */
+  private metaEntry(): string {
+    return JSON.stringify({ ts: this.meta.startedAt, event: { type: '__meta__', ...this.meta } })
+  }
+
+  /** Wait for all pending incremental writes, then finalize the meta line. */
   async flush() {
     this.meta.durationMs = Date.now() - this.startTs
     await this.writeQueue // wait for all prior writes to complete
     await fs.mkdir(LOGS_DIR, { recursive: true })
 
-    // Write meta as the first line (prepend via read-modify-write)
-    const existingContent = await fs.readFile(path.join(LOGS_DIR, `${this.filename}.jsonl`), 'utf-8')
-    const metaLine = JSON.stringify({ ts: this.meta.startedAt, event: { type: '__meta__', ...this.meta } }) + '\n'
-    await fs.writeFile(path.join(LOGS_DIR, `${this.filename}.jsonl`), metaLine + existingContent, 'utf-8')
+    const file = path.join(LOGS_DIR, `${this.filename}.jsonl`)
+    // Rewrite the up-front meta line (log() wrote it as line 0) in place with
+    // final status/duration/counts. Fall back to writing meta as the sole line
+    // if nothing was logged (no meta yet) or the file is unexpectedly shaped.
+    let existing = ''
+    try { existing = await fs.readFile(file, 'utf-8') } catch { /* nothing written yet */ }
+    const lines = existing.split('\n')
+    if (this.metaWritten && lines[0] && lines[0].includes('"__meta__"')) {
+      lines[0] = this.metaEntry()
+      await fs.writeFile(file, lines.join('\n'), 'utf-8')
+    } else {
+      await fs.writeFile(file, this.metaEntry() + '\n' + existing, 'utf-8')
+    }
 
     // Markdown: human-readable trace (unchanged)
     const md = this.toMarkdown()
@@ -145,8 +172,10 @@ export class SessionLogger {
       return lines
         .map(line => {
           const parsed = JSON.parse(line) as LogEntryJson
-          // Skip the meta line (not a real event entry for replay purposes)
-          if (parsed.event && typeof parsed.event === 'object' && parsed.event.type === '__meta__') return null
+          // Skip the meta line (not a real event entry for replay purposes).
+          // The persisted meta line's event is `{ type: '__meta__', ... }`, which
+          // isn't part of the AgentEvent union — cast for the discriminant read.
+          if (parsed.event && typeof parsed.event === 'object' && (parsed.event as { type: string }).type === '__meta__') return null
           return parsed as unknown as LogEntry
         })
         .filter((l): l is LogEntry => l !== null)
@@ -361,8 +390,9 @@ export async function readLogEvents(filename: string): Promise<Array<AgentEvent 
     const events: Array<AgentEvent & { __seq: number }> = []
     for (const line of lines_arr) {
       const parsed = JSON.parse(line) as LogEntryJson
-      // Skip the meta line (not a real event entry for replay purposes)
-      if (parsed.event && typeof parsed.event === 'object' && parsed.event.type === '__meta__') continue
+      // Skip the meta line (its event is `{ type: '__meta__', ... }`, outside the
+      // AgentEvent union — cast for the discriminant read; see readLogLines).
+      if (parsed.event && typeof parsed.event === 'object' && (parsed.event as { type: string }).type === '__meta__') continue
       // Merge the per-run seq onto the event: the browser dedupes replayed events
       // against the live SSE stream (which carries the same __seq) at reconnect.
       // Object.assign is typed to return the intersection, so no cast is needed.
