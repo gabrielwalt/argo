@@ -134,3 +134,12 @@ Models: qwen3.6:latest, devstral:24b, llama3.1:8b · 1 run/task · max_iter 60 �
 - **Decision:** adopt `qwen3.6:latest` as the target model. Keep the eval as the
   gate for future candidates (newer qwen, other local models) and for measuring
   every harness/prompt/tool/memory change from here.
+
+### 2026-07-27 — E2E — harness `5984b1b` (metrics + 2 hard tasks + baseline tag) — first run with headroom
+Models: qwen3.6:latest · 1 run/task · max_iter 60 · task completion + cost
+- qwen3.6:latest: **4/6 completed (67%)** — the two new hard tasks broke the 100% ceiling, so the flywheel now has room to measure agent improvements.
+- Wins: `store-addTask` (7 it, 42s), `store-removeTask` (8 it, 36s), `bigproj-deps` (13 it, 111s), `bigproj-duedate-bug` (10 it, 58s — the debug task; qwen root-caused and fixed the latent null-`dueDate` direction bug).
+- ✗ `bigproj-effort` — **hit max_iter: 60 it, 66 tools, 529s, plan=2, ctx≈28829, cmp=0.** Never converged on the long multi-file feature; ran to the cap with the suite still red. No compaction fired (ctx well under the 66.7% threshold), so this is non-convergence/thrash, not a memory limit. **→ the Phase-4 target.**
+- ✗ `store-deps` — 13 it, 80s. Passed in the prior baseline (8–9 it); at 1 run/temp 0.8 this is likely variance. Re-run with `EVAL_RUNS=3` to separate flaky from regressed.
+- Accounting: of the 4 original tasks, 3 reproduced as passing (`store-deps` flaked); of the 2 new tasks, `duedate-bug` passed and `effort` failed at the cap. Net 4/6.
+- Cost: passing tasks 36–111s wall; peak RSS ≈25–26 GB (model resident); 100% GPU. `tok/s` unavailable — the running worker image predates the `eval_duration` logging; rebuild to enable.
