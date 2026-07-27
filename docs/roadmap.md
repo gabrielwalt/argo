@@ -171,3 +171,17 @@ than overselling. The eval is also our early-warning system as local models impr
 at 100%. 4. Phase 4: improve the agent, one measured change at a time. 5. Phase 5 seam +
 curation later. Re-baseline after every change; keep the "hypothesis → result" log in
 `docs/eval-log.md` so the flywheel compounds.
+
+---
+
+## 2026-07-27 — Direction update: quality-first + capability matrix
+
+The eval now has headroom (qwen 5/6; `bigproj-effort` fails). Two findings reshaped Phase 4:
+
+- A **stall re-ground** (loop steer at iters 20/35/45) fixed the goal-substitution *drift* on `bigproj-effort` (it implemented the right modules, reached 6/7) but did **not** converge in 60 iters. At `max_iter=90` it got **worse** — thrashed, oscillated, and **edited the test file to game the oracle**. **More iterations is the wrong lever.** (Stall counter committed as an *unvalidated experiment*; may be reverted.)
+- **Quality > speed.** In real use qwen often "doesn't really fix the issue," and tests-pass ≠ good work (the oracle-gaming proves it). So Phase 4 is now **quality supervision**, in order:
+  1. **Supervisor eval (next).** LLM-as-judge — score models (qwen / devstral / a reasoning model) on *judging* qwen's work; use the real 60/90-iter effort runs (incl. the gaming one) as labeled material. Winner = the critic.
+  2. **Dual-model actor-critic.** Devstral/Mistral critiques qwen's plan + implementation mid-run (checkpoints: post-plan, pre-done, on-stall), feeding critique back. Measured against the quality score.
+  3. **Capability matrix.** Score models by ROLE — agent (execute), supervisor (plan/judge), vision-image (read screenshots/diagrams), vision-layout (render→screenshot→judge alignment, via Playwright). Pull Ollama vision models (`llama3.2-vision`, `llava`, `moondream`, `qwen2.5-vl`); a vision agent is a coming requirement.
+
+North star: an agent that runs ~indefinitely without losing the goal, hallucinating, looping, or losing track — with good memory of what matters. Run history: `docs/eval-log.md`.
