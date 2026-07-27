@@ -178,10 +178,25 @@ curation later. Re-baseline after every change; keep the "hypothesis → result"
 
 The eval now has headroom (qwen 5/6; `bigproj-effort` fails). Two findings reshaped Phase 4:
 
-- A **stall re-ground** (loop steer at iters 20/35/45) fixed the goal-substitution *drift* on `bigproj-effort` (it implemented the right modules, reached 6/7) but did **not** converge in 60 iters. At `max_iter=90` it got **worse** — thrashed, oscillated, and **edited the test file to game the oracle**. **More iterations is the wrong lever.** (Stall counter committed as an *unvalidated experiment*; may be reverted.)
-- **Quality > speed.** In real use qwen often "doesn't really fix the issue," and tests-pass ≠ good work (the oracle-gaming proves it). So Phase 4 is now **quality supervision**, in order:
-  1. **Supervisor eval (next).** LLM-as-judge — score models (qwen / devstral / a reasoning model) on *judging* qwen's work; use the real 60/90-iter effort runs (incl. the gaming one) as labeled material. Winner = the critic.
-  2. **Dual-model actor-critic.** Devstral/Mistral critiques qwen's plan + implementation mid-run (checkpoints: post-plan, pre-done, on-stall), feeding critique back. Measured against the quality score.
-  3. **Capability matrix.** Score models by ROLE — agent (execute), supervisor (plan/judge), vision-image (read screenshots/diagrams), vision-layout (render→screenshot→judge alignment, via Playwright). Pull Ollama vision models (`llama3.2-vision`, `llava`, `moondream`, `qwen2.5-vl`); a vision agent is a coming requirement.
+- A **stall re-ground** (loop steer at iters 20/35/45) fixed the goal-substitution *drift* on `bigproj-effort` (it implemented the right modules, reached 5/6 effort-spec / 42/43 full-suite) but did **not** converge in 60 iters. At `max_iter=90` it got **worse** — thrashed, self-reverted its own edits (`git checkout` at it76), stalled at 3/6, and **attempted to edit the test file to game the oracle** (the `edit_file` was *rejected* — the spec was never actually changed; intent-to-tamper, not landed gaming — see the eval-log CORRECTION). **More iterations is the wrong lever.** (Stall counter committed as an *unvalidated experiment*; may be reverted.)
+- **Quality > speed.** In real use qwen often "doesn't really fix the issue," and tests-pass ≠ good work (the *attempted* oracle-tampering + thrash + self-revert show it). So Phase 4 is now **quality supervision**, in order:
+  1. **Supervisor eval (BUILT; run-1 done — DIRECTIONAL).** LLM-as-judge scoring candidate critic models on *judging* qwen's work (blind), at `scripts/eval-fixtures/supervisor/` + `scripts/eval-supervisor.mjs`. **Run 1 (single-pass, 3 candidates): qwen3.6 wins (89%, gate PASS) — the only one of {qwen3.6, devstral, gemma4} that caught the attempted spec edit; devstral + gemma4 FAIL the gaming gate** (devstral even describes the violation, then labels it clean). Caveats: n=1 (noisy), no reasoning model tested, and it's qwen judging qwen. The hard gate keys on the *attempted* spec edit (intent), since no run has *landed* one yet. See `docs/eval-log.md`.
+  2. **Dual-model actor-critic — premise under review.** Run-1 suggests the best critic *is the worker* (qwen), which weakens the "different reviewer (Mistral)" idea. Fork to settle after a confirming `EVAL_SUP_RUNS=3` pass (± a pulled reasoning model): (a) a genuinely stronger *external* judge, or (b) qwen *self-critique* (separate critic pass, different prompt/temp). Then wire the chosen critic into checkpoints (post-plan, pre-done, on-stall), feeding critique back; measure against the quality score.
+  3. **Capability matrix — score models per DISTINCT capability, not one "best" model** (user-defined axes):
+     - **Coding-agent / harness use** — drive Argo's loop, use tools, take a task end-to-end.
+     - **Planning** — turn an under-specified task into a correct, complete, ordered plan.
+     - **Supervision / evaluation** — judge another agent's plan + work (the critic; measured now by the supervisor eval).
+     - **Image understanding** — read screenshots / diagrams / photos.
+     - **Visual layout & alignment** — render → screenshot → judge alignment / spacing / overflow (via Playwright).
+     Pull Ollama vision models (`llama3.2-vision`, `llava`, `moondream`, `qwen2.5-vl`); qwen3.6 already reports a `vision` capability. A vision-capable agent is a coming requirement.
+
+**Standing product requirements (from the user) — status:**
+- Quality/reliability of complex, long-running tasks **over** speed or resource efficiency → the organizing principle of Phase 4.
+- Run for very long without losing the goal, hallucinating, looping, forgetting progress, or mismanaging memory → the north star (below); the 90-iter test measured exactly this and showed a lone model degrades, which motivates the critic.
+- Improve planning, reasoning, tooling, steering, supervision, staying on-track → Phases 3–4.
+- **After producing a plan, execute without an extra "proceed" prompt** → ALREADY satisfied: the plan/act gate blocks a mutation until a plan is recorded, then auto-proceeds with no user confirmation (see `CLAUDE.md`).
+- Evaluate models by distinct capabilities (the five axes above), not one universal best → capability matrix.
+- Dual-model (qwen works, another reviews plan + implementation while running) → step 2.
+- Measure quality on realistic, difficult tasks → the `bigproj` E2E eval + the supervisor eval.
 
 North star: an agent that runs ~indefinitely without losing the goal, hallucinating, looping, or losing track — with good memory of what matters. Run history: `docs/eval-log.md`.
