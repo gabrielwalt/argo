@@ -99,7 +99,13 @@ const sh = (cmd, cwd) => execSync(cmd, { cwd, stdio: 'pipe' }).toString();
 const shOk = (cmd, cwd) => { try { execSync(cmd, { cwd, stdio: 'pipe' }); return true; } catch { return false; } };
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-const baselineOf = (ws) => { try { return sh('git rev-parse HEAD', wsPath(ws)).trim(); } catch { return null; } };
+// Prefer an explicit `eval-baseline` tag over "current HEAD" so a run interrupted
+// between the agent's auto-commit and the reset can't leave a polluted commit as
+// the next baseline. Tag each eval workspace once: `git tag -f eval-baseline`.
+const baselineOf = (ws) => {
+  try { return sh('git rev-parse eval-baseline', wsPath(ws)).trim(); } catch { /* no tag */ }
+  try { return sh('git rev-parse HEAD', wsPath(ws)).trim(); } catch { return null; }
+};
 const resetWs = (ws, base) => { if (base) { try { sh(`git reset --hard ${base} && git clean -fd`, wsPath(ws)); } catch (e) { console.error(`reset ${ws}:`, e.message); } } };
 
 // Host resource snapshot (lean, cross-platform-ish): model VRAM footprint + CPU/GPU
