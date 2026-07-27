@@ -82,3 +82,55 @@ export async function writeFile(filePath: string, content: string): Promise<Tool
     return { output: '', error: String(err) }
   }
 }
+
+// A few lines of context around the edited region, line-numbered, so the caller
+// can confirm the change landed where expected WITHOUT re-reading the file —
+// the "did my edit apply? let me look again…" round trip is the loop this
+// avoids. matchIndex is the byte offset of the (first) replacement in `updated`.
+function editedRegion(updated: string, newString: string, matchIndex: number): string {
+  const startLine = updated.slice(0, matchIndex).split('\n').length - 1  // 0-based
+  const newLineCount = newString ? newString.split('\n').length : 1
+  const lines = updated.split('\n')
+  const from = Math.max(0, startLine - 2)
+  const to = Math.min(lines.length, startLine + newLineCount + 2)
+  return lines.slice(from, to).map((l, i) => `${from + i + 1}: ${l}`).join('\n')
+}
+
+// Exact-string replace that always reports what it did — the point is the
+// feedback, not the mechanism. It confirms how many occurrences changed and
+// echoes the updated region; it errors loudly (and changes nothing) when the
+// text is missing or ambiguous, instead of silently no-op'ing the way `sed -i`
+// does. That unambiguous signal is what lets the model stop guessing.
+export async function editFile(filePath: string, oldString: string, newString: string, replaceAll = false): Promise<ToolResult> {
+  try {
+    const abs = await safePath(filePath)
+    let content: string
+    try {
+      content = await fs.readFile(abs, 'utf-8')
+    } catch {
+      return { output: '', error: `File not found: ${filePath} — read it first, or use write_file to create it.` }
+    }
+    if (oldString === '') {
+      return { output: '', error: 'old_string is empty — give the exact existing text to replace (or use write_file to create/overwrite a file).' }
+    }
+    if (oldString === newString) {
+      return { output: '', error: 'old_string and new_string are identical — nothing to change.' }
+    }
+    const matchIndex = content.indexOf(oldString)
+    if (matchIndex === -1) {
+      return { output: '', error: `old_string not found in ${filePath}; the file was NOT modified. It must match exactly, including whitespace and indentation — read the current file and copy the target text verbatim.` }
+    }
+    const occurrences = content.split(oldString).length - 1
+    if (occurrences > 1 && !replaceAll) {
+      return { output: '', error: `old_string matches ${occurrences} places in ${filePath}; the file was NOT modified. Include surrounding context to target a single one, or pass replace_all: true to change all ${occurrences}.` }
+    }
+    const updated = replaceAll
+      ? content.split(oldString).join(newString)
+      : content.slice(0, matchIndex) + newString + content.slice(matchIndex + oldString.length)
+    await fs.writeFile(abs, updated, 'utf-8')
+    const n = replaceAll ? occurrences : 1
+    return { output: truncateOutput(`Edited ${filePath} — replaced ${n} occurrence${n === 1 ? '' : 's'}. Updated region:\n${editedRegion(updated, newString, matchIndex)}`, 4000) }
+  } catch (err) {
+    return { output: '', error: String(err) }
+  }
+}
