@@ -473,6 +473,28 @@ main {
   animation: msg-in .2s ease-out;
 }
 
+.message.plan {
+  border-left: 3px solid var(--gold);
+  background: rgba(201, 162, 39, 0.05);
+  white-space: normal;
+}
+.plan-title {
+  font-weight: 600;
+  color: var(--gold);
+  margin-bottom: 6px;
+}
+.plan-objective { margin-bottom: 4px; }
+.plan-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--muted);
+  margin-right: 6px;
+}
+.plan-steps { margin: 4px 0 0; padding-left: 20px; }
+.plan-steps li { margin: 2px 0; }
+
 .message.user {
   background: linear-gradient(135deg, rgba(91, 103, 245, 0.18), rgba(91, 103, 245, 0.08));
   border: 1px solid rgba(91, 103, 245, 0.4);

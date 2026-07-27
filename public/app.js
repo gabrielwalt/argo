@@ -204,7 +204,27 @@ function handleLiveEvent(event) {
 // the replay render path, in file order — which is already correct order, since
 // each run's JSONL is appended in emission order. Returns the __seq of the last
 // event rendered, i.e. the current run's high-water mark for live dedup.
+// Per-conversation sticky settings: restore the model + sampling options a
+// session last used, derived from its most recent run's log meta (no separate
+// storage — every run already records model + options). Called for every session
+// switch via replaySessionRuns below, so switching between e.g. a Qwen
+// conversation and a Mistral one keeps each one's model, temperature and context
+// size. A session with no runs yet (fresh) leaves the current settings untouched.
+function applySessionSettings(runs) {
+  const ordered = (runs ?? []).slice().sort((a, b) => (a.startedAt || '').localeCompare(b.startedAt || ''))
+  const run = ordered.reverse().find(r => r && r.model)
+  if (!run) return
+  selectModel(run.model)
+  const o = run.options || {}
+  modelOpts.temperature = o.temperature ?? DEFAULTS.temperature
+  modelOpts.top_p       = o.top_p       ?? DEFAULTS.top_p
+  modelOpts.top_k       = o.top_k       ?? DEFAULTS.top_k
+  modelOpts.num_ctx     = o.num_ctx     ?? DEFAULTS.num_ctx
+  syncSettingsUI()
+}
+
 async function replaySessionRuns(runs) {
+  applySessionSettings(runs)
   let lastSeq = 0
   const ordered = (runs ?? []).slice().sort((a, b) => a.startedAt.localeCompare(b.startedAt))
   for (const run of ordered) {
@@ -317,6 +337,10 @@ function handleEvent(event) {
       }
       break
 
+    case 'plan':
+      renderPlan(event)
+      break
+
     case 'token_usage': {
       const pct = Math.round(event.prompt_tokens / event.num_ctx * 100)
       tokenCounter.textContent = `${event.prompt_tokens.toLocaleString()} / ${event.num_ctx.toLocaleString()} ctx`
@@ -415,6 +439,10 @@ function handleEventForSession(event) {
 
     case 'message':
       addChatMessage(event.role, event.content)
+      break
+
+    case 'plan':
+      renderPlan(event)
       break
 
     case 'compact_start':
@@ -546,6 +574,22 @@ function addTraceItem(className, label, body, collapsible) {
 
 function renderMarkdown(content) {
   return marked.parse(content, { breaks: true, gfm: true })
+}
+
+// Renders the agent's plan as a message-level card in the chat flow (not buried
+// in the collapsed trace) so the user sees it like any other message. Each
+// update_plan call emits a fresh 'plan' event, so refinements pop up as their own
+// cards, labelled with the revision.
+function renderPlan(event) {
+  const el = document.createElement('div')
+  el.className = 'message plan md'
+  const title = event.revision > 1 ? `📋 Plan · revised (v${event.revision})` : '📋 Plan'
+  const steps = (event.steps || []).map(s => `<li>${escHtml(s)}</li>`).join('')
+  el.innerHTML = `<div class="plan-title">${escHtml(title)}</div>`
+    + `<div class="plan-objective"><span class="plan-label">Objective</span> ${escHtml(event.objective)}</div>`
+    + (steps ? `<ol class="plan-steps">${steps}</ol>` : '')
+  messagesEl.appendChild(el)
+  messagesEl.scrollTop = messagesEl.scrollHeight
 }
 
 function addChatMessage(role, content) {
@@ -725,7 +769,7 @@ async function loadModels() {
       const item = document.createElement('div')
       item.className = 'nav-drop-item'
       item.dataset.model = name
-      const toolBadge = name.startsWith('qwen3') ? ' <span class="model-tool-badge" title="Validated for tool use">🔧</span>' : ''
+      const toolBadge = (name.startsWith('qwen3') || name.startsWith('devstral')) ? ' <span class="model-tool-badge" title="Validated for tool use">🔧</span>' : ''
       const noToolBadge = (name.startsWith('gemma') ) ? ' <span class="model-tool-badge" title="No tool support — will not work in Argo">⚠️</span>' : ''
       item.innerHTML = `${escHtml(name)}${toolBadge}${noToolBadge}`
       item.addEventListener('click', () => {
@@ -1491,7 +1535,10 @@ async function boot() {
   if (!window.__WS__ && !status.workspacePath) { showNoWorkspaceScreen(); finishReplay(); return }
 
   currentLiveSessionId = status.sessionId ?? ''
-  loadModels()
+  // await so the model dropdown is populated (and its models[0] default selected)
+  // BEFORE the history replay below runs applySessionSettings() — otherwise
+  // loadModels' own selection could land last and clobber the restored sticky model.
+  await loadModels()
   refreshGitLog()
   // Drop the static index.html placeholder before replaying (returnToCurrentSession
   // and viewSession clear likewise); the empty-session placeholder is re-added below.
