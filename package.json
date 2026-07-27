@@ -6,7 +6,9 @@
     "dev": "PORT=3001 tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsx --test src/*.test.ts src/tools/*.test.ts"
+    "test": "tsx --test src/*.test.ts src/tools/*.test.ts",
+    "eval": "node scripts/eval.mjs",
+    "eval:e2e": "node scripts/eval-e2e.mjs"
   },
   "dependencies": {
     "cors": "^2.8.5",
