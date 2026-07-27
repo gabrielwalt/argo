@@ -193,27 +193,28 @@ async function cleanupSession(sessionId: string, slug: string): Promise<void> {
   ])
 }
 
-test('repetition guard: a 4th identical tool call is intervened, not executed a 4th time', async () => {
+test('loop steering: a 4th identical call is skipped (steered, not executed) and the run continues', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-repeat-a-${Date.now()}`
-  // read, read, read, (4th identical read → intervention), then a final answer.
+  // read, read, read, (4th identical read → steered, not executed), then a final answer.
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, readCall, readCall, readCall, finalAnswer]))
   agent.setSessionId(sessionId)
   try {
     await agent.chat('argo repetition guard case a')
 
-    assert.equal(readResults(events).length, 3)  // the 4th identical call was blocked
-    assert.equal(warningsMatching(events, /repeated 3 times with no new information/).length, 1)
+    assert.equal(readResults(events).length, 3)  // the 4th identical call was skipped, not executed
+    assert.equal(warningsMatching(events, /no new information/).length, 1)  // one steer injected in its place
 
-    // One warning, then a clean model-produced final answer — not a forced stop.
+    // The run was NOT terminated by the guard — it continued to the model's own final answer.
     const done = events.find((e): e is Extract<AgentEvent, { type: 'done' }> => e.type === 'done')
     assert.equal(done?.content, 'Final answer.')
+    assert.equal(events.some(e => e.type === 'error'), false)
   } finally {
     await cleanupSession(sessionId, 'argo-repetition-guard-case-a')
   }
 })
 
-test('repetition guard: 2 identical calls stay under threshold and do not intervene', async () => {
+test('loop steering: 2 identical calls stay under threshold and are not steered', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-repeat-b-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, readCall, finalAnswer]))
@@ -222,31 +223,30 @@ test('repetition guard: 2 identical calls stay under threshold and do not interv
     await agent.chat('argo repetition guard case b')
 
     assert.equal(readResults(events).length, 2)  // both executed for real
-    assert.equal(warningsMatching(events, /repeated \d+ times with no new information/).length, 0)
+    assert.equal(warningsMatching(events, /no new information|STOP/).length, 0)  // no steer
   } finally {
     await cleanupSession(sessionId, 'argo-repetition-guard-case-b')
   }
 })
 
-test('repetition guard: repeating again after the warning ends the run cleanly instead of looping', async () => {
+test('loop steering: a model that never stops repeating is steered (escalating), never terminated by the guard', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-repeat-c-${Date.now()}`
-  // The model never stops repeating: readCall is the last element, so it recurs
-  // for every subsequent iteration. Escalation must terminate the run.
+  // readCall is the last (only) element, so it recurs every iteration forever.
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall]))
   agent.setSessionId(sessionId)
-  agent.setMaxIterations(10)  // safety net: if escalation failed, the run would hit max iterations (an `error`), not hang
+  agent.setMaxIterations(12)  // enough room for a few escalating steers before the real bound
   try {
     const answer = await agent.chat('argo repetition guard case c')
 
-    assert.equal(readResults(events).length, 3)  // never executed a 4th time
-    assert.equal(warningsMatching(events, /repeated 3 times with no new information/).length, 1)  // first (and only) warning
-    assert.equal(warningsMatching(events, /repeated again after a warning/).length, 1)  // escalation
+    assert.equal(readResults(events).length, 3)  // executed 3×, then every further identical call is steered, not run
+    assert.equal(warningsMatching(events, /no new information/).length, 1)  // first steer (level 1)
+    assert.ok(warningsMatching(events, /STOP/).length >= 1, 'expected the steer to escalate (level 2+)')
 
-    // Ended via `done`, not by exhausting iterations.
-    assert.ok(events.some(e => e.type === 'done'))
-    assert.equal(events.some(e => e.type === 'error'), false)
-    assert.match(answer, /even after a warning/)
+    // The guard NEVER ends the run — only MAX_ITERATIONS does (an `error`, no guard `done`).
+    assert.equal(events.some(e => e.type === 'done'), false)
+    assert.ok(events.some(e => e.type === 'error'))
+    assert.match(answer, /maximum iterations/i)
   } finally {
     await cleanupSession(sessionId, 'argo-repetition-guard-case-c')
   }
@@ -341,5 +341,53 @@ test('chat retry: a stop issued during the retry wait is honored and no retry is
     assert.equal(events.some(e => e.type === 'error'), false)
   } finally {
     await cleanupSession(sessionId, 'argo-chat-retry-case-c')
+  }
+})
+
+// ── Plan/act gate (chat() loop). A project mutation (edit_file/write_file under
+// /workspace) is blocked until the model records a plan via update_plan; read-only
+// work and plain questions never trigger it (versatility). Scripted, no live model.
+
+const editCall: ScriptedResponse = {
+  message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'edit_file', arguments: { path: '/workspace/nonexistent-argo-plan-gate.txt', old_string: 'a', new_string: 'b' } } }] },
+}
+const planCall: ScriptedResponse = {
+  message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'update_plan', arguments: { objective: 'Change the file', steps: ['edit it'] } } }] },
+}
+
+test('plan/act gate: a project mutation is blocked until a plan is recorded, then allowed', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-plan-gate-${Date.now()}`
+  // edit (blocked→steered), update_plan (records plan), edit (now allowed→executes), final answer.
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([editCall, planCall, editCall, finalAnswer]))
+  agent.setSessionId(sessionId)
+  try {
+    const answer = await agent.chat('argo plan gate case')
+    assert.ok(warningsMatching(events, /plan/i).length >= 1, 'expected a steer to record a plan first')
+    assert.equal(events.some(e => e.type === 'plan'), true)             // update_plan recorded a plan
+    // Exactly one edit_file actually executed — the post-plan one; the pre-plan
+    // attempt was blocked before reaching the tool.
+    assert.equal(events.filter(e => e.type === 'tool_result' && e.tool === 'edit_file').length, 1)
+    assert.equal(answer, 'Final answer.')
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-plan-gate-case')
+  }
+})
+
+test('plan/act gate: a read-only run needs no plan and finishes directly (versatility)', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-plan-gate-ro-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, finalAnswer]))
+  agent.setSessionId(sessionId)
+  try {
+    const answer = await agent.chat('argo plan gate read-only case')
+    assert.equal(events.some(e => e.type === 'plan'), false)            // never forced to plan
+    assert.equal(warningsMatching(events, /plan/i).length, 0)           // no plan steer
+    assert.equal(readResults(events).length, 1)                         // the read ran
+    assert.equal(answer, 'Final answer.')                               // finished directly
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-plan-gate-read-only-case')
   }
 })

@@ -335,6 +335,17 @@ export class SessionLogger {
           }
           break
 
+        case 'plan':
+          lines.push(`**📋 ${event.revision === 1 ? 'Plan' : `Plan · revision ${event.revision}`}** \`${time}\``)
+          lines.push(``)
+          lines.push(`> **Objective:** ${event.objective}`)
+          if (event.steps.length) {
+            lines.push(`>`)
+            for (const s of event.steps) lines.push(`> - ${s}`)
+          }
+          lines.push(``)
+          break
+
         default: {
           // Compile-time guard: a new AgentEvent variant without a case above
           // fails the build here instead of silently vanishing from the .md

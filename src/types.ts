@@ -1,4 +1,4 @@
-export type ToolName = 'bash' | 'web_search' | 'read_file' | 'write_file' | 'fetch_url' | 'browser_fetch'
+export type ToolName = 'bash' | 'web_search' | 'read_file' | 'write_file' | 'edit_file' | 'fetch_url' | 'browser_fetch' | 'update_plan'
 
 export interface ToolResult {
   output: string
@@ -42,6 +42,7 @@ export type AgentEvent =
       validated: boolean
       manual?: boolean
     }
+  | { type: 'plan'; objective: string; steps: string[]; revision: number }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
 

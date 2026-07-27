@@ -21,53 +21,46 @@ import {
   validateActiveSummary,
 } from './compaction.js'
 
-const SYSTEM_PROMPT = `You are a capable local agent running in an isolated Ubuntu 24.04 Docker container. The host machine is not accessible.
+// SYSTEM PROMPT — authoring guidance (for maintainers, not the model):
+// Use this for HIGH-LEVEL steering of *how to work*, awareness of the tools the
+// harness provides, and the Argo context the agent runs in. Do NOT add obvious,
+// low-level do/don't rules the model should already know or can infer (e.g.
+// "locate before you edit", "verify your change") — we cannot enumerate correct
+// behavior, and a growing wall of such rules dilutes the prompt and effectively
+// dumbs the model down. When a basic failure mode shows up, prefer fixing it in
+// the HARNESS (a better tool with real feedback, a loop steer, a guard) over
+// adding a line here — e.g. the edit_file tool replaced a prompt rule about not
+// reusing a stale remembered block; the harness now makes that failure impossible.
+const SYSTEM_PROMPT = `You are the coding agent inside Argo, a local-first coding harness. Your project is mounted at /workspace in an isolated Ubuntu Docker container (the host is not accessible). Your thoughts, tool calls, and results stream live to the user, and changes under /workspace are auto-committed to git after each run.
+
+TOOLS — invoke them through the function-calling API; never write a tool call as text, JSON, or XML in your reply.
+- bash: run shell commands. Pass the working directory via the cwd argument (e.g. /workspace); do not prefix with "cd /workspace &&".
+- read_file / write_file: whole-file I/O at any absolute path.
+- edit_file: replace an exact string in a file; it reports the changed lines and errors if the text is missing or matches more than once.
+- update_plan: record or refine your plan (a concrete objective plus steps). It is a tool call, so it does not end your turn.
+- fetch_url / browser_fetch: fetch a page (browser_fetch runs JavaScript). web_search: look up things you do not already know.
+When the task is complete, give your final answer and stop.
+
+HOW TO WORK
+- A simple question or a one-line change: answer or do it directly — no plan needed.
+- Non-trivial work: read the relevant files first, then call update_plan with ONE concrete, verifiable objective — exactly what the user asked for, never a broader or more interesting goal — plus the steps to reach it, and carry it out. You cannot modify files under /workspace until a plan is recorded.
+- Stay on the plan. Call update_plan again only when the work contradicts one of its assumptions. Rewriting the same thing many different ways with nothing forcing it is drift — stop and return to the plan.
+- For repetitive work (many files or pages), write one script instead of repeating a tool call.
+- Before finishing, verify the objective against the original request — run the relevant command or test — then give your final answer.
 
 PRECISION
-Never reconstruct exact technical strings from memory. Any identifier, URL, domain, path, package name, flag, or key that must appear in a new script or command must be copied verbatim from the tool result where it appeared — not recalled. When uncertain, re-read the source with a tool call first.
-
-REASONING
-For concurrency, derive the valid serial orderings before calling an observed result a race or lost update — it is only a defect if no valid ordering explains it or an invariant is violated.
-Before claiming a regression, show a concrete case where old and new behavior differ and the new result violates a requirement or invariant; a difference alone is not a regression.
-Label evidence by how it was obtained: verified (you ran it and checked the output), reproduced (the experiment directly exercised the claimed mechanism), inferred, hypothesized, or untested. Do not present a weaker label as a stronger one.
-When the user states an explicit constraint (e.g. "do not modify any files," "read-only," "do not commit"), it overrides any other part of the same request that could imply a conflicting action. If a task could be satisfied by either a mutating or a non-mutating action, choose the non-mutating one. If no non-mutating option exists, say so explicitly instead of proceeding anyway.
-
-EFFICIENCY
-Never call the same tool more than twice in a row with similar inputs — write a script instead. Fetching 10 pages one by one, running the same command on multiple files, processing a list item by item: all of these must be a script, not repeated tool calls.
-Test before bulk: run the script on one item first, verify the output is correct, then scale to the full set.
-When editing the same file repeatedly across many iterations, don't match a multi-line block by reusing a string you remember from earlier — re-read the exact current lines immediately before each edit. A remembered block silently no-ops or partially matches once the file has drifted, corrupting structure instead of failing loudly.
-Return conclusions and file paths only: never raw page or file contents as tool output.
-Multi-line JS: prefer writing to a script file (e.g. /tmp/script.js) and running with node — easier to inspect and rerun than an inline command. Multi-line node -e now works correctly too; use it for anything short-lived that doesn't need to be rerun.
+- Never reconstruct an exact identifier, path, URL, flag, or package name from memory — copy it verbatim from the tool result where it appeared, or re-read the source.
+- Distinguish what you verified from what you assumed; do not present a guess as a fact.
 
 FILESYSTEM
-The whole container is your working environment. /workspace is the one special directory: the user's project, git-tracked, and the only place autoCommit() operates — treat it like a clean codebase and only put intentional project changes and deliverables there. Everywhere else (/tmp, your home directory, wherever) is ordinary, disposable filesystem — freely usable for scripts, downloads, and intermediate work; none of it is committed or shown to the user.
-Commands about the project itself (npm test, npm run <script>, node <project file>, git, etc.) need cwd set to /workspace on the bash call — they assume the project root and fail otherwise. Do not prefix commands with "cd /workspace &&"; use the tool's cwd argument instead.
-A script outside /workspace that needs to import or require project code must reference it as /workspace/... — a relative import like './src/foo.js' resolves against the script's own cwd, not the project root.
-Always use absolute paths.
-Scripts that produce output required in the workspace must write directly to /workspace/... (e.g. via an OUTPUT_DIR env var) — don't assume the script's own cwd is the project root.
-Before declaring done: re-read the original request, verify every item is addressed, and if the task produced files run ls /workspace/ to confirm they are there.
+- /workspace is the git-tracked project — the only place that is committed. Keep scratch, experiments, and downloads elsewhere (/tmp, your home directory); none of that is committed or shown to the user.
+- Use absolute paths. For commands about the project itself (npm test, git, node <file>), set the bash cwd to /workspace.
 
 MEMORY
-/workspace/AGENTS.md (if present) is project-level instructions, already loaded below — don't rewrite it unless explicitly asked to do so. /workspace/MEMORY.md (if present) is durable project memory, don't re-derive what it already states. After completing a task, update MEMORY.md only when you learned something durable and reusable across sessions: an architecture fact, a convention, a decision, a recurring pitfall. Never record one-off task state, debugging detail, or anything derivable by rereading the code. Update the relevant point in place — don't append duplicates. Use terse bullet points and one-liners; MEMORY is always loaded into context, so brevity saves tokens. If MEMORY.md grows large, move a section into memory/<topic>.md and leave a one-line pointer to it in MEMORY.md, so you know it exists without needing it loaded every run.
-
-TOOLS
-Invoke tools immediately and directly — never describe plans or write tool calls as JSON/prose first.
-- bash: shell commands, run scripts
-- write_file / read_file: file I/O
-- fetch_url: static pages (fast, no JS)
-- browser_fetch: JS-rendered pages, or when fetch_url returns empty/incomplete content
-- web_search: find information you don't already have (facts, docs, unknown URLs). Never use it when you already have the URL — use fetch_url or browser_fetch directly instead.
-A tool's stated hard limits (timeouts, size caps) are enforced by the harness itself — wrapping a call in your own retry/timeout/backoff logic cannot extend one; only an explicit override parameter, where the tool's own description offers one, has any effect.
-When the task is complete, give the final answer and stop.
-
-CURRENCY
-Training data has a cutoff and goes stale. For anything that can change over time — current events, sports/election results, standings, prices, versions, "latest"/"current"/"who holds the record" claims — verify with web_search before answering, even when you're confident you already know the answer. Report what the sources say, not what memory says.
+- /workspace/AGENTS.md (project instructions) and /workspace/MEMORY.md (durable memory), if present, are already appended below. Update MEMORY.md only for durable, reusable facts — tersely, in place — never one-off task state.
 
 ENVIRONMENT
-CLI: bash, curl, wget, git, jq, node, ripgrep (rg), fd, sqlite3, mlr, parallel, tree, unzip, zip, pv, dig, nc, ping
-Node.js: NODE_PATH is set — always use require(), never import. Pre-installed: cheerio, js-yaml, csv-parse, xlsx, pdf-parse, marked, turndown, handlebars, chalk, commander, date-fns, iconv-lite, glob, playwright. Install others with npm. fetch() is native. git is configured as "Local Agent".
-HTML: const $ = cheerio.load(html); $('sel').text(); $('a').attr('href'); $.html(el)
-`
+- Ubuntu 24.04. CLI includes bash, git, jq, node, python3, rg, fd, sqlite3, curl. In Node use require() (NODE_PATH is set), not import; native fetch() is available; cheerio and playwright are preinstalled.`
 
 // Parses tool calls that a model wrote as JSON code blocks in its text content
 // instead of using the native tool-calling API (common with smaller models).
@@ -148,17 +141,56 @@ export function buildFallbackCommitMessage(changedFiles: string[]): string {
   return `Agent: update ${changedFiles.length} files`
 }
 
-// Harness-level stop against the agent spinning on identical tool calls. The
-// soft system-prompt rule ("never call the same tool more than twice in a row")
-// was ignored 9-11x consecutively in real runs, so this enforces it in code.
-// Thresholds are deliberately loose: real incidents ran into double digits, so
-// intervening only at the 3rd repeat leaves wide margin over a legitimate
-// repeat (e.g. re-running the same test twice to confirm a fix).
+// Harness-level loop STEERING — deliberately not a stop. When the model repeats
+// a tool call that yields no new information, the run is never terminated:
+// instead the redundant call is skipped and replaced with an escalating steer
+// that hands the model a different observation and concrete escape routes, so it
+// can break out on its own and keep working toward a conclusion. MAX_ITERATIONS
+// and the user's stop button remain the only hard bounds. The threshold is loose
+// (steer only from the 3rd repeat) to leave room for a legitimate repeat (e.g.
+// re-running one test to confirm a fix). Thought-text repetition is intentionally
+// not a separate detector: in every observed incident it co-occurred with an
+// identical tool call, which this already catches.
 export const REPEAT_WINDOW = 6
 export const REPEAT_THRESHOLD = 3
 
+// Deterministic context editing (see chatCall): the most recent N tool results are
+// kept verbatim in the context sent to the model; older ones longer than M chars are
+// collapsed to a short restorable stub. This keeps the LIVE window small over long
+// runs — which is what keeps small local models emitting native tool calls — and
+// makes the (expensive) LLM compaction fire far less often. Non-destructive:
+// this.history keeps the full results for the JSONL log and for compaction.
+export const KEEP_RECENT_TOOL_RESULTS = 4
+export const TOOL_RESULT_COLLAPSE_OVER = 600
+
 export function repetitionKey(name: string, args: Record<string, unknown>): string {
   return `${name}:${JSON.stringify(args)}`
+}
+
+// A "project mutation" is an edit_file/write_file targeting the git-tracked
+// workspace (scratch writes elsewhere don't count). The plan/act gate in chat()
+// uses this to enforce plan-before-act: the model may investigate (read/grep)
+// freely, but cannot change the project until it has recorded a plan via
+// update_plan — separating "figure out what to do" from "do it" as a state with
+// different rules, gated by *about to mutate the project* rather than a task
+// classifier, so read-only runs and plain questions never trigger planning.
+export function isProjectMutation(name: string, args: Record<string, unknown>): boolean {
+  if (name !== 'edit_file' && name !== 'write_file') return false
+  const p = typeof args.path === 'string' ? args.path : ''
+  return p.startsWith('/workspace')
+}
+
+// The escalating steer injected when a call repeats with no new information (see
+// the loop in chat()). Kept OUT of the system prompt on purpose: it's contextual
+// harness help, surfaced only when a loop is actually detected — not a blanket
+// instruction the model must always carry. Level 1 observes and offers options;
+// level 2+ is firmer. It names the single most common cause (verifying a change
+// that doesn't appear to take) because that is the loop seen in practice.
+export function loopSteerMessage(name: string, priorRepeats: number, level: number): string {
+  const lead = level >= 2
+    ? `STOP — you keep calling \`${name}\` with identical arguments and getting the same result (${priorRepeats}+ times). Repeating it will not help.`
+    : `That \`${name}\` call used identical arguments and returned the same result as before — no new information.`
+  return `${lead} If you were checking whether a change took effect, verify it where it actually applies — edit_file reports the exact lines it changed, and a view that looks unchanged can mean the edit didn't match or you're looking at the wrong place. Otherwise: try genuinely different arguments or a different tool, or give your final answer if you already have what you need.`
 }
 
 // Same cap as read_file's own truncation (file-ops.ts) — these are the same
@@ -208,6 +240,13 @@ export class Agent {
   // chat() run, never persisted — a legitimately repeated action in a later run
   // must start from a clean slate (see the repetition guard in chat()).
   private recentCalls: string[] = []
+  // Harness-owned plan for the current run (objective + steps + revision). Recited
+  // into the tail of context each iteration to fight goal-drift, and surfaced to
+  // the UI as a 'plan' event. NEVER written to /workspace (not a committed
+  // artifact). Reset per run (see chat()), so a trivial follow-up turn has no plan
+  // and finishes immediately — the re-grounding done-gate only fires when a plan
+  // exists, which is what keeps simple Q&A fast.
+  private currentPlan: { objective: string; steps: string[]; revision: number } | null = null
   private get historyFile(): string {
     return path.join(LOGS_DIR, this.sessionId ? `history-${this.sessionId}.json` : 'history.json')
   }
@@ -439,9 +478,38 @@ export class Agent {
   // Return type is intentionally inferred (Promise<ChatResponse>) to avoid
   // importing the ollama response type.
   private chatCall(systemPrompt: string) {
+    // Deterministic context editing (Tier-0, no LLM): the model only needs recent
+    // tool outputs verbatim; older large ones are collapsed to a short, restorable
+    // stub so the LIVE window it sees stays small over long runs — which is what
+    // keeps small local models emitting native tool calls (measured: native-call
+    // reliability falls as context grows). NON-destructive: this.history keeps the
+    // full results (the JSONL log and compaction still see everything); only what
+    // is SENT to the model shrinks. This is the cheapest way to hold the window
+    // small over many turns, and it makes the (expensive) LLM compaction fire less.
+    const toolPos: number[] = []
+    this.history.forEach((m, i) => { if (m.role === 'tool') toolPos.push(i) })
+    const collapse = new Set(toolPos.slice(0, Math.max(0, toolPos.length - KEEP_RECENT_TOOL_RESULTS)))
+    const messages: Message[] = [{ role: 'system', content: systemPrompt }]
+    this.history.forEach((m, i) => {
+      const c = m.content
+      if (collapse.has(i) && typeof c === 'string' && c.length > TOOL_RESULT_COLLAPSE_OVER) {
+        messages.push({ role: 'tool', content: `[older tool output collapsed — ${c.length} chars; re-read the file or re-run the command if you need it]\n${c.slice(0, 200).replace(/\s+/g, ' ')}…` })
+      } else {
+        messages.push(m)
+      }
+    })
+    // Recitation (Manus todo.md pattern): keep the current plan at the very tail
+    // of context every iteration so the objective stays in the model's recent
+    // attention and doesn't get lost mid-history over a long run. Transient — not
+    // stored in this.history, rebuilt from this.currentPlan each call — so it can
+    // never duplicate or drift out of sync with the live plan, and it survives
+    // compaction (which only rewrites this.history) for free.
+    if (this.currentPlan) {
+      messages.push({ role: 'tool', content: this.renderPlanReminder(this.currentPlan) })
+    }
     return withTimeout(this.ollama.chat({
       model: this.model,
-      messages: [{ role: 'system', content: systemPrompt }, ...this.history],
+      messages,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       tools: toolDefinitions as any[],
       stream: false,
@@ -474,6 +542,35 @@ export class Agent {
     }
   }
 
+  private renderPlanReminder(plan: { objective: string; steps: string[] }): string {
+    const steps = plan.steps.length
+      ? `\nSteps:\n${plan.steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}`
+      : ''
+    return `[CURRENT PLAN — keep working toward this objective; do not drift onto a broader or different goal]\nObjective: ${plan.objective}${steps}\nRefine it with update_plan only if the work contradicts an assumption; finish only once the objective is verifiably met.`
+  }
+
+  // Harness handler for the update_plan tool. Sets the run's plan, surfaces it as
+  // a 'plan' event (rendered in the UI like a message and logged for replay), and
+  // returns the confirmation that becomes the tool result in history. Because the
+  // model reaches this via a tool call, recording a plan never trips the
+  // "no tool call = done" terminal condition — the failure that made a plan-as-prose
+  // turn end the run.
+  private handleUpdatePlan(args: Record<string, unknown>, emitAndLog: (e: AgentEvent) => void): string {
+    const objective = typeof args.objective === 'string' ? args.objective.trim() : ''
+    const steps = (Array.isArray(args.steps) ? args.steps : [])
+      .map(s => String(s).trim())
+      .filter(Boolean)
+    if (!objective) {
+      return 'update_plan needs an "objective": one concrete, verifiable success criterion. Nothing was recorded — call it again with an objective.'
+    }
+    const revision = (this.currentPlan?.revision ?? 0) + 1
+    this.currentPlan = { objective, steps, revision }
+    emitAndLog({ type: 'plan', objective, steps, revision })
+    const label = revision === 1 ? 'Plan recorded' : `Plan updated (revision ${revision})`
+    const stepsText = steps.length ? `\nSteps:\n${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}` : ''
+    return `${label}. Objective: ${objective}${stepsText}\nNow execute toward this objective — keep going, do not stop until it is verifiably met.`
+  }
+
   async chat(userMessage: string): Promise<string> {
     const logger = new SessionLogger(userMessage, this.model, this.options, this.sessionId)
 
@@ -492,9 +589,11 @@ export class Agent {
     // Reassigned (not recomputed) after each compaction, since compaction replaces
     // `this.history` wholesale and returns the prompt's new position in it.
     let currentRunStart = this.history.length - 1
-    // Repetition guard state, scoped to this run only (see REPEAT_WINDOW above).
+    // Loop-steering state, scoped to this run only (see REPEAT_WINDOW above).
     this.recentCalls = []
-    let repetitionInterventions = 0
+    this.currentPlan = null
+    let loopSteers = 0
+    let regrounded = false
     emitAndLog({ type: 'message', role: 'user', content: userMessage })
     emitAndLog({ type: 'start', model: this.model, query: userMessage, options: this.options })
 
@@ -570,6 +669,25 @@ export class Agent {
 
         if (!hasCalls) {
           this.history.push(msg)
+          // Re-grounding done-gate: if a plan is active for THIS run, don't take
+          // the first "I'm done" at face value — nudge once to verify the recorded
+          // objective is actually met (checking a fix against the reported symptom
+          // is the exact step the 90-iteration drift run skipped). A run with no
+          // plan (simple task / question) finishes immediately, so versatility is
+          // untouched. At most once per run (regrounded), so it cannot loop.
+          // Read through a cast: this.currentPlan is set only inside handleUpdatePlan
+          // (the update_plan intercept), which TS's control-flow analysis can't see
+          // from here — after the run-start `this.currentPlan = null` it still believes
+          // the field is null and narrows this truthy branch to `never`. The cast
+          // restores the real plan type.
+          const activePlan = this.currentPlan as { objective: string; steps: string[]; revision: number } | null
+          if (activePlan && !regrounded) {
+            regrounded = true
+            const nudge = `Before finishing, re-ground against your plan. Objective: "${activePlan.objective}". Confirm it is fully met and state how you verified it — the command or check you ran and its result. If any step remains or you have not actually verified it, keep working; otherwise give your final answer.`
+            emitAndLog({ type: 'warning', message: nudge })
+            this.history.push({ role: 'tool', content: nudge })
+            continue
+          }
           emitAndLog({ type: 'message', role: 'assistant', content: msg.content })
           emitAndLog({ type: 'done', content: msg.content })
           await this.autoCommit(emitAndLog)
@@ -583,33 +701,42 @@ export class Agent {
           : fallbackCalls.map(fc => ({ name: fc.name as ToolName, args: fc.arguments }))
 
         for (const { name, args } of callsToRun) {
-          // Repetition guard. The record holds calls actually executed this run,
-          // so REPEAT_THRESHOLD prior occurrences means this would be the (N+1)th
-          // identical call — the model already saw the same result N times.
-          // Thought-text repetition (the model re-emitting a near-verbatim thought
-          // before each call) is intentionally NOT a separate detector: in every
-          // observed incident it co-occurred with an identical tool call, which
-          // this record already catches, so a second signal would add complexity
-          // without changing behavior on any real case.
+          // update_plan is a harness action (mutates the run's plan + emits a
+          // 'plan' event), not a sandbox tool — handle it here and skip the
+          // repetition guard. It IS a tool call, so recording/refining a plan can
+          // never be mistaken for "no tool call = done".
+          if (name === 'update_plan') {
+            this.history.push({ role: 'tool', content: this.handleUpdatePlan(args, emitAndLog) })
+            continue
+          }
+          // Plan/act gate: investigation (reads/greps) flows freely, but a project
+          // mutation is BLOCKED until a plan is recorded — separating plan from act
+          // as a state with different rules. Gated by "about to change the project"
+          // (isProjectMutation), not a task classifier, so read-only runs and plain
+          // questions never plan (versatility). Blocked, not executed; a steer takes
+          // its place and it isn't counted as a repeat, so the retried call runs
+          // normally once the plan exists.
+          if (!this.currentPlan && isProjectMutation(name, args)) {
+            const gate = `Before changing the project (\`${name}\` on ${typeof args.path === 'string' ? args.path : 'a file'}) you must record a plan. Read the relevant files if you haven't, then call update_plan with one concrete, verifiable objective and the steps to reach it — then make this change. Recording a plan does not end your turn.`
+            emitAndLog({ type: 'warning', message: gate })
+            this.history.push({ role: 'tool', content: gate })
+            continue
+          }
+          // Loop steering (see REPEAT_* above): recentCalls holds calls actually
+          // executed this run, so REPEAT_THRESHOLD prior occurrences means this
+          // identical call has already produced the same result that many times.
           const key = repetitionKey(name, args)
           const priorRepeats = this.recentCalls.filter(k => k === key).length
           if (priorRepeats >= REPEAT_THRESHOLD) {
-            if (repetitionInterventions >= 1) {
-              // The model repeated the identical call even after the warning
-              // below was injected — stop the run with a final answer rather than
-              // warning (and re-warning) forever. autoCommit so any real work done
-              // earlier in the run still honors the every-change-is-committed
-              // guarantee, same as the normal final-answer path.
-              const msg = `Ended the run: the ${name} tool was called with identical arguments repeatedly, even after a warning, without producing new information. Stopping with what is already known.`
-              emitAndLog({ type: 'warning', message: `Repetition guard: ${name} repeated again after a warning — ending the run.` })
-              emitAndLog({ type: 'done', content: msg })
-              await this.autoCommit(emitAndLog)
-              return msg
-            }
-            repetitionInterventions++
-            const warning = `This exact tool call (${name} with identical arguments) has been repeated ${priorRepeats} times with no new information. Do not repeat it again. Either provide your final answer now based on what you already know, or call a genuinely different tool or arguments.`
-            emitAndLog({ type: 'warning', message: warning })
-            this.history.push({ role: 'tool', content: warning })
+            // Skip it (re-running only reproduces a result already in context) and
+            // inject an escalating steer in its place — a different observation
+            // plus concrete escape routes — WITHOUT ending the run. The model
+            // keeps working; MAX_ITERATIONS and the stop button are the only hard
+            // bounds.
+            loopSteers++
+            const steer = loopSteerMessage(name, priorRepeats, loopSteers)
+            emitAndLog({ type: 'warning', message: steer })
+            this.history.push({ role: 'tool', content: steer })
             continue
           }
 
@@ -636,6 +763,9 @@ export class Agent {
 
           this.recentCalls.push(key)
           if (this.recentCalls.length > REPEAT_WINDOW) this.recentCalls.shift()
+          // A novel action (not already in the window) means the model moved on —
+          // reset steer escalation so any later, unrelated loop starts gentle.
+          if (priorRepeats === 0) loopSteers = 0
         }
       }
 

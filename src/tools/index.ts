@@ -1,6 +1,6 @@
 import { bash } from './bash.js'
 import { webSearch } from './web-search.js'
-import { readFile, writeFile } from './file-ops.js'
+import { readFile, writeFile, editFile } from './file-ops.js'
 import { fetchUrl } from './fetch-url.js'
 import { browserFetch } from './browser-fetch.js'
 import type { ToolName, ToolResult } from '../types.js'
@@ -69,6 +69,23 @@ export const toolDefinitions = [
   {
     type: 'function' as const,
     function: {
+      name: 'edit_file',
+      description: 'Replace an exact string in an existing file and report exactly what changed: how many occurrences were replaced, plus the updated region shown with line numbers. Errors (and changes nothing) if old_string is not found or matches more than one place — so an edit never applies silently or to the wrong spot. old_string must match the file verbatim, including whitespace and indentation.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute path, e.g. /workspace/...' },
+          old_string: { type: 'string', description: 'The exact existing text to replace. Must be unique in the file unless replace_all is true.' },
+          new_string: { type: 'string', description: 'The replacement text.' },
+          replace_all: { type: 'boolean', description: 'Replace every occurrence instead of requiring a unique match. Default false.' },
+        },
+        required: ['path', 'old_string', 'new_string'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
       name: 'fetch_url',
       description: 'Fetch the text content of a URL by making an HTTP request (HTML stripped to plain text). Fast but does NOT execute JavaScript — use browser_fetch for JS-rendered pages.',
       parameters: {
@@ -95,6 +112,21 @@ export const toolDefinitions = [
       },
     },
   },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'update_plan',
+      description: 'Record or refine your plan for a non-trivial task. Call it AFTER reading the relevant files, so the plan is grounded in this project, with ONE concrete, verifiable objective (a definition of done) plus the ordered steps to reach it. Recording a plan does NOT end your turn — keep working after calling it. Call it again to refine the plan when the work contradicts an assumption. The plan is shown to the user and kept in front of you as you work. Skip it entirely for simple questions or one-line changes.',
+      parameters: {
+        type: 'object',
+        properties: {
+          objective: { type: 'string', description: 'One concrete, verifiable success criterion — specific enough to tell unambiguously when the task is done.' },
+          steps: { type: 'array', items: { type: 'string' }, description: 'Ordered steps to reach the objective. Rewrite the whole list when refining.' },
+        },
+        required: ['objective'],
+      },
+    },
+  },
 ]
 
 export async function executeTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
@@ -107,10 +139,15 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
       return readFile(args.path as string)
     case 'write_file':
       return writeFile(args.path as string, args.content as string)
+    case 'edit_file':
+      return editFile(args.path as string, args.old_string as string, args.new_string as string, args.replace_all as boolean | undefined)
     case 'fetch_url':
       return fetchUrl(args.url as string)
     case 'browser_fetch':
       return browserFetch(args.url as string, args.wait_for as string | undefined)
+    case 'update_plan':
+      // Handled in the agent loop (needs agent state); never dispatched here.
+      return { output: '', error: 'update_plan is handled by the agent loop' }
     default:
       return { output: '', error: `Unknown tool: ${name}` }
   }
