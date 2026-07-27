@@ -1,6 +1,10 @@
 # Argo
 
-A coding harness for local LLMs. Model weights stay on your GPU — inference never leaves your machine, though the agent itself has normal internet access (bash, fetch tools) the same way a developer's terminal would.
+A **contained coding harness for locally-running LLMs** (Qwen, Mistral, and the like). The goal is local, private, self-contained agentic coding: model weights stay on your machine and inference never leaves it, while the agent works inside an isolated environment. The agent itself has normal internet access (bash, fetch tools) the same way a developer's terminal would.
+
+**Means, not ends.** The *harness* is the goal — not any particular vendor. Today Argo fills two gaps with two tools: **Ollama** runs the local models, and **Docker** contains the agent's environment. Neither is a goal in itself. If a leaner or better tool fills either gap — a different local runtime (llama.cpp's `llama-server`, LM Studio, vLLM, mlx) for inference, or a lighter sandbox (e.g. WASI — see `SANDBOXING-ALTERNATIVES.md`) for containment — Argo should be able to swap it in. "Local model" is the requirement; "Ollama" is just today's implementation.
+
+**Lean and local.** Fewer moving parts and fewer external services is better. Everything runs on your machine by default; a third-party service or API is adopted only when it delivers real value that no local option provides, never as clutter. Where a remote dependency is currently unavoidable — e.g. web search, which is inherently bound to whoever indexed the web (today via Tavily) — it is a reluctant, clearly-marked exception, to be replaced with a local alternative the moment a good one exists.
 
 ---
 
@@ -207,13 +211,14 @@ Used only in standalone `pnpm dev` mode.
 
 Any model pulled via `ollama pull` appears in the UI dropdown automatically.
 
-**Use `qwen3.6:latest` for all agentic work.** It is the only model validated to reliably call tools, follow multi-step ReAct loops, and deliver output to `/workspace`. The others are listed for reference; the UI marks validated models with 🔧 and non-functional ones with ⚠️.
+**Use `qwen3.6:latest` for agentic work.** It is the only model validated end-to-end in Argo: on the self-verifying eval (`docs/eval-log.md`) it completes every task, records a plan, and converges without drift. `devstral:24b` and `llama3.1:8b` emit tool calls but do not complete the eval tasks — they are kept as eval comparators, not for real work (details below). The UI marks tool-capable models with 🔧 and non-functional ones with ⚠️; any model pulled with `ollama pull` appears in the dropdown automatically.
 
 | Model | Size | Agentic use | Notes |
 |---|---|---|---|
-| `qwen3.6:latest` 🔧 | 23 GB | ✅ **Recommended** | Only model validated end-to-end. Reliable tool calls, strong ReAct reasoning, handles multi-step tasks with compaction. Requires ~24 GB RAM. |
+| `qwen3.6:latest` 🔧 | 23 GB | ✅ **Recommended** | The only model validated end-to-end. Reliable native tool calls, strong ReAct reasoning, multi-step tasks with compaction. Eval: 4/4 tasks completed. Requires ~24 GB RAM. |
+| `devstral:24b` 🔧 | ~14 GB | ⚠️ Tool-capable, under-performs | Mistral's agentic-coding model. Emits native tool calls (~75% on the single-turn probe) but under-executes end-to-end — finishes early with the suite still failing (eval: 0/4). An emission/behaviour ceiling, not reasoning. Re-vet as it improves. |
 | `qwen2.5-coder:14b` | 9.0 GB | ⚠️ Partial | Tool calling works but reasoning is weaker. Prone to hallucinating exact strings (URLs, paths) from memory. Usable for simple, single-step tasks. |
-| `llama3.1:8b` | 4.9 GB | ⚠️ Partial | Most consistent tool-call API compatibility of the smaller models. Reasoning depth is limited; struggles with multi-step tasks. Best option on memory-constrained machines. |
+| `llama3.1:8b` | 4.9 GB | ⚠️ Partial | Consistent tool-call API compatibility, but limited reasoning depth — engages the plan workflow yet cannot complete multi-step tasks (eval: 0/4; once re-planned to the iteration cap). Best option on memory-constrained machines. |
 | `mistral:latest` | 4.4 GB | ❓ Untested | Not tested in Argo. Tool-calling support unknown. |
 | `gemma4:latest` ⚠️ | 9.6 GB | ❌ Fails | Technically emits tool calls but cannot follow the ReAct loop across iterations — declares done on empty output, ignores prior tool results, never delivers files. |
 | `gemma3:12b` ⚠️ | 8.1 GB | ❌ Broken | Ollama returns a hard `"does not support tools"` error. The container hangs until the 120 s timeout. Do not use. |

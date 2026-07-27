@@ -36,7 +36,7 @@ Worth stating plainly, since it's easy to overclaim: Docker gives Argo real, ker
 
 **Should stay a separate, differently-handled service regardless:** Playwright/Chromium.
 
-Honest framing of that split: for a coding agent actually working on real projects, the "needs a subprocess" bucket isn't a rare edge case — running the project's own tests and build *is* most of what makes the agent useful. The sandbox mainly makes the agent's own scratch work and file edits cheap and structurally safe; it doesn't reduce how often real subprocess execution is needed, since verifying code actually works requires the real toolchain almost every turn.
+A clear-eyed framing of that split: for a coding agent actually working on real projects, the "needs a subprocess" bucket isn't a rare edge case — running the project's own tests and build *is* most of what makes the agent useful. The sandbox mainly makes the agent's own scratch work and file edits cheap and structurally safe; it doesn't reduce how often real subprocess execution is needed, since verifying code actually works requires the real toolchain almost every turn.
 
 ## Would qwen3.6 (or similar) work as well in this harness?
 

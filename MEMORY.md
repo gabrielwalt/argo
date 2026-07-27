@@ -7,6 +7,7 @@
 - Single-file vanilla JS app: `public/app.js` + `public/index.html`. No build step.
 - Uses native `fetch()` and SSE for real-time updates. API base via `API_BASE` constant (set at top of app.js).
 - Server files are in `src/` (TypeScript, compiled to `dist/`). Source is the authoritative target — never modify `dist/` directly.
+- Docker image (`docker/agent.Dockerfile`): keep the download-heavy, code-independent layers (apt, Node, sandbox npm packages, Chromium) ABOVE the app `COPY --from=builder`/`COPY public` layers. Docker's cache is linear, so if an app COPY (which changes every build) sits before those, every code rebuild re-downloads Chromium etc. `argo rebuild` reuses the layer cache and passes `--build-arg CACHE_WEEK=$(( $(date +%s)/604800 ))`, referenced in the first download layer, so downloads refresh at most weekly; `argo rebuild --fresh` forces a full `--no-cache --pull` rebuild.
 
 ---
 
@@ -61,3 +62,10 @@
 - No persisted HTML or DOM snapshots.
 - No sessionStorage, localStorage, or in-memory DOM caching for persistence.
 - No duplicate state stores.
+
+## Model & eval (2026-07)
+
+- Target agentic model: `qwen3.6:latest` — the only model that completes the end-to-end eval (4/4 tasks), plans, and converges without drift. Use it for real work.
+- `devstral:24b` emits tool calls (~75% on the fast probe) but under-executes end-to-end (0/4). `llama3.1:8b` engages the plan workflow but lacks coding depth (0/4, once re-planned to the iteration cap). Kept only as eval comparators.
+- The eval is the flywheel: `npm run eval` (fast single-turn tool-call probe) and `npm run eval:e2e` (real loops on self-verifying tasks). Both stamp the harness git SHA. Record every run in `docs/eval-log.md`; forward plan in `docs/roadmap.md`; background research in `docs/research.md`.
+- Known gap: the plan/act gate (`isProjectMutation`) only covers `edit_file`/`write_file`, so file writes via `bash` bypass it. Close only if the eval shows it matters (Phase 3).
