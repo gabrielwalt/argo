@@ -230,8 +230,18 @@ cmd_stop() {
 }
 
 cmd_rebuild() {
-  log "Rebuilding Argo image…"
-  docker build -f "$ARGO_DIR/docker/agent.Dockerfile" -t "$ARGO_IMAGE" "$ARGO_DIR"
+  # Reuse Docker's layer cache so a code-only rebuild downloads nothing: the heavy
+  # download layers (apt, Node, sandbox npm packages, Chromium) sit above the app
+  # COPYs in the Dockerfile and are keyed by CACHE_WEEK, so they rebuild at most
+  # once a week. Pass --fresh to force a full, no-cache re-download now (e.g. to
+  # pull an updated base image or refresh everything ahead of the weekly rollover).
+  if [[ "${1:-}" == "--fresh" || "${1:-}" == "-f" ]]; then
+    log "Rebuilding Argo image from scratch (--fresh: no cache, pulling latest base image)…"
+    docker build --no-cache --pull -f "$ARGO_DIR/docker/agent.Dockerfile" -t "$ARGO_IMAGE" "$ARGO_DIR"
+  else
+    log "Rebuilding Argo image (reusing cached download layers; run 'argo rebuild --fresh' to force a full re-download)…"
+    docker build --build-arg "CACHE_WEEK=$(( $(date +%s) / 604800 ))" -f "$ARGO_DIR/docker/agent.Dockerfile" -t "$ARGO_IMAGE" "$ARGO_DIR"
+  fi
   log "Done. Restart any running workspaces to use the new image."
 }
 
@@ -244,7 +254,9 @@ Commands:
   detach [path]   Stop Argo for a workspace
   list            List all attached workspaces
   stop            Stop all workspaces and the server
-  rebuild         Rebuild the Docker image after code changes
+  rebuild         Rebuild the Docker image after code changes (reuses cached
+                  download layers; refreshes them ~weekly)
+  rebuild --fresh Rebuild with no cache, pulling the latest base image
 
 If no command is given, 'attach' is assumed.
 EOF
@@ -259,7 +271,7 @@ case "$COMMAND" in
   detach|d)  shift || true; cmd_detach "$@" ;;
   list|ls)   cmd_list ;;
   stop)      cmd_stop ;;
-  rebuild)   cmd_rebuild ;;
+  rebuild)   shift || true; cmd_rebuild "$@" ;;
   help|--help|-h) cmd_help ;;
   # Bare path passed as first arg — treat as attach
   /*)        cmd_attach "$COMMAND" ;;
