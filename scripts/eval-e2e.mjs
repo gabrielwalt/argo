@@ -193,7 +193,7 @@ const baselines = Object.fromEntries([...new Set(TASKS.map(t => t.ws))].map(ws =
 const score = new Map(MODELS.map(m => [m, { pass: 0, total: 0 }]));
 
 for (const model of MODELS) {
-  for (const task of TASKS) {
+  for (const task of TASKS.filter(t => { const o = (process.env.EVAL_TASKS || '').split(',').map(s => s.trim()).filter(Boolean); return o.length === 0 || o.includes(t.id) })) {
     for (let i = 0; i < RUNS; i++) {
       resetWs(task.ws, baselines[task.ws]);
       let completed = false, m = {};

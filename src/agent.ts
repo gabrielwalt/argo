@@ -610,6 +610,24 @@ export class Agent {
         }
         emitAndLog({ type: 'iteration', current: i + 1, max: this.maxIterations })
 
+        // Stall re-ground (Magentic-One style). On a long run that is drifting, the
+        // loop-steer guard can't help — its churn has novel args — and the reground
+        // done-gate only fires at "done", never mid-run. So at fixed iteration counts
+        // (well above normal convergence — observed passing tasks ≤13 iters) inject a
+        // non-terminating re-ground toward the objective, then force a re-plan at the
+        // top. Each fires once (iterNum is strictly increasing). Thresholds are a first
+        // guess to be tuned against the eval.
+        const iterNum = i + 1
+        if (iterNum === 20 || iterNum === 35 || iterNum === 45) {
+          const activePlan = this.currentPlan as { objective: string } | null
+          const objective = activePlan?.objective || userMessage
+          const stall = iterNum === 45
+            ? `STALL: ${iterNum} iterations without finishing — your approach is not converging. Call update_plan now with a revised plan that lists ONLY the remaining work as concrete steps, then carry it out. Do not repeat what has not worked.`
+            : `PROGRESS CHECK: ${iterNum} iterations in and not finished. Objective: "${objective}". State which steps are DONE and which REMAIN, then make the single most important remaining change now — if you have been searching or re-reading without editing, stop and implement the next concrete step; if the approach is wrong, call update_plan to revise.`
+          emitAndLog({ type: 'warning', message: stall })
+          this.history.push({ role: 'tool', content: stall })
+        }
+
         emitAndLog({ type: 'ollama_request', iteration: i + 1, message_count: this.history.length + 1, model: this.model })
 
         const response = await this.chatWithRetry(systemPrompt, emitAndLog)
