@@ -147,9 +147,16 @@ app.get('/models', async (req, res) => {
   try {
     const resp = await fetch(`${config.ollamaHost}/api/tags`)
     const data = await resp.json() as { models?: { name: string }[] }
-    res.json(data.models?.map(m => m.name) ?? [])
+    const names = data.models?.map(m => m.name) ?? []
+    // Sort so the configured default model appears first in the dropdown
+    const sorted = [...names].sort((a, b) => {
+      if (a === config.model) return -1
+      if (b === config.model) return 1
+      return a.localeCompare(b)
+    })
+    res.json({ models: sorted, defaultModel: config.model })
   } catch {
-    res.json([config.model])
+    res.json({ models: [config.model], defaultModel: config.model })
   }
 })
 

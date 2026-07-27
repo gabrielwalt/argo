@@ -781,11 +781,11 @@ async function loadModels() {
 
   try {
     const resp = await fetch(`${API_BASE}/models`)
-    const models = await resp.json()
+    const { models, defaultModel } = await resp.json()
     dropdown.innerHTML = ''
     models.forEach(name => {
       const item = document.createElement('div')
-      item.className = 'nav-drop-item'
+      item.className = 'nav-drop-item' + (name === defaultModel ? ' active' : '')
       item.dataset.model = name
       const toolBadge = (name.startsWith('qwen3') || name.startsWith('devstral')) ? ' <span class="model-tool-badge" title="Validated for tool use">🔧</span>' : ''
       const noToolBadge = (name.startsWith('gemma') ) ? ' <span class="model-tool-badge" title="No tool support — will not work in Argo">⚠️</span>' : ''
@@ -796,7 +796,7 @@ async function loadModels() {
       })
       dropdown.appendChild(item)
     })
-    if (models.length) selectModel(models[0])
+    if (models.length) selectModel(defaultModel ?? models[0])
   } catch {
     const fallback = 'llama3.1:8b'
     const item = document.createElement('div')
