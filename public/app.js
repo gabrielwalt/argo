@@ -581,6 +581,21 @@ function renderMarkdown(content) {
 // update_plan call emits a fresh 'plan' event, so refinements pop up as their own
 // cards, labelled with the revision.
 function renderPlan(event) {
+  // A plan is a milestone in the run. Close off the trace that led up to it,
+  // render the plan as its own card, then RESUME the trace in a fresh block so
+  // post-plan execution unrolls *below* the plan (chronological order) instead
+  // of continuing to fill the pre-plan block *above* it — the latter read as
+  // "the agent planned but never proceeded." An empty pre-plan block (the model
+  // planned immediately) is dropped rather than left as a stray "0 tools" block.
+  const model = currentRunModel
+  const resume = !!currentTraceBlock
+  if (currentTraceBlock && currentTraceBlock.items.childElementCount === 0) {
+    currentTraceBlock.el.remove()
+    currentTraceBlock = null
+  } else {
+    finalizeTraceBlock()
+  }
+
   const el = document.createElement('div')
   el.className = 'message plan md'
   const title = event.revision > 1 ? `📋 Plan · revised (v${event.revision})` : '📋 Plan'
@@ -589,6 +604,9 @@ function renderPlan(event) {
     + `<div class="plan-objective"><span class="plan-label">Objective</span> ${escHtml(event.objective)}</div>`
     + (steps ? `<ol class="plan-steps">${steps}</ol>` : '')
   messagesEl.appendChild(el)
+
+  // Resume the live trace below the plan card so execution renders in order.
+  if (resume) startTraceBlock(model)
   messagesEl.scrollTop = messagesEl.scrollHeight
 }
 
