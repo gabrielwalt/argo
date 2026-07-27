@@ -77,6 +77,14 @@ seeds `test/dependencies.test.js`).
 - **steer** — loop-steer fired: an identical call with no new information was
   skipped and replaced with an escalating steer.
 - **ctx≈** — peak prompt tokens observed.
+- **cmp** — compactions over the run.
+- **wall** — wall-clock seconds from prompt to idle (includes the ~3 s status poll).
+- **tok/s** — generation throughput. Needs the harness to log Ollama `eval_duration`
+  (`token_usage.eval_duration_ms`); shows `?` until that lands (roadmap Phase 3(b)).
+- **rss** — peak resident memory (MB) of the Ollama process(es) during the run.
+- **CPU/GPU split + VRAM footprint** — from `ollama ps`, sampled during the run. True
+  GPU-utilisation % on Apple Silicon needs `powermetrics`/sudo — out of scope; the
+  split + tok/s are the lean cross-platform proxy.
 
 A true *stall* (model narrates and stops without acting) emits no warning — it
 shows up as low `iters` + `plan=0` + `FAIL`.

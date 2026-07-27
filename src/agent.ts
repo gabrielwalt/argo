@@ -630,6 +630,11 @@ export class Agent {
             prompt_tokens: response.prompt_eval_count,
             generated_tokens: response.eval_count ?? 0,
             num_ctx: numCtx,
+            // Ollama reports these in nanoseconds; persist as ms so the eval can
+            // compute generation throughput (tokens/sec) and per-turn latency
+            // without any extra probing. Optional — absent on a client that omits them.
+            eval_duration_ms: response.eval_duration != null ? Math.round(response.eval_duration / 1e6) : undefined,
+            total_duration_ms: response.total_duration != null ? Math.round(response.total_duration / 1e6) : undefined,
           })
           // Reserve headroom for the *next* generation, not just the input consumed so
           // far — a response near num_predict's limit can still overflow num_ctx even

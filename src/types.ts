@@ -20,7 +20,7 @@ export type AgentEvent =
   | { type: 'tool_call'; tool: ToolName; args: Record<string, unknown> }
   | { type: 'tool_result'; tool: ToolName; output: string; error?: string; duration_ms: number }
   | { type: 'message'; role: 'user' | 'assistant'; content: string }
-  | { type: 'token_usage'; prompt_tokens: number; generated_tokens: number; num_ctx: number }
+  | { type: 'token_usage'; prompt_tokens: number; generated_tokens: number; num_ctx: number; eval_duration_ms?: number; total_duration_ms?: number }
   | { type: 'done'; content: string }
   | { type: 'git_commit'; hash: string; message: string }
   | { type: 'compact_start'; messageCount: number; contextUsagePct: number; manual?: boolean }
