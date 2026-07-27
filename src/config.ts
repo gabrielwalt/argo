@@ -48,4 +48,13 @@ export const config = {
   // of succeeding. This is a brief settle before one retry, not a backoff — only
   // a single retry is ever attempted, then the existing outer catch takes over.
   chatRetryDelayMs:        parseInt(process.env.CHAT_RETRY_DELAY_MS ?? '2000', 10),
+  // ACTOR-CRITIC (Phase 4, step 2). OFF by default so the baseline loop path is
+  // BYTE-IDENTICAL unless explicitly enabled — required for a clean A/B and zero
+  // regression risk. When on, a qwen3.6 self-critique runs at a FEW checkpoints
+  // (post-plan / on-stall / pre-done), never every turn. See docs/actor-critic.md.
+  critic:           ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_CRITIC ?? '').trim().toLowerCase()),
+  // The critic is qwen3.6 itself (self-critique) — the only model that reliably
+  // flags oracle-gaming (supervisor eval, 3/3) and ZERO extra resident memory
+  // since it's already loaded. Reuses the existing Ollama client / ollamaHost.
+  criticModel:      process.env.ARGO_CRITIC_MODEL ?? 'qwen3.6:latest',
 }

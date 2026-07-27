@@ -346,6 +346,19 @@ export class SessionLogger {
           lines.push(``)
           break
 
+        case 'critic':
+          lines.push(`**🔎 Critic · ${event.checkpoint}** \`${time}\` — verdict \`${event.verdict}\`${event.gamed_oracle ? ' · ⚠️ ORACLE TAMPER' : ''}`)
+          lines.push(``)
+          if (event.issues.length) {
+            for (const iss of event.issues) lines.push(`> - ${iss}`)
+            lines.push(``)
+          }
+          if (event.guidance) {
+            lines.push(`> ${event.guidance.replace(/\n/g, '\n> ')}`)
+            lines.push(``)
+          }
+          break
+
         default: {
           // Compile-time guard: a new AgentEvent variant without a case above
           // fails the build here instead of silently vanishing from the .md

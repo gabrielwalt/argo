@@ -43,6 +43,17 @@ export type AgentEvent =
       manual?: boolean
     }
   | { type: 'plan'; objective: string; steps: string[]; revision: number }
+  | {
+      // ACTOR-CRITIC (Phase 4, step 2): a qwen3.6 self-critique verdict emitted
+      // at one of a few in-loop checkpoints, so runs are auditable. Only emitted
+      // when config.critic is on; the baseline never produces this event.
+      type: 'critic'
+      checkpoint: 'post-plan' | 'on-stall' | 'pre-done'
+      verdict: 'ok' | 'revise'
+      gamed_oracle: boolean
+      issues: string[]
+      guidance: string
+    }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
 

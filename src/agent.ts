@@ -8,6 +8,7 @@ import { bash, NO_OUTPUT } from './tools/bash.js'
 import { truncateOutput } from './tools/truncate.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
 import type { AgentEvent, ToolName, ModelOptions } from './types.js'
+import { runCritic, isTestOrSpecPath, type Critique, type CriticCheckpoint } from './critic.js'
 import {
   type CompactionState,
   emptyCompactionState,
@@ -247,6 +248,22 @@ export class Agent {
   // and finishes immediately — the re-grounding done-gate only fires when a plan
   // exists, which is what keeps simple Q&A fast.
   private currentPlan: { objective: string; steps: string[]; revision: number } | null = null
+  // ACTOR-CRITIC state (Phase 4, step 2). All reset per run and only ever READ
+  // when config.critic is on — populating them is a harmless local append, so the
+  // baseline loop path stays byte-identical. See runCriticCheckpoint / critic.ts.
+  //   criticModel     — qwen3.6 self-critique model (env ARGO_CRITIC_MODEL).
+  //   editedPaths     — unique file paths the actor edited/attempted (edit_file /
+  //                     write_file), oldest→newest; test/spec files are flagged to
+  //                     the critic so oracle-tamper detection never depends on the
+  //                     model noticing the path. Records ATTEMPTS too (a failed
+  //                     edit_file still ran) so intent-to-tamper is visible.
+  //   lastCommandOutput — most recent bash result (truncated), the "latest test
+  //                     output" the critic reviews.
+  //   actionTrace     — short recent-action trace (compact labels), oldest→newest.
+  private criticModel = config.criticModel
+  private editedPaths: string[] = []
+  private lastCommandOutput = ''
+  private actionTrace: string[] = []
   private get historyFile(): string {
     return path.join(LOGS_DIR, this.sessionId ? `history-${this.sessionId}.json` : 'history.json')
   }
@@ -571,6 +588,68 @@ export class Agent {
     return `${label}. Objective: ${objective}${stepsText}\nNow execute toward this objective — keep going, do not stop until it is verifiably met.`
   }
 
+  // ACTOR-CRITIC checkpoint (Phase 4, step 2). Runs the qwen3.6 self-critique
+  // over compact, already-tracked run state (objective, plan, files edited with
+  // test/spec flags, latest command output, recent trace), emits a 'critic' event
+  // for auditability, and — when the verdict is "revise" or gamed_oracle — injects
+  // the guidance as a `warning`-type steer through the SAME mechanism the plan/act
+  // gate, loop-steer, stall, and done-gate all use (no parallel plumbing). Returns
+  // the parsed Critique (or null) so the PRE-DONE caller can block completion.
+  //
+  // Fails OPEN: a critic timeout/error/unparseable reply yields null and only a
+  // warning — it never crashes a run and never blocks completion on its own. Only
+  // ever reached when config.critic is on, so the baseline path is untouched.
+  private async runCriticCheckpoint(
+    checkpoint: CriticCheckpoint,
+    objective: string,
+    planSteps: string[],
+    emitAndLog: (e: AgentEvent) => void,
+  ): Promise<Critique | null> {
+    const input = {
+      checkpoint,
+      objective,
+      planSteps,
+      filesEdited: this.editedPaths.map(p => ({ path: p, testOrSpec: isTestOrSpecPath(p) })),
+      latestOutput: this.lastCommandOutput,
+      recentActionTrace: this.actionTrace.slice(-12),
+    }
+    let critique: Critique | null = null
+    try {
+      critique = await withTimeout(
+        runCritic(this.ollama, this.criticModel, this.options, input),
+        config.chatTimeoutMs,
+      )
+    } catch (err) {
+      emitAndLog({ type: 'warning', message: `Critic (${checkpoint}) failed (${err instanceof Error ? err.message : String(err)}) — continuing without critique` })
+      return null
+    }
+    if (!critique) {
+      emitAndLog({ type: 'warning', message: `Critic (${checkpoint}) returned no parseable verdict — continuing without critique` })
+      return null
+    }
+
+    emitAndLog({
+      type: 'critic',
+      checkpoint,
+      verdict: critique.verdict,
+      gamed_oracle: critique.gamed_oracle,
+      issues: critique.issues,
+      guidance: critique.guidance,
+    })
+
+    if (critique.gamed_oracle || critique.verdict === 'revise') {
+      const tamperReminder = critique.gamed_oracle
+        ? '\nDo NOT edit, weaken, delete, rename, or skip any test/spec file — that is oracle tampering. Revert any such change and implement the feature in the SOURCE modules so the UNCHANGED tests judge it.'
+        : ''
+      const issuesText = critique.issues.length ? `\nIssues: ${critique.issues.join('; ')}` : ''
+      const guidanceText = critique.guidance ? `\n${critique.guidance}` : ''
+      const steer = `CRITIC (${checkpoint}) — revise before continuing.${guidanceText}${issuesText}${tamperReminder}`
+      emitAndLog({ type: 'warning', message: steer })
+      this.history.push({ role: 'tool', content: steer })
+    }
+    return critique
+  }
+
   async chat(userMessage: string): Promise<string> {
     const logger = new SessionLogger(userMessage, this.model, this.options, this.sessionId)
 
@@ -592,6 +671,11 @@ export class Agent {
     // Loop-steering state, scoped to this run only (see REPEAT_WINDOW above).
     this.recentCalls = []
     this.currentPlan = null
+    // ACTOR-CRITIC per-run state (see field docs). Reset alongside the loop-steer
+    // state so a later run starts from a clean slate.
+    this.editedPaths = []
+    this.lastCommandOutput = ''
+    this.actionTrace = []
     let loopSteers = 0
     let regrounded = false
     emitAndLog({ type: 'message', role: 'user', content: userMessage })
@@ -626,6 +710,13 @@ export class Agent {
             : `PROGRESS CHECK: ${iterNum} iterations in and not finished. Objective: "${objective}". State which steps are DONE and which REMAIN, then make the single most important remaining change now — if you have been searching or re-reading without editing, stop and implement the next concrete step; if the approach is wrong, call update_plan to revise.`
           emitAndLog({ type: 'warning', message: stall })
           this.history.push({ role: 'tool', content: stall })
+          // ON-STALL critic checkpoint: reuse the existing stall/progress trigger
+          // (no parallel plumbing). The critic reviews the recent trace + latest
+          // test output and returns a CONCRETE corrective, injected as a steer.
+          if (config.critic) {
+            const stallPlan = this.currentPlan as { steps: string[] } | null
+            await this.runCriticCheckpoint('on-stall', objective, stallPlan?.steps ?? [], emitAndLog)
+          }
         }
 
         emitAndLog({ type: 'ollama_request', iteration: i + 1, message_count: this.history.length + 1, model: this.model })
@@ -704,6 +795,20 @@ export class Agent {
           // the field is null and narrows this truthy branch to `never`. The cast
           // restores the real plan type.
           const activePlan = this.currentPlan as { objective: string; steps: string[]; revision: number } | null
+          // PRE-DONE critic checkpoint: reuse the existing done-gate. Before taking
+          // "I'm done" at face value, the critic reviews the files edited (with
+          // test/spec flags), the latest test output, and the recent trace, and
+          // answers: did it REALLY satisfy the objective, and did it tamper with any
+          // test/spec file (ORACLE TAMPER)? On tamper or objective-unmet it injects
+          // the critique (+ a hard "do NOT edit test/spec files" reminder when
+          // gamed_oracle) and BLOCKS completion — the loop continues. Fails OPEN:
+          // if the critic errors/won't parse, completion proceeds as in baseline.
+          if (config.critic && activePlan) {
+            const critique = await this.runCriticCheckpoint('pre-done', activePlan.objective, activePlan.steps, emitAndLog)
+            if (critique && (critique.gamed_oracle || critique.verdict === 'revise')) {
+              continue
+            }
+          }
           if (activePlan && !regrounded) {
             regrounded = true
             const nudge = `Before finishing, re-ground against your plan. Objective: "${activePlan.objective}". Confirm it is fully met and state how you verified it — the command or check you ran and its result. If any step remains or you have not actually verified it, keep working; otherwise give your final answer.`
@@ -730,6 +835,14 @@ export class Agent {
           // never be mistaken for "no tool call = done".
           if (name === 'update_plan') {
             this.history.push({ role: 'tool', content: this.handleUpdatePlan(args, emitAndLog) })
+            // POST-PLAN critic checkpoint: right after a plan is recorded, judge
+            // whether it actually addresses the objective and is complete/ordered;
+            // if weak, inject guidance BEFORE execution. Reuses the steer-injection
+            // path — no parallel plumbing.
+            if (config.critic) {
+              const newPlan = this.currentPlan as { objective: string; steps: string[] } | null
+              if (newPlan) await this.runCriticCheckpoint('post-plan', newPlan.objective, newPlan.steps, emitAndLog)
+            }
             continue
           }
           // Plan/act gate: investigation (reads/greps) flows freely, but a project
@@ -783,6 +896,26 @@ export class Agent {
               ? `Error: ${result.error}\n${result.output}`
               : result.output,
           })
+
+          // ACTOR-CRITIC bookkeeping (only when enabled — a no-op for the baseline).
+          // Derive the critic's compact inputs from the SAME tool-call history the
+          // loop already runs: file edits (incl. failed attempts, so intent-to-
+          // tamper with a test/spec file is visible), the latest command output,
+          // and a short action trace.
+          if (config.critic) {
+            if (name === 'edit_file' || name === 'write_file') {
+              const p = typeof args.path === 'string' ? args.path : ''
+              if (p && !this.editedPaths.includes(p)) this.editedPaths.push(p)
+              this.actionTrace.push(`${name} ${p}${result.error ? ' [attempt failed]' : ''}`)
+            } else if (name === 'bash') {
+              this.lastCommandOutput = truncateOutput(result.output || '', 4000)
+              const cmd = typeof args.command === 'string' ? args.command.replace(/\s+/g, ' ').slice(0, 120) : ''
+              this.actionTrace.push(`bash: ${cmd}`)
+            } else {
+              this.actionTrace.push(`${name} ${typeof args.path === 'string' ? args.path : ''}`.trim())
+            }
+            if (this.actionTrace.length > 16) this.actionTrace.shift()
+          }
 
           this.recentCalls.push(key)
           if (this.recentCalls.length > REPEAT_WINDOW) this.recentCalls.shift()
