@@ -1263,6 +1263,55 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 }
 .toast.visible { opacity: 1; transform: translateY(0); }
 
+/* ── Detach in-progress indicator (reusable spinner + full-view overlay) ── */
+@keyframes ui-spin { to { transform: rotate(360deg); } }
+.ui-spinner {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  vertical-align: -2px;
+  border-radius: 50%;
+  border: 2px solid rgba(226, 228, 240, .25);
+  border-top-color: var(--text);
+  animation: ui-spin .7s linear infinite;
+}
+.ui-spinner.gap { margin-right: 6px; }
+.ui-spinner.lg { width: 28px; height: 28px; border-width: 3px; }
+
+/* Dimmed/disabled look for a detach control mid-request */
+.nav-drop-detach.detaching {
+  opacity: .55 !important;
+  color: var(--muted);
+  border-color: transparent;
+  cursor: default;
+}
+
+/* Full-view overlay for the current-workspace detach (which navigates away).
+   Above dropdowns (z 100s), confirm (300) and toasts (400). */
+.detach-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 600;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: rgba(9, 11, 18, .82);
+  backdrop-filter: blur(3px);
+  color: var(--text);
+  font-family: var(--font-mono);
+}
+.detach-overlay .detach-overlay-text {
+  font-size: 13px;
+  color: var(--text);
+  letter-spacing: .02em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-spinner { animation: none; opacity: .6; }
+}
+
 /* ── Diff modal ── */
 #diff-modal {
   display: none;

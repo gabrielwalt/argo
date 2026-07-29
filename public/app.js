@@ -103,6 +103,17 @@ function showToast(message) {
   }, 4000)
 }
 
+// Full-view "Detaching <name>…" overlay — used by the current-workspace detach
+// path, which navigates away, so the indicator stays visible even if the
+// dropdown closes. Returns the element so callers can remove() it on failure.
+function showDetachOverlay(name) {
+  const overlay = document.createElement('div')
+  overlay.className = 'detach-overlay'
+  overlay.innerHTML = `<span class="ui-spinner lg"></span><span class="detach-overlay-text">Detaching ${escHtml(name)}…</span>`
+  document.body.appendChild(overlay)
+  return overlay
+}
+
 // ── Session state ────────────────────────────────────────────────
 let sessionStartTime = new Date()
 let currentSessionQuery = ''  // first user message of the current session
@@ -1630,11 +1641,21 @@ async function initNav() {
   currDetach.addEventListener('click', async (e) => {
     e.stopPropagation()
     if (!(await confirmDialog(`Detach "${window.__WS__}" and stop its container?`))) return
-    currDetach.textContent = 'Detaching…'
+    const overlay = showDetachOverlay(window.__WS__)
+    currDetach.innerHTML = '<span class="ui-spinner gap"></span>Detaching…'
     currDetach.disabled = true
     currDetach.classList.add('detaching')
-    await fetch(`/api/detach/${window.__WS__}`, { method: 'POST' }).catch(() => {})
-    window.location.href = '/'
+    try {
+      const resp = await fetch(`/api/detach/${window.__WS__}`, { method: 'POST' })
+      if (!resp.ok) throw new Error('Detach failed')
+      window.location.href = '/'
+    } catch (err) {
+      overlay.remove()
+      currDetach.textContent = 'Detach'
+      currDetach.disabled = false
+      currDetach.classList.remove('detaching')
+      showToast(err.message || 'Failed to detach workspace')
+    }
   })
   wsDropdown.appendChild(currWs)
 
@@ -1677,9 +1698,19 @@ async function initNav() {
         detachBtn.addEventListener('click', async (e) => {
           e.stopPropagation()
           if (!(await confirmDialog(`Detach "${w.name}" and stop its container?`))) return
-          detachBtn.textContent = '…'
-          await fetch(`/api/detach/${w.name}`, { method: 'POST' }).catch(() => {})
-          row.remove()
+          detachBtn.innerHTML = '<span class="ui-spinner gap"></span>Detaching…'
+          detachBtn.disabled = true
+          detachBtn.classList.add('detaching')
+          try {
+            const resp = await fetch(`/api/detach/${w.name}`, { method: 'POST' })
+            if (!resp.ok) throw new Error('Detach failed')
+            row.remove()
+          } catch (err) {
+            detachBtn.textContent = 'Detach'
+            detachBtn.disabled = false
+            detachBtn.classList.remove('detaching')
+            showToast(err.message || 'Failed to detach workspace')
+          }
         })
         othersContainer.appendChild(row)
       })

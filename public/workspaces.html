@@ -88,6 +88,16 @@
       transition: color .15s, border-color .15s;
     }
     button.ws-detach:hover { color: var(--red); border-color: var(--red); }
+    button.ws-detach:disabled { cursor: default; opacity: .8; }
+
+    @keyframes ui-spin { to { transform: rotate(360deg); } }
+    .ui-spinner {
+      display: inline-block; width: 13px; height: 13px; vertical-align: -2px;
+      border-radius: 50%; border: 2px solid rgba(226, 228, 240, .25);
+      border-top-color: var(--text); animation: ui-spin .7s linear infinite;
+      margin-right: 6px;
+    }
+    @media (prefers-reduced-motion: reduce) { .ui-spinner { animation: none; opacity: .6; } }
 
     .empty-state { color: var(--muted); font-size: 14px; padding: 20px 0; }
 
@@ -313,9 +323,20 @@
           grid.querySelectorAll('.ws-detach').forEach(btn => {
             btn.addEventListener('click', async () => {
               if (!(await confirmDialog(`Detach "${btn.dataset.name}"?`))) return
+              const original = btn.innerHTML
+              btn.style.minWidth = btn.offsetWidth + 'px'
+              btn.innerHTML = '<span class="ui-spinner"></span>Detaching…'
               btn.disabled = true
-              await fetch(`/api/detach/${btn.dataset.name}`, { method: 'POST' })
-              loadWorkspaces()
+              try {
+                const resp = await fetch(`/api/detach/${btn.dataset.name}`, { method: 'POST' })
+                if (!resp.ok) throw new Error('Detach failed')
+                loadWorkspaces()
+              } catch (err) {
+                btn.innerHTML = original
+                btn.disabled = false
+                btn.style.minWidth = ''
+                showToast(err.message || 'Failed to detach workspace')
+              }
             })
           })
         }
