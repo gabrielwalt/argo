@@ -672,6 +672,7 @@ $('chat-form').addEventListener('submit', async (e) => {
   }
   addChatMessage('user', message)
   inputEl.value = ''
+  autoGrow()
   setBusy(true)
 
   try {
@@ -692,11 +693,28 @@ $('chat-form').addEventListener('submit', async (e) => {
 })
 
 inputEl.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) {
+  if (e.key === 'Enter' && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey && !e.isComposing) {
     e.preventDefault()
     $('chat-form').dispatchEvent(new Event('submit'))
+  } else if (e.key === 'Enter' && e.altKey && !e.isComposing) {
+    // Alt+Enter doesn't insert a newline by default, so do it explicitly.
+    e.preventDefault()
+    inputEl.setRangeText('\n', inputEl.selectionStart, inputEl.selectionEnd, 'end')
+    inputEl.dispatchEvent(new Event('input'))
   }
 })
+
+// Auto-grow the textarea vertically as newlines are added, up to a cap
+// (40vh, floor ~200px), then scroll internally.
+function autoGrow() {
+  const max = Math.max(200, Math.round(window.innerHeight * 0.4))
+  inputEl.style.height = 'auto'
+  const h = Math.min(inputEl.scrollHeight, max)
+  inputEl.style.height = h + 'px'
+  inputEl.style.overflowY = inputEl.scrollHeight > max ? 'auto' : 'hidden'
+}
+inputEl.addEventListener('input', autoGrow)
+autoGrow()
 
 // Rich text (Google Docs, web pages, email, etc.) carries a text/html
 // clipboard entry with real semantic formatting — convert that to Markdown
@@ -924,6 +942,7 @@ async function fetchDirChildren(relPath) {
 async function refreshFiles() {
   const container = $('files-tree')
   container.innerHTML = ''
+  fileNodeMap.clear()
   const rootNodes = await fetchDirChildren('')
   if (!rootNodes.length) {
     const el = document.createElement('div')
@@ -978,10 +997,16 @@ async function makeFileNode(node, parentPath, forceOpen = false) {
     wrapper.appendChild(row)
     wrapper.appendChild(children)
 
-    if (forceOpen) {
+    // Programmatic expand used by selectFileInTree to walk lazy ancestors.
+    async function expand() {
       await loadChildren()
       wrapper.classList.add('open')
       row.querySelector('.file-icon').textContent = '▼'
+    }
+    fileNodeMap.set(filePath, { type: 'dir', rowEl: row, wrapperEl: wrapper, expand })
+
+    if (forceOpen) {
+      await expand()
     }
   } else {
     wrapper.className = 'file-node file'
@@ -991,6 +1016,7 @@ async function makeFileNode(node, parentPath, forceOpen = false) {
     row.innerHTML = `<span class="file-icon">·</span><span class="file-name">${escHtml(node.name)}</span><span class="file-size">${size}</span>`
     row.addEventListener('click', () => openFileInViewer(filePath, row))
     wrapper.appendChild(row)
+    fileNodeMap.set(filePath, { type: 'file', rowEl: row, wrapperEl: wrapper })
   }
 
   return wrapper
@@ -1003,6 +1029,10 @@ function formatSize(bytes) {
 }
 
 let activeFileRow = null
+let currentViewerPath = null
+// path -> { type:'dir'|'file', rowEl, wrapperEl, expand? } — lets us reveal and
+// select a file by path even though the tree loads children lazily.
+const fileNodeMap = new Map()
 
 const LANG_BY_EXT = {
   js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
@@ -1057,14 +1087,53 @@ function renderHighlightedCode(text, language) {
 async function openFileInViewer(filePath, rowEl) {
   if (activeFileRow) activeFileRow.classList.remove('active')
   activeFileRow = rowEl
-  rowEl.classList.add('active')
+  if (rowEl) rowEl.classList.add('active')
 
+  currentViewerPath = filePath
   const pathEl = $('file-viewer-path')
-  const contentEl = $('file-viewer-content')
+  const toggleEl = $('file-viewer-toggle')
   pathEl.textContent = `/${filePath}`
-  contentEl.textContent = 'Loading…'
-  contentEl.classList.remove('file-viewer-empty')
 
+  const kind = window.ArgoPreview ? ArgoPreview.previewKindFor(filePath) : null
+  // Show the preview/source toggle only for kinds that have both views.
+  if (toggleEl) {
+    const showToggle = !!(window.ArgoPreview && ArgoPreview.hasToggle(kind))
+    toggleEl.classList.toggle('hidden', !showToggle)
+    if (showToggle) {
+      const mode = ArgoPreview.getMode(kind)
+      toggleEl.querySelectorAll('.vt-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.mode === mode)
+      })
+    }
+  }
+
+  await renderViewer(filePath, kind)
+}
+
+// Render the viewer body for a file, honoring the saved preview/source mode.
+// Preview failures fall back to the guaranteed raw source view.
+async function renderViewer(filePath, kind) {
+  const contentEl = $('file-viewer-content')
+  contentEl.classList.remove('file-viewer-empty')
+  // Images are preview-only; html/markdown honor the saved mode; everything
+  // else is source.
+  let mode = 'source'
+  if (kind === 'image') mode = 'preview'
+  else if (kind && window.ArgoPreview) mode = ArgoPreview.getMode(kind)
+
+  if (mode === 'preview' && kind && window.ArgoPreview) {
+    contentEl.classList.add('preview-mode')
+    contentEl.innerHTML = ''
+    try {
+      await ArgoPreview.renderPreview({ filePath, kind, apiBase: API_BASE, container: contentEl, onNavigate: openFileByPath })
+      return
+    } catch {
+      // Preview failed — fall through to the source view below.
+    }
+  }
+  // Source view — existing behavior, and the guaranteed fallback.
+  contentEl.classList.remove('preview-mode')
+  contentEl.textContent = 'Loading…'
   try {
     const resp = await fetch(`${API_BASE}/file?path=${encodeURIComponent(filePath)}`)
     const text = await resp.text()
@@ -1074,11 +1143,60 @@ async function openFileInViewer(filePath, rowEl) {
   }
 }
 
+// Programmatic open used by preview navigation: reveal + select in the tree,
+// then render in the viewer (row may be null if not found — still renders).
+async function openFileByPath(filePath) {
+  const rowEl = await selectFileInTree(filePath)
+  await openFileInViewer(filePath, rowEl)
+}
+
+// Reveal and select a file by tree-relative path, expanding lazy ancestor
+// directories in order. Returns the file's row element, or null on failure.
+async function selectFileInTree(filePath) {
+  const segs = String(filePath).split('/').filter(Boolean)
+  let acc = ''
+  for (let i = 0; i < segs.length - 1; i++) {
+    acc = acc ? `${acc}/${segs[i]}` : segs[i]
+    const node = fileNodeMap.get(acc)
+    if (node && node.type === 'dir' && typeof node.expand === 'function') {
+      try { await node.expand() } catch { /* ignore */ }
+    } else {
+      return null // ancestor missing — fail gracefully
+    }
+  }
+  const target = fileNodeMap.get(filePath)
+  if (!target || target.type !== 'file') return null
+  if (activeFileRow) activeFileRow.classList.remove('active')
+  activeFileRow = target.rowEl
+  target.rowEl.classList.add('active')
+  target.rowEl.scrollIntoView({ block: 'nearest' })
+  return target.rowEl
+}
+
 $('file-viewer-close').addEventListener('click', () => {
   if (activeFileRow) { activeFileRow.classList.remove('active'); activeFileRow = null }
+  currentViewerPath = null
+  $('file-viewer-toggle').classList.add('hidden')
   $('file-viewer-path').textContent = ''
-  $('file-viewer-content').textContent = 'Select a file to view'
-  $('file-viewer-content').classList.add('file-viewer-empty')
+  const contentEl = $('file-viewer-content')
+  contentEl.classList.remove('preview-mode')
+  contentEl.textContent = 'Select a file to view'
+  contentEl.classList.add('file-viewer-empty')
+})
+
+// Preview/source toggle — switch mode for the current file's kind and re-render.
+$('file-viewer-toggle').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('.vt-btn')
+  if (!btn || !currentViewerPath) return
+  const kind = window.ArgoPreview ? ArgoPreview.previewKindFor(currentViewerPath) : null
+  if (!kind || !ArgoPreview.hasToggle(kind)) return
+  const mode = btn.dataset.mode
+  if (mode === ArgoPreview.getMode(kind)) return
+  ArgoPreview.setMode(kind, mode)
+  $('file-viewer-toggle').querySelectorAll('.vt-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === mode)
+  })
+  renderViewer(currentViewerPath, kind)
 })
 
 $('refresh-files').addEventListener('click', refreshFiles)

@@ -104,7 +104,7 @@
 
     <form id="chat-form">
       <div id="input-wrap">
-        <textarea id="input" placeholder="Ask anything… (Shift+Enter for newline)" rows="3"></textarea>
+        <textarea id="input" placeholder="Ask anything… (Shift/Alt+Enter for newline)" rows="3"></textarea>
         <button id="send-btn" type="submit" title="Send">
           <span class="flip-h send-icon" id="send-boat">⛵</span>
           <span class="send-stop hidden" id="send-stop"></span>
@@ -136,6 +136,9 @@
     <div id="file-viewer-pane">
       <div id="file-viewer-header">
         <span id="file-viewer-path"></span>
+        <div id="file-viewer-toggle" class="viewer-toggle hidden">
+          <button data-mode="preview" class="vt-btn">Preview</button><button data-mode="source" class="vt-btn">Source</button>
+        </div>
         <button id="file-viewer-close" class="icon-btn" title="Close">✕</button>
       </div>
       <pre id="file-viewer-content" class="file-viewer-empty">Select a file to view</pre>
@@ -191,6 +194,7 @@
   </div>
 </div>
 
+<script src="/preview.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>
