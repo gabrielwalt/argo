@@ -346,6 +346,11 @@ app.get('/files', async (req, res) => {
   res.json(await listDir(target, target === root))
 })
 
+// Raw workspace bytes, path-based so relative resources (<link>/<img>/<script>)
+// resolve — read-only, behind the same password gate as /file, binary-safe with
+// correct Content-Type. Mirrors the /file security posture (confined to browseRoot).
+app.use('/raw', express.static(browseRoot(), { index: false, dotfiles: 'allow', fallthrough: false }))
+
 // File content — ?path=relative/path
 app.get('/file', async (req, res) => {
   const root = browseRoot()
