@@ -173,6 +173,10 @@ let currentRunModel = ''
 const sendBoat = $('send-boat')
 const sendStop = $('send-stop')
 
+// Prompt queue (in-memory; lost on refresh). Items: { id, text }
+const promptQueue = []
+const originalPlaceholder = inputEl.placeholder
+
 // ── SSE connection ───────────────────────────────────────────────
 const es = new EventSource(`${API_BASE}/events`)
 
@@ -354,14 +358,23 @@ function handleEvent(event) {
       break
     }
 
-    case 'done':
+    case 'done': {
+      // Capture the user-stop flag before setBusy(false) resets stopRequested.
+      const wasStopped = stopRequested
       setStatus('ready', 'Ready')
       finalizeTraceBlock()
       setBusy(false)
       iterLabel.textContent = ''
       refreshGitLog()
       refreshFiles()
+      // Auto-advance the queue only on a clean finish (not on a user stop).
+      if (!wasStopped && promptQueue.length) {
+        const next = promptQueue.shift()
+        renderQueue()
+        startRun(next.text)
+      }
       break
+    }
 
     case 'compact_start':
       // Compaction involves separate LLM calls (update + validate) that can take
@@ -486,7 +499,8 @@ function setStatus(state, text) {
 
 function setBusy(val) {
   busy = val
-  inputEl.disabled = val
+  // Leave the textarea enabled while the agent runs so the user can queue prompts.
+  inputEl.placeholder = val ? 'Queue a prompt… (Enter to queue)' : originalPlaceholder
   const sessionBtn = $('session-btn')
   if (sessionBtn) sessionBtn.disabled = val
 
@@ -658,21 +672,16 @@ function addSystemMessage(text) {
   messagesEl.scrollTop = messagesEl.scrollHeight
 }
 
-// ── Chat form ────────────────────────────────────────────────────
-$('chat-form').addEventListener('submit', async (e) => {
-  e.preventDefault()
-  if (busy || viewingSession) return
-
-  const message = inputEl.value.trim()
-  if (!message) return
-
+// ── Prompt queue ─────────────────────────────────────────────────
+// Start an actual run: shared by direct submit and auto-advance. On failure
+// (bad response or network) the message is re-queued at the FRONT so nothing
+// is lost, and busy is cleared.
+async function startRun(message) {
   if (!currentSessionQuery) {
     currentSessionQuery = message
     updateSessionLabel()
   }
   addChatMessage('user', message)
-  inputEl.value = ''
-  autoGrow()
   setBusy(true)
 
   try {
@@ -685,11 +694,120 @@ $('chat-form').addEventListener('submit', async (e) => {
       const err = await resp.json()
       addSystemMessage(`Error: ${err.error}`)
       setBusy(false)
+      promptQueue.unshift({ id: nextQueueId(), text: message })
+      renderQueue()
     }
   } catch (err) {
     addSystemMessage(`Network error: ${err.message}`)
     setBusy(false)
+    promptQueue.unshift({ id: nextQueueId(), text: message })
+    renderQueue()
   }
+}
+
+let queueIdCounter = 0
+function nextQueueId() {
+  queueIdCounter += 1
+  return queueIdCounter
+}
+
+function enqueuePrompt(text) {
+  promptQueue.push({ id: nextQueueId(), text })
+  renderQueue()
+}
+
+function renderQueue() {
+  const container = $('prompt-queue')
+  if (!container) return
+  container.innerHTML = ''
+  if (!promptQueue.length) {
+    container.classList.remove('has-items')
+    return
+  }
+  container.classList.add('has-items')
+  for (const item of promptQueue) {
+    const card = document.createElement('div')
+    card.className = 'queue-item'
+
+    const textEl = document.createElement('div')
+    textEl.className = 'queue-item-text'
+    textEl.textContent = item.text
+
+    const actions = document.createElement('div')
+    actions.className = 'queue-item-actions'
+
+    const editBtn = document.createElement('button')
+    editBtn.type = 'button'
+    editBtn.className = 'icon-btn queue-item-btn'
+    editBtn.title = 'Edit'
+    editBtn.textContent = '✎'
+    editBtn.addEventListener('click', () => editQueued(item.id))
+
+    const delBtn = document.createElement('button')
+    delBtn.type = 'button'
+    delBtn.className = 'icon-btn queue-item-btn'
+    delBtn.title = 'Remove'
+    delBtn.textContent = '✕'
+    delBtn.addEventListener('click', () => deleteQueued(item.id))
+
+    actions.appendChild(editBtn)
+    actions.appendChild(delBtn)
+    card.appendChild(textEl)
+    card.appendChild(actions)
+    container.appendChild(card)
+  }
+}
+
+function editQueued(id) {
+  const idx = promptQueue.findIndex(it => it.id === id)
+  if (idx === -1) return
+  const [item] = promptQueue.splice(idx, 1)
+  inputEl.value = item.text
+  inputEl.focus()
+  inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length)
+  autoGrow()
+  renderQueue()
+}
+
+function deleteQueued(id) {
+  const idx = promptQueue.findIndex(it => it.id === id)
+  if (idx === -1) return
+  promptQueue.splice(idx, 1)
+  renderQueue()
+}
+
+// ── Chat form ────────────────────────────────────────────────────
+$('chat-form').addEventListener('submit', async (e) => {
+  e.preventDefault()
+  if (viewingSession) return
+
+  const text = inputEl.value.trim()
+
+  if (busy) {
+    // Agent running: Enter queues a new prompt. (The button while busy is the
+    // STOP button, handled separately in the sendBtn click listener.)
+    if (text) {
+      enqueuePrompt(text)
+      inputEl.value = ''
+      autoGrow()
+    }
+    return
+  }
+
+  // Idle:
+  if (text) {
+    // Run the typed prompt now (an explicit new prompt takes priority; any
+    // paused queue stays and resumes after this run completes naturally).
+    inputEl.value = ''
+    autoGrow()
+    startRun(text)
+  } else if (promptQueue.length) {
+    // Empty submit with a non-empty queue: run the TOP of the queue.
+    const next = promptQueue.shift()
+    renderQueue()
+    startRun(next.text)
+  }
+  // else: empty submit, empty queue -> no-op.
 })
 
 inputEl.addEventListener('keydown', (e) => {
@@ -762,6 +880,9 @@ async function newSession() {
   currentTraceBlock = null
   updateSessionLabel()
   messagesEl.innerHTML = '<div class="message system">New session started.</div>'
+  // A fresh session starts with no queued prompts.
+  promptQueue.length = 0
+  renderQueue()
 
   iterLabel.textContent = ''
   setStatus('ready', 'Ready')

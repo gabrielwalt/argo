@@ -1387,3 +1387,48 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   font-size: 12px;
   text-align: center;
 }
+
+/* ── Prompt queue ─────────────────────────────────────────────── */
+.prompt-queue {
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 12px 8px;
+  max-height: 30vh;
+  overflow-y: auto;
+}
+.prompt-queue.has-items {
+  display: flex;
+}
+.queue-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+.queue-item-text {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  text-overflow: ellipsis;
+}
+.queue-item-actions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.queue-item-btn {
+  font-size: 12px;
+  line-height: 1;
+}
