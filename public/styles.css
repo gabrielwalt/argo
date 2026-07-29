@@ -1141,7 +1141,12 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   flex-direction: column;
   height: 100%;
 }
-#file-viewer-content.preview-mode .doc-preview { flex: 1; min-height: 0; }
+/* min-width:0 lets the preview flex item shrink below its content's intrinsic width,
+   so a wide code block inside a markdown preview scrolls INSIDE its <pre> (which has
+   overflow:auto) instead of stretching the whole document and forcing a page-wide scroll. */
+#file-viewer-content.preview-mode .doc-preview { flex: 1; min-height: 0; min-width: 0; }
+#file-viewer-content.preview-mode .md-preview { min-width: 0; }
+#file-viewer-content.preview-mode .md-preview pre { max-width: 100%; }
 
 .doc-preview-frame {
   width: 100%;
