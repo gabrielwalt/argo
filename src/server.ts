@@ -114,6 +114,10 @@ app.get('/history', (req, res) => {
   res.json(agent.getChatHistory())
 })
 
+app.get('/context', (req, res) => {
+  res.json(agent.getContext())
+})
+
 app.post('/stop', (_req, res) => {
   agent.abort()
   res.json({ ok: true })
@@ -194,6 +198,7 @@ app.get('/status', (req, res) => {
     sessionId: currentSessionId,
     workspacePath: config.workspacePath || null,
     env: envStatus,
+    compactThreshold: config.compactThreshold,
   })
 })
 

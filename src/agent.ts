@@ -1087,6 +1087,58 @@ export class Agent {
       .map(msg => ({ role: msg.role, content: msg.content ?? '' }))
   }
 
+  // A JSON-serializable snapshot of the FULL context the model currently sees
+  // (unlike getChatHistory, which returns only user/assistant chat turns). Used
+  // by the context/compaction UI. Defensive: coerces non-string content, caps
+  // per-message content so the payload stays bounded, and never throws.
+  getContext(): {
+    messages: Array<{ role: string; content: string; chars: number }>
+    messageCount: number
+    totalChars: number
+    numCtx: number | null
+    compaction: string | null
+  } {
+    const MAX = 4000
+    let totalChars = 0
+    const messages = this.history.map(m => {
+      const full = typeof m.content === 'string' ? m.content : String(m.content ?? '')
+      totalChars += full.length
+      const content = full.length > MAX
+        ? `${full.slice(0, MAX)}…(+${full.length - MAX} more chars)`
+        : full
+      return { role: m.role, content, chars: full.length }
+    })
+
+    let compaction: string | null = null
+    try {
+      const state = this.compactionState
+      if (state) {
+        const hasContent = !!state.projectCapsule || [
+          state.userRequirements,
+          state.verifiedFacts,
+          state.decisionsMade,
+          state.changesMade,
+          state.testsAndVerification,
+          state.openQuestions,
+          state.hypotheses,
+          state.failedAttempts,
+          state.invalidatedConclusions,
+        ].some(arr => Array.isArray(arr) && arr.length > 0)
+        if (hasContent) compaction = renderCompactionState(state)
+      }
+    } catch {
+      compaction = null
+    }
+
+    return {
+      messages,
+      messageCount: this.history.length,
+      totalChars,
+      numCtx: this.options.num_ctx ?? null,
+      compaction,
+    }
+  }
+
   // Wraps bash() with the same tool_call/tool_result tracing the main loop
   // uses, so autoCommit's own commands show up in the JSONL/Markdown trace
   // instead of being invisible — this is what let the phantom/orphaned/
