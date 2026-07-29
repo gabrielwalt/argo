@@ -1364,22 +1364,24 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .hidden { display: none !important; }
 
 /* ── Sailing-boat animation (while a run is active) ─────────────────
-   The boat sails using 1-2 of five transform-only motions chosen at random per run and
-   layered (m1/m2) so their effects cumulate. Pitch = in-plane rock (rotate); roll = lean
-   toward/away (3D rotateX); yaw = turn (3D rotateY); plus bob (heave) and sway (drift).
-   The glyph carries the left-facing flip; the nested layers carry the motion. */
-.m1, .m2 { display: inline-flex; align-items: center; justify-content: center; transform-style: preserve-3d; transform-origin: 50% 80%; }
+   The boat continuously SAILS PAST the button — enters from the left, lingers across the
+   middle, exits to the right (sailthrough on the outer layer m1) — while ROCKING with one
+   random motion on the inner layer m2: roll = a strong lean (3D rotateX about a LOW origin,
+   so the hull bottom stays put and the height foreshortens as it heels to one side); pitch
+   = fore/aft rock; yaw = turn; bob = heave. Nested layers (m1 traverse ∘ m2 rock ∘ glyph
+   flip) so their transforms cumulate. The glyph carries the left-facing flip. */
+.m1, .m2 { display: inline-flex; align-items: center; justify-content: center; transform-style: preserve-3d; transform-origin: 50% 88%; }
 .boat-glyph { display: inline-block; filter: brightness(0); line-height: 1; transform: scaleX(-1); }
+@keyframes sailthrough { 0%{transform:translateX(-125%)} 16%{transform:translateX(-32%)} 84%{transform:translateX(32%)} 100%{transform:translateX(125%)} }
+@keyframes roll { 0%{transform:rotateX(-27deg)} 50%{transform:rotateX(27deg)} 100%{transform:rotateX(-27deg)} }
 @keyframes pitch { 0%{transform:rotate(-5deg)} 50%{transform:rotate(5deg)} 100%{transform:rotate(-5deg)} }
-@keyframes roll { 0%{transform:rotateX(-17deg)} 50%{transform:rotateX(17deg)} 100%{transform:rotateX(-17deg)} }
 @keyframes yaw { 0%{transform:rotateY(-20deg)} 50%{transform:rotateY(20deg)} 100%{transform:rotateY(-20deg)} }
-@keyframes bob { 0%{transform:translateY(6%)} 50%{transform:translateY(-8%)} 100%{transform:translateY(6%)} }
-@keyframes sway { 0%{transform:translateX(-7%)} 50%{transform:translateX(7%)} 100%{transform:translateX(-7%)} }
-.m1.a-pitch, .m2.a-pitch { animation: pitch 2.6s ease-in-out infinite; }
-.m1.a-roll,  .m2.a-roll  { animation: roll 3.1s ease-in-out infinite; }
-.m1.a-yaw,   .m2.a-yaw   { animation: yaw 3.8s ease-in-out infinite; }
-.m1.a-bob,   .m2.a-bob   { animation: bob 2.2s ease-in-out infinite; }
-.m1.a-sway,  .m2.a-sway  { animation: sway 4s ease-in-out infinite; }
+@keyframes bob { 0%{transform:translateY(6%)} 50%{transform:translateY(-9%)} 100%{transform:translateY(6%)} }
+.m1.a-sail  { animation: sailthrough 4.6s ease-in-out infinite; }
+.m2.a-roll  { animation: roll 3s ease-in-out infinite; }
+.m2.a-pitch { animation: pitch 2.6s ease-in-out infinite; }
+.m2.a-yaw   { animation: yaw 3.8s ease-in-out infinite; }
+.m2.a-bob   { animation: bob 2.2s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) { .m1, .m2 { animation: none; } }
 
 /* ── No-workspace screen ─────────────────────────────────────────── */

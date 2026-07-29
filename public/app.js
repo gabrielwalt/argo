@@ -572,20 +572,18 @@ function setStatus(state, text) {
   statusText.textContent = text
 }
 
-const SAIL_MOTIONS = ['pitch', 'roll', 'yaw', 'bob', 'sway']
-// Apply 1-2 random distinct sailing motions across the two nested boat layers (m1/m2) so
-// their transforms cumulate; clears them when off. ~half the runs use a single motion,
-// ~half combine two.
+// The outer layer always does the sail-past traverse; the inner layer rocks with one random
+// motion (roll is weighted so the stronger lean shows up most often). Cleared when off.
+const SAIL_ROCKS = ['roll', 'roll', 'pitch', 'yaw', 'bob']
 function setSailing(on) {
   const m1 = sendBoat.querySelector('.m1')
   const m2 = sendBoat.querySelector('.m2')
   if (!m1 || !m2) return
-  for (const el of [m1, m2]) for (const m of SAIL_MOTIONS) el.classList.remove('a-' + m)
+  m1.classList.remove('a-sail')
+  for (const r of ['roll', 'pitch', 'yaw', 'bob']) m2.classList.remove('a-' + r)
   if (!on) return
-  const pool = SAIL_MOTIONS.slice()
-  for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = pool[i]; pool[i] = pool[j]; pool[j] = t }
-  m1.classList.add('a-' + pool[0])
-  if (Math.random() < 0.5) m2.classList.add('a-' + pool[1])
+  m1.classList.add('a-sail')
+  m2.classList.add('a-' + SAIL_ROCKS[Math.floor(Math.random() * SAIL_ROCKS.length)])
 }
 
 function setBusy(val) {
