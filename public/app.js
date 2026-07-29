@@ -75,6 +75,9 @@ const DEFAULTS = { temperature: 0.8, top_p: 0.9, top_k: 40, num_ctx: 65536 }
 const modelOpts = { ...DEFAULTS }
 const MAX_ITERATIONS_DEFAULT = 1000
 let maxIterations = MAX_ITERATIONS_DEFAULT
+// Grounding & self-consistency guard (writing/research tasks). Default ON; sent with
+// every /chat request so the worker's per-run flag matches this toggle.
+let grounding = true
 
 function syncSettingsUI() {
   $('opt-temperature').value = modelOpts.temperature
@@ -85,6 +88,7 @@ function syncSettingsUI() {
   $('opt-num-ctx').value = modelOpts.num_ctx
   $('opt-max-iterations').value = maxIterations
   $('opt-max-iterations-val').textContent = maxIterations
+  $('opt-grounding').checked = grounding
 }
 
 $('opt-temperature').addEventListener('input', e => {
@@ -101,9 +105,11 @@ $('opt-max-iterations').addEventListener('input', e => {
   maxIterations = parseInt(e.target.value, 10)
   $('opt-max-iterations-val').textContent = maxIterations
 })
+$('opt-grounding').addEventListener('change', e => { grounding = e.target.checked })
 $('settings-reset').addEventListener('click', () => {
   Object.assign(modelOpts, DEFAULTS)
   maxIterations = MAX_ITERATIONS_DEFAULT
+  grounding = true
   syncSettingsUI()
 })
 
@@ -672,7 +678,7 @@ $('chat-form').addEventListener('submit', async (e) => {
     const resp = await fetch(`${API_BASE}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, model: selectedModel, options: modelOpts, maxIterations }),
+      body: JSON.stringify({ message, model: selectedModel, options: modelOpts, maxIterations, grounding }),
     })
     if (!resp.ok) {
       const err = await resp.json()
