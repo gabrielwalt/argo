@@ -231,7 +231,7 @@ const originalPlaceholder = inputEl.placeholder
 // ── SSE connection ───────────────────────────────────────────────
 const es = new EventSource(`${API_BASE}/events`)
 
-es.onopen = () => setStatus('ready', 'Ready')
+es.onopen = () => { if (!busy) setStatus('ready', 'Ready') }  // don't clobber a running state on (re)connect
 es.onerror = () => setStatus('error', 'Disconnected — reload page')
 
 es.onmessage = (e) => {
@@ -2093,6 +2093,12 @@ async function boot() {
   // buffered, and finishReplay() renders them (deduped) once the replay is done.
   await loadHistory()
   finishReplay()
+  // Restore the running state on reload — otherwise, mid-run, the UI acts as if idle
+  // (input, send/stop button, status dot) even though the agent is still working.
+  if (status.busy) {
+    setBusy(true)
+    setStatus('busy', `Running · ${currentRunModel || status.model || ''}`)
+  }
   if (!messagesEl.children.length) {
     messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
   }
