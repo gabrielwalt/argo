@@ -18,6 +18,54 @@ const tokenCounter = $('token-counter')
 const settingsBtn = $('settings-btn')
 const settingsPanel = $('settings-panel')
 
+// ── Context indicator (donut) ─────────────────────────────────────
+// Latest context size the model saw, plus the fraction at which auto-compaction
+// fires (fetched once from /status on boot). The donut is drawn from these and
+// redrawn on every token_usage; precise numbers live only in the dropdown.
+let ctxState = { promptTokens: 0, numCtx: 0, pct: 0 }
+let compactThreshold = 0.667
+// True while a user-triggered /compact-now is in flight — used to (a) disable the
+// dropdown action and (b) let compaction trace events render even when they'd
+// otherwise be suppressed (e.g. while viewing a past session).
+let manualCompacting = false
+
+// Arc color mirrors the old ctx-ok/ctx-warn/ctx-danger thresholds, read from the
+// same CSS custom properties so the palette stays in one place (styles.css).
+function ctxArcColor(pct) {
+  const root = getComputedStyle(document.documentElement)
+  if (pct >= 90) return root.getPropertyValue('--red').trim()
+  if (pct >= 70) return root.getPropertyValue('--yellow').trim()
+  return root.getPropertyValue('--muted').trim()
+}
+
+function renderDonut() {
+  const size = 22, cx = 11, cy = 11, r = 8, sw = 3
+  const pct = Math.max(0, Math.min(100, ctxState.pct))
+  const circ = 2 * Math.PI * r
+  const dash = circ * (pct / 100)
+  const color = ctxArcColor(pct)
+  // Threshold tick: angle measured from 12 o'clock (−90° in SVG coords).
+  const ang = compactThreshold * 2 * Math.PI - Math.PI / 2
+  const rIn = r - sw / 2 - 1, rOut = r + sw / 2 + 1
+  const tx1 = (cx + rIn * Math.cos(ang)).toFixed(2), ty1 = (cy + rIn * Math.sin(ang)).toFixed(2)
+  const tx2 = (cx + rOut * Math.cos(ang)).toFixed(2), ty2 = (cy + rOut * Math.sin(ang)).toFixed(2)
+  tokenCounter.innerHTML =
+    `<svg class="ctx-donut" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">`
+    + `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--border)" stroke-width="${sw}"/>`
+    + `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${color}" stroke-width="${sw}"`
+    + ` stroke-dasharray="${dash.toFixed(2)} ${(circ - dash).toFixed(2)}" transform="rotate(-90 ${cx} ${cy})"/>`
+    + `<line class="ctx-tick" x1="${tx1}" y1="${ty1}" x2="${tx2}" y2="${ty2}" stroke="var(--text)" stroke-width="1.5"/>`
+    + `</svg>`
+}
+
+// Update stored context size + redraw. Never touches textContent (the donut is
+// the only always-on display; numbers show in the dropdown).
+function updateCtx(promptTokens, numCtx) {
+  const pct = numCtx ? Math.round(promptTokens / numCtx * 100) : 0
+  ctxState = { promptTokens, numCtx, pct }
+  renderDonut()
+}
+
 // ── Confirm dialog / toast — replace native confirm()/alert() ────
 function confirmDialog(message) {
   return new Promise(resolve => {
@@ -280,6 +328,16 @@ function handleEvent(event) {
       setStatus('busy', `Running · ${currentRunModel}`)
       return
     }
+    // A user-triggered compaction (manualCompacting) must render its trace even
+    // here — otherwise clicking "Compact context now" while viewing a past
+    // session would show nothing. When not manual, these stay suppressed.
+    if (event.type === 'compact_start') {
+      if (manualCompacting) {
+        setStatus('busy', 'Compacting context…')
+        addTraceItem('compact', '📦 Compacting context', `${event.messageCount} messages, ${Math.round(event.contextUsagePct * 100)}% context — updating working memory…`, false)
+      }
+      return
+    }
     if (event.type === 'compact_progress') {
       const elapsedS = Math.round(event.elapsedMs / 1000)
       const timeoutS = Math.round(event.timeoutMs / 1000)
@@ -287,9 +345,7 @@ function handleEvent(event) {
       return
     }
     if (event.type === 'token_usage') {
-      const pct = Math.round(event.prompt_tokens / event.num_ctx * 100)
-      tokenCounter.textContent = `${event.prompt_tokens.toLocaleString()} / ${event.num_ctx.toLocaleString()} ctx`
-      tokenCounter.className = pct >= 90 ? 'ctx-danger' : pct >= 70 ? 'ctx-warn' : 'ctx-ok'
+      updateCtx(event.prompt_tokens, event.num_ctx)
       return
     }
     if (event.type === 'done') {
@@ -299,10 +355,16 @@ function handleEvent(event) {
       return
     }
     if (event.type === 'compact') {
-      if (event.manual) setStatus('ready', 'Ready')
-      else setStatus('busy', `Running · ${currentRunModel}`)
-      tokenCounter.textContent = 'compacted'
-      tokenCounter.className = 'ctx-ok'
+      if (manualCompacting) {
+        addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}${event.activeWorkingStateSummary ? `\n\n--- Active working state (unvalidated) ---\n${event.activeWorkingStateSummary}` : ''}`, true)
+        finalizeTraceBlock()
+        setStatus('ready', 'Ready')
+        manualCompacting = false
+      } else if (event.manual) {
+        setStatus('ready', 'Ready')
+      } else {
+        setStatus('busy', `Running · ${currentRunModel}`)
+      }
       return
     }
     // All other events (thought, tool_call, tool_result, message, start-without-model, etc.) are suppressed
@@ -351,12 +413,9 @@ function handleEvent(event) {
       renderPlan(event)
       break
 
-    case 'token_usage': {
-      const pct = Math.round(event.prompt_tokens / event.num_ctx * 100)
-      tokenCounter.textContent = `${event.prompt_tokens.toLocaleString()} / ${event.num_ctx.toLocaleString()} ctx`
-      tokenCounter.className = pct >= 90 ? 'ctx-danger' : pct >= 70 ? 'ctx-warn' : 'ctx-ok'
+    case 'token_usage':
+      updateCtx(event.prompt_tokens, event.num_ctx)
       break
-    }
 
     case 'done': {
       // Capture the user-stop flag before setBusy(false) resets stopRequested.
@@ -400,8 +459,13 @@ function handleEvent(event) {
       if (event.manual) setStatus('ready', 'Ready')
       else setStatus('busy', `Running · ${currentRunModel}`)
       addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}${event.activeWorkingStateSummary ? `\n\n--- Active working state (unvalidated) ---\n${event.activeWorkingStateSummary}` : ''}`, true)
-      tokenCounter.textContent = 'compacted'
-      tokenCounter.className = 'ctx-ok'
+      // A user-triggered manual compaction (no run to fire 'done') finalizes its
+      // own trace block here; an in-run auto-compaction leaves the block open for
+      // the run to keep filling. The donut keeps showing the last known size.
+      if (manualCompacting) {
+        finalizeTraceBlock()
+        manualCompacting = false
+      }
       break
 
     case 'warning':
@@ -533,17 +597,138 @@ async function stopAgent() {
   try { await fetch(`${API_BASE}/stop`, { method: 'POST' }) } catch { /* ignore */ }
 }
 
-tokenCounter.addEventListener('click', async () => {
-  if (busy) return
-  try {
-    const resp = await fetch(`${API_BASE}/compact-now`, { method: 'POST' })
-    const result = await resp.json()
-    if (!resp.ok) { showToast(result.error || 'Failed to compact'); return }
-    if (!result.compacted) showToast('Nothing to compact yet')
-  } catch {
-    showToast('Failed to compact')
+// ── Context dropdown ──────────────────────────────────────────────
+// Clicking the donut opens a dropdown (never compacts directly — that avoids
+// accidental triggers). Reuses the .nav-crumb / .nav-dropdown pattern, so
+// closeAllDropdowns() (outside-click + Escape) closes it for free.
+const navCtx = $('nav-ctx')
+const ctxDropdown = $('ctx-dropdown')
+
+function buildCtxDropdown() {
+  ctxDropdown.innerHTML = ''
+
+  const header = document.createElement('div')
+  header.className = 'nav-drop-label ctx-drop-header'
+  header.textContent = ctxState.numCtx
+    ? `${ctxState.promptTokens.toLocaleString()} / ${ctxState.numCtx.toLocaleString()} tokens · ${ctxState.pct}%`
+    : 'No context usage yet'
+  ctxDropdown.appendChild(header)
+
+  // Compaction only makes sense between runs — disabled while busy or already
+  // compacting, with a hint explaining why.
+  const disabled = busy || manualCompacting
+  const compactItem = document.createElement('div')
+  compactItem.className = `nav-drop-item${disabled ? ' disabled' : ''}`
+  compactItem.innerHTML = `<span>⚡ Compact context now</span>${disabled ? '<span class="ctx-hint">available between runs</span>' : ''}`
+  if (!disabled) {
+    compactItem.addEventListener('click', () => {
+      navCtx.classList.remove('open')
+      compactNow()
+    })
+  }
+  ctxDropdown.appendChild(compactItem)
+
+  const viewItem = document.createElement('div')
+  viewItem.className = 'nav-drop-item'
+  viewItem.innerHTML = `<span>🔍 View context</span>`
+  viewItem.addEventListener('click', () => {
+    navCtx.classList.remove('open')
+    viewContext()
+  })
+  ctxDropdown.appendChild(viewItem)
+}
+
+tokenCounter.addEventListener('click', (e) => {
+  e.stopPropagation()
+  const wasOpen = navCtx.classList.contains('open')
+  closeAllDropdowns()
+  if (!wasOpen) {
+    buildCtxDropdown()
+    navCtx.classList.add('open')
+    const r = tokenCounter.getBoundingClientRect()
+    ctxDropdown.style.top  = (r.bottom + 6) + 'px'
+    ctxDropdown.style.left = Math.max(8, r.right - 240) + 'px'
   }
 })
+
+// Manual compaction. Disabled in the UI while busy/in-flight, but guard anyway.
+// Ensures a trace block exists so the compact_start/compact events have somewhere
+// to render; those events (see handleEvent) finalize the block on completion.
+async function compactNow() {
+  if (busy || manualCompacting) return
+  manualCompacting = true
+  const createdBlock = !currentTraceBlock
+  if (createdBlock) startTraceBlock('manual compaction')
+  try {
+    const resp = await fetch(`${API_BASE}/compact-now`, { method: 'POST' })
+    if (resp.status === 409) {
+      showToast('Agent is finishing the previous run — try again in a moment')
+      cleanupManualCompaction(createdBlock)
+      return
+    }
+    const result = await resp.json()
+    if (!resp.ok) {
+      showToast(result.error || 'Failed to compact')
+      cleanupManualCompaction(createdBlock)
+      return
+    }
+    if (!result.compacted) {
+      showToast('Nothing to compact yet')
+      cleanupManualCompaction(createdBlock)
+      return
+    }
+    // Success: the compact_start / compact events render into the trace and
+    // finalize the block (see handleEvent). Nothing more to do here.
+  } catch {
+    showToast('Failed to compact')
+    cleanupManualCompaction(createdBlock)
+  }
+}
+
+// Tear down after a manual compaction that produced no trace: drop the empty
+// block we created (no dangling "0 tools" block), else finalize it.
+function cleanupManualCompaction(createdBlock) {
+  if (createdBlock && currentTraceBlock) {
+    if (currentTraceBlock.items.childElementCount === 0) {
+      currentTraceBlock.el.remove()
+      currentTraceBlock = null
+    } else {
+      finalizeTraceBlock()
+    }
+  }
+  manualCompacting = false
+}
+
+// View the exact context the model currently sees. Read-only; reuses #diff-modal.
+async function viewContext() {
+  diffTitle.textContent = 'Context'
+  diffContent.textContent = 'Loading…'
+  diffModal.classList.add('open')
+  try {
+    const resp = await fetch(`${API_BASE}/context`)
+    if (!resp.ok) throw new Error('bad status')
+    const data = await resp.json()
+    diffTitle.textContent = `Context (${data.messageCount ?? 0} messages · ${(data.totalChars ?? 0).toLocaleString()} chars · num_ctx ${(data.numCtx ?? 0).toLocaleString()})`
+    diffContent.innerHTML = renderContext(data)
+  } catch {
+    diffModal.classList.remove('open')
+    showToast('Failed to load context')
+  }
+}
+
+function renderContext(data) {
+  let html = ''
+  if (data.compaction != null) {
+    const c = data.compaction
+    const text = typeof c === 'string' ? c : JSON.stringify(c, null, 2)
+    html += `<div class="ctx-msg ctx-ledger"><div class="ctx-role">Compaction ledger</div><div class="ctx-content">${escHtml(text)}</div></div>`
+  }
+  for (const m of (data.messages ?? [])) {
+    const role = String(m.role ?? '')
+    html += `<div class="ctx-msg"><div class="ctx-role ctx-role-${escHtml(role)}">${escHtml(role)} · ${(m.chars ?? 0).toLocaleString()} chars</div><div class="ctx-content">${escHtml(m.content ?? '')}</div></div>`
+  }
+  return html || '<div class="ctx-msg"><div class="ctx-content">(empty context)</div></div>'
+}
 
 // Stop click: intercept button click when busy to cancel instead of submit
 sendBtn.addEventListener('click', (e) => {
@@ -911,6 +1096,7 @@ function closeAllDropdowns() {
   document.querySelectorAll('.nav-crumb.open').forEach(el => el.classList.remove('open'))
 }
 document.addEventListener('click', closeAllDropdowns)
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAllDropdowns() })
 
 // ── Model selector ───────────────────────────────────────────────
 function selectModel(name) {
@@ -1811,6 +1997,11 @@ async function boot() {
   const status = await fetch(`${API_BASE}/status`).then(r => r.json()).catch(() => ({}))
   showEnvBanner(status.env)
   if (!window.__WS__ && !status.workspacePath) { showNoWorkspaceScreen(); finishReplay(); return }
+
+  // Draw an empty donut immediately (visible before the first token_usage), and
+  // capture the auto-compaction threshold for the donut's tick.
+  compactThreshold = typeof status.compactThreshold === 'number' ? status.compactThreshold : 0.667
+  renderDonut()
 
   currentLiveSessionId = status.sessionId ?? ''
   // await so the model dropdown is populated (and its models[0] default selected)
