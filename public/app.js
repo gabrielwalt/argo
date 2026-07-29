@@ -426,6 +426,17 @@ function handleEvent(event) {
       iterLabel.textContent = ''
       refreshGitLog()
       refreshFiles()
+      // Browser notification on a clean finish (with the workspace name), when the tab is
+      // not focused — so you learn a task completed while looking elsewhere.
+      if (!wasStopped) {
+        try {
+          if (typeof Notification !== 'undefined' && Notification.permission === 'granted' && !document.hasFocus()) {
+            const ws = window.__WS__ || 'workspace'
+            const q = currentSessionQuery ? ': ' + (currentSessionQuery.length > 60 ? currentSessionQuery.slice(0, 60) + '…' : currentSessionQuery) : ''
+            new Notification('Argo · ' + ws, { body: 'Task complete' + q, icon: '/favicon.svg' })
+          }
+        } catch { /* notifications unavailable — ignore */ }
+      }
       // Auto-advance the queue only on a clean finish (not on a user stop).
       if (!wasStopped && promptQueue.length) {
         const next = promptQueue.shift()
@@ -891,6 +902,8 @@ function addSystemMessage(text) {
 // (bad response or network) the message is re-queued at the FRONT so nothing
 // is lost, and busy is cleared.
 async function startRun(message) {
+  // Ask for notification permission on the first run (a user gesture); harmless if denied.
+  if (typeof Notification !== 'undefined' && Notification.permission === 'default') { try { Notification.requestPermission() } catch { /* ignore */ } }
   if (!currentSessionQuery) {
     currentSessionQuery = message
     updateSessionLabel()
