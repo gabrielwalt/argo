@@ -25,10 +25,7 @@
     </div>
 
     <span class="nav-sep">›</span>
-    <div class="nav-crumb" id="nav-session">
-      <button class="nav-crumb-btn" id="session-btn"><span id="session-label">Now</span></button>
-      <div class="nav-dropdown" id="session-dropdown"></div>
-    </div>
+    <button id="new-session-btn" class="icon-btn" title="New session (clear the conversation)">＋</button>
   </nav>
 
   <!-- Model + params — applies to next message in current session, no restart needed -->
@@ -96,13 +93,6 @@
   <section id="chat-panel">
     <div id="messages">
       <div class="message system">Session started. Ask anything.</div>
-    </div>
-
-    <!-- Shown when viewing a past session -->
-    <div id="session-banner">
-      <span id="session-banner-label"></span>
-      <button id="resume-btn">▶ Resume</button>
-      <button id="return-btn">↩ Return to now</button>
     </div>
 
     <div id="prompt-queue" class="prompt-queue"></div>

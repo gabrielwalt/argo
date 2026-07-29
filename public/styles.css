@@ -183,7 +183,6 @@ header::after {
   box-shadow: 0 4px 12px rgba(0,0,0,.3);
 }
 .nav-crumb.open > .nav-dropdown { display: flex; flex-direction: column; }
-#session-dropdown { min-width: 320px; }
 
 .nav-drop-label {
   padding: 6px 14px 3px;
@@ -589,46 +588,6 @@ main {
   align-self: center;
   font-family: var(--font-mono);
 }
-
-/* ── Session banner (shown when viewing a past session) ── */
-#session-banner {
-  display: none;
-  align-items: center;
-  gap: 12px;
-  padding: 9px 16px;
-  background: rgba(201, 162, 39, .05);
-  border-top: 1px solid rgba(201, 162, 39, .15);
-  font-size: 12px;
-  color: var(--muted);
-  flex-shrink: 0;
-  font-family: var(--font-mono);
-}
-#session-banner.visible { display: flex; }
-
-#return-btn {
-  background: none;
-  border: 1px solid var(--border);
-  color: var(--muted);
-  padding: 3px 10px;
-  font-size: 11px;
-  transition: color .15s, border-color .15s;
-}
-#return-btn:hover { color: var(--gold); border-color: var(--gold); }
-
-#resume-btn {
-  background: rgba(201,162,39,.12);
-  color: var(--gold);
-  border: 1px solid rgba(201,162,39,.3);
-  border-radius: 4px;
-  padding: 4px 10px;
-  font-size: 11px;
-  font-family: var(--font-mono);
-  cursor: pointer;
-  margin-left: auto;
-  transition: background .15s;
-}
-#resume-btn:hover { background: rgba(201,162,39,.22); }
-#resume-btn:disabled { opacity: .4; cursor: not-allowed; }
 
 /* ── Markdown rendering inside chat messages ── */
 .message.md { white-space: normal; }

@@ -105,7 +105,6 @@ function showToast(message) {
 
 // ── Session state ────────────────────────────────────────────────
 let sessionStartTime = new Date()
-let viewingSession = null  // null = current; object = past session being viewed
 let currentSessionQuery = ''  // first user message of the current session
 
 // ── Structured-event replay state ───────────────────────────
@@ -244,19 +243,16 @@ es.onmessage = (e) => {
 
 // A single live SSE event. Dedupes against already-replayed events of the
 // current run via the per-run __seq high-water mark, then renders it through the
-// live path. (While viewing a past session, handleEvent suppresses messagesEl
-// rendering itself — no dedup needed there, and the mark is rebuilt on return.)
+// live path.
 function handleLiveEvent(event) {
-  if (!viewingSession) {
-    const seq = event.__seq
-    // __seq is per-run, so seq === 1 marks the first event of a NEW run (the
-    // user message, which precedes 'start') — reset the mark so the new run's
-    // events aren't mistaken for already-seen ones from a longer previous run.
-    if (seq === 1) liveRunMaxSeq = 0
-    if (typeof seq === 'number') {
-      if (seq <= liveRunMaxSeq) return   // already rendered (via replay or earlier)
-      liveRunMaxSeq = seq
-    }
+  const seq = event.__seq
+  // __seq is per-run, so seq === 1 marks the first event of a NEW run (the
+  // user message, which precedes 'start') — reset the mark so the new run's
+  // events aren't mistaken for already-seen ones from a longer previous run.
+  if (seq === 1) liveRunMaxSeq = 0
+  if (typeof seq === 'number') {
+    if (seq <= liveRunMaxSeq) return   // already rendered (via replay or earlier)
+    liveRunMaxSeq = seq
   }
   handleEvent(event)
 }
@@ -315,65 +311,6 @@ function finishReplay() {
 }
 
 function handleEvent(event) {
-  // While viewing a past session, suppress all SSE rendering into messagesEl —
-  // only status-bar updates proceed below. Nothing is lost: the live session's
-  // events are persisted to its JSONL and replayed in full on return (see
-  // returnToCurrentSession), so there is no in-memory DOM that needs preserving.
-  if (viewingSession) {
-    // Still allow status updates to proceed (they don't modify messagesEl)
-    if (event.type === 'start') {
-      currentRunModel = event.model
-      setStatus('busy', `Running · ${event.model}`)
-      return
-    }
-    if (event.type === 'iteration') {
-      iterLabel.textContent = `${event.current}`
-      setStatus('busy', `Running · ${currentRunModel}`)
-      return
-    }
-    // A user-triggered compaction (manualCompacting) must render its trace even
-    // here — otherwise clicking "Compact context now" while viewing a past
-    // session would show nothing. When not manual, these stay suppressed.
-    if (event.type === 'compact_start') {
-      if (manualCompacting) {
-        setStatus('busy', 'Compacting context…')
-        addTraceItem('compact', '📦 Compacting context', `${event.messageCount} messages, ${Math.round(event.contextUsagePct * 100)}% context — updating working memory…`, false)
-      }
-      return
-    }
-    if (event.type === 'compact_progress') {
-      const elapsedS = Math.round(event.elapsedMs / 1000)
-      const timeoutS = Math.round(event.timeoutMs / 1000)
-      setStatus('busy', `Compacting context… ${event.step} (${elapsedS}s / ${timeoutS}s)`)
-      return
-    }
-    if (event.type === 'token_usage') {
-      updateCtx(event.prompt_tokens, event.num_ctx)
-      return
-    }
-    if (event.type === 'done') {
-      setStatus('ready', 'Ready')
-      refreshGitLog()
-      refreshFiles()
-      return
-    }
-    if (event.type === 'compact') {
-      if (manualCompacting) {
-        addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}${event.activeWorkingStateSummary ? `\n\n--- Active working state (unvalidated) ---\n${event.activeWorkingStateSummary}` : ''}`, true)
-        finalizeTraceBlock()
-        setStatus('ready', 'Ready')
-        manualCompacting = false
-      } else if (event.manual) {
-        setStatus('ready', 'Ready')
-      } else {
-        setStatus('busy', `Running · ${currentRunModel}`)
-      }
-      return
-    }
-    // All other events (thought, tool_call, tool_result, message, start-without-model, etc.) are suppressed
-    return
-  }
-
   switch (event.type) {
     case 'start':
       currentRunModel = event.model
@@ -597,8 +534,8 @@ function setBusy(val) {
   busy = val
   // Leave the textarea enabled while the agent runs so the user can queue prompts.
   inputEl.placeholder = val ? 'Queue a prompt… (Enter to queue)' : originalPlaceholder
-  const sessionBtn = $('session-btn')
-  if (sessionBtn) sessionBtn.disabled = val
+  const nb = $('new-session-btn')
+  if (nb) nb.disabled = val
 
   if (val) {
     // The boat stays visible and sails while the agent runs: setSailing picks 1-2 random
@@ -911,7 +848,6 @@ async function startRun(message) {
   if (typeof Notification !== 'undefined' && Notification.permission === 'default') { try { Notification.requestPermission() } catch { /* ignore */ } }
   if (!currentSessionQuery) {
     currentSessionQuery = message
-    updateSessionLabel()
   }
   addChatMessage('user', message)
   setBusy(true)
@@ -1011,7 +947,6 @@ function deleteQueued(id) {
 // ── Chat form ────────────────────────────────────────────────────
 $('chat-form').addEventListener('submit', async (e) => {
   e.preventDefault()
-  if (viewingSession) return
 
   const text = inputEl.value.trim()
 
@@ -1107,12 +1042,9 @@ inputEl.addEventListener('paste', (e) => {
   inputEl.dispatchEvent(new Event('input', { bubbles: true }))
 })
 
-// ── New session (called from session dropdown) ───────────────────
+// ── New session (clear the conversation) ─────────────────────────
 async function newSession() {
-  // Leave any past-session view directly (no need to replay the old live session
-  // we're about to reset) and clear replay/boundary state for the fresh session.
-  viewingSession = null
-  $('session-banner').classList.remove('visible')
+  // Clear replay/boundary state for the fresh session.
   $('chat-form').style.display = ''
   replaying = false
   pendingEvents = []
@@ -1122,7 +1054,6 @@ async function newSession() {
   sessionStartTime = new Date()
   currentSessionQuery = ''
   currentTraceBlock = null
-  updateSessionLabel()
   messagesEl.innerHTML = '<div class="message system">New session started.</div>'
   // A fresh session starts with no queued prompts.
   promptQueue.length = 0
@@ -1606,223 +1537,13 @@ function truncateQuery(q, max = 24) {
   return q.length > max ? q.slice(0, max).trimEnd() + '…' : q
 }
 
-function updateSessionLabel() {
-  const label = $('session-label')
-  if (!label) return
-  if (viewingSession) {
-    const q = viewingSession.runs?.[viewingSession.runs.length - 1]?.query ?? ''
-    label.textContent = q ? truncateQuery(q) : 'Past session'
-  } else {
-    label.textContent = currentSessionQuery ? truncateQuery(currentSessionQuery) : 'Session'
-  }
-}
-
-async function refreshSessionDropdown() {
-  const dropdown = $('session-dropdown')
-  dropdown.innerHTML = ''
-
-  // New session CTA
-  const newItem = document.createElement('div')
-  newItem.className = 'nav-drop-cta'
-  if (busy) newItem.setAttribute('disabled', '')
-  newItem.innerHTML = `<span class="drop-icon">+</span> New session`
-  newItem.addEventListener('click', () => {
-    if (busy) return
-    $('nav-session').classList.remove('open')
-    newSession()
-  })
-  dropdown.appendChild(newItem)
-
-  const header = document.createElement('div')
-  header.className = 'nav-drop-label'
-  header.textContent = 'Sessions'
-  dropdown.appendChild(header)
-
-  // Current live session — same format as past sessions: query + Clear
-  const currItem = document.createElement('div')
-  currItem.className = `nav-drop-item ${!viewingSession ? 'active' : ''}`
-  const liveLabel = currentSessionQuery ? truncateQuery(currentSessionQuery, 28) : '(no messages)'
-  currItem.innerHTML = `<span class="drop-text">${escHtml(liveLabel)}</span>`
-  const clearCurrBtn = document.createElement('button')
-  clearCurrBtn.className = 'nav-drop-detach'
-  clearCurrBtn.textContent = 'Clear'
-  clearCurrBtn.addEventListener('click', async (e) => {
-    e.stopPropagation()
-    if (!(await confirmDialog('Clear current session?'))) return
-    $('nav-session').classList.remove('open')
-    try {
-      const st = await fetch(`${API_BASE}/status`).then(r => r.json())
-      if (st.sessionId) await fetch(`${API_BASE}/logs/${st.sessionId}`, { method: 'DELETE' }).catch(() => {})
-    } catch { /* ignore */ }
-    newSession()
-  })
-  currItem.appendChild(clearCurrBtn)
-  currItem.addEventListener('click', () => {
-    $('nav-session').classList.remove('open')
-    if (viewingSession) returnToCurrentSession()
-  })
-  dropdown.appendChild(currItem)
-
-  // Past sessions — exclude the live session (it's shown as "Now"), each with hover-reveal Clear
-  try {
-    const [sessions, status] = await Promise.all([
-      fetch(`${API_BASE}/logs`).then(r => r.json()),
-      fetch(`${API_BASE}/status`).then(r => r.json()),
-    ])
-    const liveSessionId = status?.sessionId ?? ''
-    currentLiveSessionId = liveSessionId
-    // Show all past sessions from the registry — no query requirement.
-    // Sessions without runs are intentionally-created sessions with no messages yet.
-    const pastSessions = Array.isArray(sessions)
-      ? sessions.filter(sg => sg.id !== liveSessionId)
-      : []
-
-    if (pastSessions.length > 0) {
-      const sep = document.createElement('div')
-      sep.className = 'nav-drop-sep'
-      dropdown.appendChild(sep)
-
-      pastSessions.slice(0, 20).forEach(sg => {
-        const item = document.createElement('div')
-        item.className = `nav-drop-item ${viewingSession?.id === sg.id ? 'active' : ''}`
-        const d = new Date(sg.startedAt)
-        const dateStr = isToday(d)
-          ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-          : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
-            d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        const lastQuery = sg.runs?.[sg.runs.length - 1]?.query ?? ''
-        const preview = lastQuery.length > 28 ? lastQuery.slice(0, 28) + '…' : lastQuery
-        item.innerHTML = `<span class="drop-text">${escHtml(preview || '(no messages)')}</span>`
-        item.title = lastQuery
-
-        const clearBtn = document.createElement('button')
-        clearBtn.className = 'nav-drop-detach'
-        clearBtn.textContent = 'Clear'
-        clearBtn.addEventListener('click', async (e) => {
-          e.stopPropagation()
-          if (!(await confirmDialog('Delete this session?'))) return
-          await fetch(`${API_BASE}/logs/${sg.id}`, { method: 'DELETE' }).catch(() => {})
-          if (viewingSession?.id === sg.id) returnToCurrentSession()
-          item.remove()
-        })
-        item.appendChild(clearBtn)
-
-        item.addEventListener('click', () => {
-          $('nav-session').classList.remove('open')
-          viewSession(sg)
-        })
-        dropdown.appendChild(item)
-      })
-    }
-  } catch { /* logs unavailable */ }
-
-  // Clear all history — always last
-  const endSep = document.createElement('div')
-  endSep.className = 'nav-drop-sep'
-  dropdown.appendChild(endSep)
-
-  const clearAll = document.createElement('div')
-  clearAll.className = 'nav-drop-item nav-drop-item-sm'
-  clearAll.innerHTML = `<span class="drop-icon-dim">⌫</span> Clear all history`
-  clearAll.addEventListener('click', async () => {
-    if (!(await confirmDialog('Delete all session logs and clear current history?'))) return
-    $('nav-session').classList.remove('open')
-    try { await fetch(`${API_BASE}/logs`, { method: 'DELETE' }) } catch { /* standalone */ }
-    newSession()
-  })
-  dropdown.appendChild(clearAll)
-}
-
-function isToday(date) {
-  const now = new Date()
-  return date.toDateString() === now.toDateString()
-}
-
-async function viewSession(sessionGroup) {
-  viewingSession = sessionGroup
-  currentLiveSessionId = ''
-  currentTraceBlock = null
-  messagesEl.innerHTML = ''
-  updateSessionLabel()
-
-  // Replay every run of this past session, in order, through the replay path.
-  // Live SSE for the running session keeps arriving, but handleEvent suppresses
-  // its rendering while viewingSession is set — so there's nothing to dedupe or
-  // buffer here (the live view is rebuilt from scratch on return).
-  await replaySessionRuns(sessionGroup.runs)
-
-  $('session-banner-label').textContent = `Viewing past session`
-  $('session-banner').classList.add('visible')
-  $('chat-form').style.display = 'none'
-}
-
-async function returnToCurrentSession() {
-  viewingSession = null
-  currentTraceBlock = null
-  messagesEl.innerHTML = ''
-  liveRunMaxSeq = 0
-  replaying = true       // buffer live SSE events until the replay below completes
-  pendingEvents = []
-
-  // Resolve the live session id from the server (not a stale client value), then
-  // replay all its persisted runs. Live events that stream in during the replay
-  // are buffered and flushed by finishReplay() at the boundary.
-  try {
-    const status = await fetch(`${API_BASE}/status`).then(r => r.json())
-    currentLiveSessionId = status?.sessionId ?? ''
-    const sessions = await fetch(`${API_BASE}/logs`).then(r => r.json()).catch(() => [])
-    const live = Array.isArray(sessions) ? sessions.find(s => s.id === currentLiveSessionId) : null
-    liveRunMaxSeq = await replaySessionRuns(live?.runs ?? [])
-  } catch { /* leave whatever rendered; the boundary flush still runs below */ }
-
-  finishReplay()
-  if (!messagesEl.children.length) {
-    messagesEl.innerHTML = '<div class="message system">Session started. Ask anything.</div>'
-  }
-
-  $('session-banner').classList.remove('visible')
-  $('resume-btn').disabled = false
-  $('resume-btn').textContent = '▶ Resume'
-  $('chat-form').style.display = ''
-  updateSessionLabel()
-}
-
-$('return-btn').addEventListener('click', returnToCurrentSession)
-
-$('resume-btn').addEventListener('click', async () => {
-  if (!viewingSession) return
-  const btn = $('resume-btn')
-  btn.textContent = '…'
-  btn.disabled = true
-  try {
-    await fetch(`${API_BASE}/resume/${viewingSession.id}`, { method: 'POST' })
-    await returnToCurrentSession()
-  } catch {
-    btn.textContent = '▶ Resume'
-    btn.disabled = false
-  }
-})
-
 // ── Nav init ─────────────────────────────────────────────────────
 async function initNav() {
-  // Session crumb — always visible
-  updateSessionLabel()
-
-  const navSession = $('nav-session')
-  const sessionBtn = $('session-btn')
-
-  sessionBtn.addEventListener('click', (e) => {
-    e.stopPropagation()
-    const wasOpen = navSession.classList.contains('open')
-    closeAllDropdowns()
-    if (!wasOpen) {
-      navSession.classList.add('open')
-      const r = sessionBtn.getBoundingClientRect()
-      const dropdown = $('session-dropdown')
-      dropdown.style.top  = (r.bottom + 6) + 'px'
-      dropdown.style.left = r.left + 'px'
-      refreshSessionDropdown()
-    }
+  // New session button — always visible; clears the conversation
+  const newSessionBtn = $('new-session-btn')
+  newSessionBtn.addEventListener('click', () => {
+    if (busy) return
+    newSession()
   })
 
   // Workspace crumb — only in central/worker mode
@@ -2087,8 +1808,8 @@ async function boot() {
   // loadModels' own selection could land last and clobber the restored sticky model.
   await loadModels()
   refreshGitLog()
-  // Drop the static index.html placeholder before replaying (returnToCurrentSession
-  // and viewSession clear likewise); the empty-session placeholder is re-added below.
+  // Drop the static index.html placeholder before replaying; the empty-session
+  // placeholder is re-added below.
   messagesEl.innerHTML = ''
   // Replay persisted events first, THEN open the replay/live boundary: `replaying`
   // is true from module load so any live SSE events that arrived meanwhile are
