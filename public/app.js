@@ -1909,7 +1909,9 @@ async function initNav() {
   currDetach.addEventListener('click', async (e) => {
     e.stopPropagation()
     if (!(await confirmDialog(`Detach "${window.__WS__}" and stop its container?`))) return
-    currDetach.textContent = '…'
+    currDetach.textContent = 'Detaching…'
+    currDetach.disabled = true
+    currDetach.classList.add('detaching')
     await fetch(`/api/detach/${window.__WS__}`, { method: 'POST' }).catch(() => {})
     window.location.href = '/'
   })
