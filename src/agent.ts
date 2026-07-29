@@ -46,6 +46,7 @@ When the task is complete, give your final answer and stop.
 HOW TO WORK
 - A simple question or a one-line change: answer or do it directly — no plan needed.
 - Non-trivial work: read the relevant files first, then call update_plan with ONE concrete, verifiable objective — exactly what the user asked for, never a broader or more interesting goal — plus the steps to reach it, and carry it out. You cannot modify files under /workspace until a plan is recorded.
+- Weigh the request against the project before you plan: if it is unclear, or looks mistaken or counter-productive in this project's context, ask one concise question or say what seems off — do not blindly execute something that does not make sense. Otherwise proceed.
 - Stay on the plan. Call update_plan again only when the work contradicts one of its assumptions. Rewriting the same thing many different ways with nothing forcing it is drift — stop and return to the plan.
 - For repetitive work (many files or pages), write one script instead of repeating a tool call.
 - Before finishing, verify the objective against the original request — run the relevant command or test — then give your final answer.
@@ -188,11 +189,26 @@ export function isProjectMutation(name: string, args: Record<string, unknown>): 
 // instruction the model must always carry. Level 1 observes and offers options;
 // level 2+ is firmer. It names the single most common cause (verifying a change
 // that doesn't appear to take) because that is the loop seen in practice.
-export function loopSteerMessage(name: string, priorRepeats: number, level: number): string {
+export function loopSteerMessage(name: string, priorRepeats: number, level: number, objective: string): string {
+  // A sustained loop (level 3+) has ignored the gentler hints — escalate to a grounded
+  // re-anchor that restates the objective and forces a concrete action or a conclusion.
+  if (level >= 3 && objective) {
+    return regroundSteer(objective, `you have repeated the same \`${name}\` call ${priorRepeats}+ times with no new result`)
+  }
   const lead = level >= 2
     ? `STOP — you keep calling \`${name}\` with identical arguments and getting the same result (${priorRepeats}+ times). Repeating it will not help.`
     : `That \`${name}\` call used identical arguments and returned the same result as before — no new information.`
   return `${lead} If you were checking whether a change took effect, verify it where it actually applies — edit_file reports the exact lines it changed, and a view that looks unchanged can mean the edit didn't match or you're looking at the wrong place. Otherwise: try genuinely different arguments or a different tool, or give your final answer if you already have what you need.`
+}
+
+// A GROUNDED re-anchor for a stuck run — a call repeated many times, or many tool calls
+// with no change to the project (re-inspecting instead of acting: the failure mode where
+// the plain loop-steer, even escalated, does not recover the model). Unlike the gentle
+// hint, it restates the OBJECTIVE and demands ONE concrete action toward it or a final
+// answer — never more aimless inspecting, and never a broader/different goal (chasing a
+// new goal is exactly how a stuck run drifts). Kept terse — it is injected mid-run.
+export function regroundSteer(objective: string, detail: string): string {
+  return `You appear stuck — ${detail}. Re-anchor to the objective: "${objective}". Do ONE thing now: either make the single most important change (an edit) that advances that objective, or — if it is already met, or you are genuinely blocked — give your final answer, stating what you accomplished and (if blocked) exactly what is blocking you. Stop re-inspecting the same things, and do not broaden or switch the objective.`
 }
 
 // Same cap as read_file's own truncation (file-ops.ts) — these are the same
@@ -773,6 +789,11 @@ export class Agent {
     this.lastCommandOutput = ''
     this.actionTrace = []
     let loopSteers = 0
+    // No-progress detector: tool calls since the last actual change to the project.
+    // A planned run that keeps inspecting without ever editing is stuck (the novel-arg
+    // thrash the identical-call guard misses); noProgressSteers escalates the re-anchor.
+    let callsSinceMutation = 0
+    let noProgressSteers = 0
     let regrounded = false
     let groundingChecked = false
     emitAndLog({ type: 'message', role: 'user', content: userMessage })
@@ -917,7 +938,7 @@ export class Agent {
           }
           if (activePlan && !regrounded) {
             regrounded = true
-            const nudge = `Before finishing, re-ground against your plan. Objective: "${activePlan.objective}". Confirm it is fully met and state how you verified it — the command or check you ran and its result. If any step remains or you have not actually verified it, keep working; otherwise give your final answer.`
+            const nudge = `Before finishing, re-ground against your plan. Objective: "${activePlan.objective}". Think critically: is the objective TRULY met — not just that a command exited 0, with no corner cut and the real request satisfied? State how you verified it (the check you ran and its result). If it is not genuinely met, keep working toward THIS objective (do not drift to a different one). If it is met, give your final answer as: (1) a brief summary of what you did to achieve the objective, and (2) only if there is a clear, sensible next step for this project, one short suggestion of what to do next.`
             emitAndLog({ type: 'warning', message: nudge })
             this.history.push({ role: 'tool', content: nudge })
             continue
@@ -976,7 +997,7 @@ export class Agent {
             // keeps working; MAX_ITERATIONS and the stop button are the only hard
             // bounds.
             loopSteers++
-            const steer = loopSteerMessage(name, priorRepeats, loopSteers)
+            const steer = loopSteerMessage(name, priorRepeats, loopSteers, (this.currentPlan as { objective: string } | null)?.objective ?? '')
             emitAndLog({ type: 'warning', message: steer })
             this.history.push({ role: 'tool', content: steer })
             continue
@@ -1038,6 +1059,26 @@ export class Agent {
           // A novel action (not already in the window) means the model moved on —
           // reset steer escalation so any later, unrelated loop starts gentle.
           if (priorRepeats === 0) loopSteers = 0
+
+          // NO-PROGRESS re-anchor. A successful project mutation resets the counter;
+          // otherwise, once a PLANNED run has made many tool calls without changing any
+          // file, it is re-inspecting instead of acting (the novel-arg thrash the
+          // identical-call guard misses). Fire a GROUNDED re-anchor at 12 calls, then
+          // every 8 more, capped — it names the objective and demands a concrete change
+          // or a conclusion, so the model redirects instead of drifting.
+          const noProgPlan = this.currentPlan as { objective: string } | null
+          if (isProjectMutation(name, args) && !result.error) {
+            callsSinceMutation = 0
+            noProgressSteers = 0
+          } else {
+            callsSinceMutation++
+            if (noProgPlan && callsSinceMutation >= 12 && (callsSinceMutation - 12) % 8 === 0 && noProgressSteers < 4) {
+              noProgressSteers++
+              const rg = regroundSteer(noProgPlan.objective, `${callsSinceMutation} tool calls without changing any file`)
+              emitAndLog({ type: 'warning', message: rg })
+              this.history.push({ role: 'tool', content: rg })
+            }
+          }
         }
       }
 
