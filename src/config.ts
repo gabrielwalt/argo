@@ -57,4 +57,12 @@ export const config = {
   // flags oracle-gaming (supervisor eval, 3/3) and ZERO extra resident memory
   // since it's already loaded. Reuses the existing Ollama client / ollamaHost.
   criticModel:      process.env.ARGO_CRITIC_MODEL ?? 'qwen3.6:latest',
+  // GROUNDING & SELF-CONSISTENCY guard (Phase 4). This is the DEFAULT for the agent's
+  // per-run flag (agent.grounding); the web UI's "Grounding check" toggle (default ON)
+  // overrides it per session via /chat. Default ON — set env ARGO_GROUNDING to a falsey
+  // value (0/false/no/off) to force it OFF for headless/eval runs that don't pass the
+  // flag. When on, a PRE-DONE check on WRITING/RESEARCH tasks (a document artifact was
+  // produced) verifies specifics against the fetched sources and reconciles restated
+  // numbers, blocking "done" until revised. Reuses the critic model. See docs/grounding.md.
+  grounding:        !['0', 'false', 'no', 'off'].includes((process.env.ARGO_GROUNDING ?? '').trim().toLowerCase()),
 }

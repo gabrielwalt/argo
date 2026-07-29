@@ -9,6 +9,7 @@ import { truncateOutput } from './tools/truncate.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
 import type { AgentEvent, ToolName, ModelOptions } from './types.js'
 import { runCritic, isTestOrSpecPath, type Critique, type CriticCheckpoint } from './critic.js'
+import { runGroundingCritic, isDocPath, findNumericConflicts } from './grounding.js'
 import {
   type CompactionState,
   emptyCompactionState,
@@ -232,6 +233,10 @@ export class Agent {
   private history: Message[] = []
   private model: string
   private options: ModelOptions = {}
+  // Per-run toggle for the grounding guard (see runGroundingCheckpoint). Defaults to
+  // config.grounding (env ARGO_GROUNDING, default ON); the web UI's "Grounding check"
+  // toggle overrides it per run via setGrounding().
+  private grounding = config.grounding
   private maxIterations: number = config.maxIterations
   private sessionId = ''
   private aborted = false
@@ -262,6 +267,11 @@ export class Agent {
   //   actionTrace     — short recent-action trace (compact labels), oldest→newest.
   private criticModel = config.criticModel
   private editedPaths: string[] = []
+  // Bounded excerpts of pages fetched this run (url + truncated content), so the
+  // grounding guard can verify document specifics against what was ACTUALLY fetched
+  // (the full fetch results survive in this.history, but this keeps a compact,
+  // ready-to-inject copy). Populated only when config.critic || config.grounding.
+  private fetchedSources: Array<{ url: string; content: string }> = []
   private lastCommandOutput = ''
   private actionTrace: string[] = []
   private get historyFile(): string {
@@ -339,6 +349,10 @@ export class Agent {
 
   setMaxIterations(n: number) {
     this.maxIterations = Math.min(1000, Math.max(10, Math.trunc(n)))
+  }
+
+  setGrounding(on: boolean) {
+    this.grounding = on
   }
 
   getMaxIterations(): number {
@@ -650,6 +664,87 @@ export class Agent {
     return critique
   }
 
+  // GROUNDING & self-consistency checkpoint (Phase 4) — the writing-task analogue of
+  // the coding critic. Only reached when config.grounding is on. Runs at PRE-DONE for
+  // a WRITING/RESEARCH task (the run produced a document artifact): reads that doc,
+  // runs a deterministic numeric-conflict pre-scan, then a fact-checking critic pass
+  // that flags fabricated/unsupported specifics + internal contradictions. On "revise"
+  // it injects a concrete steer and the caller BLOCKS completion (the loop continues).
+  // Returns null (no block) when it is not a writing task or the critic won't parse.
+  // Fails OPEN: any timeout/error yields null and only a warning.
+  private async runGroundingCheckpoint(
+    objective: string,
+    emitAndLog: (e: AgentEvent) => void,
+  ): Promise<Critique | null> {
+    const docPaths = this.editedPaths.filter(isDocPath)
+    if (docPaths.length === 0) return null // not a writing task — nothing to ground
+
+    let docText = ''
+    for (const p of docPaths) {
+      try {
+        const r = await executeTool('read_file', { path: p })
+        docText += `\n\n===== ${p} =====\n${r.output || ''}`
+      } catch { /* unreadable — skip */ }
+      if (docText.length > 14000) break
+    }
+    docText = docText
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 9000)
+    if (!docText) return null
+
+    const numericConflicts = findNumericConflicts(docText)
+    // Feed the critic the pages actually fetched (bounded) so it verifies specifics
+    // against real source text instead of guessing — this prevents false positives
+    // that would make the actor strip correct, well-sourced facts.
+    const sourceExcerpts = this.fetchedSources.slice(0, 8).map(s => ({ url: s.url, text: s.content }))
+
+    let critique: Critique | null = null
+    try {
+      critique = await withTimeout(
+        runGroundingCritic(this.ollama, this.criticModel, this.options, { objective, docText, sourceExcerpts, numericConflicts }),
+        config.chatTimeoutMs,
+      )
+    } catch (err) {
+      emitAndLog({ type: 'warning', message: `Grounding guard failed (${err instanceof Error ? err.message : String(err)}) — continuing without it` })
+      return null
+    }
+    if (!critique) {
+      emitAndLog({ type: 'warning', message: 'Grounding guard returned no parseable verdict — continuing without it' })
+      return null
+    }
+
+    emitAndLog({
+      type: 'critic',
+      checkpoint: 'grounding',
+      verdict: critique.verdict,
+      gamed_oracle: false,
+      issues: critique.issues,
+      guidance: critique.guidance,
+    })
+
+    if (critique.verdict === 'revise') {
+      const issuesText = critique.issues.length ? `\nIssues: ${critique.issues.join('; ')}` : ''
+      const guidanceText = critique.guidance ? `\n${critique.guidance}` : ''
+      const conflictText = numericConflicts.length ? `\nConfirmed internal conflicts: ${numericConflicts.join('; ')}` : ''
+      // Re-inject the fetched source text so the agent can VERIFY-AND-KEEP rather than
+      // delete: the sources were collapsed out of the live window, which is the root
+      // condition that made it fabricate in the first place. With them back in view it
+      // can confirm supported specifics (keep them) and fix only the unsupported ones —
+      // preserving richness, which a delete-only revision destroys.
+      const srcBlock = sourceExcerpts.length
+        ? `\n\nSOURCES YOU FETCHED (the ground truth — verify against these):\n${sourceExcerpts.map(s => `- ${s.url}: ${s.text.slice(0, 700)}`).join('\n')}`
+        : ''
+      const steer = `GROUNDING CHECK (pre-done) — fix before finishing, then stop.${guidanceText}${issuesText}${conflictText}\nFor EACH flagged specific: if the SOURCES below support it, KEEP it exactly; if they do NOT, either web_search/fetch_url to verify it (and keep it with that source) or generalize JUST that one phrase. Do NOT delete or water down content the sources DO support — the document must stay as rich and specific as it was, only more accurate. Reconcile any restated number to a single value used everywhere.${srcBlock}`
+      emitAndLog({ type: 'warning', message: steer })
+      this.history.push({ role: 'tool', content: steer })
+    }
+    return critique
+  }
+
   async chat(userMessage: string): Promise<string> {
     const logger = new SessionLogger(userMessage, this.model, this.options, this.sessionId)
 
@@ -674,10 +769,12 @@ export class Agent {
     // ACTOR-CRITIC per-run state (see field docs). Reset alongside the loop-steer
     // state so a later run starts from a clean slate.
     this.editedPaths = []
+    this.fetchedSources = []
     this.lastCommandOutput = ''
     this.actionTrace = []
     let loopSteers = 0
     let regrounded = false
+    let groundingChecked = false
     emitAndLog({ type: 'message', role: 'user', content: userMessage })
     emitAndLog({ type: 'start', model: this.model, query: userMessage, options: this.options })
 
@@ -809,6 +906,15 @@ export class Agent {
               continue
             }
           }
+          // GROUNDING & self-consistency checkpoint (writing/research tasks). At most
+          // once per run. If it flags fabricated specifics or internal contradictions,
+          // block completion so the agent revises. Only active when config.grounding is
+          // on; runGroundingCheckpoint returns null (no block) for non-writing runs.
+          if (this.grounding && activePlan && !groundingChecked) {
+            groundingChecked = true
+            const g = await this.runGroundingCheckpoint(activePlan.objective, emitAndLog)
+            if (g && g.verdict === 'revise') continue
+          }
           if (activePlan && !regrounded) {
             regrounded = true
             const nudge = `Before finishing, re-ground against your plan. Objective: "${activePlan.objective}". Confirm it is fully met and state how you verified it — the command or check you ran and its result. If any step remains or you have not actually verified it, keep working; otherwise give your final answer.`
@@ -902,11 +1008,21 @@ export class Agent {
           // loop already runs: file edits (incl. failed attempts, so intent-to-
           // tamper with a test/spec file is visible), the latest command output,
           // and a short action trace.
-          if (config.critic) {
+          if (config.critic || this.grounding) {
             if (name === 'edit_file' || name === 'write_file') {
               const p = typeof args.path === 'string' ? args.path : ''
               if (p && !this.editedPaths.includes(p)) this.editedPaths.push(p)
               this.actionTrace.push(`${name} ${p}${result.error ? ' [attempt failed]' : ''}`)
+            } else if (name === 'fetch_url' || name === 'browser_fetch') {
+              const u = typeof args.url === 'string' ? args.url : ''
+              if (u) {
+                this.actionTrace.push(`${name} ${u}`)
+                // Keep a compact copy of what was actually fetched, so the grounding
+                // guard verifies document specifics against real source text.
+                if (!result.error && result.output && this.fetchedSources.length < 12) {
+                  this.fetchedSources.push({ url: u, content: truncateOutput(result.output, 1400) })
+                }
+              }
             } else if (name === 'bash') {
               this.lastCommandOutput = truncateOutput(result.output || '', 4000)
               const cmd = typeof args.command === 'string' ? args.command.replace(/\s+/g, ' ').slice(0, 120) : ''

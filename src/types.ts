@@ -48,7 +48,7 @@ export type AgentEvent =
       // at one of a few in-loop checkpoints, so runs are auditable. Only emitted
       // when config.critic is on; the baseline never produces this event.
       type: 'critic'
-      checkpoint: 'post-plan' | 'on-stall' | 'pre-done'
+      checkpoint: 'post-plan' | 'on-stall' | 'pre-done' | 'grounding'
       verdict: 'ok' | 'revise'
       gamed_oracle: boolean
       issues: string[]
