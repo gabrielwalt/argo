@@ -505,18 +505,20 @@ function setBusy(val) {
   if (sessionBtn) sessionBtn.disabled = val
 
   if (val) {
-    // Sail the boat away, then swap to stop icon + ring animation
-    sendBtn.classList.add('sailing')
-    setTimeout(() => {
-      sendBtn.classList.remove('sailing')
-      sendBtn.classList.add('working')
-      sendBoat.classList.add('hidden')
-      sendStop.classList.remove('hidden')
-    }, 450)
-  } else {
-    sendBtn.classList.remove('sailing', 'working')
+    // The boat stays visible and sails — a randomly chosen one of five sailing
+    // animations — on a subtly scrolling sea. Hovering the button swaps the boat
+    // for the stop square (see the hover handlers) so click-to-stop stays clear.
     sendBoat.classList.remove('hidden')
     sendStop.classList.add('hidden')
+    sendBtn.classList.remove('sail-1', 'sail-2', 'sail-3', 'sail-4', 'sail-5')
+    const n = 1 + Math.floor(Math.random() * 5)
+    sendBtn.classList.add('sailing-now', 'sail-' + n)
+    sendBtn.title = 'Stop'
+  } else {
+    sendBtn.classList.remove('sailing-now', 'sail-1', 'sail-2', 'sail-3', 'sail-4', 'sail-5')
+    sendBoat.classList.remove('hidden')
+    sendStop.classList.add('hidden')
+    sendBtn.title = 'Send'
     stopRequested = false
   }
 }
@@ -549,6 +551,19 @@ sendBtn.addEventListener('click', (e) => {
   e.preventDefault()
   if (stopRequested) return
   stopAgent()
+})
+
+// While a run is active the boat is sailing; hovering the button reveals the stop
+// square so click-to-stop stays discoverable, then restores the sailing boat on leave.
+sendBtn.addEventListener('mouseenter', () => {
+  if (!busy) return
+  sendBoat.classList.add('hidden')
+  sendStop.classList.remove('hidden')
+})
+sendBtn.addEventListener('mouseleave', () => {
+  if (!busy) return
+  sendBoat.classList.remove('hidden')
+  sendStop.classList.add('hidden')
 })
 
 function addTraceItem(className, label, body, collapsible) {

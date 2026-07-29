@@ -107,7 +107,7 @@ header::after {
 #nav-home:hover .wordmark { filter: brightness(1.25) drop-shadow(0 0 4px rgba(201,162,39,.4)); }
 #nav-home:hover .flip-h   { filter: brightness(1.25); }
 /* Boat emoji on send button — filter to solid black silhouette */
-.send-icon { font-size: 17px; filter: brightness(0); line-height: 1; transition: opacity .2s ease; }
+.send-icon { font-size: 17px; filter: brightness(0); line-height: 1; transition: opacity .2s ease; transform-origin: 50% 82%; position: relative; z-index: 2; }
 
 @keyframes ring-pulse {
   0%   { box-shadow: 0 2px 8px rgba(201,162,39,.4), 0 0 0 0px  rgba(201,162,39,.55); }
@@ -1300,6 +1300,33 @@ button:disabled { opacity: .35; cursor: not-allowed; }
    sets its own `display: flex` — without !important, that ID rule outranks this class
    and the element never actually hides). */
 .hidden { display: none !important; }
+
+/* ── Sailing-boat animation (while a run is active) ─────────────────
+   Five transform-only sailing motions rotated at random per run; the boat rocks at
+   its waterline (transform-origin on .send-icon) over two parallax water layers.
+   Each keyframe bakes in scaleX(-1) so the boat keeps facing left (like .flip-h). */
+@keyframes calm-bob { 0%{transform:scaleX(-1) translateY(0) rotate(-3deg)} 50%{transform:scaleX(-1) translateY(-7%) rotate(3deg)} 100%{transform:scaleX(-1) translateY(0) rotate(-3deg)} }
+@keyframes rolling-swell { 0%{transform:scaleX(-1) translateY(3%) rotate(-6deg)} 30%{transform:scaleX(-1) translateY(-9%) rotate(5deg)} 62%{transform:scaleX(-1) translateY(-3%) rotate(-4deg)} 100%{transform:scaleX(-1) translateY(3%) rotate(-6deg)} }
+@keyframes choppy { 0%{transform:scaleX(-1) translateY(0) rotate(-6deg)} 25%{transform:scaleX(-1) translateY(-5%) rotate(5deg)} 50%{transform:scaleX(-1) translateY(-1%) rotate(-4deg)} 75%{transform:scaleX(-1) translateY(-4%) rotate(6deg)} 100%{transform:scaleX(-1) translateY(0) rotate(-6deg)} }
+@keyframes cresting { 0%{transform:scaleX(-1) translateY(6%) rotate(3deg)} 42%{transform:scaleX(-1) translateY(-10%) rotate(-8deg)} 56%{transform:scaleX(-1) translateY(-8%) rotate(7deg)} 100%{transform:scaleX(-1) translateY(6%) rotate(3deg)} }
+@keyframes drift-sway { 0%{transform:scaleX(-1) translateX(-6%) translateY(0) rotate(-3deg)} 50%{transform:scaleX(-1) translateX(6%) translateY(-4%) rotate(3deg)} 100%{transform:scaleX(-1) translateX(-6%) translateY(0) rotate(-3deg)} }
+#send-btn.sail-1 .send-icon { animation: calm-bob 2.8s ease-in-out infinite; }
+#send-btn.sail-2 .send-icon { animation: rolling-swell 3.6s ease-in-out infinite; }
+#send-btn.sail-3 .send-icon { animation: choppy 1.35s ease-in-out infinite; }
+#send-btn.sail-4 .send-icon { animation: cresting 3.2s ease-in-out infinite; }
+#send-btn.sail-5 .send-icon { animation: drift-sway 4.2s ease-in-out infinite; }
+#send-btn.sailing-now::before, #send-btn.sailing-now::after {
+  content: ''; position: absolute; left: 0; right: 0; bottom: 0; z-index: 1; pointer-events: none;
+  background-repeat: repeat-x; background-size: 40px 100%;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='40' height='16' viewBox='0 0 40 16'><path d='M0 8 Q10 2 20 8 T40 8 V16 H0 Z' fill='%231a1000'/></svg>");
+}
+#send-btn.sailing-now::before { height: 42%; opacity: .16; animation: wave-a 3.4s linear infinite; }
+#send-btn.sailing-now::after  { height: 32%; opacity: .26; animation: wave-b 2.3s linear infinite; }
+@keyframes wave-a { to { background-position: 40px 0; } }
+@keyframes wave-b { to { background-position: -40px 0; } }
+@media (prefers-reduced-motion: reduce) {
+  #send-btn[class*="sail-"] .send-icon, #send-btn.sailing-now::before, #send-btn.sailing-now::after { animation: none; }
+}
 
 /* ── No-workspace screen ─────────────────────────────────────────── */
 
