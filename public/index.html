@@ -34,10 +34,6 @@
       <button class="nav-crumb-btn" id="model-btn"><span id="model-label">—</span></button>
       <div class="nav-dropdown" id="model-dropdown"></div>
     </div>
-    <div class="nav-crumb" id="nav-ctx">
-      <span id="token-counter" title="Context usage — click for details"></span>
-      <div class="nav-dropdown" id="ctx-dropdown"></div>
-    </div>
     <button id="settings-btn" title="Model parameters — applied to next message in current session">⚙</button>
   </div>
 
@@ -100,6 +96,10 @@
     <form id="chat-form">
       <div id="input-wrap">
         <textarea id="input" placeholder="Ask anything… (Shift/Alt+Enter for newline)" rows="3"></textarea>
+        <div class="nav-crumb" id="nav-ctx">
+          <span id="token-counter" title="Context usage — click for details"></span>
+          <div class="nav-dropdown" id="ctx-dropdown"></div>
+        </div>
         <button id="send-btn" type="submit" title="Send">
           <span class="send-icon" id="send-boat"><span class="m1"><span class="m2"><span class="boat-glyph">⛵</span></span></span></span>
           <span class="send-stop hidden" id="send-stop"></span>

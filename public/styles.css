@@ -329,6 +329,15 @@ header::after {
 #token-counter .ctx-donut { display: block; }
 #token-counter .ctx-tick { opacity: .85; }
 
+/* Donut relocated into the composer's upper-right corner (Phase 3), mirroring the
+   gold send coin at the bottom-right — two round controls, one per corner of the
+   textarea. Enlarged to 34px + 2px padding = 38px so it matches the send coin.
+   The dropdown (#ctx-dropdown is position:fixed, JS-positioned) is unaffected by
+   the DOM move. */
+#input-wrap > #nav-ctx { position: absolute; top: 8px; right: 8px; z-index: 2; }
+#input-wrap > #nav-ctx > #token-counter { padding: 2px; background: rgba(17, 21, 32, .55); }
+#input-wrap > #nav-ctx > #token-counter .ctx-donut { width: 34px; height: 34px; }
+
 /* Context dropdown (reuses .nav-dropdown chrome) */
 #ctx-dropdown { min-width: 240px; }
 .ctx-drop-header {

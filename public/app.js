@@ -624,8 +624,16 @@ tokenCounter.addEventListener('click', (e) => {
     buildCtxDropdown()
     navCtx.classList.add('open')
     const r = tokenCounter.getBoundingClientRect()
-    ctxDropdown.style.top  = (r.bottom + 6) + 'px'
+    // The donut now lives in the composer at the bottom of the panel, so open the
+    // dropdown UPWARD when there isn't room below it (fall back to downward otherwise).
     ctxDropdown.style.left = Math.max(8, r.right - 240) + 'px'
+    if (window.innerHeight - r.bottom < 320) {
+      ctxDropdown.style.top = 'auto'
+      ctxDropdown.style.bottom = (window.innerHeight - r.top + 6) + 'px'
+    } else {
+      ctxDropdown.style.bottom = 'auto'
+      ctxDropdown.style.top = (r.bottom + 6) + 'px'
+    }
   }
 })
 
