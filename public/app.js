@@ -403,6 +403,10 @@ function handleEvent(event) {
       const label = `📥 Result${event.error ? ' · ERROR' : ''} · ${event.duration_ms}ms`
       const body = event.error ? `${event.error}\n${event.output}` : event.output
       addTraceItem(isError ? 'tool-result error' : 'tool-result', label, body, true)
+      // Live-update the file tree + the viewed file when the agent may have changed files.
+      if (!isError && (event.tool === 'write_file' || event.tool === 'edit_file' || event.tool === 'bash')) {
+        scheduleWorkspaceRefresh()
+      }
       break
     }
 
@@ -1302,6 +1306,11 @@ async function fetchDirChildren(relPath) {
 }
 
 async function refreshFiles() {
+  // Preserve which directories are expanded and which file is selected across the rebuild,
+  // so live refreshes (as the agent creates/edits files) don't collapse the tree or drop
+  // the current selection.
+  const wasOpen = [...fileNodeMap.entries()].filter(([, n]) => n.type === 'dir' && n.wrapperEl && n.wrapperEl.classList.contains('open')).map(([p]) => p)
+  const wasActive = currentViewerPath
   const container = $('files-tree')
   container.innerHTML = ''
   fileNodeMap.clear()
@@ -1317,6 +1326,33 @@ async function refreshFiles() {
     const isProject = node.type === 'dir' && node.name === 'workspace'
     container.appendChild(await makeFileNode(node, '', isProject))
   }
+  // Re-expand previously-open dirs, shallowest first (an ancestor must load its children
+  // before a descendant can be found and expanded).
+  for (const p of wasOpen.sort((a, b) => a.split('/').length - b.split('/').length)) {
+    const n = fileNodeMap.get(p)
+    if (n && n.expand) { try { await n.expand() } catch { /* dir gone */ } }
+  }
+  // Re-mark the active file row if it still exists.
+  if (wasActive) {
+    const t = fileNodeMap.get(wasActive)
+    if (t && t.rowEl) { if (activeFileRow) activeFileRow.classList.remove('active'); activeFileRow = t.rowEl; t.rowEl.classList.add('active') }
+  }
+}
+
+// Debounced live refresh of the workspace panels while the agent works: rebuilds the file
+// tree (preserving state) and re-renders the currently-viewed file, so newly created files
+// appear and a touched-and-viewed file updates in place. Debounced so a burst of edits
+// triggers one refresh.
+let wsRefreshTimer = null
+function scheduleWorkspaceRefresh() {
+  clearTimeout(wsRefreshTimer)
+  wsRefreshTimer = setTimeout(() => {
+    refreshFiles()
+    if (currentViewerPath) {
+      const kind = window.ArgoPreview ? ArgoPreview.previewKindFor(currentViewerPath) : null
+      renderViewer(currentViewerPath, kind)
+    }
+  }, 700)
 }
 
 async function makeFileNode(node, parentPath, forceOpen = false) {
