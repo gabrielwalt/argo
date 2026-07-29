@@ -1068,7 +1068,19 @@ const turndownService = new TurndownService({ headingStyle: 'atx', codeBlockStyl
 // Disabling it keeps the *structural* conversion (bold, links, lists)
 // without mangling ordinary prose.
 turndownService.escape = string => string
+// A normal rich paste converts HTML→markdown. Cmd/Ctrl+Shift+V ("paste and match style")
+// should instead paste PLAIN text with no formatting (bold text → "bold text", not
+// "**bold text**"): the keydown arms a flag that the paste handler honors by letting the
+// browser's default plain-text paste run (a textarea inserts clipboard text/plain).
+let plainPasteArmed = false
+inputEl.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'v' || e.key === 'V')) {
+    plainPasteArmed = true
+    setTimeout(() => { plainPasteArmed = false }, 500)
+  }
+})
 inputEl.addEventListener('paste', (e) => {
+  if (plainPasteArmed) { plainPasteArmed = false; return }  // Cmd/Ctrl+Shift+V → plain text, no markdown conversion
   const html = e.clipboardData?.getData('text/html')
   if (!html || !RICH_HTML_TAGS.test(html)) return  // let the browser's normal plain-text paste happen
   e.preventDefault()
