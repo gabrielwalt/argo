@@ -561,6 +561,22 @@ function setStatus(state, text) {
   statusText.textContent = text
 }
 
+const SAIL_MOTIONS = ['pitch', 'roll', 'yaw', 'bob', 'sway']
+// Apply 1-2 random distinct sailing motions across the two nested boat layers (m1/m2) so
+// their transforms cumulate; clears them when off. ~half the runs use a single motion,
+// ~half combine two.
+function setSailing(on) {
+  const m1 = sendBoat.querySelector('.m1')
+  const m2 = sendBoat.querySelector('.m2')
+  if (!m1 || !m2) return
+  for (const el of [m1, m2]) for (const m of SAIL_MOTIONS) el.classList.remove('a-' + m)
+  if (!on) return
+  const pool = SAIL_MOTIONS.slice()
+  for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = pool[i]; pool[i] = pool[j]; pool[j] = t }
+  m1.classList.add('a-' + pool[0])
+  if (Math.random() < 0.5) m2.classList.add('a-' + pool[1])
+}
+
 function setBusy(val) {
   busy = val
   // Leave the textarea enabled while the agent runs so the user can queue prompts.
@@ -569,17 +585,15 @@ function setBusy(val) {
   if (sessionBtn) sessionBtn.disabled = val
 
   if (val) {
-    // The boat stays visible and sails — a randomly chosen one of five sailing
-    // animations — on a subtly scrolling sea. Hovering the button swaps the boat
-    // for the stop square (see the hover handlers) so click-to-stop stays clear.
+    // The boat stays visible and sails while the agent runs: setSailing picks 1-2 random
+    // motions (pitch/roll/yaw/bob/sway) across the two nested layers so their transforms
+    // cumulate. Hovering the button swaps the boat for the stop square (hover handlers).
     sendBoat.classList.remove('hidden')
     sendStop.classList.add('hidden')
-    sendBtn.classList.remove('sail-1', 'sail-2', 'sail-3', 'sail-4', 'sail-5')
-    const n = 1 + Math.floor(Math.random() * 5)
-    sendBtn.classList.add('sailing-now', 'sail-' + n)
+    setSailing(true)
     sendBtn.title = 'Stop'
   } else {
-    sendBtn.classList.remove('sailing-now', 'sail-1', 'sail-2', 'sail-3', 'sail-4', 'sail-5')
+    setSailing(false)
     sendBoat.classList.remove('hidden')
     sendStop.classList.add('hidden')
     sendBtn.title = 'Send'
