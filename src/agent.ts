@@ -867,7 +867,9 @@ export class Agent {
           // far — a response near num_predict's limit can still overflow num_ctx even
           // when prompt_eval_count alone looks comfortably under the threshold.
           const usagePct = (response.prompt_eval_count + config.compactGenerationReserve) / numCtx
-          if (usagePct >= config.compactThreshold) {
+          // Trigger when only ~compactReserveTokens of headroom remain (near-full), instead
+          // of at a fixed fraction — the context is allowed to fill more before compacting.
+          if (response.prompt_eval_count >= numCtx - config.compactReserveTokens) {
             try {
               const result = await this.compactHistory(currentRunStart, usagePct, emitAndLog)
               currentRunStart = result.newRunStart

@@ -44,8 +44,11 @@ function renderDonut() {
   const circ = 2 * Math.PI * r
   const dash = circ * (pct / 100)
   const color = ctxArcColor(pct)
-  // Threshold tick: angle measured from 12 o'clock (−90° in SVG coords).
-  const ang = compactThreshold * 2 * Math.PI - Math.PI / 2
+  // Threshold tick at the compaction trigger. Compaction now fires when only ~4096 tokens of
+  // headroom remain (COMPACT_RESERVE_TOKENS), so the tick sits at (numCtx-reserve)/numCtx; fall
+  // back to the old fraction before the first token_usage. Angle from 12 o'clock (−90° SVG).
+  const thrFrac = ctxState.numCtx ? Math.max(0, 1 - 4096 / ctxState.numCtx) : compactThreshold
+  const ang = thrFrac * 2 * Math.PI - Math.PI / 2
   const rIn = r - sw / 2 - 1, rOut = r + sw / 2 + 1
   const tx1 = (cx + rIn * Math.cos(ang)).toFixed(2), ty1 = (cy + rIn * Math.sin(ang)).toFixed(2)
   const tx2 = (cx + rOut * Math.cos(ang)).toFixed(2), ty2 = (cy + rOut * Math.sin(ang)).toFixed(2)

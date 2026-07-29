@@ -199,6 +199,7 @@ app.get('/status', (req, res) => {
     workspacePath: config.workspacePath || null,
     env: envStatus,
     compactThreshold: config.compactThreshold,
+    compactReserveTokens: config.compactReserveTokens,
   })
 })
 

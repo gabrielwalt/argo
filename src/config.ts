@@ -21,6 +21,10 @@ export const config = {
   // Compaction: trigger before the *next* generation could overflow num_ctx,
   // not just when the input alone is already close to full.
   compactThreshold:        parseFloat(process.env.COMPACT_THRESHOLD ?? '0.667'),
+  // Compact when only about this many tokens of headroom remain (trigger near-full rather
+  // than at a fixed 2/3 fraction) — lets the context fill more before compacting. The donut
+  // draws its threshold tick from this + the run's num_ctx.
+  compactReserveTokens:    parseInt(process.env.COMPACT_RESERVE_TOKENS ?? '4096', 10),
   compactGenerationReserve: parseInt(process.env.COMPACT_GENERATION_RESERVE ?? '2048', 10),
   // 180s (raised from an original 60s) was sized against num_ctx=32768. Since
   // then num_ctx's default doubled to 65536 — compaction's threshold is still
