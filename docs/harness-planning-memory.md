@@ -80,6 +80,76 @@ The harness runs the memory loop; the model never has to decide to page memory:
 Each stage is flag-gated where feasible (byte-identical when off) and shipped only if the eval
 numbers justify it.
 
+## Integration design (research-informed, 2026-07-30)
+Pure cores are BUILT + tested: `src/memory.ts` (Stages 1/2/4, 32 tests) and `src/tasks.ts` (Stage 3
+ledger with reconcile-on-refine, 25 tests). This is how they wire into `agent.ts`, informed by
+`/shared/argo-harness/decomposition-research.md` (Manus recitation, LangGraph plan-execute-replan,
+Reflexion verify-loop, Plan-and-Solve, Anthropic gates, Qwen function-calling docs).
+
+Two independent flags (compose; each A/B-able), OFF by default = **byte-identical baseline**:
+- **`ARGO_TASKS`** (`config.tasks`) — sequential task ledger.
+- **`ARGO_MEMORY`** (`config.memory`) — AGENTS.md/MEMORY.md instrumentation.
+
+### ARGO_TASKS — sequencing (agent.ts)
+- **Decompose (LLM-owned):** `handleUpdatePlan` builds the ledger from the plan's ordered steps
+  (`createTaskList`) on the first plan; a later `update_plan` is a **re-plan** → `reconcile` (done tasks
+  frozen, only pending/added change; revision bumps) — never split deterministically. **Do NOT cap the
+  task count** (revises the research's "3-8"): per the user's experience MORE tasks are fine *provided* the
+  objective is recited regularly (below) and loop control is strict (see the ladder). A prose-only/empty
+  plan just yields no ledger (degrades to the single-objective path).
+- **Recite every step (the #1 small-model lever):** replace the single-plan tail reminder
+  (`renderPlanReminder`) with `renderTaskLedger` when `config.tasks` — `GOAL + [x]/[→]/[ ] checkboxes +
+  CURRENT task` at the very end of context (fights lost-in-the-middle drift). Recite the top-level
+  objective too, so a re-plan is checked against the same goal.
+- **One task at a time + verify-before-advance (no new tool; reuse the "no tool call = done" signal,
+  reinterpreted per-task):** when `config.tasks && !allDone`, the model emitting no tool call means it
+  believes the CURRENT task is done. First time for a task → inject a per-task verify nudge ("confirm
+  CURRENT task complete + HOW you verified; else keep working"); if it stops AGAIN for the same task →
+  `completeActiveTask` (advance), emit a task-advance event, re-recite the next task, CONTINUE the loop.
+  This does not depend on the model remembering to mark progress (harness owns advancement); the nudge is
+  the verify gate. Only when `allDone` (or no ledger) does the existing run-level done-gate
+  (critic → grounding → re-ground) fire and finish the run.
+
+### Loop detection & recovery ladder (user-directed, 2026-07-30 — the robustness backbone)
+User experience overrides the research's "cap 3-8": allow as many tasks as the LLM needs, but hold it with
+strict, IMMEDIATE, escalating loop control. Catch a loop the instant it starts and walk a recovery ladder
+rather than burning iterations on churn:
+- **L0 — block the SECOND identical action, immediately.** Never let the model run the exact same
+  (tool+args) call even twice: on the FIRST repeat (`priorRepeats ≥ 1`) skip it and inject a FIRM steer
+  ("You already ran this exact command and got the same result — stop repeating it; make a different,
+  concrete change now or conclude."). Tighten today's `REPEAT_THRESHOLD` (3 → 1); keep `repetitionKey` =
+  name+args. Also watch TASK-level repetition (re-attempting the same/just-finished task).
+- **L1 — persistent looping → COMPACTION (2nd strategy).** If it keeps looping despite L0 steers
+  (≥ N loop-steers / continued near-identical churn), trigger a context compaction — a bloated/confused
+  window is a common loop cause and reorganizing it often unsticks the model.
+- **L2 — still looping after compaction → STOP the attempt & RETRY with a refined plan.** If it STILL
+  loops, stop the current attempt and RE-FRAME: tell the model it ALREADY attempted this task and got stuck
+  in a loop, that this is a NEW attempt, and ask it to REFINE its plan/approach to solve it a different way
+  (→ `update_plan` → `reconcile`). The harness may itself refine the stuck task's STEPS (split/re-order) as
+  part of that. Keep the failed trajectory + errors visible (Reflexion) so it does not re-propose them.
+Thresholds are first guesses to tune on the eval. This ladder supersedes/absorbs the current loop-steer,
+no-progress re-anchor, and stall re-ground where they overlap. Flag-gated + eval'd OFF vs ON like the rest.
+- **Guardrails recap:** replan is event-driven (model calls update_plan on a real change) and `reconcile`
+  freezes completed work → no thrash/goal-drift; the ladder above is the safety net that makes long plans OK.
+
+### ARGO_MEMORY — instrumentation (agent.ts + compaction)
+- **Retrieval query** = objective + current task title (if `config.tasks`) + recently edited file paths.
+- **AGENTS.md (Stage 4):** `selectAgentsSections` — whole file when small, top-N relevant sections when
+  large. **MEMORY.md (Stage 2):** `selectMemoryEntries` for the query. Both injected; `renderRecallPointer`
+  appended (offer read_file/grep — never required). Rebuilt per task boundary when `config.tasks`
+  (task-scoped) via a refreshed tail message, else per run.
+- **Persist at compaction (Stage 1):** after `updateCompactionState`, `persistToMemory` the durable items
+  (verifiedFacts + decisionsMade) into the workspace `MEMORY.md` (deduped) so they survive across runs;
+  they stay in the compaction ledger for the live run (no mid-run drop — MEMORY.md is re-read next run).
+
+### Verification & rollout
+- Verify on host via bridge: `node node_modules/typescript/bin/tsc --noEmit`; `node --import tsx --test
+  src/*.test.ts`. Add integration tests to `agent.test.ts` (mock Ollama, à la critic.test.ts): ledger
+  built from a plan, per-task advance on repeated "done", reconcile on re-plan, recitation content.
+- Then eval-validate (correctness set + adversarial set below) OFF vs ON before recommending we flip a
+  default. v2 candidates (not v1): structured per-task `done_criterion` in the plan schema + executable
+  per-task oracles; non-thinking mode for tight execution steps.
+
 ## Testing plan
 ### A. Correctness on a variety of complex prompts/tasks
 Build a task set across the eval workspaces (`booklet`, `bigproj`, `test-one` — each reset to its
@@ -118,8 +188,19 @@ flywheel, applied to robustness.
 - Don't bloat the system prompt — keep the machinery in the harness + a tiny recited Ledger.
 - Don't ship a stage on assumption — measure it on the eval suite (incl. the adversarial set) first.
 
-## Open question for the user
-When a single prompt clearly contains several tasks, should the harness **auto-decompose** it into a
-sequenced task list, or only sequence the steps the model itself records in its plan? Auto-decompose
-is more powerful but leans harder on a small model getting the split right — likely worth a flag +
-an A/B once Stage 3 exists.
+## Resolved decision (2026-07-30): LLM-driven decomposition, harness-sequenced, LLM-refinable
+The harness DOES auto-decompose a multi-task prompt into a sequenced task list — but the split is
+produced by the **LLM's planning phase** (after some initial investigation), NOT by deterministic
+harness parsing. Rationale: the LLM has the broader context and is best placed to decompose the prompt
+into a meaningful, ordered sequence of tasks. The division of labour:
+- **LLM**: decomposes the prompt into ordered tasks during planning, and CORRECTS/REFINES that plan as it
+  learns (re-decompose via `update_plan` mid-run).
+- **Harness**: instruments the plan as an ordered **task ledger**, drives the tasks one at a time (curate
+  per-task context via the memory module, recite the current task, verify it before advancing, summarize),
+  and holds the model on the current task without letting it drift or thrash — while staying flexible
+  enough to absorb a legitimate re-plan.
+
+So: LLM decomposes + refines; harness sequences + verifies + curates. This must be flexible, not rigid —
+a genuine mid-course correction is expected and welcomed; only aimless churn is resisted. Design is being
+informed by a research pass on plan-and-execute / dynamic-replanning patterns and qwen-specific agent
+practices → see `/shared/argo-harness/decomposition-research.md`.

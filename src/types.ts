@@ -54,6 +54,17 @@ export type AgentEvent =
       issues: string[]
       guidance: string
     }
+  | {
+      // HARNESS TASK LEDGER (Stage 3, config.tasks): emitted when the ledger is built
+      // from a plan, re-planned (reconcile), or advanced to the next task — so runs are
+      // auditable and the eval can measure sequencing. Only emitted when config.tasks is on.
+      type: 'tasks'
+      action: 'planned' | 'replanned' | 'advanced'
+      revision: number
+      done: number
+      total: number
+      current: string | null   // active task title, or null when all tasks are done
+    }
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
 

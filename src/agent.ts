@@ -22,6 +22,22 @@ import {
   summarizeActiveMiddle,
   validateActiveSummary,
 } from './compaction.js'
+import {
+  type TaskList,
+  createTaskList,
+  reconcile as reconcileTasks,
+  activeTask,
+  completeActiveTask,
+  allDone as tasksAllDone,
+  renderTaskLedger,
+} from './tasks.js'
+import {
+  type RelevanceQuery,
+  selectAgentsSections,
+  selectMemoryEntries,
+  renderRecallPointer,
+  persistToMemory,
+} from './memory.js'
 
 // SYSTEM PROMPT — authoring guidance (for maintainers, not the model):
 // Use this for HIGH-LEVEL steering of *how to work*, awareness of the tools the
@@ -253,6 +269,13 @@ export class Agent {
   // config.grounding (env ARGO_GROUNDING, default ON); the web UI's "Grounding check"
   // toggle overrides it per run via setGrounding().
   private grounding = config.grounding
+  // Per-run toggles for the harness task ledger (ARGO_TASKS) and AGENTS.md/MEMORY.md
+  // instrumentation (ARGO_MEMORY). Default to config (env), overridable per instance
+  // via setTasks()/setMemory() — mirrors setGrounding so tests can toggle per Agent.
+  // Every new code path in the loop is gated on THESE fields (not config directly),
+  // so with both off behavior is byte-identical to the baseline.
+  private tasks = config.tasks
+  private memory = config.memory
   private maxIterations: number = config.maxIterations
   private sessionId = ''
   private aborted = false
@@ -269,6 +292,19 @@ export class Agent {
   // and finishes immediately — the re-grounding done-gate only fires when a plan
   // exists, which is what keeps simple Q&A fast.
   private currentPlan: { objective: string; steps: string[]; revision: number } | null = null
+  // HARNESS TASK LEDGER (ARGO_TASKS / this.tasks). Built from the LLM's plan in
+  // handleUpdatePlan (createTaskList) and reconciled on a re-plan; the harness drives
+  // it ONE task at a time (recite → verify-nudge → advance). null until the first plan
+  // and reset per run. taskVerifyNudged tracks which task ids have already received the
+  // verify nudge, so a second "no tool call = done" for the same task advances it.
+  // All only read/written when this.tasks is on → baseline untouched.
+  private taskList: TaskList | null = null
+  private taskVerifyNudged = new Set<number>()
+  // Raw AGENTS.md / MEMORY.md cached at run start when this.memory is on (read once).
+  // AGENTS.md feeds section-selection for the system prompt; MEMORY.md is retrieved
+  // task-scoped at the tail each step. Empty string when the file is absent/off.
+  private agentsRaw = ''
+  private memoryRaw = ''
   // ACTOR-CRITIC state (Phase 4, step 2). All reset per run and only ever READ
   // when config.critic is on — populating them is a harmless local append, so the
   // baseline loop path stays byte-identical. See runCriticCheckpoint / critic.ts.
@@ -369,6 +405,14 @@ export class Agent {
 
   setGrounding(on: boolean) {
     this.grounding = on
+  }
+
+  setTasks(on: boolean) {
+    this.tasks = on
+  }
+
+  setMemory(on: boolean) {
+    this.memory = on
   }
 
   getMaxIterations(): number {
@@ -500,6 +544,22 @@ export class Agent {
 
     await this.persistCompactionState()
 
+    // ARGO_MEMORY (this.memory), Stage 1: persist durable ledger items (verified facts +
+    // decisions the compaction distilled) into the workspace MEMORY.md so they survive
+    // across runs. persistToMemory dedupes against existing content. Only persist when
+    // there is something to persist, and wrap it so a failure NEVER breaks compaction or
+    // the run (emit a warning at most). Uses the '/workspace' root convention.
+    if (this.memory) {
+      const durable = [...this.compactionState.verifiedFacts, ...this.compactionState.decisionsMade]
+      if (durable.length > 0) {
+        try {
+          await persistToMemory(path.join('/workspace', 'MEMORY.md'), durable)
+        } catch (err) {
+          emitAndLog({ type: 'warning', message: `MEMORY.md persist failed (${err instanceof Error ? err.message : String(err)}) — continuing` })
+        }
+      }
+    }
+
     const rangeDescription = `folded ${split.prior.length} prior message(s) into structured state`
       + (split.activeMiddle.length > 0 ? `, summarized ${split.activeMiddle.length} active-run message(s)` : '')
       + `, kept ${split.antecedent.length} antecedent + current prompt + ${split.activeTail.length} recent verbatim`
@@ -551,8 +611,24 @@ export class Agent {
     // stored in this.history, rebuilt from this.currentPlan each call — so it can
     // never duplicate or drift out of sync with the live plan, and it survives
     // compaction (which only rewrites this.history) for free.
-    if (this.currentPlan) {
+    // When the task ledger is active (this.tasks) recite the FULL ledger (GOAL +
+    // checkboxes + CURRENT task) instead of the single-plan reminder — the #1 lever for
+    // holding a small model on the current task. Otherwise the baseline plan reminder is
+    // pushed unchanged. Read the ledger via a cast (same narrowing gotcha as chat()).
+    const reciteList = this.taskList as TaskList | null
+    if (this.tasks && reciteList && reciteList.tasks.length > 0) {
+      messages.push({ role: 'tool', content: renderTaskLedger(reciteList) })
+    } else if (this.currentPlan) {
       messages.push({ role: 'tool', content: this.renderPlanReminder(this.currentPlan) })
+    }
+    // Task-scoped MEMORY.md retrieval (this.memory): auto-inject the relevant durable
+    // memory entries for the current work at the tail. Never model-fetched; a recall
+    // pointer already OFFERS the full file (see buildProjectMemoryContext).
+    if (this.memory && this.memoryRaw) {
+      const mem = selectMemoryEntries(this.memoryRaw, this.retrievalQuery())
+      if (mem.text) {
+        messages.push({ role: 'tool', content: `RELEVANT MEMORY (from MEMORY.md, for the current work):\n${mem.text}` })
+      }
     }
     return withTimeout(this.ollama.chat({
       model: this.model,
@@ -596,6 +672,47 @@ export class Agent {
     return `[CURRENT PLAN — keep working toward this objective; do not drift onto a broader or different goal]\nObjective: ${plan.objective}${steps}\nRefine it with update_plan only if the work contradicts an assumption; finish only once the objective is verifiably met.`
   }
 
+  // Builds the task-scoped relevance query for MEMORY.md / AGENTS.md retrieval
+  // (this.memory): the current objective + active task title (topical prose) plus the
+  // recently edited paths (strong topical hints). Reads currentPlan/taskList via casts
+  // (the narrowing gotcha) and guards nulls, so it is safe when no plan/ledger exists.
+  private retrievalQuery(): RelevanceQuery {
+    const plan = this.currentPlan as { objective: string } | null
+    const tl = this.taskList as TaskList | null
+    const active = tl ? activeTask(tl) : null
+    const text = [plan?.objective, active?.title].filter(Boolean).join('. ')
+    return { text, files: this.editedPaths.slice(-8) }
+  }
+
+  // ARGO_MEMORY (this.memory): builds the system-prompt project-context block via the
+  // memory module instead of loadProjectContext. AGENTS.md is section-selected (whole
+  // when small, top-N relevant sections for the user's request when large) and a recall
+  // pointer OFFERS the full files on disk. MEMORY.md is deliberately NOT whole-injected
+  // here — it is retrieved task-scoped at the tail each step (see chatCall) — but its
+  // raw text is cached for that retrieval. Both files are read ONCE per run (via the
+  // same readProjectContextFile + PROJECT_CONTEXT_CHAR_CAP as loadProjectContext), using
+  // the '/workspace' root convention. When this.memory is off, chat() calls
+  // loadProjectContext() unchanged, so the baseline system prompt is byte-identical.
+  private async buildProjectMemoryContext(userMessage: string): Promise<string> {
+    const [agentsMd, memoryMd] = await Promise.all([
+      readProjectContextFile(path.join('/workspace', 'AGENTS.md')),
+      readProjectContextFile(path.join('/workspace', 'MEMORY.md')),
+    ])
+    this.agentsRaw = agentsMd ?? ''
+    this.memoryRaw = memoryMd ?? ''
+    // Label the AGENTS.md block like loadProjectContext does, so the model treats it as
+    // authoritative project instructions (not incidental context). When section-selected
+    // (large file), say so — the recall pointer then tells the model it can read the full
+    // file for anything not shown.
+    const sel = selectAgentsSections(this.agentsRaw, { text: userMessage })
+    const label = sel.mode === 'selected'
+      ? '--- /workspace/AGENTS.md (project instructions — most relevant sections; full file on disk) ---'
+      : '--- /workspace/AGENTS.md (project instructions) ---'
+    const agentsBlock = sel.text ? `${label}\n${sel.text}` : ''
+    const pointer = renderRecallPointer({ agentsPresent: !!this.agentsRaw, memoryPresent: !!this.memoryRaw })
+    return [agentsBlock, pointer].filter(Boolean).join('\n\n')
+  }
+
   // Harness handler for the update_plan tool. Sets the run's plan, surfaces it as
   // a 'plan' event (rendered in the UI like a message and logged for replay), and
   // returns the confirmation that becomes the tool result in history. Because the
@@ -613,6 +730,33 @@ export class Agent {
     const revision = (this.currentPlan?.revision ?? 0) + 1
     this.currentPlan = { objective, steps, revision }
     emitAndLog({ type: 'plan', objective, steps, revision })
+    // HARNESS TASK LEDGER (this.tasks): instrument the plan as an ordered ledger. The
+    // FIRST plan builds it (createTaskList); a later update_plan is a RE-PLAN that
+    // reconciles into the existing ledger (completed tasks frozen, revision bumps). A
+    // re-plan resets the per-task verify nudges so the (possibly re-ordered) current
+    // task gets a fresh verify gate. Read the existing ledger via a cast — TS can't see
+    // that handleUpdatePlan mutates this.taskList, so after the run-start reset it
+    // narrows the field to null (same gotcha as the activePlan cast in chat()).
+    if (this.tasks) {
+      const existing = this.taskList as TaskList | null
+      const replanned = existing !== null
+      // `existing !== null` (not the `replanned` const) so TS narrows `existing` to
+      // TaskList inside the true branch of the ternary.
+      this.taskList = existing !== null
+        ? reconcileTasks(existing, objective, steps)
+        : createTaskList(objective, steps)
+      this.taskVerifyNudged.clear()
+      const tl = this.taskList as TaskList
+      const done = tl.tasks.filter(t => t.status === 'done').length
+      emitAndLog({
+        type: 'tasks',
+        action: replanned ? 'replanned' : 'planned',
+        revision,
+        done,
+        total: tl.tasks.length,
+        current: activeTask(tl)?.title ?? null,
+      })
+    }
     const label = revision === 1 ? 'Plan recorded' : `Plan updated (revision ${revision})`
     const stepsText = steps.length ? `\nSteps:\n${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}` : ''
     return `${label}. Objective: ${objective}${stepsText}\nNow execute toward this objective — keep going, do not stop until it is verifiably met.`
@@ -782,6 +926,12 @@ export class Agent {
     // Loop-steering state, scoped to this run only (see REPEAT_WINDOW above).
     this.recentCalls = []
     this.currentPlan = null
+    // HARNESS TASK LEDGER + MEMORY per-run state (only used when this.tasks/this.memory
+    // are on; resetting them unconditionally is a harmless local write for the baseline).
+    this.taskList = null
+    this.taskVerifyNudged.clear()
+    this.agentsRaw = ''
+    this.memoryRaw = ''
     // ACTOR-CRITIC per-run state (see field docs). Reset alongside the loop-steer
     // state so a later run starts from a clean slate.
     this.editedPaths = []
@@ -799,7 +949,12 @@ export class Agent {
     emitAndLog({ type: 'message', role: 'user', content: userMessage })
     emitAndLog({ type: 'start', model: this.model, query: userMessage, options: this.options })
 
-    const projectContext = await loadProjectContext()
+    // Baseline: loadProjectContext (AGENTS.md + MEMORY.md whole-injected). When
+    // this.memory is on, build the context via the memory module instead (AGENTS.md
+    // section-selected + recall pointer; MEMORY.md retrieved task-scoped at the tail).
+    const projectContext = this.memory
+      ? await this.buildProjectMemoryContext(userMessage)
+      : await loadProjectContext()
     const systemPrompt = projectContext ? `${SYSTEM_PROMPT}\n\n${projectContext}` : SYSTEM_PROMPT
 
     try {
@@ -903,6 +1058,52 @@ export class Agent {
 
         if (!hasCalls) {
           this.history.push(msg)
+          // ── HARNESS TASK LEDGER: per-task verify-then-advance (this.tasks). A no-tool
+          // call while tasks REMAIN means the model believes the CURRENT task is done.
+          // First time for a task → inject a verify nudge and CONTINUE (don't advance
+          // yet). If it stops AGAIN for the same task → advance (completeActiveTask),
+          // emit a 'tasks' advance event, recite the next task, CONTINUE. Only when the
+          // ledger is exhausted (allDone) — or when this.tasks is off / there is no
+          // ledger — do we fall through to the existing run-level done-gate below
+          // (critic → grounding → re-ground → finish), UNCHANGED. Read the ledger via a
+          // cast (the narrowing gotcha: handleUpdatePlan sets it where TS can't see).
+          const tlGate = this.taskList as TaskList | null
+          if (this.tasks && tlGate && !tasksAllDone(tlGate)) {
+            const cur = activeTask(tlGate)
+            if (cur && !this.taskVerifyNudged.has(cur.id)) {
+              // Verify-once: nudge the model to confirm THIS task is genuinely done.
+              this.taskVerifyNudged.add(cur.id)
+              const nudge = `CURRENT TASK "${cur.title}" — before moving on, confirm it is genuinely complete and STATE how you verified it (the check + result). If not truly done, keep working on THIS task only. If done, say so and I'll advance you.`
+              emitAndLog({ type: 'warning', message: nudge })
+              this.history.push({ role: 'tool', content: nudge })
+              continue
+            }
+            if (cur) {
+              // Already nudged for this task → accept and advance the ledger.
+              const advanced = completeActiveTask(tlGate)
+              this.taskList = advanced
+              const done = advanced.tasks.filter(t => t.status === 'done').length
+              const nextActive = activeTask(advanced)
+              emitAndLog({
+                type: 'tasks',
+                action: 'advanced',
+                revision: advanced.revision,
+                done,
+                total: advanced.tasks.length,
+                current: nextActive?.title ?? null,
+              })
+              if (!tasksAllDone(advanced) && nextActive) {
+                // Recite the next task and keep the loop going — the full ledger is in
+                // the recited tail (chatCall).
+                const adv = `Task complete. NEXT TASK "${nextActive.title}". Work only on this task now; the full plan is in the recited ledger. Refine via update_plan only if the work contradicts it.`
+                emitAndLog({ type: 'warning', message: adv })
+                this.history.push({ role: 'tool', content: adv })
+                continue
+              }
+              // allDone after advancing → do NOT continue; fall through to the existing
+              // run-level done-gate below (critic → grounding → re-ground → finish).
+            }
+          }
           // Re-grounding done-gate: if a plan is active for THIS run, don't take
           // the first "I'm done" at face value — nudge once to verify the recorded
           // objective is actually met (checking a fix against the reported symptom
@@ -1031,7 +1232,7 @@ export class Agent {
           // loop already runs: file edits (incl. failed attempts, so intent-to-
           // tamper with a test/spec file is visible), the latest command output,
           // and a short action trace.
-          if (config.critic || this.grounding) {
+          if (config.critic || this.grounding || this.memory) {
             if (name === 'edit_file' || name === 'write_file') {
               const p = typeof args.path === 'string' ? args.path : ''
               if (p && !this.editedPaths.includes(p)) this.editedPaths.push(p)

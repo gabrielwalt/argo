@@ -359,6 +359,15 @@ export class SessionLogger {
           }
           break
 
+        case 'tasks': {
+          const label = event.action === 'planned' ? 'Task plan'
+            : event.action === 'replanned' ? 'Task plan · re-planned'
+            : 'Task advanced'
+          lines.push(`**🗂 ${label}** \`${time}\` — ${event.done}/${event.total} done${event.current ? ` · current: ${event.current}` : ' · all tasks complete'}`)
+          lines.push(``)
+          break
+        }
+
         default: {
           // Compile-time guard: a new AgentEvent variant without a case above
           // fails the build here instead of silently vanishing from the .md

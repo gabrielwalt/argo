@@ -69,4 +69,17 @@ export const config = {
   // produced) verifies specifics against the fetched sources and reconciles restated
   // numbers, blocking "done" until revised. Reuses the critic model. See docs/grounding.md.
   grounding:        !['0', 'false', 'no', 'off'].includes((process.env.ARGO_GROUNDING ?? '').trim().toLowerCase()),
+  // HARNESS-OWNED TASK SEQUENCING (Stage 3). OFF by default so the baseline loop is
+  // BYTE-IDENTICAL. When on, the LLM's plan (update_plan) becomes an ordered task
+  // ledger the harness recites at the tail of context every step and drives ONE task
+  // at a time (per-task verify nudge → advance), and a later update_plan RE-PLANS by
+  // reconciling into the ledger with completed tasks frozen. LLM decomposes + refines;
+  // harness sequences + verifies. See docs/harness-planning-memory.md + src/tasks.ts.
+  tasks:            ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_TASKS ?? '').trim().toLowerCase()),
+  // HARNESS-OWNED MEMORY (Stages 1/2/4). OFF by default (byte-identical baseline). When
+  // on: AGENTS.md is section-selected when large (whole when small), MEMORY.md entries
+  // are retrieved for the current task/objective, a recall pointer is OFFERED (never
+  // required), and durable ledger items (verified facts + decisions) persist to the
+  // workspace MEMORY.md at compaction so they survive across runs. See src/memory.ts.
+  memory:           ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_MEMORY ?? '').trim().toLowerCase()),
 }

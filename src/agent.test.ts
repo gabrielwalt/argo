@@ -391,3 +391,181 @@ test('plan/act gate: a read-only run needs no plan and finishes directly (versat
     await cleanupSession(sessionId, 'argo-plan-gate-read-only-case')
   }
 })
+
+// ── HARNESS TASK LEDGER (ARGO_TASKS / agent.setTasks). These drive a real Agent
+// with a scripted Ollama and the per-instance flag ON. The loop reinterprets the
+// existing "no tool call = done" signal PER TASK: the first no-call for a task is a
+// verify nudge; a second no-call for the SAME task advances the ledger. Only when
+// the ledger is exhausted (allDone) does the existing run-level done-gate fire and
+// finish the run. With the flag OFF (default) none of this runs (baseline). No live
+// model: scriptedOllama repeats its last element, and the done-gate's grounding
+// check returns null with no doc edits, so nothing here touches Ollama/network.
+
+// A no-tool-call assistant reply — the "I think this task is done" signal.
+const doneReply: ScriptedResponse = { message: { role: 'assistant', content: 'I believe this is complete.' } }
+
+function planReply(objective: string, steps: string[]): ScriptedResponse {
+  return {
+    message: {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ function: { name: 'update_plan', arguments: { objective, steps } } }],
+    },
+  }
+}
+
+function tasksEvents(events: AgentEvent[]): Array<Extract<AgentEvent, { type: 'tasks' }>> {
+  return events.filter((e): e is Extract<AgentEvent, { type: 'tasks' }> => e.type === 'tasks')
+}
+
+// Records the messages array each chat() call received, so a test can assert what
+// was actually SENT to the model (e.g. the recited ledger at the tail).
+function recordingScriptedOllama(responses: ScriptedResponse[]): {
+  ollama: Ollama
+  messagesSeen: () => Array<Array<{ role: string; content: string }>>
+} {
+  let i = 0
+  const seen: Array<Array<{ role: string; content: string }>> = []
+  const ollama = {
+    chat: async (args: { messages: Array<{ role: string; content: unknown }> }) => {
+      seen.push(args.messages.map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content : String(m.content ?? '') })))
+      return responses[Math.min(i++, responses.length - 1)]
+    },
+  } as unknown as Ollama
+  return { ollama, messagesSeen: () => seen }
+}
+
+test('tasks: update_plan builds a ledger and emits a planned event with total + current', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-tasks-planned-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
+    planReply('Ship the feature', ['Write the parser', 'Wire it in', 'Add tests']),
+    doneReply,
+  ]))
+  agent.setSessionId(sessionId)
+  agent.setTasks(true)
+  try {
+    await agent.chat('argo tasks planned case')
+    const planned = tasksEvents(events).find(e => e.action === 'planned')
+    assert.ok(planned, 'expected a tasks:planned event')
+    assert.equal(planned.total, 3)                       // one task per plan step
+    assert.equal(planned.done, 0)
+    assert.equal(planned.current, 'Write the parser')    // first step is the active task
+    assert.equal(planned.revision, 1)
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-tasks-planned-case')
+  }
+})
+
+test('tasks: per-task advance — first no-tool-call nudges, second advances to the next task', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-tasks-advance-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
+    planReply('Two-step objective', ['Step one', 'Step two']),
+    doneReply, // no-call #1 for task 1 → verify nudge (no advance yet)
+    doneReply, // no-call #2 for task 1 → advance to task 2
+  ]))
+  agent.setSessionId(sessionId)
+  agent.setTasks(true)
+  try {
+    await agent.chat('argo tasks advance case')
+
+    // The verify nudge fired for the current task BEFORE any advance.
+    const nudges = warningsMatching(events, /CURRENT TASK "Step one" — before moving on/)
+    assert.ok(nudges.length >= 1, 'expected a verify nudge for the current task')
+
+    // The first advance moves task 1 → done and makes task 2 the current task.
+    const advanced = tasksEvents(events).filter(e => e.action === 'advanced')
+    assert.ok(advanced.length >= 1, 'expected at least one advance')
+    assert.equal(advanced[0].done, 1)
+    assert.equal(advanced[0].total, 2)
+    assert.equal(advanced[0].current, 'Step two')
+
+    // The nudge must precede the first advance (verify-then-advance ordering).
+    const firstNudgeIdx = events.findIndex(e => e.type === 'warning' && /CURRENT TASK "Step one"/.test(e.message))
+    const firstAdvanceIdx = events.findIndex(e => e.type === 'tasks' && e.action === 'advanced')
+    assert.ok(firstNudgeIdx >= 0 && firstAdvanceIdx > firstNudgeIdx, 'nudge must come before advance')
+
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-tasks-advance-case')
+  }
+})
+
+test('tasks: the run only completes once ALL tasks are done (allDone → existing done-gate)', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-tasks-complete-${Date.now()}`
+  // Every response after the plan is a no-tool "done": task1 nudge, task1 advance,
+  // task2 nudge, task2 advance (allDone), then the run-level reground nudge, then finish.
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
+    planReply('Finish both tasks', ['First task', 'Second task']),
+    doneReply,
+  ]))
+  agent.setSessionId(sessionId)
+  agent.setTasks(true)
+  try {
+    const answer = await agent.chat('argo tasks complete case')
+
+    // Both tasks advanced; the final advance reports current === null (ledger exhausted).
+    const advanced = tasksEvents(events).filter(e => e.action === 'advanced')
+    assert.equal(advanced.length, 2)
+    assert.equal(advanced[advanced.length - 1].current, null)
+    assert.equal(advanced[advanced.length - 1].done, 2)
+
+    // The run reached 'done' with the model's own final content, only after allDone.
+    const done = events.find((e): e is Extract<AgentEvent, { type: 'done' }> => e.type === 'done')
+    assert.ok(done, 'expected the run to finish')
+    assert.equal(done.content, 'I believe this is complete.')
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-tasks-complete-case')
+  }
+})
+
+test('tasks: the ledger is recited to the model (renderTaskLedger CURRENT marker at the tail)', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-tasks-recite-${Date.now()}`
+  const { ollama, messagesSeen } = recordingScriptedOllama([
+    planReply('Recited objective', ['Alpha task', 'Beta task']),
+    doneReply,
+  ])
+  const agent = new Agent(e => events.push(e), 'test-model', ollama)
+  agent.setSessionId(sessionId)
+  agent.setTasks(true)
+  try {
+    await agent.chat('argo tasks recite case')
+
+    // Some chat() call must have carried the recited ledger (CURRENT marker + objective).
+    const sawLedger = messagesSeen().some(msgs =>
+      msgs.some(m => m.role === 'tool' && /CURRENT: Alpha task/.test(m.content) && /Objective: Recited objective/.test(m.content)),
+    )
+    assert.ok(sawLedger, 'expected the recited task ledger (CURRENT marker) in the sent messages')
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-tasks-recite-case')
+  }
+})
+
+test('tasks OFF (baseline): no tasks events, and a plan + immediate done still finishes as before', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-tasks-baseline-${Date.now()}`
+  // Default flag (setTasks not called / false): the single-plan path is unchanged —
+  // a plan then a no-tool "done" gets ONE reground nudge, then finishes.
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
+    planReply('Baseline objective', ['Only step']),
+    finalAnswer,
+  ]))
+  agent.setSessionId(sessionId)
+  agent.setTasks(false)
+  try {
+    const answer = await agent.chat('argo tasks baseline case')
+
+    assert.equal(tasksEvents(events).length, 0)             // no ledger machinery ran
+    assert.equal(events.some(e => e.type === 'plan'), true) // the single plan still recorded
+    assert.equal(answer, 'Final answer.')                   // finished via the baseline path
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-tasks-baseline-case')
+  }
+})
