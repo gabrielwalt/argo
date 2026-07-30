@@ -201,7 +201,8 @@ for (const model of MODELS) {
         if (task.setup) sh(task.setup(wsPath(task.ws)), wsPath(task.ws));  // seed the failing test
         await post(task.ws, 'reset', {});
         const tRun = Date.now();
-        await post(task.ws, 'chat', { message: task.prompt, model, options: OPTS, maxIterations: MAX_ITER });
+        const HARNESS = ['1', 'true', 'on', 'yes'].includes((process.env.EVAL_HARNESS || '').trim().toLowerCase());
+        await post(task.ws, 'chat', { message: task.prompt, model, options: OPTS, maxIterations: MAX_ITER, ...(HARNESS ? { tasks: true, memory: true, loop: true } : {}) });
         const w = await waitIdle(task.ws);
         const wallMs = Date.now() - tRun;
         completed = w.idle && shOk(task.check, wsPath(task.ws));
