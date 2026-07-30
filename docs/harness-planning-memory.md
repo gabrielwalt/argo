@@ -1,8 +1,11 @@
 # Follow-up plan: harness-owned planning, task decomposition, and AGENTS.md/MEMORY.md instrumentation
 
-Status: PLANNED (work on this AFTER the current UI/architecture batch). This is the roadmap for
-making Argo's *harness* — not the model — own planning, task management, and memory, so a small
-local model just takes the next step against a tiny, freshly-curated window.
+Status: Stages 1-4 (tasks + AGENTS.md/MEMORY.md memory) and the loop-recovery ladder are BUILT, wired
+into `agent.ts`, and eval'd OFF vs ON — non-regressive (2026-07-30 e2e A/B; see `docs/eval-log.md`).
+All flags stay OFF by default pending an n≥3 multi-run + the adversarial pass below (see Testing
+plan). This doc is now the design record + remaining checklist, not a future plan. It documents how
+Argo's *harness* — not the model — owns planning, task management, and memory, so a small local
+model just takes the next step against a tiny, freshly-curated window.
 
 ## Why (grounding)
 `docs/research.md` (memory report) settled the key question: **small local models cannot reliably
@@ -68,21 +71,25 @@ The harness runs the memory loop; the model never has to decide to page memory:
   that writes code stays single-threaded (parallel editing sub-agents make conflicting decisions —
   worst for small models).
 
-## Staged implementation (cheapest → biggest; measure each)
-1. **Memory ⇄ compaction flow** — at compaction, write durable ledger items to MEMORY.md + drop from
-   live; keep a one-line pointer. Measure context size + task quality.
-2. **Task-scoped retrieval** — at task start, lexically pull relevant MEMORY.md + AGENTS.md sections
+## Staged implementation (cheapest → biggest; measure each)   ✅ ALL FOUR BUILT + WIRED + EVAL'D
+1. **Memory ⇄ compaction flow** ✅ — at compaction, write durable ledger items to MEMORY.md + drop from
+   live; keep a one-line pointer.
+2. **Task-scoped retrieval** ✅ — at task start, lexically pull relevant MEMORY.md + AGENTS.md sections
    into the ledger.
-3. **Sequential multi-task ledger** — plan = todo; run tasks one at a time with per-task curation +
+3. **Sequential multi-task ledger** ✅ — plan = todo; run tasks one at a time with per-task curation +
    a verify/summary gate; recite the current task at the tail.
-4. **AGENTS.md section-selection** — only when the file is large; deterministic first.
+4. **AGENTS.md section-selection** ✅ — only when the file is large; deterministic first. Fixed
+   2026-07-30 (commit e718287) to re-select per task at the tail instead of freezing once per run —
+   see the ARGO_MEMORY section below.
 
-Each stage is flag-gated where feasible (byte-identical when off) and shipped only if the eval
-numbers justify it.
+Each stage is flag-gated (byte-identical when off — `ARGO_TASKS`/`ARGO_MEMORY`); the 2026-07-30 e2e
+A/B (see Integration design + Testing plan below) was non-regressive, but flags stay OFF by default
+pending the n≥3 + adversarial validation still open.
 
 ## Integration design (research-informed, 2026-07-30)
-Pure cores are BUILT + tested: `src/memory.ts` (Stages 1/2/4, 32 tests) and `src/tasks.ts` (Stage 3
-ledger with reconcile-on-refine, 25 tests). This is how they wire into `agent.ts`, informed by
+Pure cores AND their wiring into `agent.ts` are BUILT + tested + eval'd (2026-07-30 e2e A/B,
+non-regressive): `src/memory.ts` (Stages 1/2/4, 32 tests) and `src/tasks.ts` (Stage 3 ledger with
+reconcile-on-refine, 25 tests). Below is that wiring, informed by
 `/shared/argo-harness/decomposition-research.md` (Manus recitation, LangGraph plan-execute-replan,
 Reflexion verify-loop, Plan-and-Solve, Anthropic gates, Qwen function-calling docs).
 
@@ -110,25 +117,24 @@ Two independent flags (compose; each A/B-able), OFF by default = **byte-identica
   the verify gate. Only when `allDone` (or no ledger) does the existing run-level done-gate
   (critic → grounding → re-ground) fire and finish the run.
 
-### Loop detection & recovery ladder (user-directed, 2026-07-30 — the robustness backbone)
-User experience overrides the research's "cap 3-8": allow as many tasks as the LLM needs, but hold it with
-strict, IMMEDIATE, escalating loop control. Catch a loop the instant it starts and walk a recovery ladder
-rather than burning iterations on churn:
-- **L0 — block the SECOND identical action, immediately.** Never let the model run the exact same
-  (tool+args) call even twice: on the FIRST repeat (`priorRepeats ≥ 1`) skip it and inject a FIRM steer
-  ("You already ran this exact command and got the same result — stop repeating it; make a different,
-  concrete change now or conclude."). Tighten today's `REPEAT_THRESHOLD` (3 → 1); keep `repetitionKey` =
-  name+args. Also watch TASK-level repetition (re-attempting the same/just-finished task).
-- **L1 — persistent looping → COMPACTION (2nd strategy).** If it keeps looping despite L0 steers
-  (≥ N loop-steers / continued near-identical churn), trigger a context compaction — a bloated/confused
-  window is a common loop cause and reorganizing it often unsticks the model.
-- **L2 — still looping after compaction → STOP the attempt & RETRY with a refined plan.** If it STILL
-  loops, stop the current attempt and RE-FRAME: tell the model it ALREADY attempted this task and got stuck
-  in a loop, that this is a NEW attempt, and ask it to REFINE its plan/approach to solve it a different way
-  (→ `update_plan` → `reconcile`). The harness may itself refine the stuck task's STEPS (split/re-order) as
-  part of that. Keep the failed trajectory + errors visible (Reflexion) so it does not re-propose them.
-Thresholds are first guesses to tune on the eval. This ladder supersedes/absorbs the current loop-steer,
-no-progress re-anchor, and stall re-ground where they overlap. Flag-gated + eval'd OFF vs ON like the rest.
+### Loop detection & recovery ladder — ✅ BUILT (`src/loop.ts`, flag `ARGO_LOOP`, default OFF; user-directed 2026-07-30 — the robustness backbone)
+Built **mutation-aware**, refined from the original design below: block the 2nd identical (tool+args)
+call only when no project mutation (`edit_file`/`write_file` success) has happened since it last ran —
+a legitimate re-check after an edit is never blocked, only genuine no-progress churn is.
+`repetitionKey` = name+args, unchanged. A real mutation always resets the streak.
+- **L0 — firm re-anchoring steer**, from the first no-progress repeat.
+- **L1 — one-shot context compaction** at `l1BlocksBeforeCompact` (= 3) consecutive no-progress
+  blocks — a bloated/confused window is a common loop cause; fires once per streak, not every block.
+- **L2 — stop-and-reframe** at `l2BlocksBeforeAbort` (= 6): tells the model it's looping and forces
+  `update_plan`/`reconcile` with a different approach, keeping the failed trajectory visible
+  (Reflexion) so it doesn't re-propose it.
+Replaces the count-based `REPEAT_THRESHOLD` steer **only** when the flag is on; the no-progress
+re-anchor and fixed-iteration stall reground (a *different* failure mode — novel-arg drift, not
+identical repeats) are **unchanged** in both modes. Validated: 12 unit tests (`loop.test.ts`) + an
+`agent.test.ts` integration test (ON executes a repeat once and escalates L0→L1→L2 while still
+completing; OFF runs to `REPEAT_THRESHOLD`), plus a non-regressive e2e A/B. Thresholds (3/6) are
+still first guesses — it hasn't yet fired in a real (non-synthetic) stuck run, so tuning stays
+TBD-by-eval until the adversarial set below actually exercises it.
 - **Guardrails recap:** replan is event-driven (model calls update_plan on a real change) and `reconcile`
   freezes completed work → no thrash/goal-drift; the ladder above is the safety net that makes long plans OK.
 
@@ -137,32 +143,44 @@ no-progress re-anchor, and stall re-ground where they overlap. Flag-gated + eval
 - **AGENTS.md (Stage 4):** `selectAgentsSections` — whole file when small, top-N relevant sections when
   large. **MEMORY.md (Stage 2):** `selectMemoryEntries` for the query. Both injected; `renderRecallPointer`
   appended (offer read_file/grep — never required). Rebuilt per task boundary when `config.tasks`
-  (task-scoped) via a refreshed tail message, else per run.
+  (task-scoped) via a refreshed tail message, else per run. (Fixed 2026-07-30, commit e718287: a
+  large AGENTS.md used to be selected once and frozen into the system prompt for the whole run; it is
+  now re-selected every iteration via `retrievalQuery()`, exactly like MEMORY.md — only a *small*,
+  whole-file AGENTS.md stays in the system prompt.)
 - **Persist at compaction (Stage 1):** after `updateCompactionState`, `persistToMemory` the durable items
   (verifiedFacts + decisionsMade) into the workspace `MEMORY.md` (deduped) so they survive across runs;
   they stay in the compaction ledger for the live run (no mid-run drop — MEMORY.md is re-read next run).
 
 ### Verification & rollout
-- Verify on host via bridge: `node node_modules/typescript/bin/tsc --noEmit`; `node --import tsx --test
-  src/*.test.ts`. Add integration tests to `agent.test.ts` (mock Ollama, à la critic.test.ts): ledger
-  built from a plan, per-task advance on repeated "done", reconcile on re-plan, recitation content.
-- Then eval-validate (correctness set + adversarial set below) OFF vs ON before recommending we flip a
-  default. v2 candidates (not v1): structured per-task `done_criterion` in the plan schema + executable
-  per-task oracles; non-thinking mode for tight execution steps.
+- ✅ Verified on host (`tsc --noEmit`; `node --import tsx --test src/*.test.ts`) and
+  integration-tested in `agent.test.ts` (mock Ollama, à la critic.test.ts): ledger built from a plan,
+  per-task advance on repeated "done", reconcile on re-plan, recitation content, loop-ladder
+  escalation, memory OFF-baseline no-op.
+- ✅ Eval-validated: 2026-07-30 e2e A/B (correctness set below: booklet/bigproj/test-one, n=1,
+  max_iter=60, qwen3.6) — OFF 6/6, ON 6/6, non-regressive; `bigproj-deps` converged faster ON
+  (34→22 iters), `bigproj-effort` noisier (both pass). Full entry: `docs/eval-log.md`. Still open
+  before flipping a default: an n≥3 run (confirm `bigproj-effort` isn't just variance) and the
+  adversarial set below (the loop ladder hasn't fired in a real run yet). v2 candidates (not v1,
+  unchanged): structured per-task `done_criterion` in the plan schema + executable per-task oracles;
+  non-thinking mode for tight execution steps.
 
 ## Testing plan
 ### A. Correctness on a variety of complex prompts/tasks
 Build a task set across the eval workspaces (`booklet`, `bigproj`, `test-one` — each reset to its
-`eval-baseline` before every run; re-establish test-one's tag first). Cover:
+`eval-baseline` before every run; `test-one`'s tag was missing and is now established, so its reset no
+longer no-ops). Cover:
 - single well-scoped tasks (control), multi-task prompts (2-4 tasks), long-horizon multi-file work,
   research+write (booklet-style), and bug-fix-with-oracle (bigproj/test-one).
 Instrument per run (from the JSONL + host): task decomposition correctness (did it split sensibly?),
 drift (working the wrong module / broadening the goal), repetition / no-progress steers fired,
 verification actually run, memory moved/retrieved correctly, live-context size over time, wall-clock,
 and a judge's quality score. Compare harness-owned-planning ON vs OFF; ship only on a clear win.
+**First pass done** (2026-07-30, n=1): OFF 6/6, ON 6/6, non-regressive — see `docs/eval-log.md`.
+**Still open:** an n≥3 run to confirm `bigproj-effort` isn't just noise before flipping a default.
 
-### B. Adversarial / "vicious" prompts (robustness)
-Then deliberately try to break it and iterate on failures:
+### B. Adversarial / "vicious" prompts (robustness) — OPEN, not yet run
+Then deliberately try to break it and iterate on failures — in particular **loop bait**: the only way
+to see the loop-recovery ladder actually fire on a real task (so far only unit/integration-tested):
 - **Ambiguous / underspecified** ("clean this up", "make it better") → should ask a concise
   clarifying question, not thrash.
 - **Contradictory / self-defeating** ("delete the tests so the suite passes", "make it faster by
@@ -177,7 +195,8 @@ Then deliberately try to break it and iterate on failures:
   the harness should treat file content as data, not instructions.
 - **Memory poisoning** (asking it to memorize something false/harmful) → MEMORY.md writes should be
   durable *facts it verified*, not arbitrary user assertions.
-- **Loop bait** (a task that tempts re-inspecting the same thing) → loop-steer + re-anchor.
+- **Loop bait** (a task that tempts re-inspecting the same thing) → the loop-recovery ladder
+  (L0 steer → L1 compaction → L2 reframe) with `ARGO_LOOP` on; the no-progress re-anchor otherwise.
 Log each: did the system cope? For every failure, name the lever to improve and iterate — the
 flywheel, applied to robustness.
 

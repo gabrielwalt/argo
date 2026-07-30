@@ -188,7 +188,7 @@ The eval now has headroom (qwen 5/6; `bigproj-effort` fails). Two findings resha
      - **Supervision / evaluation** — judge another agent's plan + work (the critic; measured now by the supervisor eval).
      - **Image understanding** — read screenshots / diagrams / photos.
      - **Visual layout & alignment** — render → screenshot → judge alignment / spacing / overflow (via Playwright).
-     Pull Ollama vision models (`llama3.2-vision`, `llava`, `moondream`, `qwen2.5-vl`); qwen3.6 already reports a `vision` capability. A vision-capable agent is a coming requirement.
+     Pull Ollama vision models (`llama3.2-vision`, `llava`, `moondream`, `qwen2.5-vl`); qwen3.6 already reports a `vision` capability. A vision-capable agent is a coming requirement. `qwen2.5vl:7b` is pulled but **not yet wired** into Argo (deferred — "Vision Step 2").
 
 **Standing product requirements (from the user) — status:**
 - Quality/reliability of complex, long-running tasks **over** speed or resource efficiency → the organizing principle of Phase 4.
@@ -200,3 +200,31 @@ The eval now has headroom (qwen 5/6; `bigproj-effort` fails). Two findings resha
 - Measure quality on realistic, difficult tasks → the `bigproj` E2E eval + the supervisor eval.
 
 North star: an agent that runs ~indefinitely without losing the goal, hallucinating, looping, or losing track — with good memory of what matters. Run history: `docs/eval-log.md`.
+
+---
+
+## 2026-07-30 — Loop-recovery ladder + harness tasks/memory: built, wired, eval'd non-regressive
+
+Two Phase 4 items landed, both flag-gated OFF by default and validated together in an e2e A/B
+(booklet/bigproj/test-one, n=1, max_iter 60, qwen3.6 — OFF 6/6, ON 6/6, no regression; full entry in
+`docs/eval-log.md`). Detailed design/status: `docs/harness-planning-memory.md`.
+
+- **Loop-recovery ladder (`src/loop.ts`, `ARGO_LOOP`) — built + validated.** Mutation-aware: blocks
+  the 2nd identical (tool+args) call only when no project mutation happened since it last ran (a
+  legitimate re-check after an edit is never blocked), escalating L0 firm steer → L1 one-shot
+  compaction → L2 stop-and-reframe (forces `update_plan`/`reconcile`). Replaces the count-based
+  `REPEAT_THRESHOLD` steer when on; the no-progress re-anchor and stall reground (novel-arg drift, a
+  different failure mode) are unchanged. 12 unit tests + an `agent.test.ts` integration test cover it,
+  but it hasn't yet fired in a real (non-synthetic) run — that needs the adversarial/vicious set.
+- **Harness tasks + AGENTS.md/MEMORY.md memory (`ARGO_TASKS`/`ARGO_MEMORY`) — all four stages built,
+  wired, eval'd.** Also fixed: large AGENTS.md is now section-selected PER TASK at the tail (mirroring
+  MEMORY.md) instead of frozen once per run. ON converged the hardest multi-file task (`bigproj-deps`)
+  in fewer iterations (34→22); `bigproj-effort` stayed noisier (both pass) — an n≥3 run is needed to
+  rule out variance before flipping a default.
+- **Auto-commit is now opt-in, default OFF** (`ARGO_AUTOCOMMIT`) — the agent no longer always commits
+  after a run; uncommitted work shows in the new Changes view (web UI). `/chat` accepts per-request
+  overrides for all four flags above, and `/status` reports them, so any can be flipped without a
+  rebuild once validated.
+
+Both harness flags stay **OFF by default** pending (a) the n≥3 multi-run above and (b) an adversarial
+pass that actually exercises the loop ladder — see `docs/harness-planning-memory.md`'s Testing plan.
