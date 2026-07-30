@@ -137,9 +137,24 @@ async function isContainerRunning(name: string): Promise<boolean> {
   }
 }
 
+async function removeStaleContainer(name: string): Promise<void> {
+  // `docker run --name` fails hard if that name is already held — even by a
+  // stopped/exited container. Workers run with `--rm`, so a clean stop removes
+  // them, but a daemon restart or a crashed start can orphan the name (observed
+  // as "container name already in use" when re-attaching, e.g. argo-test-two).
+  // With one worker per workspace, any pre-existing container of this name is
+  // stale and we are about to start a fresh one, so force-remove it first.
+  // `docker rm -f` on a missing name exits non-zero, which we ignore.
+  try {
+    await execAsync(`docker rm -f ${CONTAINER_PREFIX}${name}`)
+  } catch { /* no such container — nothing to clean up */ }
+}
+
 async function startWorker(ws: WorkspaceEntry): Promise<string> {
   const logsDir = path.join(LOGS_BASE, ws.name)
   await fs.mkdir(logsDir, { recursive: true })
+  // Guarantee our container name is free before `docker run --name` below.
+  await removeStaleContainer(ws.name)
 
   const envVars = await loadGlobalEnv()
 
