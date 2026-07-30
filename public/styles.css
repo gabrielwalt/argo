@@ -97,11 +97,13 @@ header::after {
   margin: 8px 0;
 }
 
-/* FILE/CHANGE section — mirrors #files-panel; reserved for a later task. */
+/* FILE/CHANGE section — mirrors #files-panel: Files/Changes toggle, current
+   file/diff path, Preview/Source toggle, close, refresh, auto-commit. */
 #toolbar-files {
   flex: 1;
   display: flex;
   align-items: center;
+  gap: 10px;
   padding: 0 16px;
   min-width: 200px;
 }
@@ -1058,25 +1060,6 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   overflow: hidden;
 }
 
-#files-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-
-.files-toolbar-label {
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: .07em;
-  color: var(--muted);
-  flex: 1;
-  opacity: .65;
-}
-
 /* Shared bare-glyph button size (⚙ ↻ ✕ etc.) — unified to 14px/line-height:1
    so every icon-only header/panel control reads the same visual weight;
    previously settings-btn (13px, its own rule) and .icon-btn (13px) matched
@@ -1138,19 +1121,13 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   border-left: 1px solid var(--border);
 }
 
-#file-viewer-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-  flex-shrink: 0;
-  min-height: 36px;
-}
-
+/* Current file/diff path — lives in the header toolbar now (#toolbar-files).
+   Text is already MIDDLE-ellipsized in JS (setViewerPathText/middleEllipsizePath)
+   so the filename stays visible on a long path; text-overflow here is just a
+   safety fallback. */
 #file-viewer-path {
   flex: 1;
+  min-width: 0;
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--muted);
@@ -1201,6 +1178,81 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 }
 
 .file-viewer-empty { color: var(--muted) !important; white-space: normal !important; font-size: 12px; }
+
+/* Changes-mode diff view (working-tree or per-commit) rendered into
+   #file-viewer-content via colorize() — same renderer/classes as the
+   diff-modal's #diff-content, just pre-formatted text instead of the
+   per-line .code-line divs used for plain source. */
+#file-viewer-content.diff-view { white-space: pre; }
+
+/* ── VS Code-style Changes list (uncommitted changes + commit history) ──
+   Renders into #files-tree (same container the file tree uses) when
+   files-mode-toggle is set to "Changes" — see refreshChanges() in app.js.
+   Reuses .file-row/.file-icon/.file-name/.file-empty/.file-children from
+   the file tree for hover/active states and the expand-arrow pattern. */
+.changes-section + .changes-section { border-top: 1px solid var(--border); margin-top: 4px; }
+.changes-section-label {
+  padding: 6px 8px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--muted);
+  opacity: .65;
+}
+.git-status-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+}
+.git-status-glyph.git-status-add  { color: var(--green);  background: rgba(34,197,94,.12); }
+.git-status-glyph.git-status-del  { color: var(--red);    background: rgba(239,68,68,.12); }
+.git-status-glyph.git-status-move { color: var(--blue);   background: rgba(59,130,246,.12); }
+.git-status-glyph.git-status-mod  { color: var(--yellow); background: rgba(234,179,8,.12); }
+.commit-message { color: var(--text); }
+.commit-relative { flex-shrink: 0; font-size: 10px; color: var(--muted); margin-left: 4px; }
+
+/* ── Auto-commit toggle ──────────────────────────────────────────
+   Small pill in the header toolbar; default OFF (muted) with a clearly
+   distinct filled/gold state when ON — see app.js's `autoCommit`. */
+.ac-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 4px 10px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  border-radius: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.ac-toggle:hover { color: var(--text); border-color: var(--text); }
+.ac-toggle .ac-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+  transition: background .15s, box-shadow .15s;
+}
+.ac-toggle.on {
+  background: rgba(201,162,39,.14);
+  border-color: var(--gold);
+  color: var(--gold);
+}
+.ac-toggle.on .ac-dot { background: var(--gold); box-shadow: 0 0 6px var(--gold-glow); }
 
 /* ── Document preview ── */
 .viewer-toggle {
@@ -1508,9 +1560,12 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   white-space: pre;
   line-height: 1.5;
 }
-#diff-content .add  { color: var(--green); }
-#diff-content .del  { color: var(--red); }
-#diff-content .meta { color: var(--muted); }
+/* Global (not #diff-content-scoped) so colorize()'s output also works when
+   rendered into #file-viewer-content.diff-view (Changes mode) — one shared
+   diff renderer/palette instead of duplicating it per call site. */
+.diff-add  { color: var(--green); }
+.diff-del  { color: var(--red); }
+.diff-meta { color: var(--muted); }
 
 #close-diff { background: none; border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; }
 

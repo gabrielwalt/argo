@@ -528,7 +528,8 @@ function handleEvent(event) {
       iterLabel.textContent = ''
       currentIteration = null
       refreshGitLog()
-      refreshFiles()
+      if (filesMode === 'files') refreshFiles()
+      else refreshChanges()
       // Browser notification on a clean finish (with the workspace name), when the tab is
       // not focused — so you learn a task completed while looking elsewhere.
       if (!wasStopped) {
@@ -610,6 +611,8 @@ function handleEvent(event) {
       addTraceItem('git', `🔀 Committed`, `${event.hash} — ${event.message}`, false)
       surfaceActivity('🔀 Committed')
       refreshGitLog()
+      // The new commit + cleared working changes only matter to Changes mode.
+      refreshChangesIfActive()
       break
 
     case 'error':
@@ -1096,7 +1099,7 @@ async function startRun(message) {
     const resp = await fetch(`${API_BASE}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, model: selectedModel, options: modelOpts, maxIterations, grounding }),
+      body: JSON.stringify({ message, model: selectedModel, options: modelOpts, maxIterations, grounding, autoCommit }),
     })
     if (!resp.ok) {
       const err = await resp.json()
@@ -1486,12 +1489,16 @@ async function showDiff(hash) {
   }
 }
 
+// Shared unified-diff colorizer — used by the "View diff" modal (#diff-content,
+// via showDiff()) AND by the Changes-mode viewer-pane diffs (#file-viewer-content.diff-view,
+// via renderDiffIntoViewer()). Classes are global (.diff-add/.diff-del/.diff-meta in
+// styles.css), not scoped to either container, precisely so this one function serves both.
 function colorize(text) {
   return text.split('\n').map(line => {
     const esc = escHtml(line)
-    if (line.startsWith('+') && !line.startsWith('+++')) return `<span class="add">${esc}</span>`
-    if (line.startsWith('-') && !line.startsWith('---')) return `<span class="del">${esc}</span>`
-    if (line.startsWith('@@') || line.startsWith('diff ') || line.startsWith('index ')) return `<span class="meta">${esc}</span>`
+    if (line.startsWith('+') && !line.startsWith('+++')) return `<span class="diff-add">${esc}</span>`
+    if (line.startsWith('-') && !line.startsWith('---')) return `<span class="diff-del">${esc}</span>`
+    if (line.startsWith('@@') || line.startsWith('diff ') || line.startsWith('index ')) return `<span class="diff-meta">${esc}</span>`
     return esc
   }).join('\n')
 }
@@ -1571,13 +1578,237 @@ let wsRefreshTimer = null
 function scheduleWorkspaceRefresh() {
   clearTimeout(wsRefreshTimer)
   wsRefreshTimer = setTimeout(() => {
-    refreshFiles()
-    if (currentViewerPath) {
-      const kind = window.ArgoPreview ? ArgoPreview.previewKindFor(currentViewerPath) : null
-      renderViewer(currentViewerPath, kind)
+    if (filesMode === 'files') {
+      refreshFiles()
+      if (currentViewerPath) {
+        const kind = window.ArgoPreview ? ArgoPreview.previewKindFor(currentViewerPath) : null
+        renderViewer(currentViewerPath, kind)
+      }
+    } else {
+      refreshChanges()
     }
   }, 700)
 }
+
+// ── Files / Changes toggle ────────────────────────────────────────
+const filesModeToggle = $('files-mode-toggle')
+
+function setFilesMode(mode) {
+  if (mode === filesMode) return
+  filesMode = mode
+  filesModeToggle.querySelectorAll('.vt-btn').forEach(b => b.classList.toggle('active', b.dataset.mode === mode))
+  // A file/diff selected in one mode isn't meaningful in the other.
+  closeViewer()
+  if (mode === 'files') refreshFiles()
+  else refreshChanges()
+}
+filesModeToggle.addEventListener('click', (e) => {
+  const btn = e.target.closest('.vt-btn')
+  if (!btn) return
+  setFilesMode(btn.dataset.mode)
+})
+
+// ── Changes mode — VS Code-style git view ──────────────────────────
+// Renders into the SAME #files-tree container the file tree uses (only one
+// of the two is ever shown, per filesMode) — a "Changes" section of
+// uncommitted working-tree changes (GET /git-status) above a commit
+// "History" section (GET /git-log), each commit lazily expandable to its
+// changed files (GET /commit-files/:hash). Clicking any file/change row
+// shows that file's diff in the viewer pane via colorize() — the same
+// renderer the "View diff" modal uses, not a second implementation.
+function statusGlyph(status) {
+  return (String(status || '').trim().charAt(0) || '?').toUpperCase()
+}
+
+function statusClass(status) {
+  const s = statusGlyph(status)
+  if (s === 'A' || s === '?') return 'git-status-add'
+  if (s === 'D') return 'git-status-del'
+  if (s === 'R' || s === 'C') return 'git-status-move'
+  return 'git-status-mod'
+}
+
+async function refreshChanges() {
+  const container = $('files-tree')
+  container.innerHTML = '<div class="file-empty">Loading…</div>'
+
+  let statusRows = []
+  let commits = []
+  try { statusRows = await fetch(`${API_BASE}/git-status`).then(r => r.json()) } catch { /* keep empty */ }
+  try { commits = await fetch(`${API_BASE}/git-log`).then(r => r.json()) } catch { /* keep empty */ }
+
+  container.innerHTML = ''
+
+  const changesSection = document.createElement('div')
+  changesSection.className = 'changes-section'
+  const changesLabel = document.createElement('div')
+  changesLabel.className = 'changes-section-label'
+  changesLabel.textContent = `Changes${statusRows.length ? ` (${statusRows.length})` : ''}`
+  changesSection.appendChild(changesLabel)
+  if (!statusRows.length) {
+    const empty = document.createElement('div')
+    empty.className = 'file-empty'
+    empty.textContent = 'No uncommitted changes'
+    changesSection.appendChild(empty)
+  } else {
+    for (const row of statusRows) changesSection.appendChild(makeChangeRow(row))
+  }
+  container.appendChild(changesSection)
+
+  const historySection = document.createElement('div')
+  historySection.className = 'changes-section'
+  const historyLabel = document.createElement('div')
+  historyLabel.className = 'changes-section-label'
+  historyLabel.textContent = 'History'
+  historySection.appendChild(historyLabel)
+  if (!commits.length) {
+    const empty = document.createElement('div')
+    empty.className = 'file-empty'
+    empty.textContent = 'No commits yet'
+    historySection.appendChild(empty)
+  } else {
+    for (const c of commits) historySection.appendChild(makeCommitRow(c))
+  }
+  container.appendChild(historySection)
+}
+
+function makeChangeRow(row) {
+  const el = document.createElement('div')
+  el.className = 'file-row change-row'
+  el.innerHTML = `<span class="git-status-glyph ${statusClass(row.status)}">${escHtml(statusGlyph(row.status))}</span><span class="file-name">${escHtml(row.path)}</span>`
+  el.addEventListener('click', () => showWorkingDiff(row.path, el))
+  return el
+}
+
+// A commit row expands (lazily, like a tree directory) to its changed files
+// via GET /commit-files/:hash. Message + relative time only — no hash shown
+// in the row (kept clean; the hash is still used internally for the fetch).
+function makeCommitRow(c) {
+  const wrapper = document.createElement('div')
+  wrapper.className = 'commit-node'
+
+  const row = document.createElement('div')
+  row.className = 'file-row commit-row'
+  row.innerHTML = `<span class="file-icon">▶</span><span class="file-name commit-message">${escHtml(c.message)}</span><span class="commit-relative">${escHtml(c.relative || '')}</span>`
+
+  const filesWrap = document.createElement('div')
+  filesWrap.className = 'file-children'
+  let loaded = false
+
+  row.addEventListener('click', async () => {
+    const opening = !wrapper.classList.contains('open')
+    if (opening && !loaded) {
+      loaded = true
+      let files = []
+      try { files = await fetch(`${API_BASE}/commit-files/${c.hash}`).then(r => r.json()) } catch { /* keep empty */ }
+      filesWrap.innerHTML = ''
+      if (!files.length) {
+        const empty = document.createElement('div')
+        empty.className = 'file-empty'
+        empty.textContent = '(no files)'
+        filesWrap.appendChild(empty)
+      } else {
+        for (const f of files) filesWrap.appendChild(makeCommitFileRow(c, f))
+      }
+    }
+    wrapper.classList.toggle('open', opening)
+    row.querySelector('.file-icon').textContent = opening ? '▼' : '▶'
+  })
+
+  wrapper.appendChild(row)
+  wrapper.appendChild(filesWrap)
+  return wrapper
+}
+
+function makeCommitFileRow(c, f) {
+  const el = document.createElement('div')
+  el.className = 'file-row change-row'
+  el.innerHTML = `<span class="git-status-glyph ${statusClass(f.status)}">${escHtml(statusGlyph(f.status))}</span><span class="file-name">${escHtml(f.path)}</span>`
+  el.addEventListener('click', () => showCommitFileDiff(c.hash, f.path, el))
+  return el
+}
+
+function markActiveChangeRow(rowEl) {
+  if (activeChangeRow) activeChangeRow.classList.remove('active')
+  activeChangeRow = rowEl || null
+  if (rowEl) rowEl.classList.add('active')
+}
+
+// Shared render for both a working-tree diff and a per-commit file diff — same
+// colorize() used by the "View diff" modal, just rendered into the viewer pane
+// instead of #diff-content.
+async function renderDiffIntoViewer(path, fetchUrl) {
+  if (activeFileRow) { activeFileRow.classList.remove('active'); activeFileRow = null }
+  currentViewerPath = null
+  setViewerPathText(path)
+  $('file-viewer-toggle').classList.add('hidden')   // diffs aren't previewable
+  const contentEl = $('file-viewer-content')
+  contentEl.classList.remove('file-viewer-empty', 'preview-mode')
+  contentEl.classList.add('diff-view')
+  contentEl.textContent = 'Loading…'
+  try {
+    const resp = await fetch(fetchUrl)
+    const text = await resp.text()
+    contentEl.innerHTML = colorize(text) || '<span class="muted-sm">(no changes)</span>'
+  } catch {
+    contentEl.textContent = 'Failed to load diff.'
+  }
+}
+
+async function showWorkingDiff(path, rowEl) {
+  markActiveChangeRow(rowEl)
+  currentDiffRef = { type: 'working', path }
+  await renderDiffIntoViewer(path, `${API_BASE}/git-diff-working?path=${encodeURIComponent(path)}`)
+}
+
+async function showCommitFileDiff(hash, path, rowEl) {
+  markActiveChangeRow(rowEl)
+  currentDiffRef = { type: 'commit', hash, path }
+  await renderDiffIntoViewer(path, `${API_BASE}/git-diff/${hash}?path=${encodeURIComponent(path)}`)
+}
+
+// Refreshes BOTH the left pane's list (tree or changes) and whatever's
+// currently shown on the right (an open file/preview, or a diff) — the
+// header's "Refresh" action.
+async function refreshWorkspacePane() {
+  if (filesMode === 'files') {
+    await refreshFiles()
+    if (currentViewerPath) {
+      const kind = window.ArgoPreview ? ArgoPreview.previewKindFor(currentViewerPath) : null
+      await renderViewer(currentViewerPath, kind)
+    }
+  } else {
+    await refreshChanges()
+    if (currentDiffRef) {
+      const url = currentDiffRef.type === 'working'
+        ? `${API_BASE}/git-diff-working?path=${encodeURIComponent(currentDiffRef.path)}`
+        : `${API_BASE}/git-diff/${currentDiffRef.hash}?path=${encodeURIComponent(currentDiffRef.path)}`
+      await renderDiffIntoViewer(currentDiffRef.path, url)
+    }
+  }
+}
+
+// Only refreshes the Changes lists if that's the active mode — called after
+// events that change git state (a commit, or a run finishing) so an open
+// Files-mode tree isn't refetched needlessly.
+function refreshChangesIfActive() {
+  if (filesMode === 'changes') refreshChanges()
+}
+
+// ── Auto-commit toggle ─────────────────────────────────────────────
+// Whether the worker should commit the agent's changes after each run.
+// Default OFF; sent with every /chat request (like `grounding`) so the
+// worker's per-run behavior matches this toggle. Initialized from /status's
+// `autoCommit` on boot (see boot()).
+let autoCommit = false
+const autoCommitBtn = $('auto-commit-toggle')
+function syncAutoCommitUI() {
+  autoCommitBtn.classList.toggle('on', autoCommit)
+}
+autoCommitBtn.addEventListener('click', () => {
+  autoCommit = !autoCommit
+  syncAutoCommitUI()
+})
 
 async function makeFileNode(node, parentPath, forceOpen = false) {
   const filePath = parentPath ? `${parentPath}/${node.name}` : node.name
@@ -1656,6 +1887,18 @@ let currentViewerPath = null
 // select a file by path even though the tree loads children lazily.
 const fileNodeMap = new Map()
 
+// ── Files / Changes mode + viewer-pane diff state ─────────────────
+// 'files' | 'changes' — which content #files-tree currently shows (see
+// setFilesMode()/refreshChanges() below).
+let filesMode = 'files'
+// The active row in the Changes-mode list (a working-tree change or a
+// commit's file) — mirrors activeFileRow's role for the file tree.
+let activeChangeRow = null
+// Identifies whatever diff is currently shown in the viewer pane, so
+// Refresh (refreshWorkspacePane()) can re-fetch and re-render it:
+// { type: 'working', path } | { type: 'commit', hash, path } | null.
+let currentDiffRef = null
+
 const LANG_BY_EXT = {
   js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
   ts: 'typescript', tsx: 'typescript',
@@ -1710,11 +1953,13 @@ async function openFileInViewer(filePath, rowEl) {
   if (activeFileRow) activeFileRow.classList.remove('active')
   activeFileRow = rowEl
   if (rowEl) rowEl.classList.add('active')
+  // Opening a plain file always supersedes whatever diff (if any) was showing.
+  if (activeChangeRow) { activeChangeRow.classList.remove('active'); activeChangeRow = null }
+  currentDiffRef = null
 
   currentViewerPath = filePath
-  const pathEl = $('file-viewer-path')
+  setViewerPathText(filePath)
   const toggleEl = $('file-viewer-toggle')
-  pathEl.textContent = `/${filePath}`
 
   const kind = window.ArgoPreview ? ArgoPreview.previewKindFor(filePath) : null
   // Show the preview/source toggle only for kinds that have both views.
@@ -1736,7 +1981,7 @@ async function openFileInViewer(filePath, rowEl) {
 // Preview failures fall back to the guaranteed raw source view.
 async function renderViewer(filePath, kind) {
   const contentEl = $('file-viewer-content')
-  contentEl.classList.remove('file-viewer-empty')
+  contentEl.classList.remove('file-viewer-empty', 'diff-view')
   // Images are preview-only; html/markdown honor the saved mode; everything
   // else is source.
   let mode = 'source'
@@ -1795,16 +2040,46 @@ async function selectFileInTree(filePath) {
   return target.rowEl
 }
 
-$('file-viewer-close').addEventListener('click', () => {
+// Shortens a long path in the MIDDLE (keeps the start + the filename) instead of at
+// one end — e.g. "/src/very/long/nested/path/file.ts" -> "/src/very/…/file.ts" — since
+// the toolbar slot is narrow and a plain end-ellipsis would hide the filename, the most
+// identifying part of the path, on anything long.
+function middleEllipsizePath(path, maxLen = 46) {
+  if (!path || path.length <= maxLen) return path
+  const slash = path.lastIndexOf('/')
+  const filename = slash === -1 ? path : path.slice(slash + 1)
+  const keep = Math.max(1, maxLen - filename.length - 5)   // room for "/…/ "
+  const head = path.slice(0, keep)
+  return `${head}/…/${filename}`
+}
+
+// Sets #file-viewer-path's text (middle-ellipsized) for whatever is currently shown —
+// an open file (Files mode) or a diff (Changes mode). Full path is always available via
+// the title tooltip.
+function setViewerPathText(relPath) {
+  const pathEl = $('file-viewer-path')
+  if (!relPath) { pathEl.textContent = ''; pathEl.removeAttribute('title'); return }
+  const full = `/${relPath}`
+  pathEl.textContent = middleEllipsizePath(full)
+  pathEl.title = full
+}
+
+// Resets the viewer pane to its empty state and clears whichever selection (a file row
+// in Files mode, or a change/commit-file row in Changes mode) was active. Shared by the
+// close button and by setFilesMode() (switching modes retires whatever was shown).
+function closeViewer() {
   if (activeFileRow) { activeFileRow.classList.remove('active'); activeFileRow = null }
+  if (activeChangeRow) { activeChangeRow.classList.remove('active'); activeChangeRow = null }
   currentViewerPath = null
+  currentDiffRef = null
   $('file-viewer-toggle').classList.add('hidden')
-  $('file-viewer-path').textContent = ''
+  setViewerPathText('')
   const contentEl = $('file-viewer-content')
-  contentEl.classList.remove('preview-mode')
+  contentEl.classList.remove('preview-mode', 'diff-view')
   contentEl.textContent = 'Select a file to view'
   contentEl.classList.add('file-viewer-empty')
-})
+}
+$('file-viewer-close').addEventListener('click', closeViewer)
 
 // Preview/source toggle — switch mode for the current file's kind and re-render.
 $('file-viewer-toggle').addEventListener('click', (ev) => {
@@ -1821,7 +2096,7 @@ $('file-viewer-toggle').addEventListener('click', (ev) => {
   renderViewer(currentViewerPath, kind)
 })
 
-$('refresh-files').addEventListener('click', refreshFiles)
+$('refresh-files').addEventListener('click', refreshWorkspacePane)
 
 
 // ── Nav init ─────────────────────────────────────────────────────
@@ -2104,6 +2379,10 @@ async function boot() {
   // capture the auto-compaction threshold for the donut's tick.
   compactThreshold = typeof status.compactThreshold === 'number' ? status.compactThreshold : 0.667
   renderDonut()
+
+  // Auto-commit defaults OFF; restore whatever the worker currently has set.
+  autoCommit = !!status.autoCommit
+  syncAutoCommitUI()
 
   currentLiveSessionId = status.sessionId ?? ''
   // await so the model dropdown is populated (and its models[0] default selected)

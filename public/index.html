@@ -14,8 +14,10 @@
 <body>
 
 <!-- Unified toolbar: CHAT section (left, mirrors #chat-panel's width) + a
-     divider + a FILE/CHANGE section (right, mirrors #files-panel) — a later
-     task fills the file section with the Files/Changes toggle + file path. -->
+     divider + a FILE/CHANGE section (right, mirrors #files-panel): the
+     Files/Changes toggle, the current file/diff path (middle-ellipsized),
+     the Preview/Source toggle (moved up from the old per-pane file-viewer
+     header), close, refresh, and the auto-commit toggle. -->
 <header>
   <div id="toolbar-chat">
     <!-- Breadcrumb: Argo › workspace -->
@@ -45,9 +47,22 @@
 
   <div id="toolbar-div" aria-hidden="true"></div>
 
-  <!-- File/Change section — reserved container + divider; populated by a
-       later task with the Files/Changes toggle and current file path. -->
-  <div id="toolbar-files"></div>
+  <!-- File/Change section — mirrors #files-panel. -->
+  <div id="toolbar-files">
+    <div class="viewer-toggle" id="files-mode-toggle" title="Switch between the file tree and uncommitted/committed changes">
+      <button type="button" class="vt-btn active" data-mode="files">Files</button>
+      <button type="button" class="vt-btn" data-mode="changes">Changes</button>
+    </div>
+    <span id="file-viewer-path"></span>
+    <div id="file-viewer-toggle" class="viewer-toggle hidden">
+      <button data-mode="preview" class="vt-btn">Preview</button><button data-mode="source" class="vt-btn">Source</button>
+    </div>
+    <button id="file-viewer-close" class="icon-btn" title="Close">✕</button>
+    <button id="refresh-files" class="icon-btn" title="Refresh">↻</button>
+    <button id="auto-commit-toggle" class="ac-toggle" type="button" title="Automatically commit the agent's changes after each run">
+      <span class="ac-dot"></span>Auto-commit
+    </button>
+  </div>
 </header>
 
 <!-- Legacy status readout — kept in the DOM (some code paths still write to
@@ -135,12 +150,11 @@
 
   <!-- Files panel -->
   <section id="files-panel">
-    <!-- File tree pane -->
+    <!-- File tree pane — shows either the file tree (Files mode) or the
+         changes list (Changes mode: uncommitted changes + commit history);
+         see files-mode-toggle in the header and renderFiles.../refreshChanges
+         in app.js. -->
     <div id="file-tree-pane">
-      <div id="files-toolbar">
-        <span class="files-toolbar-label">Files</span>
-        <button id="refresh-files" class="icon-btn" title="Refresh">↻</button>
-      </div>
       <div id="files-content">
         <div id="files-tree" class="file-tree"></div>
       </div>
@@ -149,22 +163,19 @@
     <!-- Resize handle (tree | viewer) -->
     <div id="tree-resize" class="resize-handle"></div>
 
-    <!-- File viewer -->
+    <!-- File viewer — path/toggle/close now live in the header toolbar
+         (#toolbar-files); this pane is just the content (source, preview,
+         or a colorized diff). -->
     <div id="file-viewer-pane">
-      <div id="file-viewer-header">
-        <span id="file-viewer-path"></span>
-        <div id="file-viewer-toggle" class="viewer-toggle hidden">
-          <button data-mode="preview" class="vt-btn">Preview</button><button data-mode="source" class="vt-btn">Source</button>
-        </div>
-        <button id="file-viewer-close" class="icon-btn" title="Close">✕</button>
-      </div>
       <pre id="file-viewer-content" class="file-viewer-empty">Select a file to view</pre>
     </div>
   </section>
 </main>
 
-<!-- Git log panel -->
-<div id="git-panel">
+<!-- Git log panel — retired: its commit-list + diff role is now the
+     Changes mode in #toolbar-files/#files-tree. Kept in the DOM (some code
+     paths still write to it) but hidden so there's only one git UI. -->
+<div id="git-panel" class="hidden">
   <div id="git-header">
     <div id="git-latest"><span class="muted-sm">Loading…</span></div>
     <button id="refresh-git">↻ Refresh</button>
