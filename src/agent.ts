@@ -50,7 +50,7 @@ import { createLoopState, noteMutation, evaluateCall, type LoopState } from './l
 // the HARNESS (a better tool with real feedback, a loop steer, a guard) over
 // adding a line here — e.g. the edit_file tool replaced a prompt rule about not
 // reusing a stale remembered block; the harness now makes that failure impossible.
-const SYSTEM_PROMPT = `You are the coding agent inside Argo, a local-first coding harness. Your project is mounted at /workspace in an isolated Ubuntu Docker container (the host is not accessible). Your thoughts, tool calls, and results stream live to the user, and changes under /workspace are auto-committed to git after each run.
+const SYSTEM_PROMPT = `You are the coding agent inside Argo, a local-first coding harness. Your project is mounted at /workspace in an isolated Ubuntu Docker container (the host is not accessible). Your thoughts, tool calls, and results stream live to the user, and changes under /workspace are committed to git when auto-commit is enabled.
 
 TOOLS — invoke them through the function-calling API; never write a tool call as text, JSON, or XML in your reply.
 - bash: run shell commands. Pass the working directory via the cwd argument (e.g. /workspace); do not prefix with "cd /workspace &&".
@@ -280,6 +280,9 @@ export class Agent {
   // Per-run toggle for the loop-recovery ladder (ARGO_LOOP), mirroring tasks/memory —
   // gated on THIS field so with it off behavior is byte-identical to the baseline.
   private loop = config.loopRecovery
+  // Per-run toggle for auto-commit (ARGO_AUTOCOMMIT), OFF by default — gates the
+  // autoCommit() call at the end of chat() (see setAutoCommit / chat()).
+  private autoCommitEnabled = config.autoCommit
   private maxIterations: number = config.maxIterations
   private sessionId = ''
   private aborted = false
@@ -424,6 +427,10 @@ export class Agent {
 
   setLoop(on: boolean) {
     this.loop = on
+  }
+
+  setAutoCommit(on: boolean) {
+    this.autoCommitEnabled = on
   }
 
   getMaxIterations(): number {
@@ -1183,7 +1190,7 @@ export class Agent {
           }
           emitAndLog({ type: 'message', role: 'assistant', content: msg.content })
           emitAndLog({ type: 'done', content: msg.content })
-          await this.autoCommit(emitAndLog)
+          if (this.autoCommitEnabled) await this.autoCommit(emitAndLog)
           return msg.content
         }
 

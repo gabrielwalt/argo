@@ -88,4 +88,9 @@ export const config = {
   // identical tool call when nothing changed since it last ran, and escalates
   // L0 steer -> L1 compaction -> L2 stop-and-reframe (forced re-plan). See src/loop.ts.
   loopRecovery:     ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_LOOP ?? '').trim().toLowerCase()),
+  // AUTO-COMMIT. OFF by default — the agent used to ALWAYS commit after every run; this
+  // makes it opt-in (per-run overridable via agent.setAutoCommit(), mirroring the other
+  // flags above) so uncommitted changes stay visible in the Changes view until the user
+  // (or an explicit toggle) decides to commit them. See Agent.autoCommit() in agent.ts.
+  autoCommit:       ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_AUTOCOMMIT ?? '').trim().toLowerCase()),
 }

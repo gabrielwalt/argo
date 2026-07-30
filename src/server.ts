@@ -87,7 +87,7 @@ app.post('/chat', async (req, res) => {
   // Per-request harness toggles mirror `grounding`: env sets the default (config.*),
   // the UI/eval can override per run. Lets the A/B eval flip tasks/memory/loop on the
   // SAME worker (no rebuild) and lets the settings panel dogfood them live.
-  const { message, model, options, maxIterations, grounding, tasks, memory, loop } = req.body as { message: string; model?: string; options?: ModelOptions; maxIterations?: number; grounding?: boolean; tasks?: boolean; memory?: boolean; loop?: boolean }
+  const { message, model, options, maxIterations, grounding, tasks, memory, loop, autoCommit } = req.body as { message: string; model?: string; options?: ModelOptions; maxIterations?: number; grounding?: boolean; tasks?: boolean; memory?: boolean; loop?: boolean; autoCommit?: boolean }
   if (!message?.trim()) {
     res.status(400).json({ error: 'message required' })
     return
@@ -104,6 +104,7 @@ app.post('/chat', async (req, res) => {
   if (tasks != null) agent.setTasks(tasks)
   if (memory != null) agent.setMemory(memory)
   if (loop != null) agent.setLoop(loop)
+  if (autoCommit != null) agent.setAutoCommit(autoCommit)
 
   isBusy = true
   res.json({ ok: true })
@@ -164,16 +165,18 @@ app.get('/models', async (req, res) => {
   }
 })
 
-// Git log for workspace
+// Git log for workspace. Additive: `relative` (%cr, e.g. "3 hours ago") alongside the
+// existing fields, for the Changes view's commit list — existing callers reading
+// hash/short/message/date/author are unaffected.
 app.get('/git-log', async (req, res) => {
   try {
     const { stdout } = await execAsync(
-      'git log --format="%H|%h|%s|%ai|%an" -30 2>/dev/null || echo ""',
+      'git log --format="%H|%h|%s|%ai|%an|%cr" -30 2>/dev/null || echo ""',
       { cwd: config.workspacePath }
     )
     const commits = stdout.trim().split('\n').filter(Boolean).map(line => {
-      const [hash, short, message, date, author] = line.split('|')
-      return { hash, short, message, date, author }
+      const [hash, short, message, date, author, relative] = line.split('|')
+      return { hash, short, message, date, author, relative }
     })
     res.json(commits)
   } catch {
@@ -181,15 +184,126 @@ app.get('/git-log', async (req, res) => {
   }
 })
 
-// Git diff for a specific commit
+// Git op path arguments come from the client (?path=) — confine them to the workspace
+// root (config.workspacePath, the git repo root; NOT browseRoot(), which is '/' inside
+// the container) and reject traversal. Returns a path relative to that root (safe to
+// hand straight to a git command run with cwd: config.workspacePath), or null if it's
+// missing/would escape the root.
+function resolveWorkspaceRelPath(rawPath: unknown): string | null {
+  const root = config.workspacePath
+  if (!root) return null
+  const rel = ((rawPath as string) ?? '').replace(/\.\./g, '').replace(/^\/+/, '')
+  if (!rel) return null
+  const abs = path.join(root, rel)
+  if (abs !== root && !abs.startsWith(root + path.sep)) return null
+  return rel
+}
+
+// exec() runs through a shell, so a path pulled from the client must never be
+// interpolated unescaped into the command string — single-quote it, escaping any
+// embedded single quotes. (git hashes are validated against a fixed charset instead,
+// same as the existing /git-diff/:hash route, so they don't need this.)
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`
+}
+
+// Git diff for a specific commit — whole-commit (unchanged, existing callers), or, with
+// ?path=<file>, just that one file's diff within the commit (Changes view: clicking a
+// file under a commit).
 app.get('/git-diff/:hash', async (req, res) => {
   const { hash } = req.params
-  if (!/^[0-9a-f]{4,64}$/.test(hash)) { res.status(400).send('Invalid hash'); return }
+  if (!/^[0-9a-f]{4,64}$/i.test(hash)) { res.status(400).send('Invalid hash'); return }
+  let rel: string | null = null
+  if (req.query.path != null) {
+    rel = resolveWorkspaceRelPath(req.query.path)
+    if (rel === null) { res.status(400).send('Invalid path'); return }
+  }
   try {
     const { stdout } = await execAsync(
-      `git show ${hash} --stat --patch 2>/dev/null`,
+      rel != null
+        ? `git show ${hash} -- ${shQuote(rel)} 2>/dev/null`
+        : `git show ${hash} --stat --patch 2>/dev/null`,
       { cwd: config.workspacePath }
     )
+    res.type('text/plain').send(stdout.slice(0, 50_000))
+  } catch {
+    res.status(404).send('Not found')
+  }
+})
+
+// Files changed in a specific commit — {status, path} pairs (status: A/M/D/R/C…),
+// for the Changes view's per-commit file list.
+app.get('/commit-files/:hash', async (req, res) => {
+  const { hash } = req.params
+  if (!/^[0-9a-f]{4,64}$/i.test(hash)) { res.status(400).send('Invalid hash'); return }
+  try {
+    const { stdout } = await execAsync(
+      `git show --name-status --format= ${hash} 2>/dev/null`,
+      { cwd: config.workspacePath }
+    )
+    const files = stdout.trim().split('\n').filter(Boolean).map(line => {
+      const parts = line.split('\t')
+      // Renames/copies are "R100\told-path\tnew-path" — collapse the score to a plain
+      // letter and report the new path; everything else is "M\tpath" (one path).
+      const status = parts[0][0]
+      const filePath = parts[parts.length - 1]
+      return { status, path: filePath }
+    })
+    res.json(files)
+  } catch {
+    res.status(404).json([])
+  }
+})
+
+// Uncommitted working-tree changes (staged + unstaged + untracked) — the Changes
+// view's live section, most relevant now that auto-commit defaults to off.
+app.get('/git-status', async (req, res) => {
+  try {
+    const { stdout } = await execAsync('git status --porcelain 2>/dev/null', { cwd: config.workspacePath })
+    const files = stdout.split('\n').filter(Boolean).map(line => {
+      const code = line.slice(0, 2)
+      let filePath = line.slice(3)
+      // Renames show as "old -> new" (no -z here) — report the new path.
+      const arrow = filePath.indexOf(' -> ')
+      if (arrow !== -1) filePath = filePath.slice(arrow + 4)
+      filePath = filePath.replace(/^"|"$/g, '')
+      return { status: porcelainStatus(code), path: filePath }
+    })
+    res.json(files)
+  } catch {
+    res.json([])
+  }
+})
+
+// Maps a `git status --porcelain` two-char code (index-status + worktree-status) to one
+// simple letter: "??" (untracked) -> 'U'; otherwise the first non-space side (index
+// takes priority over worktree, since a staged change is the more meaningful state).
+function porcelainStatus(code: string): string {
+  if (code === '??') return 'U'
+  const [x, y] = code
+  return (x !== ' ' ? x : y) || 'M'
+}
+
+// Working-tree diff for a single file — tracked changes via `git diff HEAD` (this also
+// renders deletions correctly); an untracked file has nothing to diff against, so it's
+// rendered directly as an all-added diff instead.
+app.get('/git-diff-working', async (req, res) => {
+  const rel = resolveWorkspaceRelPath(req.query.path)
+  if (rel === null) { res.status(400).send('Invalid path'); return }
+  try {
+    const { stdout: statusOut } = await execAsync(
+      `git status --porcelain -- ${shQuote(rel)} 2>/dev/null`,
+      { cwd: config.workspacePath }
+    )
+    if (statusOut.startsWith('??')) {
+      const abs = path.join(config.workspacePath, rel)
+      const content = await fs.readFile(abs, 'utf-8').catch(() => '')
+      const body = content.length ? content.split('\n').map(l => `+${l}`).join('\n') : ''
+      const diff = `--- /dev/null\n+++ b/${rel}\n${body}`
+      res.type('text/plain').send(diff.slice(0, 50_000))
+      return
+    }
+    const { stdout } = await execAsync(`git diff HEAD -- ${shQuote(rel)} 2>/dev/null`, { cwd: config.workspacePath })
     res.type('text/plain').send(stdout.slice(0, 50_000))
   } catch {
     res.status(404).send('Not found')
@@ -216,6 +330,7 @@ app.get('/status', (req, res) => {
     tasks: config.tasks,
     memory: config.memory,
     loop: config.loopRecovery,
+    autoCommit: config.autoCommit,
   })
 })
 
