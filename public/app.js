@@ -15,7 +15,7 @@ const diffModal = $('diff-modal')
 const diffContent = $('diff-content')
 const diffTitle = $('diff-title')
 const tokenCounter = $('token-counter')
-const settingsBtn = $('settings-btn')
+const indicatorArea = $('indicator-area')
 const settingsPanel = $('settings-panel')
 
 // ── Message-list scroll tracking ────────────────────────────────
@@ -235,8 +235,10 @@ function syncSettingsUI() {
   if (sel && src.model && sel.querySelector(`option[value="${src.model}"]`)) sel.value = src.model
 }
 
+// Anchored to #indicator-area now that the settings gear is gone — opened
+// from the "⚙ Model & parameters" action in the indicator's dropdown instead.
 function positionSettingsPanel() {
-  const r = settingsBtn.getBoundingClientRect()
+  const r = indicatorArea.getBoundingClientRect()
   const width = settingsPanel.getBoundingClientRect().width || 320
   settingsPanel.style.left = Math.max(8, r.right - width) + 'px'
   settingsPanel.style.top = (r.bottom + 6) + 'px'
@@ -303,12 +305,6 @@ $('settings-save').addEventListener('click', saveSettingsPanel)
 // Clicks inside the dropdown shouldn't bubble to the document-level
 // closeAllDropdowns() listener (same pattern as .nav-drop-attach).
 settingsPanel.addEventListener('click', e => e.stopPropagation())
-
-settingsBtn.addEventListener('click', (e) => {
-  e.stopPropagation()
-  if (isSettingsOpen()) cancelSettingsPanel()
-  else { closeAllDropdowns(); openSettingsPanel() }
-})
 syncSettingsUI()
 
 // ── Inline trace block (in chat) ──────────────────────────────────
@@ -837,13 +833,15 @@ async function stopAgent() {
 }
 
 // ── Combined indicator dropdown ───────────────────────────────────
-// Clicking the indicator opens a dropdown with three rows: status+model
-// (opens the settings panel), precise context numbers (opens the context
-// viewer), and "Clear conversation" (replaces the old standalone new-session
-// button). Reuses the .nav-crumb / .nav-dropdown pattern, so
-// closeAllDropdowns() (outside-click + Escape) closes it for free. "Compact
-// now" lives in the context viewer's title bar instead of here (see
-// viewContext()).
+// Clicking the indicator opens a dropdown with a non-clickable 2-line status
+// readout (status+model / precise context numbers) on top, then three
+// clickable actions: "⚙ Model & parameters" (opens the settings panel, which
+// used to be opened by the now-removed gear button), "🔍 View context" (opens
+// the context viewer), and "＋ Clear conversation" (replaces the old
+// standalone new-session button). Reuses the .nav-crumb / .nav-dropdown
+// pattern, so closeAllDropdowns() (outside-click + Escape) closes it for
+// free. "Compact now" lives in the context viewer's title bar instead of
+// here (see viewContext()).
 const navCtx = $('nav-ctx')
 const ctxDropdown = $('ctx-dropdown')
 
@@ -862,34 +860,52 @@ function compactStatusText() {
 function buildCtxDropdown() {
   ctxDropdown.innerHTML = ''
 
-  // Row 1 — textual status + model. Click opens the LLM settings panel.
-  const statusRow = document.createElement('div')
-  statusRow.className = 'nav-drop-item ctx-drop-status'
-  statusRow.innerHTML = `<span>${escHtml(compactStatusText())}</span>`
-  statusRow.addEventListener('click', () => {
+  // Non-clickable 2-line status readout — plain info, not an action.
+  const head = document.createElement('div')
+  head.className = 'ctx-status-head'
+  const line1 = document.createElement('div')
+  line1.className = 'ctx-status-line1'
+  line1.textContent = compactStatusText()
+  head.appendChild(line1)
+  if (ctxState.numCtx) {
+    const line2 = document.createElement('div')
+    line2.className = 'ctx-status-line2'
+    line2.textContent = `${ctxState.promptTokens.toLocaleString()} / ${ctxState.numCtx.toLocaleString()} tokens · ${ctxState.pct}%`
+    head.appendChild(line2)
+  } else {
+    const line2 = document.createElement('div')
+    line2.className = 'ctx-status-line2 muted'
+    line2.textContent = 'No context yet'
+    head.appendChild(line2)
+  }
+  ctxDropdown.appendChild(head)
+
+  const sep = document.createElement('div')
+  sep.className = 'nav-drop-sep'
+  ctxDropdown.appendChild(sep)
+
+  // Action 1 — model & parameters. Opens the LLM settings panel (formerly
+  // opened by the standalone gear button, now removed).
+  const settingsRow = document.createElement('div')
+  settingsRow.className = 'nav-drop-item'
+  settingsRow.innerHTML = `<span>⚙ Model &amp; parameters</span>`
+  settingsRow.addEventListener('click', () => {
     navCtx.classList.remove('open')
     openSettingsPanel()
   })
-  ctxDropdown.appendChild(statusRow)
+  ctxDropdown.appendChild(settingsRow)
 
-  // Row 2 — precise context numbers. Click opens the context viewer.
+  // Action 2 — view context. Opens the context viewer.
   const ctxRow = document.createElement('div')
   ctxRow.className = 'nav-drop-item'
-  const ctxTxt = ctxState.numCtx
-    ? `${ctxState.promptTokens.toLocaleString()} / ${ctxState.numCtx.toLocaleString()} tokens · ${ctxState.pct}%`
-    : 'No context usage yet'
-  ctxRow.innerHTML = `<span>🔍 ${escHtml(ctxTxt)}</span>`
+  ctxRow.innerHTML = `<span>🔍 View context</span>`
   ctxRow.addEventListener('click', () => {
     navCtx.classList.remove('open')
     viewContext()
   })
   ctxDropdown.appendChild(ctxRow)
 
-  const sep = document.createElement('div')
-  sep.className = 'nav-drop-sep'
-  ctxDropdown.appendChild(sep)
-
-  // Row 3 — clear conversation (was the standalone "＋" button in the breadcrumb).
+  // Action 3 — clear conversation (was the standalone "＋" button in the breadcrumb).
   const clearDisabled = busy
   const clearRow = document.createElement('div')
   clearRow.className = `nav-drop-item${clearDisabled ? ' disabled' : ''}`

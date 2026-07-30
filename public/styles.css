@@ -325,9 +325,7 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding-left: 10px;
   margin-left: auto;
-  border-left: 1px solid var(--border);
   flex-shrink: 0;
   height: 100%;
 }
@@ -361,7 +359,34 @@ body {
 
 /* Context dropdown (reuses .nav-dropdown chrome) */
 #ctx-dropdown { min-width: 260px; }
-.ctx-drop-status { font-family: var(--font-mono); }
+
+/* Non-clickable 2-line status readout at the top of the dropdown (see
+   buildCtxDropdown() in app.js) — plain info, not a .nav-drop-item, so it
+   gets no hover highlight and no pointer cursor. Line 1 = status word + model
+   (uppercase-ish muted label feel); line 2 = precise token usage in mono, or
+   a muted "No context yet" placeholder when there's nothing to show yet. */
+.ctx-status-head {
+  padding: 8px 12px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  cursor: default;
+  user-select: none;
+}
+.ctx-status-line1 {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--text);
+}
+.ctx-status-line2 {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+.ctx-status-line2.muted { opacity: .7; font-style: italic; }
+
 .nav-drop-item.disabled {
   opacity: .4;
   cursor: not-allowed;
@@ -419,22 +444,17 @@ body {
   color: var(--text);
 }
 
-/* #settings-btn shares .icon-btn's sizing (14px glyph, 1 line-height) for
-   visual consistency with the other bare-glyph header/panel buttons (↻ ✕). */
-#settings-btn {
-  border: 1px solid var(--border);
-  border-radius: 4px;
-}
-
 /* ── Status (legacy) — hidden; folded into the combined indicator ── */
 #status { display: none; }
 
-/* ── Settings dropdown — anchored to the chat toolbar's gear (#settings-btn),
-   width-capped so it never spans wider than the chat column. Aligned
-   label|control rows (a 2-col grid: 92px label + 1fr control, so every
-   select/slider/number's right edge lines up); value read-outs for sliders
-   sit in a fixed-width slot at the end of the control cell. Positioned by JS
-   (positionSettingsPanel() in app.js) the same way the other .nav-dropdowns
+/* ── Settings dropdown — opened from the combined indicator's dropdown
+   ("⚙ Model & parameters", see buildCtxDropdown() in app.js); the old
+   standalone gear button (#settings-btn) is gone. Width-capped so it never
+   spans wider than the chat column. Aligned label|control rows (a 2-col
+   grid: 92px label + 1fr control, so every select/slider/number's right
+   edge lines up); value read-outs for sliders sit in a fixed-width slot at
+   the end of the control cell. Positioned by JS (positionSettingsPanel() in
+   app.js, anchored to #indicator-area) the same way the other .nav-dropdowns
    are — this isn't a .nav-crumb child, so it gets its own open/close state
    instead of reusing that class. Order: Model, Context size, Grounding,
    Temperature, Top-p, Top-k, Max iterations, then Reset | Cancel/Save. */
@@ -1122,11 +1142,8 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   overflow: hidden;
 }
 
-/* Shared bare-glyph button size (⚙ ↻ ✕ etc.) — unified to 14px/line-height:1
-   so every icon-only header/panel control reads the same visual weight;
-   previously settings-btn (13px, its own rule) and .icon-btn (13px) matched
-   by coincidence but were declared independently — settings-btn now uses
-   this class directly (index.html) instead of duplicating the rule. */
+/* Shared bare-glyph button size (↻ ✕ etc.) — unified to 14px/line-height:1
+   so every icon-only header/panel control reads the same visual weight. */
 .icon-btn {
   background: none;
   border: none;

@@ -23,10 +23,12 @@
 
 <div id="env-banner" class="hidden"></div>
 
-<!-- LLM settings dropdown — anchored to the chat toolbar's gear (#settings-btn).
-     Width-capped, aligned label|control rows, draft-then-apply: opening seeds a
-     draft from the committed modelOpts/maxIterations/grounding; edits touch only
-     the draft; Save commits it (what the next /chat sends), Cancel discards it.
+<!-- LLM settings dropdown — opened from the combined indicator's dropdown
+     ("⚙ Model & parameters", see buildCtxDropdown() in app.js) and anchored to
+     #indicator-area (the old standalone gear button is gone). Width-capped,
+     aligned label|control rows, draft-then-apply: opening seeds a draft from
+     the committed modelOpts/maxIterations/grounding; edits touch only the
+     draft; Save commits it (what the next /chat sends), Cancel discards it.
      Order: Model, Context size, Grounding, Temperature, Top-p, Top-k, Max
      iterations, then Reset | Cancel/Save. -->
 <div id="settings-panel">
@@ -106,14 +108,14 @@
       <!-- Combined context + status indicator — center shows agent state
            (green=ready / yellow=running, with iteration number / flashing
            violet=compacting); ring shows context usage; tick marks the
-           auto-compaction threshold. Click opens a dropdown: status+model,
-           context detail, clear conversation. -->
+           auto-compaction threshold. Click opens a dropdown: a non-clickable
+           status+context readout on top, then Model & parameters, View
+           context, and Clear conversation actions. -->
       <div id="indicator-area">
         <div class="nav-crumb" id="nav-ctx">
           <span id="token-counter" title="Status &amp; context — click for details"></span>
           <div class="nav-dropdown" id="ctx-dropdown"></div>
         </div>
-        <button id="settings-btn" class="icon-btn" title="Model &amp; parameters">⚙</button>
       </div>
     </div>
 
