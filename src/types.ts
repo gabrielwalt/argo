@@ -47,8 +47,11 @@ export type AgentEvent =
       // ACTOR-CRITIC (Phase 4, step 2): a qwen3.6 self-critique verdict emitted
       // at one of a few in-loop checkpoints, so runs are auditable. Only emitted
       // when config.critic is on; the baseline never produces this event.
+      // 'grounding' (config.grounding) and 'layout' (config.layout) reuse this SAME
+      // event shape for their own pre-done checkpoints — gamed_oracle is always
+      // false for both; see grounding.ts / layout.ts.
       type: 'critic'
-      checkpoint: 'post-plan' | 'on-stall' | 'pre-done' | 'grounding'
+      checkpoint: 'post-plan' | 'on-stall' | 'pre-done' | 'grounding' | 'layout'
       verdict: 'ok' | 'revise'
       gamed_oracle: boolean
       issues: string[]

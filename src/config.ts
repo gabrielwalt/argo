@@ -69,6 +69,14 @@ export const config = {
   // produced) verifies specifics against the fetched sources and reconciles restated
   // numbers, blocking "done" until revised. Reuses the critic model. See docs/grounding.md.
   grounding:        !['0', 'false', 'no', 'off'].includes((process.env.ARGO_GROUNDING ?? '').trim().toLowerCase()),
+  // LAYOUT JUDGE (visual-layout guard, the GROUNDING guard's analogue for viewable HTML
+  // artifacts). UNPROVEN — OFF by default; set env ARGO_LAYOUT to a truthy value
+  // (1/true/yes/on) to enable. When on, a PRE-DONE check renders the run's most
+  // recently edited .html/.htm artifact (if any) in headless chromium, screenshots it,
+  // and asks the local vision model (visionModel below) whether the RENDERED layout
+  // has a clear problem (overflow, overlap, truncation, broken structure), blocking
+  // "done" until fixed. See src/layout.ts.
+  layout:           ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_LAYOUT ?? '').trim().toLowerCase()),
   // HARNESS-OWNED TASK SEQUENCING (Stage 3). ON by default (env ARGO_TASKS=0/false/off forces OFF). When on, the LLM's plan (update_plan) becomes an ordered task
   // ledger the harness recites at the tail of context every step and drives ONE task
   // at a time (per-task verify nudge → advance), and a later update_plan RE-PLANS by

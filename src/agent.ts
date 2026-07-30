@@ -10,6 +10,7 @@ import { SessionLogger, LOGS_DIR } from './logger.js'
 import type { AgentEvent, ToolName, ModelOptions } from './types.js'
 import { runCritic, isTestOrSpecPath, type Critique, type CriticCheckpoint } from './critic.js'
 import { runGroundingCritic, isDocPath, findNumericConflicts } from './grounding.js'
+import { checkLayout, selectLayoutArtifact, type LayoutVerdict } from './layout.js'
 import {
   type CompactionState,
   emptyCompactionState,
@@ -278,6 +279,11 @@ export class Agent {
   // config.grounding (env ARGO_GROUNDING, default ON); the web UI's "Grounding check"
   // toggle overrides it per run via setGrounding().
   private grounding = config.grounding
+  // Per-run toggle for the LAYOUT JUDGE (see runLayoutCheckpoint) — the visual-layout
+  // analogue of the grounding guard, for tasks that produced a viewable HTML
+  // artifact. Defaults to config.layout (env ARGO_LAYOUT, default OFF — unproven);
+  // overridable per instance via setLayout(), mirroring setGrounding.
+  private layout = config.layout
   // Per-run toggles for the harness task ledger (ARGO_TASKS) and AGENTS.md/MEMORY.md
   // instrumentation (ARGO_MEMORY). Default to config (env), overridable per instance
   // via setTasks()/setMemory() — mirrors setGrounding so tests can toggle per Agent.
@@ -446,6 +452,10 @@ export class Agent {
 
   setGrounding(on: boolean) {
     this.grounding = on
+  }
+
+  setLayout(on: boolean) {
+    this.layout = on
   }
 
   setTasks(on: boolean) {
@@ -1007,6 +1017,40 @@ export class Agent {
     return critique
   }
 
+  // LAYOUT JUDGE checkpoint (see layout.ts) — the visual-layout analogue of
+  // runGroundingCheckpoint, above. Only reached when this.layout is on AND
+  // selectLayoutArtifact found an HTML artifact this run (checked by the caller).
+  // Renders the artifact, screenshots it, and asks the local vision model whether
+  // the RENDERED page has a clear layout problem. checkLayout fails OPEN internally
+  // (render error / unreachable model / timeout / unparseable reply all resolve to
+  // {ok:true, issues:[]}), so this method itself never throws and never wedges a run.
+  // On a problem it emits the SAME 'critic' event shape grounding uses (checkpoint
+  // 'layout', gamed_oracle always false) plus a warning, and injects a concrete steer
+  // naming the artifact and the issues; the caller BLOCKS completion (continue).
+  private async runLayoutCheckpoint(
+    artifactPath: string,
+    emitAndLog: (e: AgentEvent) => void,
+  ): Promise<LayoutVerdict> {
+    const verdict = await checkLayout(artifactPath)
+
+    emitAndLog({
+      type: 'critic',
+      checkpoint: 'layout',
+      verdict: verdict.ok ? 'ok' : 'revise',
+      gamed_oracle: false,
+      issues: verdict.issues,
+      guidance: verdict.ok ? '' : 'Fix the rendered layout problems, then finish.',
+    })
+
+    if (!verdict.ok) {
+      const issuesText = verdict.issues.length ? verdict.issues.join('; ') : 'the rendered layout looks broken'
+      const steer = `Before finishing: the rendered layout of ${artifactPath} has problems: ${issuesText}. Fix them, then finish.`
+      emitAndLog({ type: 'warning', message: steer })
+      this.pushCtx({ role: 'tool', content: steer })
+    }
+    return verdict
+  }
+
   async chat(userMessage: string): Promise<string> {
     const logger = new SessionLogger(userMessage, this.model, this.options, this.sessionId)
 
@@ -1051,6 +1095,9 @@ export class Agent {
     let noProgressSteers = 0
     let regrounded = false
     let groundingChecked = false
+    // At most one (render + vision-model) layout check per run, mirroring
+    // groundingChecked — a bounded block, never an infinite one.
+    let layoutChecked = false
     emitAndLog({ type: 'message', role: 'user', content: userMessage })
     emitAndLog({ type: 'start', model: this.model, query: userMessage, options: this.options })
 
@@ -1188,7 +1235,7 @@ export class Agent {
           // Either way, once advanced, emit a 'tasks' advance event, recite the next
           // task, CONTINUE. Only when the ledger is exhausted (allDone) — or when
           // this.tasks is off / there is no ledger — do we fall through to the existing
-          // run-level done-gate below (critic → grounding → re-ground → finish),
+          // run-level done-gate below (critic → grounding → layout → re-ground → finish),
           // UNCHANGED. Read the ledger via a cast (the narrowing gotcha: handleUpdatePlan
           // sets it where TS can't see).
           const tlGate = this.taskList as TaskList | null
@@ -1220,7 +1267,7 @@ export class Agent {
                   continue
                 }
                 // allDone after advancing → do NOT continue; fall through to the
-                // existing run-level done-gate below (critic → grounding → re-ground →
+                // existing run-level done-gate below (critic → grounding → layout → re-ground →
                 // finish).
               } else {
                 // VERIFY FAILED — do not advance. Feed the failure straight back,
@@ -1272,7 +1319,7 @@ export class Agent {
                 continue
               }
               // allDone after advancing → do NOT continue; fall through to the existing
-              // run-level done-gate below (critic → grounding → re-ground → finish).
+              // run-level done-gate below (critic → grounding → layout → re-ground → finish).
             }
           }
           // Re-grounding done-gate: if a plan is active for THIS run, don't take
@@ -1309,6 +1356,20 @@ export class Agent {
             groundingChecked = true
             const g = await this.runGroundingCheckpoint(activePlan.objective, emitAndLog)
             if (g && g.verdict === 'revise') continue
+          }
+          // LAYOUT JUDGE checkpoint (visual-layout guard, config.layout / this.layout —
+          // default OFF, unproven). At most once per run (layoutChecked), mirroring
+          // groundingChecked's cap so this can never block indefinitely. Only runs the
+          // (render + vision-model) check at all when selectLayoutArtifact finds an
+          // HTML artifact this run edited — a no-op for non-HTML tasks or when the flag
+          // is off, so baseline behavior is untouched either way.
+          if (this.layout && !layoutChecked) {
+            const artifact = selectLayoutArtifact(this.editedPaths)
+            if (artifact) {
+              layoutChecked = true
+              const lv = await this.runLayoutCheckpoint(artifact, emitAndLog)
+              if (!lv.ok) continue
+            }
           }
           if (activePlan && !regrounded) {
             regrounded = true
@@ -1429,7 +1490,7 @@ export class Agent {
           // loop already runs: file edits (incl. failed attempts, so intent-to-
           // tamper with a test/spec file is visible), the latest command output,
           // and a short action trace.
-          if (config.critic || this.grounding || this.memory) {
+          if (config.critic || this.grounding || this.memory || this.layout) {
             if (name === 'edit_file' || name === 'write_file') {
               const p = typeof args.path === 'string' ? args.path : ''
               if (p && !this.editedPaths.includes(p)) this.editedPaths.push(p)
