@@ -852,8 +852,6 @@ function addSystemMessage(text) {
   const el = document.createElement('div')
   el.className = 'message system'
   el.textContent = text
-  // Cache system message for session-switch persistence
-  // system messages tracked by SSE event stream
   messagesEl.appendChild(el)
   messagesEl.scrollTop = messagesEl.scrollHeight
 }
@@ -1549,12 +1547,6 @@ $('file-viewer-toggle').addEventListener('click', (ev) => {
 
 $('refresh-files').addEventListener('click', refreshFiles)
 
-
-// ── Session switcher (breadcrumb: session crumb) ─────────────────
-
-function truncateQuery(q, max = 24) {
-  return q.length > max ? q.slice(0, max).trimEnd() + '…' : q
-}
 
 // ── Nav init ─────────────────────────────────────────────────────
 async function initNav() {
