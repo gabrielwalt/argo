@@ -38,6 +38,7 @@ import {
   renderRecallPointer,
   persistToMemory,
 } from './memory.js'
+import { createLoopState, noteMutation, evaluateCall, type LoopState } from './loop.js'
 
 // SYSTEM PROMPT — authoring guidance (for maintainers, not the model):
 // Use this for HIGH-LEVEL steering of *how to work*, awareness of the tools the
@@ -276,6 +277,9 @@ export class Agent {
   // so with both off behavior is byte-identical to the baseline.
   private tasks = config.tasks
   private memory = config.memory
+  // Per-run toggle for the loop-recovery ladder (ARGO_LOOP), mirroring tasks/memory —
+  // gated on THIS field so with it off behavior is byte-identical to the baseline.
+  private loop = config.loopRecovery
   private maxIterations: number = config.maxIterations
   private sessionId = ''
   private aborted = false
@@ -285,6 +289,9 @@ export class Agent {
   // chat() run, never persisted — a legitimately repeated action in a later run
   // must start from a clean slate (see the repetition guard in chat()).
   private recentCalls: string[] = []
+  // Mutation-aware loop-recovery ladder state (ARGO_LOOP). Reset per chat() run like
+  // recentCalls — a legitimately repeated action in a later run starts clean.
+  private loopState: LoopState = createLoopState()
   // Harness-owned plan for the current run (objective + steps + revision). Recited
   // into the tail of context each iteration to fight goal-drift, and surfaced to
   // the UI as a 'plan' event. NEVER written to /workspace (not a committed
@@ -413,6 +420,10 @@ export class Agent {
 
   setMemory(on: boolean) {
     this.memory = on
+  }
+
+  setLoop(on: boolean) {
+    this.loop = on
   }
 
   getMaxIterations(): number {
@@ -672,6 +683,19 @@ export class Agent {
     return `[CURRENT PLAN — keep working toward this objective; do not drift onto a broader or different goal]\nObjective: ${plan.objective}${steps}\nRefine it with update_plan only if the work contradicts an assumption; finish only once the objective is verifiably met.`
   }
 
+  // Re-anchor text for the loop-recovery steer (this.loop): the same objective/plan
+  // recitation the context tail already uses (see the recite block in chatCall) —
+  // task ledger when this.tasks is on and a ledger is active, else the plan objective.
+  private buildLoopRecite(): string {
+    const reciteList = this.taskList as TaskList | null
+    if (this.tasks && reciteList && reciteList.tasks.length > 0) {
+      return renderTaskLedger(reciteList)
+    } else if (this.currentPlan) {
+      return `Objective: ${(this.currentPlan as { objective: string }).objective}`
+    }
+    return ''
+  }
+
   // Builds the task-scoped relevance query for MEMORY.md / AGENTS.md retrieval
   // (this.memory): the current objective + active task title (topical prose) plus the
   // recently edited paths (strong topical hints). Reads currentPlan/taskList via casts
@@ -925,6 +949,7 @@ export class Agent {
     let currentRunStart = this.history.length - 1
     // Loop-steering state, scoped to this run only (see REPEAT_WINDOW above).
     this.recentCalls = []
+    this.loopState = createLoopState()
     this.currentPlan = null
     // HARNESS TASK LEDGER + MEMORY per-run state (only used when this.tasks/this.memory
     // are on; resetting them unconditionally is a harmless local write for the baseline).
@@ -1192,18 +1217,40 @@ export class Agent {
           // executed this run, so REPEAT_THRESHOLD prior occurrences means this
           // identical call has already produced the same result that many times.
           const key = repetitionKey(name, args)
-          const priorRepeats = this.recentCalls.filter(k => k === key).length
-          if (priorRepeats >= REPEAT_THRESHOLD) {
-            // Skip it (re-running only reproduces a result already in context) and
-            // inject an escalating steer in its place — a different observation
-            // plus concrete escape routes — WITHOUT ending the run. The model
-            // keeps working; MAX_ITERATIONS and the stop button are the only hard
-            // bounds.
-            loopSteers++
-            const steer = loopSteerMessage(name, priorRepeats, loopSteers, (this.currentPlan as { objective: string } | null)?.objective ?? '')
-            emitAndLog({ type: 'warning', message: steer })
-            this.history.push({ role: 'tool', content: steer })
-            continue
+          let priorRepeats = 0
+          if (this.loop) {
+            // Mutation-aware ladder (ARGO_LOOP): blocks the 2nd identical call when
+            // nothing changed since it last ran; escalates L0 steer -> L1 compaction
+            // -> L2 forced re-plan. Replaces the count-based REPEAT_THRESHOLD steer.
+            const recite = this.buildLoopRecite()
+            const action = evaluateCall(this.loopState, key, { toolName: name, recite, hasTasks: this.tasks && recite.length > 0 })
+            if (action.kind !== 'allow') {
+              if (action.kind === 'compact') {
+                try {
+                  const r = await this.compactHistory(currentRunStart, 0, emitAndLog)
+                  currentRunStart = r.newRunStart
+                } catch (err) {
+                  emitAndLog({ type: 'warning', message: `Loop-recovery compaction failed (${err instanceof Error ? err.message : String(err)}) — continuing` })
+                }
+              }
+              emitAndLog({ type: 'warning', message: action.message })
+              this.history.push({ role: 'tool', content: action.message })
+              continue
+            }
+          } else {
+            priorRepeats = this.recentCalls.filter(k => k === key).length
+            if (priorRepeats >= REPEAT_THRESHOLD) {
+              // Skip it (re-running only reproduces a result already in context) and
+              // inject an escalating steer in its place — a different observation
+              // plus concrete escape routes — WITHOUT ending the run. The model
+              // keeps working; MAX_ITERATIONS and the stop button are the only hard
+              // bounds.
+              loopSteers++
+              const steer = loopSteerMessage(name, priorRepeats, loopSteers, (this.currentPlan as { objective: string } | null)?.objective ?? '')
+              emitAndLog({ type: 'warning', message: steer })
+              this.history.push({ role: 'tool', content: steer })
+              continue
+            }
           }
 
           emitAndLog({ type: 'tool_call', tool: name, args })
@@ -1271,6 +1318,7 @@ export class Agent {
           // or a conclusion, so the model redirects instead of drifting.
           const noProgPlan = this.currentPlan as { objective: string } | null
           if (isProjectMutation(name, args) && !result.error) {
+            if (this.loop) noteMutation(this.loopState)
             callsSinceMutation = 0
             noProgressSteers = 0
           } else {

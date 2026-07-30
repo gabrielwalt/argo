@@ -82,4 +82,10 @@ export const config = {
   // required), and durable ledger items (verified facts + decisions) persist to the
   // workspace MEMORY.md at compaction so they survive across runs. See src/memory.ts.
   memory:           ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_MEMORY ?? '').trim().toLowerCase()),
+  // LOOP-RECOVERY LADDER (docs/harness-planning-memory.md "Loop detection & recovery
+  // ladder"). OFF by default (byte-identical baseline). When on, a mutation-aware
+  // repeat detector REPLACES the count-based REPEAT_THRESHOLD steer: it blocks the 2nd
+  // identical tool call when nothing changed since it last ran, and escalates
+  // L0 steer -> L1 compaction -> L2 stop-and-reframe (forced re-plan). See src/loop.ts.
+  loopRecovery:     ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_LOOP ?? '').trim().toLowerCase()),
 }
