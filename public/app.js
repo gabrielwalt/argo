@@ -799,22 +799,51 @@ function setSailing(on) {
   pickRockMotions().forEach((motion, i) => layers[i].classList.add('a-' + motion))
 }
 
+// On run start the idle boat first SAILS OUT to the right (a one-shot depart), and only
+// once it has left do the running animations begin (a-sail re-enters from the left). This
+// replaces the old abrupt jump (a-sail starts at translateX(-130%), so the resting boat
+// appeared to vanish off-left). departTimer bridges the depart → loop; it's cancelled if
+// the run ends (stop) mid-depart so the loop never starts after the fact.
+let departTimer = null
+
+function startSailing() {
+  const m1 = sendBoat.querySelector('.m1')
+  if (!m1) { setSailing(true); return }
+  if (departTimer) { clearTimeout(departTimer); departTimer = null }
+  m1.classList.remove('a-sail', 'departing')
+  // Reduced motion: skip the depart, just run.
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) { setSailing(true); return }
+  // 1) sail the resting boat out to the right, 2) once gone, start the running loop.
+  void m1.offsetWidth  // restart the animation cleanly on a re-submit
+  m1.classList.add('departing')
+  departTimer = setTimeout(() => {
+    departTimer = null
+    m1.classList.remove('departing')
+    setSailing(true)
+  }, 470)
+}
+
+function stopSailing() {
+  if (departTimer) { clearTimeout(departTimer); departTimer = null }
+  const m1 = sendBoat.querySelector('.m1')
+  if (m1) m1.classList.remove('departing')
+  setSailing(false)
+}
+
 function setBusy(val) {
   busy = val
   // Leave the textarea enabled while the agent runs so the user can queue prompts.
   inputEl.placeholder = val ? 'Queue a prompt… (Enter to queue)' : originalPlaceholder
 
   if (val) {
-    // The boat stays visible and sails while the agent runs: setSailing randomly composes
-    // 1-3 rock motions (roll/yaw/pitch variants) across the nested layers so their
-    // transforms cumulate. Hovering the button swaps the boat for the stop square (hover
-    // handlers).
+    // The boat departs right, then sails while the agent runs (setSailing composes 1-3 rock
+    // motions across the nested layers). Hovering the button swaps the boat for the stop square.
     sendBoat.classList.remove('hidden')
     sendStop.classList.add('hidden')
-    setSailing(true)
+    startSailing()
     sendBtn.title = 'Stop'
   } else {
-    setSailing(false)
+    stopSailing()
     sendBoat.classList.remove('hidden')
     sendStop.classList.add('hidden')
     sendBtn.title = 'Send'

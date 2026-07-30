@@ -1711,6 +1711,9 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .m1, .m2, .m3, .m4 { display: inline-flex; align-items: center; justify-content: center; transform-style: preserve-3d; transform-origin: 50% 88%; }
 .boat-glyph { display: inline-block; filter: brightness(0); line-height: 1; transform: scaleX(-1); }
 @keyframes sailthrough { from{transform:translateX(-130%)} to{transform:translateX(130%)} }
+/* Run-start depart: the resting boat sails out to the right before the loop begins. */
+@keyframes boat-depart { from{transform:translateX(0);opacity:1} to{transform:translateX(130%);opacity:0} }
+.m1.departing { animation: boat-depart .45s ease-in forwards; }
 @keyframes roll { 0%{transform:rotateX(-38deg)} 50%{transform:rotateX(38deg)} 100%{transform:rotateX(-38deg)} }
 @keyframes yaw  { 0%{transform:rotateY(-33deg)} 50%{transform:rotateY(33deg)} 100%{transform:rotateY(-33deg)} }
 /* Three gentle, differently-shaped wave variants (uneven keyframe stops, not a plain
