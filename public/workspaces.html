@@ -82,24 +82,28 @@
     .ws-path { font-size: 11px; color: var(--muted); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
     .ws-actions { display: flex; gap: 8px; flex-shrink: 0; }
-    a.ws-open {
-      background: var(--accent); color: #fff; border-radius: 6px;
+    /* Main action (filled blue, with a hover shimmer sweep) — shared look for
+       every card's primary button: Open/Start here, Attach on the recent card. */
+    a.ws-open, button.recent-attach {
+      background: var(--accent); color: #fff; border: none; border-radius: 6px;
       padding: 6px 14px; font-size: 12px; font-weight: 500;
-      text-decoration: none; transition: opacity .15s;
+      text-decoration: none; cursor: pointer; transition: opacity .15s;
       position: relative; overflow: hidden;
     }
-    a.ws-open::after {
+    a.ws-open::after, button.recent-attach::after {
       content: '';
       position: absolute; inset: 0;
       background: linear-gradient(105deg, transparent 40%, rgba(255,255,255,.13) 50%, transparent 60%);
       transform: translateX(-150%);
       transition: transform .5s ease;
     }
-    a.ws-open:hover::after { transform: translateX(150%); }
-    a.ws-open.stopped { background: var(--surface); color: var(--muted); border: 1px solid var(--border); cursor: pointer; }
-    a.ws-open.stopped:hover { border-color: rgba(201,162,39,.45); color: var(--gold); }
+    a.ws-open:hover::after, button.recent-attach:hover::after { transform: translateX(150%); }
+    /* Stopped is still the card's main action (start the workspace) — same blue
+       fill as running, not a muted/outlined treatment. */
+    a.ws-open.stopped { cursor: pointer; }
 
-    button.ws-detach {
+    /* Secondary action (outlined, transparent) — shared look for Detach/Forget. */
+    button.ws-detach, button.recent-forget {
       background: none; border: 1px solid var(--border); color: var(--muted);
       border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer;
       transition: color .15s, border-color .15s;
@@ -135,7 +139,16 @@
       background: var(--gold); color: var(--bg); border: none; border-radius: 6px;
       padding: 10px 20px; font-size: 13px; font-weight: 600; cursor: pointer;
       white-space: nowrap; transition: filter .15s;
+      position: relative; overflow: hidden;
     }
+    .attach-row button::after {
+      content: '';
+      position: absolute; inset: 0;
+      background: linear-gradient(105deg, transparent 40%, rgba(255,255,255,.13) 50%, transparent 60%);
+      transform: translateX(-150%);
+      transition: transform .5s ease;
+    }
+    .attach-row button:hover:not(:disabled)::after { transform: translateX(150%); }
     .attach-row button:hover:not(:disabled) { filter: brightness(1.15); }
     .attach-row button:disabled { opacity: .4; cursor: not-allowed; }
 
@@ -158,18 +171,10 @@
     .recent-name { font-size: 13px; font-weight: 500; color: var(--text); margin-bottom: 2px; }
     .recent-path { font-size: 11px; color: var(--muted); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .7; }
     .recent-actions { display: flex; gap: 8px; flex-shrink: 0; }
-    button.recent-attach {
-      background: none; border: 1px solid var(--border); color: var(--text);
-      border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer;
-      transition: border-color .15s, color .15s;
-    }
-    button.recent-attach:hover { border-color: rgba(201,162,39,.45); color: var(--gold); }
-    button.recent-forget {
-      background: none; border: 1px solid transparent; color: var(--muted);
-      border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer;
-      transition: color .15s, border-color .15s;
-    }
-    button.recent-forget:hover { color: var(--red); border-color: rgba(239,68,68,.3); }
+    /* button.recent-attach: main-action blue fill + shimmer, styled with
+       a.ws-open above. button.recent-forget: secondary outlined, styled with
+       button.ws-detach above — just needs its own red hover. */
+    button.recent-forget:hover { color: var(--red); border-color: var(--red); }
 
     .error-msg { color: var(--red); font-size: 12px; margin-top: 8px; display: none; }
     .spinner { color: var(--muted); font-size: 13px; padding: 20px 0; }
