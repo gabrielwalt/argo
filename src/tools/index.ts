@@ -3,6 +3,7 @@ import { webSearch } from './web-search.js'
 import { readFile, writeFile, editFile } from './file-ops.js'
 import { fetchUrl } from './fetch-url.js'
 import { browserFetch } from './browser-fetch.js'
+import { viewImage } from './view-image.js'
 import type { ToolName, ToolResult } from '../types.js'
 
 export const toolDefinitions = [
@@ -115,6 +116,21 @@ export const toolDefinitions = [
   {
     type: 'function' as const,
     function: {
+      name: 'view_image',
+      description: 'View an image file (screenshot, diagram, or rendered UI) and ask a question about it, answered by a local vision model. Use it to read screenshots/diagrams or to judge a rendered UI\'s layout (alignment, overflow, overlap, truncation).',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Path to an image file (png/jpg/jpeg/webp/gif) in the workspace, e.g. /workspace/screenshot.png' },
+          prompt: { type: 'string', description: 'The question to ask about the image. Defaults to a general description + UI-layout check if omitted.' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
       name: 'update_plan',
       description: 'Record or refine your plan for a non-trivial task. Call it AFTER reading the relevant files, so the plan is grounded in this project, with ONE concrete, verifiable objective (a definition of done) plus the ordered steps to reach it. Recording a plan does NOT end your turn — keep working after calling it. Call it again to refine the plan when the work contradicts an assumption. The plan is shown to the user and kept in front of you as you work. Skip it entirely for simple questions or one-line changes.',
       parameters: {
@@ -130,7 +146,9 @@ export const toolDefinitions = [
 ]
 
 export async function executeTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
-  switch (name as ToolName) {
+  // 'view_image' isn't (yet) part of the ToolName union in types.ts — widen the
+  // switch discriminant locally rather than touch that file for this addition.
+  switch (name as ToolName | 'view_image') {
     case 'bash':
       return bash(args.command as string, args.cwd as string | undefined, args.timeout_ms as number | undefined)
     case 'web_search':
@@ -145,6 +163,8 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
       return fetchUrl(args.url as string)
     case 'browser_fetch':
       return browserFetch(args.url as string, args.wait_for as string | undefined)
+    case 'view_image':
+      return viewImage(args.path as string, args.prompt as string | undefined)
     case 'update_plan':
       // Handled in the agent loop (needs agent state); never dispatched here.
       return { output: '', error: 'update_plan is handled by the agent loop' }

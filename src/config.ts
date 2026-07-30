@@ -93,4 +93,7 @@ export const config = {
   // flags above) so uncommitted changes stay visible in the Changes view until the user
   // (or an explicit toggle) decides to commit them. See Agent.autoCommit() in agent.ts.
   autoCommit:       ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_AUTOCOMMIT ?? '').trim().toLowerCase()),
+  // Local vision model used by the view_image tool to read/judge images (screenshots,
+  // diagrams, rendered layouts). See src/tools/view-image.ts.
+  visionModel:      process.env.ARGO_VISION_MODEL ?? 'qwen2.5vl:7b',
 }
