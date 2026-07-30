@@ -641,6 +641,17 @@ export class Agent {
         messages.push({ role: 'tool', content: `RELEVANT MEMORY (from MEMORY.md, for the current work):\n${mem.text}` })
       }
     }
+    // Task-scoped AGENTS.md (this.memory): when the file is large it is NOT in the system
+    // prompt (see buildProjectMemoryContext) — inject only the sections relevant to the
+    // CURRENT task at the tail, re-selected each step via retrievalQuery(), so project
+    // instructions track the active task the same way MEMORY.md does. A small (whole)
+    // AGENTS.md is already fully in the system prompt, so skip it here to avoid duplication.
+    if (this.memory && this.agentsRaw) {
+      const asel = selectAgentsSections(this.agentsRaw, this.retrievalQuery())
+      if (asel.mode === 'selected' && asel.text) {
+        messages.push({ role: 'tool', content: `RELEVANT PROJECT INSTRUCTIONS (from AGENTS.md, for the current task):\n${asel.text}` })
+      }
+    }
     return withTimeout(this.ollama.chat({
       model: this.model,
       messages,
@@ -709,14 +720,17 @@ export class Agent {
   }
 
   // ARGO_MEMORY (this.memory): builds the system-prompt project-context block via the
-  // memory module instead of loadProjectContext. AGENTS.md is section-selected (whole
-  // when small, top-N relevant sections for the user's request when large) and a recall
-  // pointer OFFERS the full files on disk. MEMORY.md is deliberately NOT whole-injected
-  // here — it is retrieved task-scoped at the tail each step (see chatCall) — but its
-  // raw text is cached for that retrieval. Both files are read ONCE per run (via the
-  // same readProjectContextFile + PROJECT_CONTEXT_CHAR_CAP as loadProjectContext), using
-  // the '/workspace' root convention. When this.memory is off, chat() calls
-  // loadProjectContext() unchanged, so the baseline system prompt is byte-identical.
+  // memory module instead of loadProjectContext. AGENTS.md is injected WHOLE into the
+  // system prompt only when it is small; when it is large it is section-selected PER
+  // TASK at the tail instead (see chatCall) — matching MEMORY.md — so instructions are
+  // reconsidered for each task rather than frozen at the initial request. A recall
+  // pointer OFFERS the full files on disk either way. MEMORY.md is deliberately NOT
+  // whole-injected here — it is retrieved task-scoped at the tail each step (see
+  // chatCall) — but its raw text is cached for that retrieval. Both files are read ONCE
+  // per run (via the same readProjectContextFile + PROJECT_CONTEXT_CHAR_CAP as
+  // loadProjectContext), using the '/workspace' root convention. When this.memory is
+  // off, chat() calls loadProjectContext() unchanged, so the baseline system prompt is
+  // byte-identical.
   private async buildProjectMemoryContext(userMessage: string): Promise<string> {
     const [agentsMd, memoryMd] = await Promise.all([
       readProjectContextFile(path.join('/workspace', 'AGENTS.md')),
@@ -724,15 +738,11 @@ export class Agent {
     ])
     this.agentsRaw = agentsMd ?? ''
     this.memoryRaw = memoryMd ?? ''
-    // Label the AGENTS.md block like loadProjectContext does, so the model treats it as
-    // authoritative project instructions (not incidental context). When section-selected
-    // (large file), say so — the recall pointer then tells the model it can read the full
-    // file for anything not shown.
+    // Only whole-file AGENTS.md goes into the system prompt. When it's large (selected),
+    // inject nothing here — the per-task tail injection in chatCall handles it, and the
+    // recall pointer below already tells the model the full file is on disk.
     const sel = selectAgentsSections(this.agentsRaw, { text: userMessage })
-    const label = sel.mode === 'selected'
-      ? '--- /workspace/AGENTS.md (project instructions — most relevant sections; full file on disk) ---'
-      : '--- /workspace/AGENTS.md (project instructions) ---'
-    const agentsBlock = sel.text ? `${label}\n${sel.text}` : ''
+    const agentsBlock = (sel.mode === 'whole' && sel.text) ? '--- /workspace/AGENTS.md (project instructions) ---\n' + sel.text : ''
     const pointer = renderRecallPointer({ agentsPresent: !!this.agentsRaw, memoryPresent: !!this.memoryRaw })
     return [agentsBlock, pointer].filter(Boolean).join('\n\n')
   }

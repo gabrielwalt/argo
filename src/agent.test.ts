@@ -569,3 +569,39 @@ test('tasks OFF (baseline): no tasks events, and a plan + immediate done still f
     await cleanupSession(sessionId, 'argo-tasks-baseline-case')
   }
 })
+
+// ── HARNESS MEMORY (ARGO_MEMORY / agent.setMemory). buildProjectMemoryContext reads
+// AGENTS.md/MEMORY.md from the hardcoded '/workspace' root (unlike loadProjectContext,
+// it takes no override parameter), and none of the existing scripted-Ollama tests stub
+// or write into that path. Writing real fixture files into a live '/workspace' during a
+// test run would be brittle (it isn't test-scoped, could collide with other runs, and
+// could mutate whatever real project instructions live there) and is deliberately NOT
+// done here. So only the OFF-baseline regression net below is added — the key guarantee
+// that the new memory hooks in chatCall/buildProjectMemoryContext are strictly gated on
+// this.memory and are complete no-ops when it is off (default). An ON-path test
+// (asserting the recall pointer + task-scoped 'RELEVANT PROJECT INSTRUCTIONS'/'RELEVANT
+// MEMORY' tail messages) was not implemented for the reason above — see summary.
+test('memory OFF (baseline): no RELEVANT MEMORY / RELEVANT PROJECT INSTRUCTIONS messages, and the run behaves as before', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-memory-baseline-${Date.now()}`
+  const { ollama, messagesSeen } = recordingScriptedOllama([
+    planReply('Baseline memory objective', ['Only step']),
+    finalAnswer,
+  ])
+  const agent = new Agent(e => events.push(e), 'test-model', ollama)
+  agent.setSessionId(sessionId)
+  agent.setMemory(false)
+  try {
+    const answer = await agent.chat('argo memory baseline case')
+
+    const sawMemoryTail = messagesSeen().some(msgs =>
+      msgs.some(m => m.role === 'tool' && (/RELEVANT MEMORY/.test(m.content) || /RELEVANT PROJECT INSTRUCTIONS/.test(m.content))),
+    )
+    assert.equal(sawMemoryTail, false)                      // memory hooks never fired
+    assert.equal(events.some(e => e.type === 'plan'), true) // the single plan still recorded
+    assert.equal(answer, 'Final answer.')                   // finished via the baseline path
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-memory-baseline-case')
+  }
+})
