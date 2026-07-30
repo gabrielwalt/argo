@@ -15,7 +15,21 @@ export interface Task {
   id: number
   title: string
   status: TaskStatus
+  // Optional shell command (run from the workspace root) that exits 0 EXACTLY when
+  // this task is genuinely complete — e.g. a test command, a build, or a grep. When
+  // present, the harness's per-task gate (agent.ts) RUNS it instead of taking the
+  // model's self-report at face value; only a clean exit advances the ledger, and a
+  // non-zero exit blocks with the failure fed back. Absent (undefined) → the existing
+  // self-check nudge path is used unchanged. This module never executes it (pure, no
+  // shell) — it only carries the string through create/reconcile.
+  verify?: string
 }
+
+// A plan step as the LLM's update_plan tool call supplies it: either bare title text
+// (the original shape — still fully supported, unverified) or an object naming the
+// task plus an optional programmatic verify command. createTaskList/reconcile accept
+// either, freely mixed within one steps array.
+export type StepInput = string | { task: string; verify?: string }
 
 export interface TaskList {
   objective: string
@@ -24,6 +38,19 @@ export interface TaskList {
   // Bumps ONLY when the plan changes (reconcile), not on progress — so telemetry
   // can distinguish "the model re-planned" from "the model finished a task".
   revision: number
+}
+
+// Normalises one raw step (string or {task, verify}) to a plain {title, verify}
+// shape, trimming both. A bare string step carries no verify (undefined) — the
+// exact pre-existing behavior. Defensive against malformed input (this ultimately
+// comes from model-authored tool-call JSON): anything that isn't a string or an
+// object with a string `task` normalises to a blank title, which the blank-step
+// filter in createTaskList/reconcile then drops.
+function normalizeStep(step: StepInput): { title: string; verify?: string } {
+  if (typeof step === 'string') return { title: step.trim() }
+  const title = typeof step.task === 'string' ? step.task.trim() : ''
+  const verify = typeof step.verify === 'string' ? step.verify.trim() : undefined
+  return { title, verify: verify || undefined }
 }
 
 // ── Title normalisation ───────────────────────────────────────────
@@ -52,21 +79,22 @@ export function normalizeTitle(s: string): string {
 // ledger never reach allDone. The displayed title keeps the author's ORIGINAL wording
 // (only the dedup KEY is normalised). ids are 1-based by order; the first task is
 // 'active', the rest 'pending'. Empty/all-blank steps → empty tasks (revision 1).
-export function createTaskList(objective: string, steps: string[]): TaskList {
+export function createTaskList(objective: string, steps: StepInput[]): TaskList {
   const seen = new Set<string>()
-  const titles: string[] = []
+  const kept: { title: string; verify?: string }[] = []
   for (const step of steps) {
-    const title = step.trim()
+    const { title, verify } = normalizeStep(step)
     if (!title) continue
     const key = normalizeTitle(title)
     if (!key || seen.has(key)) continue
     seen.add(key)
-    titles.push(title)
+    kept.push({ title, verify })
   }
-  const tasks: Task[] = titles.map((title, i) => ({
+  const tasks: Task[] = kept.map((k, i) => ({
     id: i + 1,
-    title,
+    title: k.title,
     status: i === 0 ? 'active' : 'pending',
+    ...(k.verify ? { verify: k.verify } : {}),
   }))
   return { objective: objective.trim(), tasks, revision: 1 }
 }
@@ -131,28 +159,38 @@ export function completeActiveTask(list: TaskList): TaskList {
 // becomes 'active'. ids are fresh 1-based by the NEW order; revision increments (a
 // plan change); objective updates. Input is never mutated. newSteps is deduped/blank-
 // stripped exactly like createTaskList so the two constructors agree.
-export function reconcile(list: TaskList, newObjective: string, newSteps: string[]): TaskList {
-  // Titles that were completed in the prior plan, keyed by normalized title.
+export function reconcile(list: TaskList, newObjective: string, newSteps: StepInput[]): TaskList {
+  // Titles that were completed in the prior plan, keyed by normalized title — plus
+  // every prior task's verify command, keyed the same way, so a re-plan that repeats
+  // a step without repeating its verify still keeps the check it had.
   const doneKeys = new Set<string>()
+  const priorVerifyByKey = new Map<string, string | undefined>()
   for (const t of list.tasks) {
-    if (t.status === 'done') doneKeys.add(normalizeTitle(t.title))
+    const key = normalizeTitle(t.title)
+    if (t.status === 'done') doneKeys.add(key)
+    priorVerifyByKey.set(key, t.verify)
   }
 
   const seen = new Set<string>()
-  const kept: { title: string; done: boolean }[] = []
+  const kept: { title: string; done: boolean; verify?: string }[] = []
   for (const step of newSteps) {
-    const title = step.trim()
+    const { title, verify } = normalizeStep(step)
     if (!title) continue
     const key = normalizeTitle(title)
     if (!key || seen.has(key)) continue
     seen.add(key)
-    kept.push({ title, done: doneKeys.has(key) })
+    // Prefer the freshly-supplied verify; fall back to the one this step already
+    // carried in the prior plan (a re-plan that just reorders/rewords steps
+    // shouldn't silently lose an existing programmatic check).
+    const carriedVerify = verify ?? priorVerifyByKey.get(key)
+    kept.push({ title, done: doneKeys.has(key), verify: carriedVerify })
   }
 
   const tasks: Task[] = kept.map((k, i) => ({
     id: i + 1,
     title: k.title,
     status: k.done ? 'done' : 'pending',
+    ...(k.verify ? { verify: k.verify } : {}),
   }))
   // Promote the first non-done task to 'active' (if any remain).
   const next = tasks.find(t => t.status === 'pending')
@@ -183,7 +221,10 @@ export function renderTaskLedger(list: TaskList): string {
   const lines = list.tasks.map(t => {
     const box = STATUS_BOX[t.status]
     const label = current && t.id === current.id ? `CURRENT: ${t.title}` : t.title
-    return `${box} ${t.id}. ${label}`
+    // Hint that this step is machine-checked, not just self-reported — helps the
+    // model understand why it might get blocked with a command failure instead of
+    // a plain "are you sure?" nudge.
+    return `${box} ${t.id}. ${label}${t.verify ? ' (auto-verified)' : ''}`
   })
   const footer = 'Finish the current task and verify it before moving on.'
   return `${header}\nObjective: ${list.objective}\n${lines.join('\n')}\n${footer}`

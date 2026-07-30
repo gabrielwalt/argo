@@ -57,6 +57,55 @@ test('createTaskList: empty steps → empty tasks, still revision 1', () => {
   assert.equal(list.revision, 1)
 })
 
+// ── createTaskList: executable per-task verification (verify) ─────
+
+test('createTaskList: a plain string step has no verify', () => {
+  const list = createTaskList('obj', ['a'])
+  assert.equal(list.tasks[0].verify, undefined)
+})
+
+test('createTaskList: an object step {task, verify} populates title + verify', () => {
+  const list = createTaskList('obj', [{ task: 'run the tests', verify: 'npm test' }])
+  assert.equal(list.tasks[0].title, 'run the tests')
+  assert.equal(list.tasks[0].verify, 'npm test')
+  assert.equal(list.tasks[0].status, 'active')
+})
+
+test('createTaskList: an object step with no verify behaves like a plain string', () => {
+  const list = createTaskList('obj', [{ task: 'plain object step' }])
+  assert.equal(list.tasks[0].title, 'plain object step')
+  assert.equal(list.tasks[0].verify, undefined)
+})
+
+test('createTaskList: mixed string and object steps both work, in order', () => {
+  const list = createTaskList('obj', [
+    'first, plain',
+    { task: 'second, verified', verify: 'echo ok' },
+    'third, plain',
+  ])
+  assert.deepEqual(list.tasks.map(t => [t.title, t.verify]), [
+    ['first, plain', undefined],
+    ['second, verified', 'echo ok'],
+    ['third, plain', undefined],
+  ])
+})
+
+test('createTaskList: dedupe-by-normalized-title still applies to object steps', () => {
+  const list = createTaskList('obj', [
+    { task: 'Add auth', verify: 'npm test -- auth' },
+    { task: '1. add   AUTH', verify: 'echo other' },
+    'Wire UI',
+  ])
+  assert.deepEqual(list.tasks.map(t => t.title), ['Add auth', 'Wire UI'])
+  // First occurrence wins — including its verify command.
+  assert.equal(list.tasks[0].verify, 'npm test -- auth')
+})
+
+test('createTaskList: blank/whitespace-only verify is treated as absent', () => {
+  const list = createTaskList('obj', [{ task: 'a', verify: '   ' }])
+  assert.equal(list.tasks[0].verify, undefined)
+})
+
 // ── activeTask ────────────────────────────────────────────────────
 
 test('activeTask: returns the active task', () => {
@@ -200,6 +249,41 @@ test('reconcile: when every new step was already done, none is active', () => {
   assert.equal(allDone(next), true)
 })
 
+// ── reconcile: executable per-task verification (verify) ──────────
+
+test('reconcile: carries verify forward when the re-plan step omits it', () => {
+  const list = createTaskList('obj', [{ task: 'Add auth', verify: 'npm test -- auth' }, 'Wire UI'])
+  // Re-plan repeats "Add auth" as a bare string (no verify given this time).
+  const next = reconcile(list, 'obj v2', ['Add auth', 'Wire UI', 'Deploy'])
+  const auth = next.tasks.find(t => normalizeTitle(t.title) === 'add auth')
+  assert.equal(auth?.verify, 'npm test -- auth')
+})
+
+test('reconcile: a freshly-supplied verify overrides the previously carried one', () => {
+  const list = createTaskList('obj', [{ task: 'Add auth', verify: 'npm test -- auth' }])
+  const next = reconcile(list, 'obj v2', [{ task: 'Add auth', verify: 'npm run e2e:auth' }])
+  const auth = next.tasks.find(t => normalizeTitle(t.title) === 'add auth')
+  assert.equal(auth?.verify, 'npm run e2e:auth')
+})
+
+test('reconcile: a step that never had a verify still has none after re-plan', () => {
+  const list = createTaskList('obj', ['Wire UI'])
+  const next = reconcile(list, 'obj', ['Wire UI', 'Deploy'])
+  const wireUi = next.tasks.find(t => normalizeTitle(t.title) === 'wire ui')
+  assert.equal(wireUi?.verify, undefined)
+})
+
+test('reconcile: mixed string/object newSteps work together, done-state still preserved', () => {
+  let list = createTaskList('obj', ['Add auth', { task: 'Wire UI', verify: 'npm run build' }])
+  list = completeActiveTask(list) // "Add auth" done, "Wire UI" active
+  const next = reconcile(list, 'obj', ['Add auth', { task: 'Wire UI', verify: 'npm run build' }, 'Deploy'])
+  const auth = next.tasks.find(t => normalizeTitle(t.title) === 'add auth')
+  const wireUi = next.tasks.find(t => normalizeTitle(t.title) === 'wire ui')
+  assert.equal(auth?.status, 'done')
+  assert.equal(wireUi?.verify, 'npm run build')
+  assert.deepEqual(next.tasks.map(t => t.title), ['Add auth', 'Wire UI', 'Deploy'])
+})
+
 // ── renderTaskLedger ──────────────────────────────────────────────
 
 test('renderTaskLedger: shows [x]/[→]/[ ], marks CURRENT, numbers tasks', () => {
@@ -215,6 +299,14 @@ test('renderTaskLedger: shows [x]/[→]/[ ], marks CURRENT, numbers tasks', () =
 
 test('renderTaskLedger: empty list → empty string', () => {
   assert.equal(renderTaskLedger(createTaskList('obj', [])), '')
+})
+
+test('renderTaskLedger: hints "(auto-verified)" only for steps with a verify command', () => {
+  const list = createTaskList('obj', [{ task: 'checked step', verify: 'npm test' }, 'manual step'])
+  const out = renderTaskLedger(list)
+  assert.ok(out.includes('CURRENT: checked step (auto-verified)'))
+  assert.ok(out.includes('[ ] 2. manual step'))
+  assert.ok(!out.includes('manual step (auto-verified)'))
 })
 
 // ── progress ──────────────────────────────────────────────────────

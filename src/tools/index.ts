@@ -132,12 +132,28 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'update_plan',
-      description: 'Record or refine your plan for a non-trivial task. Call it AFTER reading the relevant files, so the plan is grounded in this project, with ONE concrete, verifiable objective (a definition of done) plus the ordered steps to reach it. Recording a plan does NOT end your turn — keep working after calling it. Call it again to refine the plan when the work contradicts an assumption. The plan is shown to the user and kept in front of you as you work. Skip it entirely for simple questions or one-line changes.',
+      description: 'Record or refine your plan for a non-trivial task. Call it AFTER reading the relevant files, so the plan is grounded in this project, with ONE concrete, verifiable objective (a definition of done) plus the ordered steps to reach it. Recording a plan does NOT end your turn — keep working after calling it. Call it again to refine the plan when the work contradicts an assumption. The plan is shown to the user and kept in front of you as you work. Skip it entirely for simple questions or one-line changes.\n\nEach step may be given either as plain text, or as an object {"task": "...", "verify": "..."} when it can be checked PROGRAMMATICALLY. `verify` is a shell command, run from the workspace root, that must exit 0 EXACTLY when that step is truly complete — e.g. a test command, a build, or a grep for the change you made. The harness RUNS this command itself before letting you move to the next step; it does not just take your word for it. Provide a verify for every step where a real check is possible — it is far more reliable than a manual claim. Steps left as plain text (or with no verify) fall back to a self-check where you state how you confirmed the step is done.',
       parameters: {
         type: 'object',
         properties: {
           objective: { type: 'string', description: 'One concrete, verifiable success criterion — specific enough to tell unambiguously when the task is done.' },
-          steps: { type: 'array', items: { type: 'string' }, description: 'Ordered steps to reach the objective. Rewrite the whole list when refining.' },
+          steps: {
+            type: 'array',
+            items: {
+              oneOf: [
+                { type: 'string' },
+                {
+                  type: 'object',
+                  properties: {
+                    task: { type: 'string', description: 'The step text.' },
+                    verify: { type: 'string', description: 'Shell command (run from the workspace root) that exits 0 exactly when this step is genuinely done — e.g. a test command, a build, or a grep. Omit if there is no real programmatic check.' },
+                  },
+                  required: ['task'],
+                },
+              ],
+            },
+            description: 'Ordered steps to reach the objective. Rewrite the whole list when refining. Give each step as a plain string, or as {"task", "verify"} to attach a shell command the harness will run to confirm the step before advancing.',
+          },
         },
         required: ['objective'],
       },
