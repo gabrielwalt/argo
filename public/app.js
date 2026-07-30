@@ -1655,24 +1655,16 @@ async function refreshFiles() {
   }
 }
 
-// Debounced live refresh of the workspace panels while the agent works: rebuilds the file
-// tree (preserving state) and re-renders the currently-viewed file, so newly created files
-// appear and a touched-and-viewed file updates in place. Debounced so a burst of edits
-// triggers one refresh.
+// Debounced live refresh of the workspace panels while the agent works: rebuilds the
+// left pane's list (tree in Files mode, changes list in Changes mode) and re-renders
+// whatever's currently shown on the right (an open file/preview, or a diff), so newly
+// created files appear and a touched-and-viewed file/diff updates in place. Debounced
+// so a burst of edits triggers one refresh. Shares refreshWorkspacePane() with the
+// header's manual "Refresh" button so both refresh the same things the same way.
 let wsRefreshTimer = null
 function scheduleWorkspaceRefresh() {
   clearTimeout(wsRefreshTimer)
-  wsRefreshTimer = setTimeout(() => {
-    if (filesMode === 'files') {
-      refreshFiles()
-      if (currentViewerPath) {
-        const kind = window.ArgoPreview ? ArgoPreview.previewKindFor(currentViewerPath) : null
-        renderViewer(currentViewerPath, kind)
-      }
-    } else {
-      refreshChanges()
-    }
-  }, 700)
+  wsRefreshTimer = setTimeout(refreshWorkspacePane, 700)
 }
 
 // ── Files / Changes toggle ────────────────────────────────────────
@@ -2125,27 +2117,14 @@ async function selectFileInTree(filePath) {
   return target.rowEl
 }
 
-// Shortens a long path in the MIDDLE (keeps the start + the filename) instead of at
-// one end — e.g. "/src/very/long/nested/path/file.ts" -> "/src/very/…/file.ts" — since
-// the toolbar slot is narrow and a plain end-ellipsis would hide the filename, the most
-// identifying part of the path, on anything long.
-function middleEllipsizePath(path, maxLen = 46) {
-  if (!path || path.length <= maxLen) return path
-  const slash = path.lastIndexOf('/')
-  const filename = slash === -1 ? path : path.slice(slash + 1)
-  const keep = Math.max(1, maxLen - filename.length - 5)   // room for "/…/ "
-  const head = path.slice(0, keep)
-  return `${head}/…/${filename}`
-}
-
-// Sets #file-viewer-path's text (middle-ellipsized) for whatever is currently shown —
-// an open file (Files mode) or a diff (Changes mode). Full path is always available via
-// the title tooltip.
+// Sets #file-viewer-path's text — just the file's BASENAME (last path segment) —
+// for whatever is currently shown — an open file (Files mode) or a diff (Changes
+// mode). The full path is always available via the title tooltip.
 function setViewerPathText(relPath) {
   const pathEl = $('file-viewer-path')
   if (!relPath) { pathEl.textContent = ''; pathEl.removeAttribute('title'); return }
   const full = `/${relPath}`
-  pathEl.textContent = middleEllipsizePath(full)
+  pathEl.textContent = full.slice(full.lastIndexOf('/') + 1)
   pathEl.title = full
 }
 
@@ -2164,8 +2143,6 @@ function closeViewer() {
   contentEl.textContent = 'Select a file to view'
   contentEl.classList.add('file-viewer-empty')
 }
-$('file-viewer-close').addEventListener('click', closeViewer)
-
 // Preview/source toggle — switch mode for the current file's kind and re-render.
 $('file-viewer-toggle').addEventListener('click', (ev) => {
   const btn = ev.target.closest('.vt-btn')

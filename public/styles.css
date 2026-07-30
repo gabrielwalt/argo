@@ -1196,20 +1196,26 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   flex-direction: column;
   overflow: hidden;
   min-width: 100px;
+  max-width: 100%;
   background: var(--bg);
   border-left: 1px solid var(--border);
 }
 
-/* Current file/diff path — lives in the header toolbar now (#toolbar-files).
-   Text is already MIDDLE-ellipsized in JS (setViewerPathText/middleEllipsizePath)
-   so the filename stays visible on a long path; text-overflow here is just a
-   safety fallback. */
+/* Current file/diff name — lives in the header toolbar now (#toolbar-files).
+   Shows only the file's BASENAME (set in JS by setViewerPathText); the full
+   path is always available via the element's title tooltip. Styled like the
+   chat toolbar's workspace name (#nav-ws .nav-crumb-btn / the home screen's
+   .ws-name — system sans, 14px, default text color) but at normal weight
+   (not 600) so it doesn't read as bold/heavier than the workspace name it
+   echoes. text-overflow here is just a safety fallback for names too wide
+   for the slot. */
 #file-viewer-path {
   flex: 1;
   min-width: 0;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--muted);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1217,6 +1223,8 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 
 #file-viewer-content {
   flex: 1;
+  min-width: 0;
+  max-width: 100%;
   overflow: auto;
   padding: 12px 16px;
   font-family: var(--font-mono);
@@ -1366,11 +1374,17 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   height: 100%;
 }
 /* min-width:0 lets the preview flex item shrink below its content's intrinsic width,
-   so a wide code block inside a markdown preview scrolls INSIDE its <pre> (which has
-   overflow:auto) instead of stretching the whole document and forcing a page-wide scroll. */
-#file-viewer-content.preview-mode .doc-preview { flex: 1; min-height: 0; min-width: 0; }
-#file-viewer-content.preview-mode .md-preview { min-width: 0; }
-#file-viewer-content.preview-mode .md-preview pre { max-width: 100%; }
+   so a wide code block/table inside a markdown preview scrolls INSIDE its own box
+   (pre/table below, each with overflow-x:auto) instead of stretching the whole
+   document and forcing a page-wide scroll. max-width:100% keeps each link in the
+   chain from ever rendering wider than the pane that contains it. */
+#file-viewer-content.preview-mode .doc-preview { flex: 1; min-height: 0; min-width: 0; max-width: 100%; }
+#file-viewer-content.preview-mode .md-preview { min-width: 0; max-width: 100%; }
+#file-viewer-content.preview-mode .md-preview pre { max-width: 100%; overflow-x: auto; }
+/* Tables lay out to their content's min-width in auto table layout — wider than
+   width:100% if a cell's content demands it — so the table itself must become its
+   own horizontal scroll container rather than pushing its parent wider. */
+#file-viewer-content.preview-mode .md-preview table { display: block; max-width: 100%; overflow-x: auto; }
 
 .doc-preview-frame {
   width: 100%;
@@ -1380,7 +1394,7 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 }
 
 .md-preview {
-  max-width: 820px;
+  max-width: min(820px, 100%);
   margin: 0 auto;
   padding: 20px 28px;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -1410,6 +1424,7 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: .1em .35em;
+  overflow-wrap: anywhere;
 }
 .md-preview pre {
   background: var(--surface);
@@ -1417,6 +1432,8 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   border-radius: 6px;
   padding: 12px 14px;
   overflow: auto;
+  overflow-x: auto;
+  max-width: 100%;
   margin: .8em 0;
 }
 .md-preview pre code { background: transparent; border: 0; padding: 0; font-size: .85em; }
@@ -1432,6 +1449,7 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   border-collapse: collapse;
   margin: .8em 0;
   width: 100%;
+  max-width: 100%;
 }
 .md-preview th, .md-preview td {
   border: 1px solid var(--border);
