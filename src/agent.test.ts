@@ -7,7 +7,7 @@ import { config } from './config.js'
 import { LOGS_DIR } from './logger.js'
 import type { AgentEvent } from './types.js'
 import type { Ollama } from 'ollama'
-import { Agent, parseChangedFiles, buildFallbackCommitMessage, isCleanStatus, loadProjectContext } from './agent.js'
+import { Agent, parseChangedFiles, buildFallbackCommitMessage, isCleanStatus, loadProjectContext, REPEAT_THRESHOLD } from './agent.js'
 import { NO_OUTPUT } from './tools/bash.js'
 
 test('setMaxIterations clamps out-of-range values into [10, 1000]', () => {
@@ -603,5 +603,81 @@ test('memory OFF (baseline): no RELEVANT MEMORY / RELEVANT PROJECT INSTRUCTIONS 
     assert.equal(events.some(e => e.type === 'error'), false)
   } finally {
     await cleanupSession(sessionId, 'argo-memory-baseline-case')
+  }
+})
+
+// ── LOOP-RECOVERY LADDER (ARGO_LOOP / agent.setLoop). Same scripted-Ollama harness as
+// the repetition-guard and tasks/memory tests above — read_file on a nonexistent path is
+// a non-mutating call (no edit_file/write_file, so noteMutation never fires), driven with
+// the SAME script in both tests below so the ON vs OFF contrast is direct. Deliberately
+// deterministic: no live model, and the L1 "compact" action's underlying compactHistory
+// call is a no-op here (this run's history never grows past compaction.ts's own
+// KEEP_ACTIVE_TAIL, so it returns early without touching this.ollama) — but evaluateCall
+// still returns the level-specific message text regardless, so escalation is asserted via
+// that message text rather than via compaction events (see loop.ts's l0/l1/l2 message
+// builders).
+
+test('loop ON: repeated identical non-mutating call is blocked and escalates L0 -> L1 -> L2', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-loop-on-${Date.now()}`
+  // 7 identical read_file calls, then a final answer. Per DEFAULT_LOOP_CONFIG (loop.ts):
+  // call 1 is new -> allowed + executed; calls 2-3 -> L0 steer (blocks 1-2); call 4 -> L1
+  // compaction + steer (blocks==3); calls 5-6 -> L0 steer (blocks 4-5); call 7 -> L2
+  // forced re-plan reframe (blocks==6). Never a mutation, so the streak never resets.
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
+    readCall, readCall, readCall, readCall, readCall, readCall, readCall, finalAnswer,
+  ]))
+  agent.setSessionId(sessionId)
+  agent.setLoop(true)
+  try {
+    const answer = await agent.chat('argo loop ladder case')
+
+    // The identical call actually ran exactly once — every later repeat (no mutation
+    // since it last ran) was blocked before reaching the tool, not executed.
+    assert.equal(readResults(events).length, 1)
+    assert.equal(events.filter(e => e.type === 'tool_call' && e.tool === 'read_file').length, 1)
+
+    // One warning steer per blocked repeat (6 of the 7 identical calls).
+    const warnings = warningsMatching(events, /./)
+    assert.equal(warnings.length, 6)
+    // Escalation genuinely reached all three levels (message text is level-specific —
+    // see l0SteerMessage/l1SteerMessage/l2ReframeMessage in loop.ts).
+    assert.ok(warnings.some(w => 'message' in w && /STOP repeating it/.test(w.message)), 'expected an L0 steer')
+    assert.ok(warnings.some(w => 'message' in w && /context was just compacted/.test(w.message)), 'expected the L1 steer')
+    assert.ok(warnings.some(w => 'message' in w && /ABANDON this approach/.test(w.message)), 'expected the L2 reframe')
+
+    // The ladder never hard-terminates the run — it still finishes with the model's own
+    // final answer once it stops repeating.
+    assert.equal(answer, 'Final answer.')
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-loop-on-case')
+  }
+})
+
+test('loop OFF (baseline): the identical call runs up to REPEAT_THRESHOLD before the old count-based steer', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-loop-off-${Date.now()}`
+  // Same script as the ON case above, flag left off (default) — proves the ladder only
+  // replaces the count-based guard when this.loop is actually on.
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
+    readCall, readCall, readCall, readCall, readCall, readCall, readCall, finalAnswer,
+  ]))
+  agent.setSessionId(sessionId)
+  agent.setLoop(false)
+  try {
+    const answer = await agent.chat('argo loop baseline case')
+
+    // Baseline REPEAT_THRESHOLD (3): the first 3 identical calls all execute for real;
+    // only the 4th+ repeat is skipped/steered — more than the single execution the ON
+    // ladder allows above.
+    assert.equal(readResults(events).length, REPEAT_THRESHOLD)
+    assert.ok(readResults(events).length > 1, 'baseline allows more than one execution, unlike the ON ladder')
+    assert.equal(events.filter(e => e.type === 'tool_call' && e.tool === 'read_file').length, REPEAT_THRESHOLD)
+
+    assert.equal(answer, 'Final answer.')
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-loop-off-case')
   }
 })
