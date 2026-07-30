@@ -72,8 +72,6 @@ let manualCompacting = false
 // while compactingNow is true, which always wins (a compaction can happen
 // mid-run, and should visually override "Running").
 let indicatorState = 'ready'
-// Current iteration number, shown in the donut's center while busy/running.
-let currentIteration = null
 // True from 'compact_start' until 'compact' (or a safety-net clear on the next
 // 'iteration'/'error') — independent of `busy` since manual compaction can run
 // between agent runs.
@@ -110,12 +108,14 @@ function renderDonut() {
   const tx1 = (cx + rIn * Math.cos(ang)).toFixed(2), ty1 = (cy + rIn * Math.sin(ang)).toFixed(2)
   const tx2 = (cx + rOut * Math.cos(ang)).toFixed(2), ty2 = (cy + rOut * Math.sin(ang)).toFixed(2)
 
-  // Core: solid state color, filling the middle of the ring. Flashes while compacting.
+  // Core: solid state color, filling the middle of the ring. Glows to match the state
+  // color (same "shiny" treatment as the home screen's status dot) and pulses gently
+  // while busy/compacting; steady (just the glow) while ready/idle.
   const coreColor = { ready: 'var(--green)', busy: 'var(--yellow)', compacting: 'var(--purple)', error: 'var(--red)' }[indicatorState] || 'var(--green)'
-  const coreClass = indicatorState === 'compacting' ? 'ctx-core compacting' : 'ctx-core'
+  const coreClass = indicatorState === 'compacting' ? 'ctx-core compacting'
+    : indicatorState === 'busy' ? 'ctx-core running'
+    : 'ctx-core'
   const coreR = r - sw / 2 - 2.5
-  // Iteration number, shown only while actually running (not idle/compacting).
-  const centerText = (indicatorState === 'busy' && currentIteration) ? String(currentIteration) : ''
 
   tokenCounter.innerHTML =
     `<svg class="ctx-donut" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">`
@@ -123,8 +123,7 @@ function renderDonut() {
     + `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${color}" stroke-width="${sw}"`
     + ` stroke-dasharray="${dash.toFixed(2)} ${(circ - dash).toFixed(2)}" transform="rotate(-90 ${cx} ${cy})"/>`
     + `<line class="ctx-tick" x1="${tx1}" y1="${ty1}" x2="${tx2}" y2="${ty2}" stroke="var(--text)" stroke-width="1.5"/>`
-    + `<circle class="${coreClass}" cx="${cx}" cy="${cy}" r="${coreR.toFixed(2)}" fill="${coreColor}"/>`
-    + (centerText ? `<text x="${cx}" y="${cy}" class="ctx-center-text" text-anchor="middle" dominant-baseline="central">${escHtml(centerText)}</text>` : '')
+    + `<circle class="${coreClass}" cx="${cx}" cy="${cy}" r="${coreR.toFixed(2)}" fill="${coreColor}" style="filter: drop-shadow(0 0 3px ${coreColor})"/>`
     + `</svg>`
 }
 
@@ -532,13 +531,11 @@ function handleEvent(event) {
   switch (event.type) {
     case 'start':
       currentRunModel = event.model
-      currentIteration = null
       startTraceBlock(event.model)
       setStatus('busy', `Running · ${event.model}`)
       break
 
     case 'iteration':
-      currentIteration = event.current
       iterLabel.textContent = `${event.current}`
       addIterationSeparator(event.current)
       // Safety net: if compaction failed last iteration, only a 'warning' fires
@@ -593,7 +590,6 @@ function handleEvent(event) {
       finalizeTraceBlock()
       setBusy(false)
       iterLabel.textContent = ''
-      currentIteration = null
       refreshGitLog()
       if (filesMode === 'files') refreshFiles()
       else refreshChanges()
@@ -1424,7 +1420,6 @@ async function newSession() {
   renderQueue()
 
   iterLabel.textContent = ''
-  currentIteration = null
   compactingNow = false
   setStatus('ready', 'Ready')
   // Track the new live session id so its events are the ones replayed later.
@@ -2181,7 +2176,6 @@ async function initNav() {
   // Workspace crumb — only in central/worker mode
   if (!window.__WS__) return
 
-  $('sep-ws').style.display = 'inline'
   $('nav-ws').style.display = 'inline-flex'
   $('ws-name-label').textContent = window.__WS__
 

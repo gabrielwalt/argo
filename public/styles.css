@@ -170,6 +170,19 @@ body {
 .nav-crumb-btn:hover { background: rgba(255,255,255,.05); }
 .nav-crumb.open > .nav-crumb-btn { background: rgba(255,255,255,.07); }
 
+/* Workspace crumb — folder name styled to match the home screen's plain
+   `.ws-name` (system sans, 14px/600, default text color), not the mono/
+   uppercase treatment other breadcrumb buttons use. Still a real button
+   (opens the workspace dropdown), just visually a plain folder name. */
+#nav-ws .nav-crumb-btn {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text);
+}
+
 .nav-dropdown {
   display: none;
   position: fixed;   /* fixed = not clipped by any ancestor overflow */
@@ -333,15 +346,17 @@ body {
 #token-counter .ctx-donut { display: block; }
 #token-counter .ctx-tick { opacity: .85; }
 
-/* Core (agent-state dot) — flashes while compacting. */
-@keyframes ctx-core-flash { 0%, 100% { opacity: 1; } 50% { opacity: .2; } }
-.ctx-core.compacting { animation: ctx-core-flash .9s ease-in-out infinite; }
-.ctx-center-text {
-  font-family: var(--font-mono);
-  font-size: 7px;
-  font-weight: 700;
-  fill: #0a0b10;
-  pointer-events: none;
+/* Core (agent-state dot) — solid state color with a soft glow (same "shiny" quality
+   as the home screen's #status-dot, via the inline drop-shadow filter set in
+   renderDonut()). Pulses gently while busy ("running") or compacting; steady
+   (glow only, no motion) while ready/idle. */
+@keyframes ctx-core-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .4; transform: scale(.72); } }
+.ctx-core.running,
+.ctx-core.compacting { transform-box: fill-box; transform-origin: center; }
+.ctx-core.running { animation: ctx-core-pulse 1.4s ease-in-out infinite; }
+.ctx-core.compacting { animation: ctx-core-pulse 1s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .ctx-core.running, .ctx-core.compacting { animation: none; }
 }
 
 /* Context dropdown (reuses .nav-dropdown chrome) */
@@ -1638,8 +1653,8 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .m1, .m2, .m3, .m4 { display: inline-flex; align-items: center; justify-content: center; transform-style: preserve-3d; transform-origin: 50% 88%; }
 .boat-glyph { display: inline-block; filter: brightness(0); line-height: 1; transform: scaleX(-1); }
 @keyframes sailthrough { from{transform:translateX(-130%)} to{transform:translateX(130%)} }
-@keyframes roll { 0%{transform:rotateX(-46deg)} 50%{transform:rotateX(46deg)} 100%{transform:rotateX(-46deg)} }
-@keyframes yaw  { 0%{transform:rotateY(-40deg)} 50%{transform:rotateY(40deg)} 100%{transform:rotateY(-40deg)} }
+@keyframes roll { 0%{transform:rotateX(-38deg)} 50%{transform:rotateX(38deg)} 100%{transform:rotateX(-38deg)} }
+@keyframes yaw  { 0%{transform:rotateY(-33deg)} 50%{transform:rotateY(33deg)} 100%{transform:rotateY(-33deg)} }
 /* Three gentle, differently-shaped wave variants (uneven keyframe stops, not a plain
    symmetric rock) so pitch feels varied run to run instead of identical — and softer on
    average than the old single pitch motion. */
@@ -1647,10 +1662,10 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 @keyframes pitch2 { 0%{transform:rotate(1.8deg)}  30%{transform:rotate(-1.5deg)} 65%{transform:rotate(2deg)}   100%{transform:rotate(1.8deg)} }
 @keyframes pitch3 { 0%{transform:rotate(-1.5deg)} 55%{transform:rotate(1.8deg)}  80%{transform:rotate(-.5deg)} 100%{transform:rotate(-1.5deg)} }
 /* sailthrough stays LINEAR = constant-speed glide across the button. roll/yaw are now
-   slower + stronger than before; each pitch variant has its own gentle timing. */
+   slower + a touch gentler than before; each pitch variant has its own gentle timing. */
 .m1.a-sail { animation: sailthrough 6s linear infinite; }
-.a-roll    { animation: roll 7.4s ease-in-out infinite; }
-.a-yaw     { animation: yaw 8.2s ease-in-out infinite; }
+.a-roll    { animation: roll 9.5s ease-in-out infinite; }
+.a-yaw     { animation: yaw 10.5s ease-in-out infinite; }
 .a-pitch1  { animation: pitch1 3.6s ease-in-out infinite; }
 .a-pitch2  { animation: pitch2 4.1s ease-in-out infinite; }
 .a-pitch3  { animation: pitch3 3.8s ease-in-out infinite; }
