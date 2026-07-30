@@ -4,9 +4,11 @@ import {
   createTaskList,
   activeTask,
   completeActiveTask,
+  recordActiveTaskSummary,
   allDone,
   reconcile,
   renderTaskLedger,
+  renderTaskSummaries,
   progress,
   normalizeTitle,
   type TaskList,
@@ -317,4 +319,80 @@ test('progress: correct done/total', () => {
   list = completeActiveTask(list)
   assert.deepEqual(progress(list), { done: 1, total: 3 })
   assert.deepEqual(progress(createTaskList('obj', [])), { done: 0, total: 0 })
+})
+
+// ── recordActiveTaskSummary ────────────────────────────────────────
+
+test('recordActiveTaskSummary: sets the summary on the active task only', () => {
+  const list = createTaskList('obj', ['a', 'b'])
+  const next = recordActiveTaskSummary(list, 'did the thing via the other thing')
+  assert.equal(next.tasks[0].summary, 'did the thing via the other thing') // "a" is active
+  assert.equal(next.tasks[1].summary, undefined)                          // "b" is pending, untouched
+  assert.equal(next.tasks[0].status, 'active')                            // status unchanged
+})
+
+test('recordActiveTaskSummary: trims the text', () => {
+  const list = createTaskList('obj', ['a'])
+  const next = recordActiveTaskSummary(list, '  padded summary  \n')
+  assert.equal(next.tasks[0].summary, 'padded summary')
+})
+
+test('recordActiveTaskSummary: does not mutate the input', () => {
+  const list = createTaskList('obj', ['a', 'b'])
+  const snapshot = JSON.stringify(list)
+  recordActiveTaskSummary(list, 'a summary')
+  assert.equal(JSON.stringify(list), snapshot)
+})
+
+test('recordActiveTaskSummary: no-op (fresh copy) when nothing is active', () => {
+  const allDoneList: TaskList = {
+    objective: 'obj',
+    revision: 1,
+    tasks: [{ id: 1, title: 'a', status: 'done' }],
+  }
+  const next = recordActiveTaskSummary(allDoneList, 'irrelevant')
+  assert.deepEqual(next.tasks, allDoneList.tasks)
+  assert.notEqual(next, allDoneList) // fresh object
+  assert.equal(next.tasks[0].summary, undefined)
+})
+
+// ── reconcile: summary carry-forward ───────────────────────────────
+
+test('reconcile: carries the summary forward for a step preserved as done', () => {
+  let list = createTaskList('obj', ['Add auth', 'Wire UI'])
+  list = recordActiveTaskSummary(list, 'Implemented auth via the existing session module.')
+  list = completeActiveTask(list) // "Add auth" done, with its summary
+  const next = reconcile(list, 'obj v2', ['1. add   AUTH', 'Wire UI', 'Deploy'])
+  const auth = next.tasks.find(t => normalizeTitle(t.title) === 'add auth')
+  assert.equal(auth?.status, 'done')
+  assert.equal(auth?.summary, 'Implemented auth via the existing session module.')
+})
+
+test('reconcile: a step that is NOT preserved as done gets no carried summary', () => {
+  let list = createTaskList('obj', ['Add auth', 'Wire UI'])
+  list = recordActiveTaskSummary(list, 'Implemented auth via the existing session module.')
+  // "Add auth" never completed (still active) — reconcile brings it back as pending/active.
+  const next = reconcile(list, 'obj v2', ['Add auth', 'Wire UI'])
+  const auth = next.tasks.find(t => normalizeTitle(t.title) === 'add auth')
+  assert.notEqual(auth?.status, 'done')
+  assert.equal(auth?.summary, undefined)
+})
+
+// ── renderTaskSummaries ─────────────────────────────────────────────
+
+test('renderTaskSummaries: numbers tasks with title, status, and summary', () => {
+  let list = createTaskList('ship it', ['first', 'second'])
+  list = recordActiveTaskSummary(list, 'Did the first thing by doing X.')
+  list = completeActiveTask(list) // "first" done with its summary; "second" now active
+  const out = renderTaskSummaries(list)
+  assert.ok(out.includes('1. first [done]'))
+  assert.ok(out.includes('Did the first thing by doing X.'))
+  assert.ok(out.includes('2. second [active]'))
+})
+
+test('renderTaskSummaries: a task with no recorded summary shows the placeholder', () => {
+  const list = createTaskList('obj', ['only step'])
+  const out = renderTaskSummaries(list)
+  assert.ok(out.includes('1. only step [active]'))
+  assert.ok(out.includes('(no summary recorded)'))
 })

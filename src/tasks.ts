@@ -23,6 +23,14 @@ export interface Task {
   // self-check nudge path is used unchanged. This module never executes it (pure, no
   // shell) — it only carries the string through create/reconcile.
   verify?: string
+  // Per-task SUMMARY (harness Change: SUMMARIES + FINAL RECONCILIATION), captured
+  // by agent.ts once the active task is genuinely complete (after its verify, if
+  // any, passes): a brief model-authored account of WHAT was done and HOW. Set via
+  // recordActiveTaskSummary just before the task is marked 'done'. Undefined until
+  // then. Carried FORWARD across reconcile for tasks preserved as 'done', same as
+  // verify — it is the record the final reconciliation pass reviews, so losing it
+  // on an incidental re-plan would make that pass blind to already-finished work.
+  summary?: string
 }
 
 // A plan step as the LLM's update_plan tool call supplies it: either bare title text
@@ -161,18 +169,21 @@ export function completeActiveTask(list: TaskList): TaskList {
 // stripped exactly like createTaskList so the two constructors agree.
 export function reconcile(list: TaskList, newObjective: string, newSteps: StepInput[]): TaskList {
   // Titles that were completed in the prior plan, keyed by normalized title — plus
-  // every prior task's verify command, keyed the same way, so a re-plan that repeats
-  // a step without repeating its verify still keeps the check it had.
+  // every prior task's verify command and summary, keyed the same way, so a re-plan
+  // that repeats a step without repeating its verify (or without the model restating
+  // its summary) still keeps the check/record it had.
   const doneKeys = new Set<string>()
   const priorVerifyByKey = new Map<string, string | undefined>()
+  const priorSummaryByKey = new Map<string, string | undefined>()
   for (const t of list.tasks) {
     const key = normalizeTitle(t.title)
     if (t.status === 'done') doneKeys.add(key)
     priorVerifyByKey.set(key, t.verify)
+    priorSummaryByKey.set(key, t.summary)
   }
 
   const seen = new Set<string>()
-  const kept: { title: string; done: boolean; verify?: string }[] = []
+  const kept: { title: string; done: boolean; verify?: string; summary?: string }[] = []
   for (const step of newSteps) {
     const { title, verify } = normalizeStep(step)
     if (!title) continue
@@ -183,7 +194,11 @@ export function reconcile(list: TaskList, newObjective: string, newSteps: StepIn
     // carried in the prior plan (a re-plan that just reorders/rewords steps
     // shouldn't silently lose an existing programmatic check).
     const carriedVerify = verify ?? priorVerifyByKey.get(key)
-    kept.push({ title, done: doneKeys.has(key), verify: carriedVerify })
+    const done = doneKeys.has(key)
+    // A summary only ever makes sense for a step PRESERVED as done — a step that is
+    // (re)starting as pending/active has no completed work to summarise yet.
+    const carriedSummary = done ? priorSummaryByKey.get(key) : undefined
+    kept.push({ title, done, verify: carriedVerify, summary: carriedSummary })
   }
 
   const tasks: Task[] = kept.map((k, i) => ({
@@ -191,12 +206,29 @@ export function reconcile(list: TaskList, newObjective: string, newSteps: StepIn
     title: k.title,
     status: k.done ? 'done' : 'pending',
     ...(k.verify ? { verify: k.verify } : {}),
+    ...(k.summary ? { summary: k.summary } : {}),
   }))
   // Promote the first non-done task to 'active' (if any remain).
   const next = tasks.find(t => t.status === 'pending')
   if (next) next.status = 'active'
 
   return { objective: newObjective.trim(), tasks, revision: list.revision + 1 }
+}
+
+// Sets the SUMMARY on the currently-active task ONLY — a pure sibling of
+// completeActiveTask, called just before it so the harness can capture "what/how"
+// on the same turn it advances the ledger. Does NOT change status (that is
+// completeActiveTask's job — callers compose the two). A no-op (fresh copy, no
+// active task) when nothing is active, mirroring completeActiveTask's shape so
+// callers can use it unconditionally.
+export function recordActiveTaskSummary(list: TaskList, summary: string): TaskList {
+  const trimmed = summary.trim()
+  const active = list.tasks.find(t => t.status === 'active')
+  if (!active) {
+    return { ...list, tasks: list.tasks.map(t => ({ ...t })) }
+  }
+  const tasks: Task[] = list.tasks.map(t => (t.id === active.id ? { ...t, summary: trimmed } : { ...t }))
+  return { ...list, tasks }
 }
 
 // ── Rendering ─────────────────────────────────────────────────────
@@ -228,4 +260,16 @@ export function renderTaskLedger(list: TaskList): string {
   })
   const footer = 'Finish the current task and verify it before moving on.'
   return `${header}\nObjective: ${list.objective}\n${lines.join('\n')}\n${footer}`
+}
+
+// Renders the ledger's per-task SUMMARIES as a compact numbered list — the record
+// the FINAL RECONCILIATION pass (agent.ts) feeds back to the model alongside the
+// objective, so it can double-check nothing was missed across the whole run. One
+// entry per task, in ledger order; a task with no recorded summary (never reached,
+// or reached without capturing one) renders an explicit placeholder rather than a
+// blank line, so its absence is legible to the model reviewing it.
+export function renderTaskSummaries(list: TaskList): string {
+  return list.tasks
+    .map(t => `${t.id}. ${t.title} [${t.status}]\n    ${t.summary || '(no summary recorded)'}`)
+    .join('\n')
 }

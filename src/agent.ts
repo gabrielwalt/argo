@@ -30,8 +30,10 @@ import {
   reconcile as reconcileTasks,
   activeTask,
   completeActiveTask,
+  recordActiveTaskSummary,
   allDone as tasksAllDone,
   renderTaskLedger,
+  renderTaskSummaries,
 } from './tasks.js'
 import {
   type RelevanceQuery,
@@ -332,12 +334,20 @@ export class Agent {
   private currentPlan: { objective: string; steps: string[]; revision: number } | null = null
   // HARNESS TASK LEDGER (ARGO_TASKS / this.tasks). Built from the LLM's plan in
   // handleUpdatePlan (createTaskList) and reconciled on a re-plan; the harness drives
-  // it ONE task at a time (recite → verify-nudge → advance). null until the first plan
-  // and reset per run. taskVerifyNudged tracks which task ids have already received the
-  // verify nudge, so a second "no tool call = done" for the same task advances it.
-  // All only read/written when this.tasks is on → baseline untouched.
+  // it ONE task at a time (recite → verify → summary → advance). null until the first
+  // plan and reset per run. All only read/written when this.tasks is on → baseline
+  // untouched.
   private taskList: TaskList | null = null
-  private taskVerifyNudged = new Set<number>()
+  // Task ids whose verify command has already PASSED this run — lets the per-task
+  // gate skip re-running a verify it already confirmed while it waits on the (once
+  // per task) summary turn. Keyed by task id (reissued on every reconcile, so a
+  // re-plan naturally starts fresh even for a same-titled task).
+  private taskVerifyPassed = new Set<number>()
+  // Task ids that have already been asked, once, for their per-task SUMMARY (the
+  // capture step between verify passing/being absent and the actual advance). A
+  // second no-tool-call turn for the SAME task id is treated as the model's summary
+  // reply and advances the ledger. Replaces the old bare "confirm you're done" nudge.
+  private taskSummaryAsked = new Set<number>()
   // Consecutive verify-command FAILURE count per task id, for the executable-verify
   // gate (Change 3). Keyed by task id (not title) — ids are reissued on every
   // reconcile, so a re-plan naturally starts a task's counter fresh even if it keeps
@@ -347,6 +357,13 @@ export class Agent {
   // switches from "fix this" to "stop repeating yourself, reconsider or re-plan" —
   // maxIterations/the stall re-ground remain the actual hard backstop either way.
   private taskVerifyFails = new Map<number, number>()
+  // Set once per run (and reset on a re-plan — see handleUpdatePlan) after the
+  // FINAL RECONCILIATION steer has fired, so it cannot loop: the run-level done-gate
+  // only injects it the FIRST time every task is done. A re-plan mid-reconciliation
+  // clears it, so a later allDone re-arms exactly one more reconciliation pass. A
+  // private field (not a local `let` in chat()) because handleUpdatePlan — reached
+  // from deep inside the same loop — needs to reset it too.
+  private finalReconciled = false
   // Raw AGENTS.md / MEMORY.md cached at run start when this.memory is on (read once).
   // AGENTS.md feeds section-selection for the system prompt; MEMORY.md is retrieved
   // task-scoped at the tail each step. Empty string when the file is absent/off.
@@ -840,9 +857,10 @@ export class Agent {
     emitAndLog({ type: 'plan', objective, steps, revision })
     // HARNESS TASK LEDGER (this.tasks): instrument the plan as an ordered ledger. The
     // FIRST plan builds it (createTaskList); a later update_plan is a RE-PLAN that
-    // reconciles into the existing ledger (completed tasks frozen, revision bumps). A
-    // re-plan resets the per-task verify nudges so the (possibly re-ordered) current
-    // task gets a fresh verify gate. Read the existing ledger via a cast — TS can't see
+    // reconciles into the existing ledger (completed tasks frozen, revision bumps,
+    // summaries carried forward for tasks preserved as done). A re-plan resets the
+    // per-task verify/summary state so the (possibly re-ordered) current task gets a
+    // fresh verify + summary gate. Read the existing ledger via a cast — TS can't see
     // that handleUpdatePlan mutates this.taskList, so after the run-start reset it
     // narrows the field to null (same gotcha as the activePlan cast in chat()).
     if (this.tasks) {
@@ -853,11 +871,16 @@ export class Agent {
       this.taskList = existing !== null
         ? reconcileTasks(existing, objective, rawSteps)
         : createTaskList(objective, rawSteps)
-      this.taskVerifyNudged.clear()
-      // A re-plan reissues task ids (reconcile), so any per-task verify-fail counts
-      // keyed on the OLD ids are meaningless against the new ledger — clear them so
-      // the (possibly re-ordered/re-verified) current task starts with a clean count.
+      // A re-plan reissues task ids (reconcile), so any per-task verify-pass/verify-
+      // fail/summary-asked state keyed on the OLD ids is meaningless against the new
+      // ledger — clear it so the (possibly re-ordered/re-verified) current task
+      // starts clean, and re-arm the final reconciliation gate (it may have just
+      // fired the steer that CAUSED this re-plan; once the newly re-opened work is
+      // allDone again, reconciliation should be able to fire once more).
+      this.taskVerifyPassed.clear()
+      this.taskSummaryAsked.clear()
       this.taskVerifyFails.clear()
+      this.finalReconciled = false
       const tl = this.taskList as TaskList
       const done = tl.tasks.filter(t => t.status === 'done').length
       emitAndLog({
@@ -1077,8 +1100,10 @@ export class Agent {
     // HARNESS TASK LEDGER + MEMORY per-run state (only used when this.tasks/this.memory
     // are on; resetting them unconditionally is a harmless local write for the baseline).
     this.taskList = null
-    this.taskVerifyNudged.clear()
+    this.taskVerifyPassed.clear()
+    this.taskSummaryAsked.clear()
     this.taskVerifyFails.clear()
+    this.finalReconciled = false
     this.agentsRaw = ''
     this.memoryRaw = ''
     // ACTOR-CRITIC per-run state (see field docs). Reset alongside the loop-steer
@@ -1215,63 +1240,46 @@ export class Agent {
 
         if (!hasCalls) {
           this.pushCtx(msg)
-          // ── HARNESS TASK LEDGER: per-task verify-then-advance (this.tasks). A no-tool
-          // call while tasks REMAIN means the model believes the CURRENT task is done.
+          // ── HARNESS TASK LEDGER: per-task verify → SUMMARY → advance (this.tasks). A
+          // no-tool call while tasks REMAIN means the model believes the CURRENT task
+          // is done.
           //
-          // If the current task carries a `verify` command (Change 3 — EXECUTABLE
-          // per-task verification), the harness does NOT take that self-report at face
-          // value: it RUNS the command itself (via tracedBash, same trace/log path as
-          // any other tool call) and only advances on a clean exit. A failing command
-          // blocks — the model stays on THIS task and sees the real failure output, not
-          // just a "are you sure?" nudge. Repeated consecutive failures escalate the
-          // steer (see taskVerifyFails) so a permanently-broken verify can't just repeat
-          // the identical message forever; maxIterations / the stall re-ground above
-          // remain the actual backstop that guarantees the run still ends or re-plans.
+          // Step 1 — EXECUTABLE VERIFY (Change 3, unchanged): if the current task
+          // carries a `verify` command and it hasn't already passed this run, the
+          // harness does NOT take the self-report at face value: it RUNS the command
+          // itself (via tracedBash, same trace/log path as any other tool call). A
+          // failing command blocks — taskVerifyFails increments, the real output is
+          // fed back (escalating past VERIFY_FAIL_ESCALATE), and the model stays on
+          // THIS task; no summary is asked for. A passing command is recorded
+          // (taskVerifyPassed) and FALLS THROUGH to step 2 — it does NOT advance yet.
           //
-          // A task with NO verify keeps the original self-check path unchanged: first
-          // "done" → nudge once (taskVerifyNudged) and CONTINUE; second "done" for the
-          // SAME task → advance (completeActiveTask).
+          // Step 2 — SUMMARY (NEW): the executable oracle (or its absence) is
+          // necessary but not sufficient — the harness also wants the model's own
+          // brief account of WHAT it did and HOW, for the final reconciliation pass.
+          // First no-tool-call turn for this task id (taskSummaryAsked) asks for that
+          // summary once and CONTINUEs; the NEXT no-tool-call turn for the SAME task
+          // is treated as the summary itself — it is recorded onto the active task
+          // (recordActiveTaskSummary) and the ledger advances (completeActiveTask). A
+          // task with no verify lands here directly; a task with a verify lands here
+          // only once its verify has passed. Net shape is unchanged from before for a
+          // no-verify task (ask once, advance on the next turn) — the summary now
+          // fills the role the old bare "confirm you're done" nudge used to.
           //
           // Either way, once advanced, emit a 'tasks' advance event, recite the next
           // task, CONTINUE. Only when the ledger is exhausted (allDone) — or when
           // this.tasks is off / there is no ledger — do we fall through to the existing
-          // run-level done-gate below (critic → grounding → layout → re-ground → finish),
-          // UNCHANGED. Read the ledger via a cast (the narrowing gotcha: handleUpdatePlan
-          // sets it where TS can't see).
+          // run-level done-gate below (final reconciliation → critic → grounding →
+          // layout → re-ground → finish). Read the ledger via a cast (the narrowing
+          // gotcha: handleUpdatePlan sets it where TS can't see).
           const tlGate = this.taskList as TaskList | null
           if (this.tasks && tlGate && !tasksAllDone(tlGate)) {
             const cur = activeTask(tlGate)
-            if (cur && cur.verify) {
+            if (cur && cur.verify && !this.taskVerifyPassed.has(cur.id)) {
               const verifyResult = await this.tracedBash(cur.verify, emitAndLog)
-              if (!verifyResult.error) {
-                // VERIFY PASSED — the task is genuinely done; advance without asking
-                // the model to self-report at all.
-                this.taskVerifyFails.delete(cur.id)
-                emitAndLog({ type: 'warning', message: `VERIFY PASSED for task "${cur.title}" (\`${cur.verify}\`) — advancing.` })
-                const advanced = completeActiveTask(tlGate)
-                this.taskList = advanced
-                const done = advanced.tasks.filter(t => t.status === 'done').length
-                const nextActive = activeTask(advanced)
-                emitAndLog({
-                  type: 'tasks',
-                  action: 'advanced',
-                  revision: advanced.revision,
-                  done,
-                  total: advanced.tasks.length,
-                  current: nextActive?.title ?? null,
-                })
-                if (!tasksAllDone(advanced) && nextActive) {
-                  const adv = `Task complete (verified). NEXT TASK "${nextActive.title}". Work only on this task now; the full plan is in the recited ledger. Refine via update_plan only if the work contradicts it.`
-                  emitAndLog({ type: 'warning', message: adv })
-                  this.pushCtx({ role: 'tool', content: adv })
-                  continue
-                }
-                // allDone after advancing → do NOT continue; fall through to the
-                // existing run-level done-gate below (critic → grounding → layout → re-ground →
-                // finish).
-              } else {
-                // VERIFY FAILED — do not advance. Feed the failure straight back,
-                // output intact (never hidden), and keep the model on this one task.
+              if (verifyResult.error) {
+                // VERIFY FAILED — do not advance, do not ask for a summary. Feed the
+                // failure straight back, output intact (never hidden), and keep the
+                // model on this one task.
                 const fails = (this.taskVerifyFails.get(cur.id) ?? 0) + 1
                 this.taskVerifyFails.set(cur.id, fails)
                 const failOutput = truncateOutput(
@@ -1288,17 +1296,26 @@ export class Agent {
                 this.pushCtx({ role: 'tool', content: steer })
                 continue
               }
-            } else if (cur && !this.taskVerifyNudged.has(cur.id)) {
-              // No verify command — original self-check path. Verify-once: nudge the
-              // model to confirm THIS task is genuinely done.
-              this.taskVerifyNudged.add(cur.id)
-              const nudge = `CURRENT TASK "${cur.title}" — before moving on, confirm it is genuinely complete and STATE how you verified it (the check + result). If not truly done, keep working on THIS task only. If done, say so and I'll advance you.`
-              emitAndLog({ type: 'warning', message: nudge })
-              this.pushCtx({ role: 'tool', content: nudge })
+              // VERIFY PASSED — the task is genuinely done by the executable oracle;
+              // record it and fall through to the summary step below (do NOT advance
+              // yet — the summary is still captured for the final reconciliation).
+              this.taskVerifyFails.delete(cur.id)
+              this.taskVerifyPassed.add(cur.id)
+              emitAndLog({ type: 'warning', message: `VERIFY PASSED for task "${cur.title}" (\`${cur.verify}\`) — capturing a summary before advancing.` })
+            }
+            if (cur && !this.taskSummaryAsked.has(cur.id)) {
+              // First no-tool-call turn for this task (post-verify, if any) — ask for
+              // the summary once and wait for the next turn.
+              this.taskSummaryAsked.add(cur.id)
+              const ask = `CURRENT TASK "${cur.title}" — if it is genuinely complete, reply with a brief 2-4 sentence summary of WHAT you did and HOW you solved it (this becomes the record used for the final check). If it is NOT actually done, keep working on THIS task only.`
+              emitAndLog({ type: 'warning', message: ask })
+              this.pushCtx({ role: 'tool', content: ask })
               continue
             } else if (cur) {
-              // No verify command, already nudged for this task → accept and advance.
-              const advanced = completeActiveTask(tlGate)
+              // Already asked for this task → THIS no-tool-call turn IS the summary.
+              // Record it, then advance the ledger.
+              const summarized = recordActiveTaskSummary(tlGate, msg.content.trim() || '(no summary provided)')
+              const advanced = completeActiveTask(summarized)
               this.taskList = advanced
               const done = advanced.tasks.filter(t => t.status === 'done').length
               const nextActive = activeTask(advanced)
@@ -1319,21 +1336,31 @@ export class Agent {
                 continue
               }
               // allDone after advancing → do NOT continue; fall through to the existing
-              // run-level done-gate below (critic → grounding → layout → re-ground → finish).
+              // run-level done-gate below (final reconciliation → critic → grounding →
+              // layout → re-ground → finish).
             }
           }
-          // Re-grounding done-gate: if a plan is active for THIS run, don't take
-          // the first "I'm done" at face value — nudge once to verify the recorded
-          // objective is actually met (checking a fix against the reported symptom
-          // is the exact step the 90-iteration drift run skipped). A run with no
-          // plan (simple task / question) finishes immediately, so versatility is
-          // untouched. At most once per run (regrounded), so it cannot loop.
           // Read through a cast: this.currentPlan is set only inside handleUpdatePlan
           // (the update_plan intercept), which TS's control-flow analysis can't see
           // from here — after the run-start `this.currentPlan = null` it still believes
           // the field is null and narrows this truthy branch to `never`. The cast
           // restores the real plan type.
           const activePlan = this.currentPlan as { objective: string; steps: string[]; revision: number } | null
+          // FINAL RECONCILIATION (NEW): once every planned task is done, before any of
+          // the existing critic/grounding/layout/re-ground checks run, feed the model
+          // ALL the per-task summaries plus the objective and make it double-check
+          // nothing is missing — it can re-open work via update_plan (which resets
+          // finalReconciled, so a later allDone re-arms exactly one more pass) or give
+          // its genuine final answer. At most once per run (finalReconciled) so this
+          // cannot loop.
+          if (this.tasks && tlGate && tasksAllDone(tlGate) && !this.finalReconciled) {
+            this.finalReconciled = true
+            const objective = activePlan?.objective || tlGate.objective
+            const reconcileMsg = `ALL PLANNED TASKS ARE DONE — final check before finishing. Objective: "${objective}". What was done per task:\n${renderTaskSummaries(tlGate)}\nVerify this FULLY addresses the objective. If ANYTHING is missing, incomplete, or inconsistent, call update_plan to add/adjust the remaining work and keep going. If it is genuinely complete, give your FINAL ANSWER now: a clear summary for the user of what was accomplished, and suggest a sensible next step.`
+            emitAndLog({ type: 'warning', message: reconcileMsg })
+            this.pushCtx({ role: 'tool', content: reconcileMsg })
+            continue
+          }
           // PRE-DONE critic checkpoint: reuse the existing done-gate. Before taking
           // "I'm done" at face value, the critic reviews the files edited (with
           // test/spec flags), the latest test output, and the recent trace, and
@@ -1371,6 +1398,12 @@ export class Agent {
               if (!lv.ok) continue
             }
           }
+          // Re-grounding done-gate: if a plan is active for THIS run, don't take the
+          // first "I'm done" at face value — nudge once to verify the recorded
+          // objective is actually met (checking a fix against the reported symptom is
+          // the exact step the 90-iteration drift run skipped). A run with no plan
+          // (simple task / question) finishes immediately, so versatility is
+          // untouched. At most once per run (regrounded), so it cannot loop.
           if (activePlan && !regrounded) {
             regrounded = true
             const nudge = `Before finishing, re-ground against your plan. Objective: "${activePlan.objective}". Think critically: is the objective TRULY met — not just that a command exited 0, with no corner cut and the real request satisfied? State how you verified it (the check you ran and its result). If it is not genuinely met, keep working toward THIS objective (do not drift to a different one). If it is met, give your final answer as: (1) a brief summary of what you did to achieve the objective, and (2) only if there is a clear, sensible next step for this project, one short suggestion of what to do next.`

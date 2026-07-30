@@ -180,8 +180,8 @@ const finalAnswer: ScriptedResponse = { message: { role: 'assistant', content: '
 function readResults(events: AgentEvent[]): AgentEvent[] {
   return events.filter(e => e.type === 'tool_result' && e.tool === 'read_file')
 }
-function warningsMatching(events: AgentEvent[], re: RegExp): AgentEvent[] {
-  return events.filter(e => e.type === 'warning' && re.test(e.message))
+function warningsMatching(events: AgentEvent[], re: RegExp): Array<Extract<AgentEvent, { type: 'warning' }>> {
+  return events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning' && re.test(e.message))
 }
 async function cleanupSession(sessionId: string, slug: string): Promise<void> {
   await Promise.all([
@@ -397,12 +397,15 @@ test('plan/act gate: a read-only run needs no plan and finishes directly (versat
 
 // ── HARNESS TASK LEDGER (ARGO_TASKS / agent.setTasks). These drive a real Agent
 // with a scripted Ollama and the per-instance flag ON. The loop reinterprets the
-// existing "no tool call = done" signal PER TASK: the first no-call for a task is a
-// verify nudge; a second no-call for the SAME task advances the ledger. Only when
-// the ledger is exhausted (allDone) does the existing run-level done-gate fire and
-// finish the run. With the flag OFF (default) none of this runs (baseline). No live
-// model: scriptedOllama repeats its last element, and the done-gate's grounding
-// check returns null with no doc edits, so nothing here touches Ollama/network.
+// existing "no tool call = done" signal PER TASK: for a task with an executable
+// verify, that runs first; either way, the first no-call for a task then asks for a
+// brief SUMMARY (once), and a second no-call for the SAME task is treated as that
+// summary and advances the ledger. Once the ledger is exhausted (allDone), a FINAL
+// RECONCILIATION steer fires once (feeding the objective + all per-task summaries
+// back to the model) before the existing run-level done-gate finishes the run. With
+// the flag OFF (default) none of this runs (baseline). No live model: scriptedOllama
+// repeats its last element, and the done-gate's grounding check returns null with no
+// doc edits, so nothing here touches Ollama/network.
 
 // A no-tool-call assistant reply — the "I think this task is done" signal.
 const doneReply: ScriptedResponse = { message: { role: 'assistant', content: 'I believe this is complete.' } }
@@ -461,22 +464,22 @@ test('tasks: update_plan builds a ledger and emits a planned event with total + 
   }
 })
 
-test('tasks: per-task advance — first no-tool-call nudges, second advances to the next task', async () => {
+test('tasks: per-task advance — first no-tool-call asks for a summary, second advances to the next task', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-tasks-advance-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
     planReply('Two-step objective', ['Step one', 'Step two']),
-    doneReply, // no-call #1 for task 1 → verify nudge (no advance yet)
-    doneReply, // no-call #2 for task 1 → advance to task 2
+    doneReply, // no-call #1 for task 1 → summary ask (no advance yet)
+    doneReply, // no-call #2 for task 1 → treated as the summary, advance to task 2
   ]))
   agent.setSessionId(sessionId)
   agent.setTasks(true)
   try {
     await agent.chat('argo tasks advance case')
 
-    // The verify nudge fired for the current task BEFORE any advance.
-    const nudges = warningsMatching(events, /CURRENT TASK "Step one" — before moving on/)
-    assert.ok(nudges.length >= 1, 'expected a verify nudge for the current task')
+    // The summary ask fired for the current task BEFORE any advance.
+    const asks = warningsMatching(events, /CURRENT TASK "Step one" — if it is genuinely complete/)
+    assert.ok(asks.length >= 1, 'expected a summary ask for the current task')
 
     // The first advance moves task 1 → done and makes task 2 the current task.
     const advanced = tasksEvents(events).filter(e => e.action === 'advanced')
@@ -485,14 +488,101 @@ test('tasks: per-task advance — first no-tool-call nudges, second advances to 
     assert.equal(advanced[0].total, 2)
     assert.equal(advanced[0].current, 'Step two')
 
-    // The nudge must precede the first advance (verify-then-advance ordering).
-    const firstNudgeIdx = events.findIndex(e => e.type === 'warning' && /CURRENT TASK "Step one"/.test(e.message))
+    // The ask must precede the first advance (ask-then-advance ordering).
+    const firstAskIdx = events.findIndex(e => e.type === 'warning' && /CURRENT TASK "Step one"/.test(e.message))
     const firstAdvanceIdx = events.findIndex(e => e.type === 'tasks' && e.action === 'advanced')
-    assert.ok(firstNudgeIdx >= 0 && firstAdvanceIdx > firstNudgeIdx, 'nudge must come before advance')
+    assert.ok(firstAskIdx >= 0 && firstAdvanceIdx > firstAskIdx, 'ask must come before advance')
 
     assert.equal(events.some(e => e.type === 'error'), false)
   } finally {
     await cleanupSession(sessionId, 'argo-tasks-advance-case')
+  }
+})
+
+test('tasks: per-task summary is captured and drives advance (no verify command)', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-tasks-summary-${Date.now()}`
+  const summaryText = 'I built the widget by adding widget.ts and wiring it into index.ts; the demo page renders it correctly.'
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
+    planReply('Ship the widget', ['Build the widget']),
+    { message: { role: 'assistant', content: 'Working on it now.' } },           // no-call #1 → summary ask
+    { message: { role: 'assistant', content: summaryText } },                    // no-call #2 → captured as the summary, advances (allDone)
+  ]))
+  agent.setSessionId(sessionId)
+  agent.setTasks(true)
+  try {
+    await agent.chat('argo tasks summary case')
+
+    // The ask fired once for the only task, before it advanced.
+    const asks = warningsMatching(events, /CURRENT TASK "Build the widget" — if it is genuinely complete/)
+    assert.equal(asks.length, 1)
+
+    // It advanced (the single task), reaching allDone.
+    const advanced = tasksEvents(events).filter(e => e.action === 'advanced')
+    assert.equal(advanced.length, 1)
+    assert.equal(advanced[0].done, 1)
+    assert.equal(advanced[0].current, null)
+
+    // The captured summary is observable in the final-reconciliation message that
+    // fires immediately after the last task advances (renderTaskSummaries) — the
+    // 'tasks' event schema itself carries no summary field, so this is the harness's
+    // own account of what it recorded onto the ledger.
+    const reconciliation = warningsMatching(events, /ALL PLANNED TASKS ARE DONE/)
+    assert.equal(reconciliation.length, 1)
+    assert.ok(reconciliation[0].message.includes(summaryText), 'expected the captured summary in the reconciliation message')
+    assert.ok(reconciliation[0].message.includes('Build the widget [done]'), 'expected the task title + status in the reconciliation message')
+
+    // The ask must precede the advance, which must precede the reconciliation.
+    const askIdx = events.findIndex(e => e.type === 'warning' && /CURRENT TASK "Build the widget"/.test(e.message))
+    const advanceIdx = events.findIndex(e => e.type === 'tasks' && e.action === 'advanced')
+    const reconcileIdx = events.findIndex(e => e.type === 'warning' && /ALL PLANNED TASKS ARE DONE/.test(e.message))
+    assert.ok(askIdx >= 0 && advanceIdx > askIdx && reconcileIdx > advanceIdx, 'expected ask → advance → reconciliation ordering')
+
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-tasks-summary-case')
+  }
+})
+
+test('final reconciliation fires exactly once when all tasks are done, then the run finishes normally', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-tasks-reconcile-${Date.now()}`
+  // Every no-tool-call turn after the plan is a generic "done" reply: task1 summary
+  // ask, task1 advance, task2 summary ask, task2 advance (allDone) — the
+  // reconciliation fires in that same turn — then the run's existing re-ground nudge,
+  // then a genuine final answer.
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
+    planReply('Finish both tasks', ['First task', 'Second task']),
+    doneReply,
+  ]))
+  agent.setSessionId(sessionId)
+  agent.setTasks(true)
+  try {
+    const answer = await agent.chat('argo tasks reconcile case')
+
+    const advanced = tasksEvents(events).filter(e => e.action === 'advanced')
+    assert.equal(advanced.length, 2)
+    assert.equal(advanced[advanced.length - 1].current, null) // ledger exhausted
+
+    // The final-reconciliation steer fires exactly once, AFTER the last advance,
+    // mentions the objective, and lists both tasks as done.
+    const reconciliation = warningsMatching(events, /ALL PLANNED TASKS ARE DONE/)
+    assert.equal(reconciliation.length, 1)
+    assert.ok(reconciliation[0].message.includes('Finish both tasks'))
+    assert.ok(reconciliation[0].message.includes('First task [done]'))
+    assert.ok(reconciliation[0].message.includes('Second task [done]'))
+    const lastAdvanceIdx = events.findIndex(e => e.type === 'tasks' && e.action === 'advanced' && e.current === null)
+    const reconcileIdx = events.findIndex(e => e.type === 'warning' && /ALL PLANNED TASKS ARE DONE/.test(e.message))
+    assert.ok(reconcileIdx > lastAdvanceIdx, 'reconciliation must come after the last advance')
+
+    // The run still finishes normally afterward (re-ground → final answer), same as
+    // the existing allDone done-gate behavior.
+    const done = events.find((e): e is Extract<AgentEvent, { type: 'done' }> => e.type === 'done')
+    assert.ok(done, 'expected the run to finish')
+    assert.equal(done.content, 'I believe this is complete.')
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-tasks-reconcile-case')
   }
 })
 
