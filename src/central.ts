@@ -137,6 +137,34 @@ async function isContainerRunning(name: string): Promise<boolean> {
   }
 }
 
+// Home-screen status dot: ready / running / compacting / error / stopped. Talks
+// to the worker directly on localhost (never through the password-gated proxy)
+// with a short timeout so one slow/unreachable worker can't hang the whole list.
+async function workspaceStatus(
+  running: boolean,
+  port: number
+): Promise<'ready' | 'running' | 'compacting' | 'error' | 'stopped'> {
+  if (!running) return 'stopped'
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 1500)
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/status`, { signal: controller.signal })
+    if (!res.ok) return 'running'
+    const data = (await res.json()) as { busy?: boolean; phase?: string }
+    if (data.phase === 'error') return 'error'
+    if (data.phase === 'compacting') return 'compacting'
+    if (data.busy === true || data.phase === 'running') return 'running'
+    return 'ready'
+  } catch {
+    // Container is up but the worker didn't answer in time (still booting,
+    // overloaded, or unreachable) — fall back to a status that doesn't imply
+    // the workspace is unusable.
+    return 'running'
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 async function removeStaleContainer(name: string): Promise<void> {
   // `docker run --name` fails hard if that name is already held — even by a
   // stopped/exited container. Workers run with `--rm`, so a clean stop removes
@@ -342,11 +370,15 @@ export function startCentral(): void {
   // List workspaces
   app.get('/api/workspaces', async (_req, res) => {
     const registry = await loadRegistry()
-    const result = await Promise.all(registry.map(async ws => ({
-      ...ws,
-      running: await isContainerRunning(ws.name),
-      url: `http://localhost:${config.port}/ws/${ws.name}/`,
-    })))
+    const result = await Promise.all(registry.map(async ws => {
+      const running = await isContainerRunning(ws.name)
+      return {
+        ...ws,
+        running,
+        status: await workspaceStatus(running, ws.port),
+        url: `http://localhost:${config.port}/ws/${ws.name}/`,
+      }
+    }))
     res.json(result)
   })
 

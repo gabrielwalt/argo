@@ -314,6 +314,10 @@ app.get('/git-diff-working', async (req, res) => {
 app.get('/status', (req, res) => {
   res.json({
     busy: isBusy,
+    // Fine-grained run phase (agent.ts's Agent#getPhase) — lets central's
+    // /api/workspaces aggregate a real ready/running/compacting/error status for
+    // the home screen's status dot, rather than just busy/idle.
+    phase: agent.getPhase(),
     model: config.model,
     sessionId: currentSessionId,
     workspacePath: config.workspacePath || null,

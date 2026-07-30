@@ -9,7 +9,7 @@
       --bg: #090b12; --surface: #111520; --border: #1e2235;
       --text: #e2e4f0; --muted: #565e7a; --accent: #5b67f5;
       --gold: #c9a227; --gold-glow: rgba(201, 162, 39, 0.20);
-      --green: #22c55e; --red: #ef4444; --yellow: #eab308;
+      --green: #22c55e; --red: #ef4444; --yellow: #eab308; --purple: #a855f7;
       --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
     }
     @keyframes gold-shimmer {
@@ -19,6 +19,10 @@
     @keyframes card-in {
       from { opacity: 0; transform: translateY(8px); }
       to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes dot-pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%      { opacity: .45; transform: scale(.85); }
     }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -58,7 +62,20 @@
     }
 
     .ws-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--muted); }
+    /* Legacy modifier, kept for anything still keying off .running directly. */
     .ws-dot.running { background: var(--green); box-shadow: 0 0 5px rgba(34, 197, 94, .5); }
+
+    /* Status dot — reflects the worker's agent phase (see /api/workspaces). */
+    .ws-dot.status-ready    { background: var(--green);  box-shadow: 0 0 5px rgba(34, 197, 94, .5); }
+    .ws-dot.status-stopped  { background: var(--muted); }
+    .ws-dot.status-error    { background: var(--red);    box-shadow: 0 0 5px rgba(239, 68, 68, .5); }
+    .ws-dot.status-running,
+    .ws-dot.status-compacting { animation: dot-pulse 1.1s ease-in-out infinite; }
+    .ws-dot.status-running    { background: var(--yellow); box-shadow: 0 0 5px rgba(234, 179, 8, .5); }
+    .ws-dot.status-compacting { background: var(--purple);  box-shadow: 0 0 5px rgba(168, 85, 247, .6); }
+    @media (prefers-reduced-motion: reduce) {
+      .ws-dot.status-running, .ws-dot.status-compacting { animation: none; }
+    }
 
     .ws-info { flex: 1; min-width: 0; }
     .ws-name { font-size: 14px; font-weight: 600; margin-bottom: 3px; }
@@ -101,7 +118,7 @@
 
     .empty-state { color: var(--muted); font-size: 14px; padding: 20px 0; }
 
-    .attach-section { margin-top: 36px; max-width: 720px; }
+    .attach-section { max-width: 720px; }
     .attach-section h2 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 12px; }
 
     .attach-row { display: flex; gap: 10px; }
@@ -196,15 +213,6 @@
     <span class="subtitle">Navigate your workspaces</span>
   </header>
 
-  <div id="workspace-grid" class="workspace-grid">
-    <div class="spinner">Loading…</div>
-  </div>
-
-  <div id="recent-section" class="recent-section" style="display:none">
-    <div class="section-header">Recent</div>
-    <div id="recent-grid" class="workspace-grid"></div>
-  </div>
-
   <div class="attach-section">
     <h2>Attach workspace</h2>
     <div class="attach-row">
@@ -212,6 +220,18 @@
       <button id="attach-btn">+ Attach</button>
     </div>
     <div id="error-msg" class="error-msg"></div>
+  </div>
+
+  <div id="active-section" class="recent-section">
+    <div class="section-header">Active</div>
+    <div id="workspace-grid" class="workspace-grid">
+      <div class="spinner">Loading…</div>
+    </div>
+  </div>
+
+  <div id="recent-section" class="recent-section" style="display:none">
+    <div class="section-header">Recent</div>
+    <div id="recent-grid" class="workspace-grid"></div>
   </div>
 
   <div id="confirm-modal">
@@ -283,7 +303,7 @@
         } else {
           grid.innerHTML = list.map(ws => `
             <div class="workspace-card">
-              <div class="ws-dot ${ws.running ? 'running' : ''}"></div>
+              <div class="ws-dot status-${esc(ws.status || (ws.running ? 'ready' : 'stopped'))}" title="${esc(ws.status||'')}"></div>
               <div class="ws-info">
                 <div class="ws-name">${esc(ws.name)}</div>
                 <div class="ws-path">${esc(ws.path)}</div>

@@ -286,6 +286,11 @@ export class Agent {
   private maxIterations: number = config.maxIterations
   private sessionId = ''
   private aborted = false
+  // Fine-grained run phase, surfaced via getPhase() -> server.ts's GET /status ->
+  // central's /api/workspaces aggregation, so the home screen's status dot can
+  // show ready/running/compacting/error instead of just busy/idle. 'idle' between
+  // runs (and briefly during compactNow's manual, between-runs compaction).
+  private phase: 'idle' | 'running' | 'compacting' | 'error' = 'idle'
   // Persisted structured memory that survives across compactions — see compaction.ts.
   private compactionState: CompactionState = emptyCompactionState()
   // Rolling record of the last REPEAT_WINDOW executed (name+args) keys. Reset per
@@ -446,6 +451,10 @@ export class Agent {
     return this.maxIterations
   }
 
+  getPhase(): 'idle' | 'running' | 'compacting' | 'error' {
+    return this.phase
+  }
+
   setSessionId(id: string) { this.sessionId = id }
 
   abort() { this.aborted = true }
@@ -478,10 +487,12 @@ export class Agent {
     }
     try {
       const currentRunStart = this.history.length - 1
+      this.phase = 'compacting'
       const result = await this.compactHistory(currentRunStart, 0, emitAndLog, true)
       if (result.compacted) await this.persistHistory()
       return { compacted: result.compacted }
     } finally {
+      this.phase = 'idle'
       await logger.flush()
     }
   }
@@ -977,6 +988,7 @@ export class Agent {
     }
 
     this.pushCtx({ role: 'user', content: userMessage })
+    this.phase = 'running'
     // The index of the message that started this run — compactHistory() always
     // keeps history[currentRunStart] verbatim, however many iterations follow it.
     // Reassigned (not recomputed) after each compaction, since compaction replaces
@@ -1023,6 +1035,7 @@ export class Agent {
           this.aborted = false
           const msg = 'Stopped.'
           emitAndLog({ type: 'done', content: msg })
+          this.phase = 'idle'
           return msg
         }
         emitAndLog({ type: 'iteration', current: i + 1, max: this.maxIterations })
@@ -1062,6 +1075,7 @@ export class Agent {
           this.aborted = false
           const stopped = 'Stopped.'
           emitAndLog({ type: 'done', content: stopped })
+          this.phase = 'idle'
           return stopped
         }
 
@@ -1086,8 +1100,10 @@ export class Agent {
           // of at a fixed fraction — the context is allowed to fill more before compacting.
           if (response.prompt_eval_count >= numCtx - config.compactReserveTokens) {
             try {
+              this.phase = 'compacting'
               const result = await this.compactHistory(currentRunStart, usagePct, emitAndLog)
               currentRunStart = result.newRunStart
+              this.phase = 'running'
             } catch (err) {
               // Deliberately falls through to the next normal iteration rather than
               // blocking on a synchronous compaction retry: a hard block risks the
@@ -1098,6 +1114,7 @@ export class Agent {
               // the next attempt — accepted here since raising compactTimeoutMs
               // above is the primary fix for the actual observed failure mode
               // (timeout, not a structural error).
+              this.phase = 'running'
               emitAndLog({ type: 'warning', message: `Context compaction failed (${err instanceof Error ? err.message : String(err)}) — continuing with full history` })
             }
           }
@@ -1209,6 +1226,7 @@ export class Agent {
           emitAndLog({ type: 'message', role: 'assistant', content: msg.content })
           emitAndLog({ type: 'done', content: msg.content })
           if (this.autoCommitEnabled) await this.autoCommit(emitAndLog)
+          this.phase = 'idle'
           return msg.content
         }
 
@@ -1262,9 +1280,12 @@ export class Agent {
             if (action.kind !== 'allow') {
               if (action.kind === 'compact') {
                 try {
+                  this.phase = 'compacting'
                   const r = await this.compactHistory(currentRunStart, 0, emitAndLog)
                   currentRunStart = r.newRunStart
+                  this.phase = 'running'
                 } catch (err) {
+                  this.phase = 'running'
                   emitAndLog({ type: 'warning', message: `Loop-recovery compaction failed (${err instanceof Error ? err.message : String(err)}) — continuing` })
                 }
               }
@@ -1370,6 +1391,7 @@ export class Agent {
 
       const errMsg = `Reached maximum iterations (${this.maxIterations}) without a final answer.`
       emitAndLog({ type: 'error', message: errMsg })
+      this.phase = 'idle'
       return errMsg
     } catch (err) {
       // Nothing above this catches a failure from the main per-iteration
@@ -1382,6 +1404,7 @@ export class Agent {
       // --rm'd container was later found gone with no way to recover its logs.
       const message = `Unexpected error: ${err instanceof Error ? err.message : String(err)}`
       emitAndLog({ type: 'error', message })
+      this.phase = 'error'
       return message
     } finally {
       await Promise.all([logger.flush(), this.persistHistory()])
