@@ -13,60 +13,8 @@
 </head>
 <body>
 
-<!-- Unified toolbar: CHAT section (left, mirrors #chat-panel's width) + a
-     divider + a FILE/CHANGE section (right, mirrors #files-panel): the
-     Files/Changes toggle, the current file/diff path (middle-ellipsized),
-     the Preview/Source toggle (moved up from the old per-pane file-viewer
-     header), close, refresh, and the auto-commit toggle. -->
-<header>
-  <div id="toolbar-chat">
-    <!-- Breadcrumb: Argo › workspace -->
-    <nav id="breadcrumb">
-      <a id="nav-home" href="/" title="All workspaces"><span class="flip-h">⛵</span><span class="wordmark"> Argo</span></a>
-
-      <span class="nav-sep" id="sep-ws" style="display:none">›</span>
-      <div class="nav-crumb" id="nav-ws" style="display:none">
-        <button class="nav-crumb-btn" id="ws-btn"><span id="ws-name-label"></span></button>
-        <div class="nav-dropdown" id="ws-dropdown"></div>
-      </div>
-    </nav>
-
-    <!-- Combined context + status indicator — center shows agent state
-         (green=ready / yellow=running, with iteration number / flashing
-         violet=compacting); ring shows context usage; tick marks the
-         auto-compaction threshold. Click opens a dropdown: status+model,
-         context detail, clear conversation. -->
-    <div id="indicator-area">
-      <div class="nav-crumb" id="nav-ctx">
-        <span id="token-counter" title="Status &amp; context — click for details"></span>
-        <div class="nav-dropdown" id="ctx-dropdown"></div>
-      </div>
-      <button id="settings-btn" class="icon-btn" title="Model &amp; parameters">⚙</button>
-    </div>
-  </div>
-
-  <div id="toolbar-div" aria-hidden="true"></div>
-
-  <!-- File/Change section — mirrors #files-panel. -->
-  <div id="toolbar-files">
-    <div class="viewer-toggle" id="files-mode-toggle" title="Switch between the file tree and uncommitted/committed changes">
-      <button type="button" class="vt-btn active" data-mode="files">Files</button>
-      <button type="button" class="vt-btn" data-mode="changes">Changes</button>
-    </div>
-    <span id="file-viewer-path"></span>
-    <div id="file-viewer-toggle" class="viewer-toggle hidden">
-      <button data-mode="preview" class="vt-btn">Preview</button><button data-mode="source" class="vt-btn">Source</button>
-    </div>
-    <button id="file-viewer-close" class="icon-btn" title="Close">✕</button>
-    <button id="refresh-files" class="icon-btn" title="Refresh">↻</button>
-    <button id="auto-commit-toggle" class="ac-toggle" type="button" title="Automatically commit the agent's changes after each run">
-      <span class="ac-dot"></span>Auto-commit
-    </button>
-  </div>
-</header>
-
 <!-- Legacy status readout — kept in the DOM (some code paths still write to
-     it) but visually folded into the combined indicator above; not shown. -->
+     it) but visually folded into the combined indicator; not shown. -->
 <div id="status" class="hidden">
   <div id="status-dot"></div>
   <span id="status-text">Connecting…</span>
@@ -75,9 +23,12 @@
 
 <div id="env-banner" class="hidden"></div>
 
-<!-- LLM settings — vertical list, opened by the gear (or the indicator's
-     status row). Order: Model, Context size, Grounding, Temperature, Top-p,
-     Top-k, Max iterations, Reset. -->
+<!-- LLM settings dropdown — anchored to the chat toolbar's gear (#settings-btn).
+     Width-capped, aligned label|control rows, draft-then-apply: opening seeds a
+     draft from the committed modelOpts/maxIterations/grounding; edits touch only
+     the draft; Save commits it (what the next /chat sends), Cancel discards it.
+     Order: Model, Context size, Grounding, Temperature, Top-p, Top-k, Max
+     iterations, then Reset | Cancel/Save. -->
 <div id="settings-panel">
   <div class="setting-group setting-model">
     <label for="opt-model">Model</label>
@@ -102,13 +53,17 @@
   </div>
   <div class="setting-group">
     <label for="opt-temperature">Temperature</label>
-    <input type="range" id="opt-temperature" min="0" max="2" step="0.05" value="0.8">
-    <span class="opt-val" id="opt-temperature-val">0.8</span>
+    <div class="setting-control">
+      <input type="range" id="opt-temperature" min="0" max="2" step="0.05" value="0.8">
+      <span class="opt-val" id="opt-temperature-val">0.8</span>
+    </div>
   </div>
   <div class="setting-group">
     <label for="opt-top-p">Top P</label>
-    <input type="range" id="opt-top-p" min="0" max="1" step="0.05" value="0.9">
-    <span class="opt-val" id="opt-top-p-val">0.9</span>
+    <div class="setting-control">
+      <input type="range" id="opt-top-p" min="0" max="1" step="0.05" value="0.9">
+      <span class="opt-val" id="opt-top-p-val">0.9</span>
+    </div>
   </div>
   <div class="setting-group">
     <label for="opt-top-k">Top K</label>
@@ -116,15 +71,53 @@
   </div>
   <div class="setting-group">
     <label for="opt-max-iterations">Max iterations</label>
-    <input type="range" id="opt-max-iterations" min="10" max="1000" step="10" value="1000">
-    <span class="opt-val" id="opt-max-iterations-val">1000</span>
+    <div class="setting-control">
+      <input type="range" id="opt-max-iterations" min="10" max="1000" step="10" value="1000">
+      <span class="opt-val" id="opt-max-iterations-val">1000</span>
+    </div>
   </div>
-  <button id="settings-reset">Reset</button>
+  <div class="settings-actions">
+    <button id="settings-reset" type="button">Reset</button>
+    <div class="settings-actions-right">
+      <button id="settings-cancel" type="button">Cancel</button>
+      <button id="settings-save" type="button">Save</button>
+    </div>
+  </div>
 </div>
 
+<!-- Two self-contained, full-height columns. Each is its own vertical flex
+     stack with its OWN toolbar on top (mirroring the old unified header's
+     two sections, now split one-per-column) so the two halves read as
+     parallel VS-Code-like panes. -->
 <main>
-  <!-- Chat panel -->
+  <!-- LEFT column — chat half -->
   <section id="chat-panel">
+    <div id="toolbar-chat" class="col-toolbar">
+      <!-- Breadcrumb: Argo › workspace -->
+      <nav id="breadcrumb">
+        <a id="nav-home" href="/" title="All workspaces"><span class="flip-h">⛵</span><span class="wordmark"> Argo</span></a>
+
+        <span class="nav-sep" id="sep-ws" style="display:none">›</span>
+        <div class="nav-crumb" id="nav-ws" style="display:none">
+          <button class="nav-crumb-btn" id="ws-btn"><span id="ws-name-label"></span></button>
+          <div class="nav-dropdown" id="ws-dropdown"></div>
+        </div>
+      </nav>
+
+      <!-- Combined context + status indicator — center shows agent state
+           (green=ready / yellow=running, with iteration number / flashing
+           violet=compacting); ring shows context usage; tick marks the
+           auto-compaction threshold. Click opens a dropdown: status+model,
+           context detail, clear conversation. -->
+      <div id="indicator-area">
+        <div class="nav-crumb" id="nav-ctx">
+          <span id="token-counter" title="Status &amp; context — click for details"></span>
+          <div class="nav-dropdown" id="ctx-dropdown"></div>
+        </div>
+        <button id="settings-btn" class="icon-btn" title="Model &amp; parameters">⚙</button>
+      </div>
+    </div>
+
     <div id="messages-scroll-wrap">
       <div id="messages">
         <div class="message system">Session started. Ask anything.</div>
@@ -148,26 +141,46 @@
   <!-- Resize handle (chat | files) -->
   <div id="panel-resize" class="resize-handle"></div>
 
-  <!-- Files panel -->
+  <!-- RIGHT column — file/change half -->
   <section id="files-panel">
-    <!-- File tree pane — shows either the file tree (Files mode) or the
-         changes list (Changes mode: uncommitted changes + commit history);
-         see files-mode-toggle in the header and renderFiles.../refreshChanges
-         in app.js. -->
-    <div id="file-tree-pane">
-      <div id="files-content">
-        <div id="files-tree" class="file-tree"></div>
+    <div id="toolbar-files" class="col-toolbar">
+      <div class="viewer-toggle" id="files-mode-toggle" title="Switch between the file tree and uncommitted/committed changes">
+        <button type="button" class="vt-btn active" data-mode="files">Files</button>
+        <button type="button" class="vt-btn" data-mode="changes">Changes</button>
       </div>
+      <span id="file-viewer-path"></span>
+      <div id="file-viewer-toggle" class="viewer-toggle hidden">
+        <button data-mode="preview" class="vt-btn">Preview</button><button data-mode="source" class="vt-btn">Source</button>
+      </div>
+      <button id="file-viewer-close" class="icon-btn" title="Close">✕</button>
+      <button id="refresh-files" class="icon-btn" title="Refresh">↻</button>
+      <button id="auto-commit-toggle" class="ac-toggle" type="button" title="Automatically commit the agent's changes after each run">
+        <span class="ac-dot"></span>Auto-commit
+      </button>
     </div>
 
-    <!-- Resize handle (tree | viewer) -->
-    <div id="tree-resize" class="resize-handle"></div>
+    <!-- File tree pane / viewer pane, side by side (VS Code explorer|editor
+         style) below the column's toolbar. -->
+    <div id="files-panel-body">
+      <!-- File tree pane — shows either the file tree (Files mode) or the
+           changes list (Changes mode: uncommitted changes + commit history);
+           see files-mode-toggle above and renderFiles.../refreshChanges
+           in app.js. -->
+      <div id="file-tree-pane">
+        <div id="files-content">
+          <div id="files-tree" class="file-tree"></div>
+        </div>
+      </div>
 
-    <!-- File viewer — path/toggle/close now live in the header toolbar
-         (#toolbar-files); this pane is just the content (source, preview,
-         or a colorized diff). -->
-    <div id="file-viewer-pane">
-      <pre id="file-viewer-content" class="file-viewer-empty">Select a file to view</pre>
+      <!-- Resize handle (tree | viewer) -->
+      <div id="tree-resize" class="resize-handle"></div>
+
+      <!-- File viewer — path/toggle/close live in the column's toolbar
+           (#toolbar-files); this pane is just the content (source, preview,
+           or a colorized diff). -->
+      <div id="file-viewer-pane">
+        <pre id="file-viewer-content" class="file-viewer-empty">Select a file to view</pre>
+      </div>
     </div>
   </section>
 </main>

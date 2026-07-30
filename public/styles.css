@@ -52,23 +52,25 @@ body {
   overflow: hidden;
 }
 
-/* ── Header — unified toolbar, two sections ──────────────────────────
-   A CHAT section (left, sized to mirror #chat-panel's width so the divider
-   below it lines up with the boundary between #chat-panel and #files-panel)
-   and a FILE/CHANGE section (right, mirrors #files-panel) — the latter is a
-   reserved container for a later task (Files/Changes toggle + file path). */
-header {
+/* ── Column toolbars ──────────────────────────────────────────────────
+   Each of the two self-contained columns (#chat-panel / #files-panel) owns
+   its own full-width header bar — #toolbar-chat (breadcrumb, combined
+   indicator, settings gear) atop the chat half, #toolbar-files (Files/
+   Changes toggle, path, preview toggle, refresh, auto-commit) atop the file
+   half. Both share this .col-toolbar chrome (height/background/gold
+   underline) so the two halves read as parallel. */
+.col-toolbar {
   display: flex;
-  align-items: stretch;
-  gap: 0;
-  padding: 0;
+  align-items: center;
+  gap: 10px;
   height: 42px;
+  padding: 0 16px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   position: relative;
 }
-header::after {
+.col-toolbar::after {
   content: '';
   position: absolute;
   bottom: -1px; left: 8%; right: 8%;
@@ -78,35 +80,9 @@ header::after {
   pointer-events: none;
 }
 
-/* CHAT section — same width as #chat-panel below it. */
-#toolbar-chat {
-  display: flex;
-  align-items: center;
-  width: var(--chat-width, 50%);
-  min-width: 240px;
-  flex-shrink: 0;
-  padding: 0 16px;
-}
+#toolbar-chat { width: 100%; }
 
-/* Divider between the two toolbar sections, aligned with the chat/files
-   panel boundary. */
-#toolbar-div {
-  width: 1px;
-  flex-shrink: 0;
-  background: var(--border);
-  margin: 8px 0;
-}
-
-/* FILE/CHANGE section — mirrors #files-panel: Files/Changes toggle, current
-   file/diff path, Preview/Source toggle, close, refresh, auto-commit. */
-#toolbar-files {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 0 16px;
-  min-width: 200px;
-}
+#toolbar-files { width: 100%; min-width: 200px; }
 
 /* ── Breadcrumb nav ── */
 #breadcrumb {
@@ -438,49 +414,54 @@ header::after {
 /* ── Status (legacy) — hidden; folded into the combined indicator ── */
 #status { display: none; }
 
-/* ── Settings panel — vertical list, opened by the gear or the indicator's
-   status row. Order: Model, Context size, Grounding, Temperature, Top-p,
-   Top-k, Max iterations, Reset. */
+/* ── Settings dropdown — anchored to the chat toolbar's gear (#settings-btn),
+   width-capped so it never spans wider than the chat column. Aligned
+   label|control rows (a 2-col grid: 92px label + 1fr control, so every
+   select/slider/number's right edge lines up); value read-outs for sliders
+   sit in a fixed-width slot at the end of the control cell. Positioned by JS
+   (positionSettingsPanel() in app.js) the same way the other .nav-dropdowns
+   are — this isn't a .nav-crumb child, so it gets its own open/close state
+   instead of reusing that class. Order: Model, Context size, Grounding,
+   Temperature, Top-p, Top-k, Max iterations, then Reset | Cancel/Save. */
 #settings-panel {
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-  display: flex;
+  display: none;
   flex-direction: column;
-  align-items: stretch;
   gap: 10px;
-  padding: 0 20px;
-  max-height: 0;
-  overflow: hidden;
-  transition: max-height 0.15s ease, padding 0.15s ease;
+  position: fixed;
+  top: 0; left: 0;   /* overridden by JS when opened */
+  width: 320px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  box-shadow: 0 12px 32px rgba(0,0,0,.4);
+  z-index: 1000;
 }
-#settings-panel.open { max-height: 420px; overflow-y: auto; padding: 14px 20px; }
+#settings-panel.open { display: flex; }
 
 .setting-group {
-  display: flex;
+  display: grid;
+  grid-template-columns: 92px 1fr;
   align-items: center;
-  gap: 8px;
+  column-gap: 10px;
   font-size: 12px;
   color: var(--muted);
-  white-space: nowrap;
 }
 .setting-group label {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: .04em;
-  width: 190px;
-  flex-shrink: 0;
   display: flex;
   align-items: center;
   gap: 5px;
 }
-.setting-group input[type="range"] { width: 160px; accent-color: var(--gold); cursor: pointer; }
+.setting-group select,
+.setting-group input[type="number"] { width: 100%; }
 .setting-group input[type="number"] {
-  width: 56px;
   background: var(--bg);
   border: 1px solid var(--border);
   color: var(--text);
-  padding: 2px 6px;
+  padding: 3px 6px;
   font-size: 12px;
   font-family: var(--font-mono);
   border-radius: 4px;
@@ -496,27 +477,35 @@ header::after {
   border-radius: 4px;
   cursor: pointer;
   outline: none;
-  min-width: 200px;
 }
 .setting-group select:focus { border-color: rgba(201, 162, 39, .4); }
-.opt-val { font-family: var(--font-mono); font-size: 12px; color: var(--text); min-width: 32px; }
 
-/* Model select is the first row — a little more breathing room, no uppercase
-   truncation since model names are long/mixed-case. */
-.setting-model select { min-width: 260px; font-family: var(--font-mono); }
+/* Slider + value read-out share the control cell so the value sits in a
+   consistent slot without breaking the label|control grid alignment. */
+.setting-control { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.setting-control input[type="range"] { flex: 1; min-width: 0; accent-color: var(--gold); cursor: pointer; }
+.opt-val { font-family: var(--font-mono); font-size: 11px; color: var(--text); flex-shrink: 0; width: 32px; text-align: right; }
 
-/* Grounding's label is a full sentence, not a short field name — let it wrap
-   instead of forcing the shared 190px column + nowrap. */
-.setting-grounding { align-items: flex-start; white-space: normal; }
+/* Model select is the first row — monospace to match model-name style. */
+.setting-model select { font-family: var(--font-mono); }
+
+/* Grounding's label is a full sentence, not a short field name — this row
+   drops the shared grid for a simple flex row so the sentence can wrap at
+   the panel's width, with the checkbox pinned top-right. */
+.setting-grounding {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
 .setting-grounding label {
-  width: auto;
-  max-width: 420px;
+  flex: 1;
   white-space: normal;
   text-transform: none;
   letter-spacing: normal;
   font-size: 12px;
   padding-top: 1px;
 }
+.setting-grounding input[type="checkbox"] { margin-top: 2px; flex-shrink: 0; }
 
 /* Grounding info affordance — small "ⓘ" with a native tooltip (title attr)
    explaining what the check does. */
@@ -537,6 +526,17 @@ header::after {
 }
 .info-affordance:hover, .info-affordance:focus-visible { color: var(--text); border-color: var(--text); outline: none; }
 
+/* Reset (discards draft to defaults) | Cancel/Save (draft-then-apply — see
+   openSettingsPanel()/saveSettingsPanel()/cancelSettingsPanel() in app.js). */
+.settings-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.settings-actions-right { display: flex; gap: 8px; }
 #settings-reset {
   background: none;
   border: 1px solid var(--border);
@@ -545,10 +545,29 @@ header::after {
   font-size: 11px;
   cursor: pointer;
   border-radius: 4px;
-  align-self: flex-start;
-  margin-top: 4px;
 }
 #settings-reset:hover { color: var(--text); }
+#settings-cancel {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 5px 14px;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+#settings-cancel:hover { color: var(--text); border-color: var(--text); }
+#settings-save {
+  background: var(--gold);
+  border: none;
+  color: #1a1000;
+  font-weight: 600;
+  padding: 5px 14px;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+#settings-save:hover { filter: brightness(1.1); }
 
 #status-dot {
   width: 7px; height: 7px;
@@ -572,7 +591,9 @@ main {
   overflow: hidden;
 }
 
-/* ── Chat panel ── */
+/* ── Chat panel — self-contained LEFT column: its own toolbar (#toolbar-chat)
+   on top, message history in the middle (flex:1, scrolls on its own), the
+   composer pinned at the bottom. ── */
 #chat-panel {
   width: var(--chat-width, 50%);
   min-width: 240px;
@@ -1054,13 +1075,26 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 }
 .git-toggle-btn:hover { color: var(--text); }
 
-/* ── Files panel ── */
+/* ── Files panel — self-contained RIGHT column: its own toolbar
+   (#toolbar-files) spans the column width on top; below it, #files-panel-body
+   keeps today's tree|viewer side-by-side arrangement (VS Code explorer|editor
+   style) as the column's body. ── */
 #files-panel {
   flex: 1;
   display: flex;
+  flex-direction: column;
   overflow: hidden;
   min-width: 200px;
   border-left: 1px solid var(--border);
+}
+
+/* The tree|viewer row — everything #files-panel used to lay out directly
+   before the toolbar moved to the top of this column. */
+#files-panel-body {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  min-width: 0;
 }
 
 #file-tree-pane {

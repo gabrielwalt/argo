@@ -208,41 +208,108 @@ let maxIterations = MAX_ITERATIONS_DEFAULT
 // every /chat request so the worker's per-run flag matches this toggle.
 let grounding = true
 
+// ── Settings dropdown — draft-then-apply ────────────────────────────
+// The dropdown no longer live-applies: opening it seeds `settingsDraft` from
+// the committed state (modelOpts/maxIterations/grounding/selectedModel);
+// every control below writes into the draft only. Save copies the draft back
+// into the committed variables (what the next /chat request sends) and
+// closes; Cancel (or any outside-click/Escape close) just discards the draft
+// and closes, leaving the committed state untouched. `null` means "closed".
+let settingsDraft = null
+
+function isSettingsOpen() { return settingsPanel.classList.contains('open') }
+
+// Reflects the draft (while open) or the committed state (while closed) into
+// the control DOM — used both when opening (seed) and after Reset.
 function syncSettingsUI() {
-  $('opt-temperature').value = modelOpts.temperature
-  $('opt-temperature-val').textContent = modelOpts.temperature.toFixed(2)
-  $('opt-top-p').value = modelOpts.top_p
-  $('opt-top-p-val').textContent = modelOpts.top_p.toFixed(2)
-  $('opt-top-k').value = modelOpts.top_k
-  $('opt-num-ctx').value = modelOpts.num_ctx
-  $('opt-max-iterations').value = maxIterations
-  $('opt-max-iterations-val').textContent = maxIterations
-  $('opt-grounding').checked = grounding
+  const src = settingsDraft || { ...modelOpts, maxIterations, grounding, model: selectedModel }
+  $('opt-temperature').value = src.temperature
+  $('opt-temperature-val').textContent = src.temperature.toFixed(2)
+  $('opt-top-p').value = src.top_p
+  $('opt-top-p-val').textContent = src.top_p.toFixed(2)
+  $('opt-top-k').value = src.top_k
+  $('opt-num-ctx').value = src.num_ctx
+  $('opt-max-iterations').value = src.maxIterations
+  $('opt-max-iterations-val').textContent = src.maxIterations
+  $('opt-grounding').checked = src.grounding
+  const sel = $('opt-model')
+  if (sel && src.model && sel.querySelector(`option[value="${src.model}"]`)) sel.value = src.model
+}
+
+function positionSettingsPanel() {
+  const r = settingsBtn.getBoundingClientRect()
+  const width = settingsPanel.getBoundingClientRect().width || 320
+  settingsPanel.style.left = Math.max(8, r.right - width) + 'px'
+  settingsPanel.style.top = (r.bottom + 6) + 'px'
+}
+
+function openSettingsPanel() {
+  if (isSettingsOpen()) return
+  settingsDraft = { ...modelOpts, maxIterations, grounding, model: selectedModel }
+  syncSettingsUI()
+  settingsPanel.classList.add('open')
+  positionSettingsPanel()
+}
+
+// Closes without touching the committed state — shared by Cancel and any
+// outside-click/Escape dismissal (see closeAllDropdowns()).
+function cancelSettingsPanel() {
+  settingsPanel.classList.remove('open')
+  settingsDraft = null
+}
+
+function saveSettingsPanel() {
+  if (settingsDraft) {
+    modelOpts.temperature = settingsDraft.temperature
+    modelOpts.top_p = settingsDraft.top_p
+    modelOpts.top_k = settingsDraft.top_k
+    modelOpts.num_ctx = settingsDraft.num_ctx
+    maxIterations = settingsDraft.maxIterations
+    grounding = settingsDraft.grounding
+    if (settingsDraft.model && settingsDraft.model !== selectedModel) selectModel(settingsDraft.model)
+  }
+  settingsPanel.classList.remove('open')
+  settingsDraft = null
 }
 
 $('opt-temperature').addEventListener('input', e => {
-  modelOpts.temperature = parseFloat(e.target.value)
-  $('opt-temperature-val').textContent = modelOpts.temperature.toFixed(2)
+  if (!settingsDraft) return
+  settingsDraft.temperature = parseFloat(e.target.value)
+  $('opt-temperature-val').textContent = settingsDraft.temperature.toFixed(2)
 })
 $('opt-top-p').addEventListener('input', e => {
-  modelOpts.top_p = parseFloat(e.target.value)
-  $('opt-top-p-val').textContent = modelOpts.top_p.toFixed(2)
+  if (!settingsDraft) return
+  settingsDraft.top_p = parseFloat(e.target.value)
+  $('opt-top-p-val').textContent = settingsDraft.top_p.toFixed(2)
 })
-$('opt-top-k').addEventListener('change', e => { modelOpts.top_k = parseInt(e.target.value, 10) })
-$('opt-num-ctx').addEventListener('change', e => { modelOpts.num_ctx = parseInt(e.target.value, 10) })
+$('opt-top-k').addEventListener('change', e => { if (settingsDraft) settingsDraft.top_k = parseInt(e.target.value, 10) })
+$('opt-num-ctx').addEventListener('change', e => { if (settingsDraft) settingsDraft.num_ctx = parseInt(e.target.value, 10) })
 $('opt-max-iterations').addEventListener('input', e => {
-  maxIterations = parseInt(e.target.value, 10)
-  $('opt-max-iterations-val').textContent = maxIterations
+  if (!settingsDraft) return
+  settingsDraft.maxIterations = parseInt(e.target.value, 10)
+  $('opt-max-iterations-val').textContent = settingsDraft.maxIterations
 })
-$('opt-grounding').addEventListener('change', e => { grounding = e.target.checked })
+$('opt-grounding').addEventListener('change', e => { if (settingsDraft) settingsDraft.grounding = e.target.checked })
+// Reset restores the DRAFT to defaults (still requires Save to commit), so it
+// composes with the same draft/Save/Cancel flow as every other control.
 $('settings-reset').addEventListener('click', () => {
-  Object.assign(modelOpts, DEFAULTS)
-  maxIterations = MAX_ITERATIONS_DEFAULT
-  grounding = true
+  if (!settingsDraft) return
+  Object.assign(settingsDraft, DEFAULTS)
+  settingsDraft.maxIterations = MAX_ITERATIONS_DEFAULT
+  settingsDraft.grounding = true
   syncSettingsUI()
 })
+$('settings-cancel').addEventListener('click', cancelSettingsPanel)
+$('settings-save').addEventListener('click', saveSettingsPanel)
+// Clicks inside the dropdown shouldn't bubble to the document-level
+// closeAllDropdowns() listener (same pattern as .nav-drop-attach).
+settingsPanel.addEventListener('click', e => e.stopPropagation())
 
-settingsBtn.addEventListener('click', () => settingsPanel.classList.toggle('open'))
+settingsBtn.addEventListener('click', (e) => {
+  e.stopPropagation()
+  if (isSettingsOpen()) cancelSettingsPanel()
+  else { closeAllDropdowns(); openSettingsPanel() }
+})
 syncSettingsUI()
 
 // ── Inline trace block (in chat) ──────────────────────────────────
@@ -805,7 +872,7 @@ function buildCtxDropdown() {
   statusRow.innerHTML = `<span>${escHtml(compactStatusText())}</span>`
   statusRow.addEventListener('click', () => {
     navCtx.classList.remove('open')
-    settingsPanel.classList.add('open')
+    openSettingsPanel()
   })
   ctxDropdown.appendChild(statusRow)
 
@@ -1368,6 +1435,7 @@ async function newSession() {
 // ── Dropdown mutual exclusion ─────────────────────────────────────
 function closeAllDropdowns() {
   document.querySelectorAll('.nav-crumb.open').forEach(el => el.classList.remove('open'))
+  if (isSettingsOpen()) cancelSettingsPanel()
 }
 document.addEventListener('click', closeAllDropdowns)
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAllDropdowns() })
@@ -1388,7 +1456,10 @@ function selectModel(name) {
 async function loadModels() {
   const select = $('opt-model')
 
-  select.addEventListener('change', e => selectModel(e.target.value))
+  // Model choice lives in the settings dropdown now — an edit here only
+  // updates the draft; selectModel() (which actually applies it) fires from
+  // saveSettingsPanel() on Save.
+  select.addEventListener('change', e => { if (settingsDraft) settingsDraft.model = e.target.value })
 
   try {
     const resp = await fetch(`${API_BASE}/models`)
@@ -2331,7 +2402,8 @@ function initResize(handleId, getWidth, cssVar, minPx) {
 
 // ── Workspace gate (standalone mode only — central/worker always has one) ──
 function showNoWorkspaceScreen() {
-  document.querySelector('header').classList.add('hidden')
+  // Both column toolbars now live inside <main> (#chat-panel/#files-panel),
+  // so hiding main alone hides everything the old standalone <header> did.
   document.querySelector('main').classList.add('hidden')
   $('no-workspace-screen').classList.remove('hidden')
 }
