@@ -837,7 +837,7 @@ async function stopAgent() {
 // readout (status+model / precise context numbers) on top, then three
 // clickable actions: "⚙ Model & parameters" (opens the settings panel, which
 // used to be opened by the now-removed gear button), "🔍 View context" (opens
-// the context viewer), and "＋ Clear conversation" (replaces the old
+// the context viewer), and "↺ Clear conversation" (replaces the old
 // standalone new-session button). Reuses the .nav-crumb / .nav-dropdown
 // pattern, so closeAllDropdowns() (outside-click + Escape) closes it for
 // free. "Compact now" lives in the context viewer's title bar instead of
@@ -889,7 +889,14 @@ function buildCtxDropdown() {
   const settingsRow = document.createElement('div')
   settingsRow.className = 'nav-drop-item'
   settingsRow.innerHTML = `<span>⚙ Model &amp; parameters</span>`
-  settingsRow.addEventListener('click', () => {
+  settingsRow.addEventListener('click', (e) => {
+    // Without this, the click bubbles up to the document-level
+    // closeAllDropdowns() listener AFTER openSettingsPanel() has already run
+    // (both fire during the same bubble phase) — closeAllDropdowns() sees the
+    // panel is open and immediately cancels it via cancelSettingsPanel(), so
+    // the panel flashed open and shut in the same click. Stopping propagation
+    // here (same pattern as settingsPanel's own click handler) is the fix.
+    e.stopPropagation()
     navCtx.classList.remove('open')
     openSettingsPanel()
   })
@@ -905,11 +912,13 @@ function buildCtxDropdown() {
   })
   ctxDropdown.appendChild(ctxRow)
 
-  // Action 3 — clear conversation (was the standalone "＋" button in the breadcrumb).
+  // Action 3 — clear conversation (was the standalone "＋" button in the breadcrumb;
+  // now uses a reset-style "↺" glyph, which reads as clearing/restarting rather
+  // than adding).
   const clearDisabled = busy
   const clearRow = document.createElement('div')
   clearRow.className = `nav-drop-item${clearDisabled ? ' disabled' : ''}`
-  clearRow.innerHTML = `<span>＋ Clear conversation</span>${clearDisabled ? '<span class="ctx-hint">running…</span>' : ''}`
+  clearRow.innerHTML = `<span>↺ Clear conversation</span>${clearDisabled ? '<span class="ctx-hint">running…</span>' : ''}`
   if (!clearDisabled) {
     clearRow.addEventListener('click', () => {
       navCtx.classList.remove('open')
@@ -1484,7 +1493,15 @@ async function loadModels() {
       opt.textContent = `${name}${toolBadge}${noToolBadge}`
       select.appendChild(opt)
     })
-    if (models.length) selectModel(models[0])
+    // Default to qwen3.6 (the validated best model) when it's in the list,
+    // falling back to the first model otherwise. This only picks the
+    // DEFAULT — applySessionSettings()/a sticky restored model still wins
+    // when this runs before/after that, since selectModel() here just sets
+    // the initial value and later calls simply overwrite it.
+    if (models.length) {
+      const preferred = models.find(name => name === 'qwen3.6' || name.startsWith('qwen3.6'))
+      selectModel(preferred || models[0])
+    }
   } catch {
     const fallback = 'llama3.1:8b'
     select.innerHTML = ''
@@ -2187,54 +2204,12 @@ async function initNav() {
     }
   })
 
-  // Build workspace dropdown — attach form at top, then workspace list
+  // Build workspace dropdown — just the workspace list (current + others,
+  // no separators between them), then a single separator and a trailing
+  // "Attach another workspace…" item that hands off to the home screen (the
+  // inline attach-a-folder form that used to live here is gone).
   const wsDropdown = $('ws-dropdown')
   wsDropdown.innerHTML = ''
-
-  // Attach form at top
-  const attachRow = document.createElement('div')
-  attachRow.className = 'nav-drop-attach'
-  attachRow.innerHTML = `<input type="text" placeholder="Attach /path/to/folder…" spellcheck="false" autocomplete="off"><button type="button">Attach</button>`
-  wsDropdown.appendChild(attachRow)
-
-  const attachInput = attachRow.querySelector('input')
-  const attachBtn = attachRow.querySelector('button')
-
-  async function doAttach() {
-    const p = attachInput.value.trim()
-    if (!p) { attachInput.focus(); return }
-    attachBtn.textContent = '…'
-    attachBtn.disabled = true
-    try {
-      const resp = await fetch('/api/attach', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: p }),
-      })
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.error ?? 'Failed')
-      window.location.href = data.url
-      attachInput.value = ''
-    } catch (err) {
-      attachInput.value = ''
-      attachInput.placeholder = err.message
-      setTimeout(() => { attachInput.placeholder = 'Attach /path/to/folder…' }, 3000)
-    } finally {
-      attachBtn.textContent = 'Attach'
-      attachBtn.disabled = false
-    }
-  }
-
-  attachBtn.addEventListener('click', doAttach)
-  attachRow.addEventListener('click', e => e.stopPropagation())
-  attachInput.addEventListener('keydown', e => {
-    e.stopPropagation()
-    if (e.key === 'Enter') doAttach()
-  })
-
-  const sepAttach = document.createElement('div')
-  sepAttach.className = 'nav-drop-sep'
-  wsDropdown.appendChild(sepAttach)
 
   const wsLabel = document.createElement('div')
   wsLabel.className = 'nav-drop-label'
@@ -2277,9 +2252,6 @@ async function initNav() {
     const workspaces = await fetch('/api/workspaces').then(r => r.json())
     const others = workspaces.filter(w => w.name !== window.__WS__)
     if (others.length > 0) {
-      const sep = document.createElement('div')
-      sep.className = 'nav-drop-sep'
-      othersContainer.appendChild(sep)
       others.forEach(w => {
         const row = document.createElement('div')
         row.className = 'nav-drop-item'
@@ -2325,6 +2297,18 @@ async function initNav() {
     }
   } catch { /* standalone dev — no workspace API */ }
 
+  // Trailing "Attach another workspace…" item — the only separator in this
+  // dropdown sits directly above it, setting it apart from the workspace
+  // list above.
+  const sepAttach = document.createElement('div')
+  sepAttach.className = 'nav-drop-sep'
+  wsDropdown.appendChild(sepAttach)
+
+  const attachAnotherRow = document.createElement('div')
+  attachAnotherRow.className = 'nav-drop-item'
+  attachAnotherRow.innerHTML = `<span>Attach another workspace…</span>`
+  attachAnotherRow.addEventListener('click', () => { window.location.href = '/' })
+  wsDropdown.appendChild(attachAnotherRow)
 }
 
 // ── Init ─────────────────────────────────────────────────────────

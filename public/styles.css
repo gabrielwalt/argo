@@ -1189,6 +1189,13 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .file-node.dir.open > .file-children { display: block; }
 .file-empty { color: var(--muted); font-size: 11px; padding: 2px 8px; }
 
+/* History section's commit rows reuse .file-children for their expanded
+   file list, but their wrapper is .commit-node (not .file-node.dir) — the
+   reveal rule above only matches the file tree's own wrapper class, so
+   without this, an "opened" commit's fetched files stayed permanently
+   display:none. See makeCommitRow() in app.js. */
+.commit-node.open > .file-children { display: block; }
+
 /* ── File viewer ── */
 #file-viewer-pane {
   flex: 1;
