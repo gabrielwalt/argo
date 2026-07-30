@@ -575,6 +575,18 @@ main {
   overflow: hidden;
 }
 
+/* Wraps #messages so the floating "scroll to bottom" button can be
+   positioned relative to the visible message pane (not the scrolled
+   content, and not the whole chat panel including the composer below). */
+#messages-scroll-wrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+
 #messages {
   flex: 1;
   overflow-y: auto;
@@ -583,6 +595,27 @@ main {
   flex-direction: column;
   gap: 12px;
 }
+
+/* Floating control shown only when the user has scrolled up AND new content
+   has arrived below — see maybeAutoScroll() in app.js. Click smooth-scrolls
+   to bottom and hides itself. */
+#scroll-bottom-btn {
+  position: absolute;
+  bottom: 14px;
+  right: 20px;
+  padding: 6px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 11px;
+  font-family: var(--font-mono);
+  box-shadow: 0 4px 14px rgba(0,0,0,.35);
+  cursor: pointer;
+  z-index: 5;
+  transition: opacity .15s, transform .15s;
+}
+#scroll-bottom-btn:hover { border-color: var(--gold); color: var(--gold); }
 
 .message {
   max-width: 100%;
@@ -849,9 +882,22 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 }
 .trace-block-toggle:hover { background: rgba(255,255,255,.03); }
 .trace-block-arrow { color: var(--muted); font-size: 9px; flex-shrink: 0; }
-.trace-block-title { font-size: 11px; color: var(--muted); }
+.trace-block-title-wrap { display: flex; flex-direction: column; min-width: 0; overflow: hidden; gap: 1px; }
+.trace-block-title { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .trace-block.running .trace-block-title { color: var(--gold); }
-.trace-block-meta { margin-left: auto; font-size: 10px; opacity: .5; color: var(--muted); }
+/* Current-activity line — only meaningful while running; paced in JS (see
+   surfaceActivity() in app.js) so it stays readable instead of flickering
+   with every streamed event. */
+.trace-block-subtitle {
+  font-size: 10px;
+  color: var(--muted);
+  opacity: .7;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.trace-block-subtitle:empty { display: none; }
+.trace-block-meta { margin-left: auto; font-size: 10px; opacity: .5; color: var(--muted); flex-shrink: 0; }
 
 .trace-block-items {
   display: none;
@@ -862,24 +908,48 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 }
 .trace-block.open .trace-block-items { display: flex; }
 
+/* Bold full-width divider marking a new iteration — deliberately NOT a
+   .trace-item (no label/body chrome, no left edge to match) so it reads as a
+   structural break in the trace rather than another event row. */
+.trace-separator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 2px 2px;
+}
+.trace-separator-line {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--purple), transparent);
+  opacity: .6;
+}
+.trace-separator-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--purple);
+  letter-spacing: .03em;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+/* Items no longer carry a colored left edge (removed by design) — each type
+   stays distinguishable by its emoji label plus a muted text tint. */
 .trace-item {
   padding: 5px 10px;
   border-radius: 5px;
-  border-left: 2px solid transparent;
   background: var(--surface);
   animation: trace-in .12s ease-out;
   font-family: var(--font-mono);
   font-size: 11px;
 }
-.trace-item.thought          { border-left-color: var(--blue);   color: #93c5fd; }
-.trace-item.tool-call        { border-left-color: var(--yellow); color: var(--yellow); }
-.trace-item.tool-result      { border-left-color: var(--green);  color: #86efac; }
-.trace-item.tool-result.error{ border-left-color: var(--red);    color: #fca5a5; }
-.trace-item.iteration        { border-left-color: var(--purple); color: var(--purple); font-size: 10px; }
-.trace-item.git              { border-left-color: var(--gold);   color: var(--gold); }
-.trace-item.compact          { border-left-color: var(--accent); color: var(--accent); }
-.trace-item.error-item       { border-left-color: var(--red);    color: #fca5a5; }
-.trace-item.warning          { border-left-color: var(--yellow); color: var(--yellow); }
+.trace-item.thought           { color: #93c5fd; }
+.trace-item.tool-call         { color: var(--yellow); }
+.trace-item.tool-result       { color: #86efac; }
+.trace-item.tool-result.error { color: #fca5a5; background: rgba(239,68,68,.06); }
+.trace-item.git                { color: var(--gold); }
+.trace-item.compact            { color: var(--accent); }
+.trace-item.error-item         { color: #fca5a5; background: rgba(239,68,68,.08); }
+.trace-item.warning            { color: var(--yellow); background: rgba(234,179,8,.06); }
 
 .trace-label { font-weight: 700; margin-bottom: 3px; display: flex; align-items: center; gap: 6px; }
 .trace-duration { margin-left: auto; font-weight: 400; opacity: .6; font-size: 10px; }

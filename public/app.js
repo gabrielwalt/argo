@@ -18,6 +18,43 @@ const tokenCounter = $('token-counter')
 const settingsBtn = $('settings-btn')
 const settingsPanel = $('settings-panel')
 
+// ── Message-list scroll tracking ────────────────────────────────
+// #messages force-scrolled to bottom on every append before this — fine
+// while watching a run live, annoying once you've scrolled up to reread
+// something and new trace items yank you back down. Track whether the user
+// is at (or within NEAR_BOTTOM_PX of) the bottom; only auto-scroll when they
+// already are there, and surface a floating button otherwise.
+const scrollBottomBtn = $('scroll-bottom-btn')
+const NEAR_BOTTOM_PX = 40
+let messagesAtBottom = true
+
+function isNearBottom() {
+  return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight <= NEAR_BOTTOM_PX
+}
+
+messagesEl.addEventListener('scroll', () => {
+  messagesAtBottom = isNearBottom()
+  if (messagesAtBottom) scrollBottomBtn.classList.add('hidden')
+})
+
+// Call this instead of a bare `messagesEl.scrollTop = messagesEl.scrollHeight`
+// after appending anything to #messages: keeps the stick-to-bottom behavior
+// when the user is already there, and otherwise reveals the "new messages"
+// button rather than yanking their scroll position around.
+function maybeAutoScroll() {
+  if (messagesAtBottom) {
+    messagesEl.scrollTop = messagesEl.scrollHeight
+  } else {
+    scrollBottomBtn.classList.remove('hidden')
+  }
+}
+
+scrollBottomBtn.addEventListener('click', () => {
+  messagesAtBottom = true
+  messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior: 'smooth' })
+  scrollBottomBtn.classList.add('hidden')
+})
+
 // ── Combined context + status indicator (donut) ────────────────────
 // Latest context size the model saw, plus the fraction at which auto-compaction
 // fires (fetched once from /status on boot). The donut's ring+tick are drawn
@@ -212,10 +249,54 @@ syncSettingsUI()
 let currentTraceBlock = null
 let traceToolCalls = 0
 let traceStartTime = null
+// Latest iteration number of the CURRENT trace block — drives the collapsed
+// title while running (see addIterationSeparator()).
+let latestIteration = null
+
+// ── Collapsed "current activity" pacing ─────────────────────────
+// Trace items append the instant their SSE event arrives, so a fast run's
+// collapsed one-line summary would otherwise flicker through several lines a
+// second. Queue surfaced lines instead: each one stays on screen for at
+// least ACTIVITY_MIN_MS before the next queued one takes over. Nothing is
+// ever dropped — a burst just drains at a readable pace, a little behind
+// live (the expanded trace below still has every item, instantly, in order).
+const ACTIVITY_MIN_MS = 5000
+let activityQueue = []
+let activityTimer = null
+
+function surfaceActivity(text) {
+  if (!currentTraceBlock) return
+  activityQueue.push(text)
+  pumpActivityQueue()
+}
+
+function pumpActivityQueue() {
+  if (activityTimer || !currentTraceBlock || !activityQueue.length) return
+  currentTraceBlock.subtitle.textContent = activityQueue.shift()
+  activityTimer = setTimeout(() => {
+    activityTimer = null
+    pumpActivityQueue()
+  }, ACTIVITY_MIN_MS)
+}
+
+function clearActivityQueue() {
+  activityQueue = []
+  clearTimeout(activityTimer)
+  activityTimer = null
+}
+
+// One line, no newlines — for the collapsed activity subtitle only; the full
+// text still goes into the expanded trace item body untouched.
+function summarize(text, max = 90) {
+  const oneLine = String(text ?? '').replace(/\s+/g, ' ').trim()
+  return oneLine.length > max ? oneLine.slice(0, max - 1) + '…' : oneLine
+}
 
 function startTraceBlock(model) {
   traceToolCalls = 0
   traceStartTime = Date.now()
+  latestIteration = null
+  clearActivityQueue()
 
   const block = document.createElement('div')
   block.className = 'trace-block running'
@@ -227,14 +308,22 @@ function startTraceBlock(model) {
   arrow.className = 'trace-block-arrow'
   arrow.textContent = '▶'
 
+  const titleWrap = document.createElement('div')
+  titleWrap.className = 'trace-block-title-wrap'
+
   const title = document.createElement('span')
   title.className = 'trace-block-title'
   title.textContent = `Running · ${model}`
 
+  const subtitle = document.createElement('span')
+  subtitle.className = 'trace-block-subtitle'
+
+  titleWrap.append(title, subtitle)
+
   const meta = document.createElement('span')
   meta.className = 'trace-block-meta'
 
-  toggle.append(arrow, title, meta)
+  toggle.append(arrow, titleWrap, meta)
   toggle.addEventListener('click', () => {
     block.classList.toggle('open')
     arrow.textContent = block.classList.contains('open') ? '▼' : '▶'
@@ -245,19 +334,39 @@ function startTraceBlock(model) {
 
   block.append(toggle, items)
   messagesEl.appendChild(block)
-  messagesEl.scrollTop = messagesEl.scrollHeight
+  maybeAutoScroll()
 
-
-  currentTraceBlock = { el: block, items, title, meta, arrow }
+  currentTraceBlock = { el: block, items, title, subtitle, meta, arrow }
 }
 
 function finalizeTraceBlock() {
   if (!currentTraceBlock) return
   const dur = traceStartTime ? ((Date.now() - traceStartTime) / 1000).toFixed(1) : ''
   currentTraceBlock.title.textContent = 'Agent trace'
+  currentTraceBlock.subtitle.textContent = ''
   currentTraceBlock.meta.textContent = `${traceToolCalls} tool${traceToolCalls !== 1 ? 's' : ''} · ${dur}s`
   currentTraceBlock.el.classList.remove('running')
+  clearActivityQueue()
   currentTraceBlock = null
+}
+
+// Bold full-width divider marking a new iteration — a structural break in
+// the trace, not another event row (no label/body chrome, no left edge to
+// match). Also drives the collapsed title while running: "Iteration N" so
+// glancing at a collapsed block shows how far the run has gotten, instead of
+// a static "Running · model".
+function addIterationSeparator(n) {
+  latestIteration = n
+  if (!currentTraceBlock) return null
+  const el = document.createElement('div')
+  el.className = 'trace-separator'
+  el.innerHTML = `<span class="trace-separator-line"></span><span class="trace-separator-label">Iteration ${n}</span><span class="trace-separator-line"></span>`
+  currentTraceBlock.items.appendChild(el)
+  if (currentTraceBlock.el.classList.contains('running')) {
+    currentTraceBlock.title.textContent = `Iteration ${n}`
+  }
+  maybeAutoScroll()
+  return el
 }
 
 let busy = false
@@ -364,7 +473,7 @@ function handleEvent(event) {
     case 'iteration':
       currentIteration = event.current
       iterLabel.textContent = `${event.current}`
-      addTraceItem('iteration', null, `── Iteration ${event.current} ──`, false)
+      addIterationSeparator(event.current)
       // Safety net: if compaction failed last iteration, only a 'warning' fires
       // (no 'compact'), so this is what clears "Compacting context…" from the
       // indicator/status bar.
@@ -374,11 +483,13 @@ function handleEvent(event) {
 
     case 'thought':
       addTraceItem('thought', '💭 Thought', event.content, true)
+      surfaceActivity(`💭 ${summarize(event.content)}`)
       break
 
     case 'tool_call':
       traceToolCalls++
       addTraceItem('tool-call', `🔧 ${event.tool}`, JSON.stringify(event.args, null, 2), true)
+      surfaceActivity(`🔧 ${event.tool}`)
       break
 
     case 'tool_result': {
@@ -386,6 +497,7 @@ function handleEvent(event) {
       const label = `📥 Result${event.error ? ' · ERROR' : ''} · ${event.duration_ms}ms`
       const body = event.error ? `${event.error}\n${event.output}` : event.output
       addTraceItem(isError ? 'tool-result error' : 'tool-result', label, body, true)
+      surfaceActivity(isError ? `📥 ${event.tool || 'tool'} failed` : `📥 ${event.tool || 'result'} received`)
       // Live-update the file tree + the viewed file when the agent may have changed files.
       if (!isError && (event.tool === 'write_file' || event.tool === 'edit_file' || event.tool === 'bash')) {
         scheduleWorkspaceRefresh()
@@ -450,6 +562,7 @@ function handleEvent(event) {
       compactStep = null
       setStatus('busy', 'Compacting context…')
       addTraceItem('compact', '📦 Compacting context', `${event.messageCount} messages, ${Math.round(event.contextUsagePct * 100)}% context — updating working memory…`, false)
+      surfaceActivity('📦 Compacting context…')
       break
 
     case 'compact_progress': {
@@ -478,6 +591,7 @@ function handleEvent(event) {
       if (event.manual) setStatus('ready', 'Ready')
       else setStatus('busy', `Running · ${currentRunModel}`)
       addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}${event.activeWorkingStateSummary ? `\n\n--- Active working state (unvalidated) ---\n${event.activeWorkingStateSummary}` : ''}`, true)
+      surfaceActivity('⚡ Context compacted')
       // A user-triggered manual compaction (no run to fire 'done') finalizes its
       // own trace block here; an in-run auto-compaction leaves the block open for
       // the run to keep filling. The donut's ring keeps showing the last known size.
@@ -489,10 +603,12 @@ function handleEvent(event) {
 
     case 'warning':
       addTraceItem('warning', '⚠ Warning', event.message, false)
+      surfaceActivity(`⚠ ${summarize(event.message)}`)
       break
 
     case 'git_commit':
       addTraceItem('git', `🔀 Committed`, `${event.hash} — ${event.message}`, false)
+      surfaceActivity('🔀 Committed')
       refreshGitLog()
       break
 
@@ -520,7 +636,7 @@ function handleEventForSession(event) {
       break
 
     case 'iteration':
-      addTraceItem('iteration', null, `── Iteration ${event.current} ──`, false)
+      addIterationSeparator(event.current)
       break
 
     case 'thought':
@@ -759,6 +875,7 @@ function cleanupManualCompaction(createdBlock) {
   if (createdBlock && currentTraceBlock) {
     if (currentTraceBlock.items.childElementCount === 0) {
       currentTraceBlock.el.remove()
+      clearActivityQueue()
       currentTraceBlock = null
     } else {
       finalizeTraceBlock()
@@ -862,7 +979,7 @@ function addTraceItem(className, label, body, collapsible) {
   }
 
   currentTraceBlock.items.appendChild(el)
-  messagesEl.scrollTop = messagesEl.scrollHeight
+  maybeAutoScroll()
   return el
 }
 
@@ -901,7 +1018,7 @@ function renderPlan(event) {
 
   // Resume the live trace below the plan card so execution renders in order.
   if (resume) startTraceBlock(model)
-  messagesEl.scrollTop = messagesEl.scrollHeight
+  maybeAutoScroll()
 }
 
 function addChatMessage(role, content) {
@@ -933,7 +1050,7 @@ function addChatMessage(role, content) {
   }
 
   messagesEl.appendChild(el)
-  messagesEl.scrollTop = messagesEl.scrollHeight
+  maybeAutoScroll()
 }
 
 function addSystemMessage(text) {
@@ -941,7 +1058,7 @@ function addSystemMessage(text) {
   el.className = 'message system'
   el.textContent = text
   messagesEl.appendChild(el)
-  messagesEl.scrollTop = messagesEl.scrollHeight
+  maybeAutoScroll()
 }
 
 // ── Prompt queue ─────────────────────────────────────────────────
@@ -1082,15 +1199,31 @@ $('chat-form').addEventListener('submit', async (e) => {
   // else: empty submit, empty queue -> no-op.
 })
 
+// Programmatic insertion into #input that participates in the native
+// undo/redo stack (Cmd/Ctrl+Z, Shift+Z, Y). setRangeText() is a scripted DOM
+// Range mutation that browsers don't reliably coalesce into one undo step;
+// execCommand('insertText', ...) is treated as a real edit, same as a native
+// paste or keystroke. Falls back to setRangeText if execCommand is
+// unavailable or returns false (older/future browsers).
+function insertTextUndoable(text) {
+  inputEl.focus()
+  let ok = false
+  try { ok = document.execCommand('insertText', false, text) } catch { ok = false }
+  if (!ok) {
+    inputEl.setRangeText(text, inputEl.selectionStart, inputEl.selectionEnd, 'end')
+  }
+  inputEl.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
 inputEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey && !e.isComposing) {
     e.preventDefault()
     $('chat-form').dispatchEvent(new Event('submit'))
   } else if (e.key === 'Enter' && e.altKey && !e.isComposing) {
-    // Alt+Enter doesn't insert a newline by default, so do it explicitly.
+    // Alt+Enter doesn't insert a newline by default, so do it explicitly —
+    // via insertTextUndoable so the newline is undoable like any other edit.
     e.preventDefault()
-    inputEl.setRangeText('\n', inputEl.selectionStart, inputEl.selectionEnd, 'end')
-    inputEl.dispatchEvent(new Event('input'))
+    insertTextUndoable('\n')
   }
 })
 
@@ -1131,20 +1264,52 @@ turndownService.escape = string => string
 // "**bold text**"): the keydown arms a flag that the paste handler honors by letting the
 // browser's default plain-text paste run (a textarea inserts clipboard text/plain).
 let plainPasteArmed = false
+// Cmd/Ctrl+Shift+V ("paste and match style") arms plain-text paste. So does
+// Cmd/Ctrl+Alt+Shift+V — matching on e.code (not just e.key) because some
+// OS/keyboard layouts turn Option/Alt+V's `key` into a different character
+// (e.g. "√" on macOS), which would otherwise silently miss the shortcut
+// whenever Alt is held.
 inputEl.addEventListener('keydown', (e) => {
-  if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'v' || e.key === 'V')) {
+  const isV = e.code === 'KeyV' || e.key === 'v' || e.key === 'V'
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && isV) {
     plainPasteArmed = true
     setTimeout(() => { plainPasteArmed = false }, 500)
   }
 })
 inputEl.addEventListener('paste', (e) => {
-  if (plainPasteArmed) { plainPasteArmed = false; return }  // Cmd/Ctrl+Shift+V → plain text, no markdown conversion
+  if (plainPasteArmed) { plainPasteArmed = false; return }  // Cmd/Ctrl+(Alt+)Shift+V → plain text, no markdown conversion
   const html = e.clipboardData?.getData('text/html')
   if (!html || !RICH_HTML_TAGS.test(html)) return  // let the browser's normal plain-text paste happen
   e.preventDefault()
   const markdown = turndownService.turndown(html).trim()
-  inputEl.setRangeText(markdown, inputEl.selectionStart, inputEl.selectionEnd, 'end')
-  inputEl.dispatchEvent(new Event('input', { bubbles: true }))
+  insertTextUndoable(markdown)
+})
+
+// ── Prompt navigation (Up/Down) ───────────────────────────────────
+// When focus is anywhere OTHER than a text input (i.e. not actively typing),
+// Up/Down walks between past USER prompts in the message list instead of
+// doing nothing — handy for re-reading "what did I actually ask" without
+// grabbing the mouse. The index is recomputed against the live list on every
+// press so it stays correct even as new messages arrive meanwhile.
+let promptNavIndex = -1
+function navigatePrompts(dir) {
+  const prompts = messagesEl.querySelectorAll('.message.user')
+  if (!prompts.length) return
+  if (promptNavIndex < 0 || promptNavIndex >= prompts.length) {
+    promptNavIndex = prompts.length - 1
+  } else {
+    promptNavIndex = Math.max(0, Math.min(prompts.length - 1, promptNavIndex + dir))
+  }
+  prompts[promptNavIndex].scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return
+  const active = document.activeElement
+  const tag = active && active.tagName
+  if (tag === 'TEXTAREA' || tag === 'INPUT' || (active && active.isContentEditable)) return
+  if (!messagesEl.querySelector('.message.user')) return
+  e.preventDefault()
+  navigatePrompts(e.key === 'ArrowUp' ? -1 : 1)
 })
 
 // ── New session (clear the conversation) ─────────────────────────
@@ -1160,6 +1325,9 @@ async function newSession() {
   currentSessionQuery = ''
   currentTraceBlock = null
   messagesEl.innerHTML = '<div class="message system">New session started.</div>'
+  messagesAtBottom = true
+  scrollBottomBtn.classList.add('hidden')
+  promptNavIndex = -1
   // A fresh session starts with no queued prompts.
   promptQueue.length = 0
   renderQueue()

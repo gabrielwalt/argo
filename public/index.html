@@ -110,8 +110,11 @@
 <main>
   <!-- Chat panel -->
   <section id="chat-panel">
-    <div id="messages">
-      <div class="message system">Session started. Ask anything.</div>
+    <div id="messages-scroll-wrap">
+      <div id="messages">
+        <div class="message system">Session started. Ask anything.</div>
+      </div>
+      <button id="scroll-bottom-btn" class="hidden" type="button" title="Scroll to latest">↓ New messages</button>
     </div>
 
     <div id="prompt-queue" class="prompt-queue"></div>
