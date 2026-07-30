@@ -178,3 +178,23 @@ qwen3.6 in-loop self-critique (`ARGO_CRITIC`) at post-plan / on-stall / pre-done
 - **Critic fired correctly (4 events on the ON effort run):** post-plan `ok`; **on-stall `revise`** with a genuinely useful, specific diagnosis — *"persistent MODULE_NOT_FOUND … broken import in src/service.js from repeated edits; agent is thrashing"* + concrete guidance to fix the exact import line; pre-done `ok` ×2. `gamed_oracle` events: **0** (correct — no tamper attempted this run).
 - **Inconclusive on VALUE (by construction):** the BASELINE effort run PASSED (converged at it=24). `bigproj-effort` is **high-variance, not a reliable failure** — so a single OFF-vs-ON run can't show whether the critic rescues a failing/gaming run (both converged at it=24 here). This is the n=1 noise problem, now confirmed empirically.
 - **Next:** a proper multi-run A/B — `EVAL_RUNS≈5` per condition at **`max_iter=90`** (the regime where qwen historically thrashed / self-reverted / *attempted* oracle-gaming) — comparing PASS RATE, thrash/self-revert/gaming incidence, and critic-block incidence. That is where the critic earns its place, if it does. Functional integration is proven; VALUE is the open question.
+
+### 2026-07-30 — E2E — harness `c2431af` (harness-owned TASKS + MEMORY + LOOP-recovery ladder) — OFF vs ON, n=1
+First A/B of the Stage 1-4 harness features together, flipped per-request on ONE worker via the new `/chat` flag overrides (`EVAL_HARNESS=1` → `tasks:true, memory:true, loop:true`; the ladder = `ARGO_LOOP`). qwen3.6, `max_iter=60`, `EVAL_RUNS=1`, all 6 e2e tasks. Both conditions = **6/6 completed (100%)** — no regression.
+
+| task | OFF it/tool/wall | ON it/tool/wall |
+|---|---|---|
+| store-addTask | 7 / 12 / 52s | 7 / 12 / 45s |
+| store-removeTask | 7 / 12 / 39s | 8 / 13 / 51s |
+| store-deps | 7 / 12 / 80s | 7 / 12 / 76s |
+| bigproj-deps | 34 / 46 / 395s | **22 / 26 / 154s** |
+| bigproj-effort | 23 / 37 / 189s | 49 / 49 / 319s |
+| bigproj-duedate-bug | 7 / 12 / 55s | 10 / 15 / 67s |
+
+- **No regression: 6/6 in both conditions.** The three easy store-* tasks are ~identical (±1 iter).
+- **Clear win on the hardest multi-file task `bigproj-deps`: 34→22 iters, 395→154s** — the task ledger (`plan=2`, decomposed + recited at the tail) + task-scoped MEMORY.md/AGENTS.md kept it converging instead of re-inspecting.
+- **`bigproj-effort` noisier: ON took MORE iters (23→49)** but still PASSED. ON decomposed it into 3 tasks (`plan=3` vs `plan=1`) and drove each with per-task verify-then-advance — more thorough, more iterations. This task is documented high-variance at n=1. Both pass.
+- **Loop-recovery ladder did NOT fire** (no repeated-identical-call blocks; `cmp=0`) — none of these tasks loop pathologically, so this run shows the ladder is **non-regressive** (zero false blocks, zero wasted iterations) but does NOT yet demonstrate its RESCUE value. That needs a deliberately looping/vicious task (next).
+- **No compactions anywhere** (`cmp=0`; peak ctx ≈23k OFF / ≈18k ON of 65k) — contexts stayed under the near-full trigger even on the multi-file tasks.
+- **Verdict:** tasks+memory+loop ON is correctness-safe (6/6) and helps the hardest convergence case; it is a sound opt-in. Keep the defaults OFF until (a) an n≥3 run confirms the `bigproj-effort` iteration variance is benign and (b) the ladder is validated on a task engineered to loop.
+- **Next:** an adversarial/vicious set to exercise L0→L1→L2 (a task that induces repeated identical failing calls, and a multi-task/contradictory prompt), plus n≥3 on `bigproj-effort`.
