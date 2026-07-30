@@ -84,7 +84,10 @@ app.post('/chat', async (req, res) => {
     return
   }
 
-  const { message, model, options, maxIterations, grounding } = req.body as { message: string; model?: string; options?: ModelOptions; maxIterations?: number; grounding?: boolean }
+  // Per-request harness toggles mirror `grounding`: env sets the default (config.*),
+  // the UI/eval can override per run. Lets the A/B eval flip tasks/memory/loop on the
+  // SAME worker (no rebuild) and lets the settings panel dogfood them live.
+  const { message, model, options, maxIterations, grounding, tasks, memory, loop } = req.body as { message: string; model?: string; options?: ModelOptions; maxIterations?: number; grounding?: boolean; tasks?: boolean; memory?: boolean; loop?: boolean }
   if (!message?.trim()) {
     res.status(400).json({ error: 'message required' })
     return
@@ -98,6 +101,9 @@ app.post('/chat', async (req, res) => {
   if (options) agent.setOptions(options)
   if (maxIterations != null) agent.setMaxIterations(maxIterations)
   if (grounding != null) agent.setGrounding(grounding)
+  if (tasks != null) agent.setTasks(tasks)
+  if (memory != null) agent.setMemory(memory)
+  if (loop != null) agent.setLoop(loop)
 
   isBusy = true
   res.json({ ok: true })
@@ -198,8 +204,18 @@ app.get('/status', (req, res) => {
     sessionId: currentSessionId,
     workspacePath: config.workspacePath || null,
     env: envStatus,
-    compactThreshold: config.compactThreshold,
+    // Effective compaction trigger is near-full: fires when only compactReserveTokens of
+    // headroom remain (agent.ts), NOT at the old 2/3 fraction. Report the effective
+    // fraction (from the default num_ctx) so the donut's threshold tick is correct; the
+    // UI can refine it from the run's live num_ctx (see /context) + compactReserveTokens.
+    compactThreshold: (65536 - config.compactReserveTokens) / 65536,
     compactReserveTokens: config.compactReserveTokens,
+    // Harness feature flags (defaults; per-run overridable via the /chat body). Let the
+    // settings UI reflect current state and the eval confirm what it's testing.
+    grounding: config.grounding,
+    tasks: config.tasks,
+    memory: config.memory,
+    loop: config.loopRecovery,
   })
 })
 
