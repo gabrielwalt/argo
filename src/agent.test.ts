@@ -200,6 +200,7 @@ test('loop steering: a 4th identical call is skipped (steered, not executed) and
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, readCall, readCall, readCall, finalAnswer]))
   agent.setSessionId(sessionId)
   try {
+    agent.setLoop(false)  // baseline count-based steer path (loop ladder is default-on now)
     await agent.chat('argo repetition guard case a')
 
     assert.equal(readResults(events).length, 3)  // the 4th identical call was skipped, not executed
@@ -220,6 +221,7 @@ test('loop steering: 2 identical calls stay under threshold and are not steered'
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, readCall, finalAnswer]))
   agent.setSessionId(sessionId)
   try {
+    agent.setLoop(false)  // baseline count-based steer path (loop ladder is default-on now)
     await agent.chat('argo repetition guard case b')
 
     assert.equal(readResults(events).length, 2)  // both executed for real
@@ -237,6 +239,7 @@ test('loop steering: a model that never stops repeating is steered (escalating),
   agent.setSessionId(sessionId)
   agent.setMaxIterations(12)  // enough room for a few escalating steers before the real bound
   try {
+    agent.setLoop(false)  // baseline count-based steer path (loop ladder is default-on now)
     const answer = await agent.chat('argo repetition guard case c')
 
     assert.equal(readResults(events).length, 3)  // executed 3×, then every further identical call is steered, not run

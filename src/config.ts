@@ -52,9 +52,9 @@ export const config = {
   // of succeeding. This is a brief settle before one retry, not a backoff — only
   // a single retry is ever attempted, then the existing outer catch takes over.
   chatRetryDelayMs:        parseInt(process.env.CHAT_RETRY_DELAY_MS ?? '2000', 10),
-  // ACTOR-CRITIC (Phase 4, step 2). OFF by default so the baseline loop path is
-  // BYTE-IDENTICAL unless explicitly enabled — required for a clean A/B and zero
-  // regression risk. When on, a qwen3.6 self-critique runs at a FEW checkpoints
+  // ACTOR-CRITIC (Phase 4, step 2). OFF by default (env ARGO_CRITIC=1 to enable) — value was
+  // inconclusive at n=1 and it adds per-checkpoint latency; executable per-task verification
+  // (tasks) is the preferred verification lever. When on, When on, a qwen3.6 self-critique runs at a FEW checkpoints
   // (post-plan / on-stall / pre-done), never every turn. See docs/actor-critic.md.
   critic:           ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_CRITIC ?? '').trim().toLowerCase()),
   // The critic is qwen3.6 itself (self-critique) — the only model that reliably
@@ -69,25 +69,24 @@ export const config = {
   // produced) verifies specifics against the fetched sources and reconciles restated
   // numbers, blocking "done" until revised. Reuses the critic model. See docs/grounding.md.
   grounding:        !['0', 'false', 'no', 'off'].includes((process.env.ARGO_GROUNDING ?? '').trim().toLowerCase()),
-  // HARNESS-OWNED TASK SEQUENCING (Stage 3). OFF by default so the baseline loop is
-  // BYTE-IDENTICAL. When on, the LLM's plan (update_plan) becomes an ordered task
+  // HARNESS-OWNED TASK SEQUENCING (Stage 3). ON by default (env ARGO_TASKS=0/false/off forces OFF). When on, the LLM's plan (update_plan) becomes an ordered task
   // ledger the harness recites at the tail of context every step and drives ONE task
   // at a time (per-task verify nudge → advance), and a later update_plan RE-PLANS by
   // reconciling into the ledger with completed tasks frozen. LLM decomposes + refines;
   // harness sequences + verifies. See docs/harness-planning-memory.md + src/tasks.ts.
-  tasks:            ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_TASKS ?? '').trim().toLowerCase()),
-  // HARNESS-OWNED MEMORY (Stages 1/2/4). OFF by default (byte-identical baseline). When
+  tasks:            !['0', 'false', 'no', 'off'].includes((process.env.ARGO_TASKS ?? '').trim().toLowerCase()),
+  // HARNESS-OWNED MEMORY (Stages 1/2/4). ON by default (env ARGO_MEMORY=0/false/off forces OFF). When
   // on: AGENTS.md is section-selected when large (whole when small), MEMORY.md entries
   // are retrieved for the current task/objective, a recall pointer is OFFERED (never
   // required), and durable ledger items (verified facts + decisions) persist to the
   // workspace MEMORY.md at compaction so they survive across runs. See src/memory.ts.
-  memory:           ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_MEMORY ?? '').trim().toLowerCase()),
+  memory:           !['0', 'false', 'no', 'off'].includes((process.env.ARGO_MEMORY ?? '').trim().toLowerCase()),
   // LOOP-RECOVERY LADDER (docs/harness-planning-memory.md "Loop detection & recovery
-  // ladder"). OFF by default (byte-identical baseline). When on, a mutation-aware
+  // ladder"). ON by default (env ARGO_LOOP=0/false/off forces OFF). When on, a mutation-aware
   // repeat detector REPLACES the count-based REPEAT_THRESHOLD steer: it blocks the 2nd
   // identical tool call when nothing changed since it last ran, and escalates
   // L0 steer -> L1 compaction -> L2 stop-and-reframe (forced re-plan). See src/loop.ts.
-  loopRecovery:     ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_LOOP ?? '').trim().toLowerCase()),
+  loopRecovery:     !['0', 'false', 'no', 'off'].includes((process.env.ARGO_LOOP ?? '').trim().toLowerCase()),
   // AUTO-COMMIT. OFF by default — the agent used to ALWAYS commit after every run; this
   // makes it opt-in (per-run overridable via agent.setAutoCommit(), mirroring the other
   // flags above) so uncommitted changes stay visible in the Changes view until the user
