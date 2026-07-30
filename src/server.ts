@@ -170,13 +170,16 @@ app.get('/models', async (req, res) => {
 // hash/short/message/date/author are unaffected.
 app.get('/git-log', async (req, res) => {
   try {
+    // Record-separated (\x1e per commit) + field-separated (\x1f) so the body (%b) can
+    // contain newlines safely. `message` stays the SUBJECT (%s) for existing callers;
+    // `body` (%b) is added so the Changes-view History can show the full message on expand.
     const { stdout } = await execAsync(
-      'git log --format="%H|%h|%s|%ai|%an|%cr" -30 2>/dev/null || echo ""',
+      'git log --format="%H%x1f%h%x1f%s%x1f%b%x1f%ai%x1f%an%x1f%cr%x1e" -30 2>/dev/null || echo ""',
       { cwd: config.workspacePath }
     )
-    const commits = stdout.trim().split('\n').filter(Boolean).map(line => {
-      const [hash, short, message, date, author, relative] = line.split('|')
-      return { hash, short, message, date, author, relative }
+    const commits = stdout.split('\x1e').map(r => r.replace(/^\n/, '')).filter(r => r.trim()).map(rec => {
+      const [hash, short, message, body, date, author, relative] = rec.split('\x1f')
+      return { hash, short, message, body: (body || '').trim(), date, author, relative }
     })
     res.json(commits)
   } catch {

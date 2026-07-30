@@ -1311,7 +1311,23 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .git-status-glyph.git-status-move { color: var(--blue);   background: rgba(59,130,246,.12); }
 .git-status-glyph.git-status-mod  { color: var(--yellow); background: rgba(234,179,8,.12); }
 .commit-message { color: var(--text); }
-.commit-relative { flex-shrink: 0; font-size: 10px; color: var(--muted); margin-left: 4px; }
+
+/* Expanded commit detail block (full message + hash/date meta) — sits
+   between the folded .commit-row header and the .file-children file list,
+   revealed together with them via the .commit-node.open rule below. */
+.commit-detail { display: none; padding: 2px 8px 6px 22px; }
+.commit-node.open > .commit-detail { display: block; }
+.commit-full-message {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin-bottom: 4px;
+}
+.commit-meta { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.commit-hash { font-family: var(--font-mono); font-size: 10px; color: var(--gold); }
+.commit-date { font-size: 10px; color: var(--muted); white-space: nowrap; }
 
 /* ── Auto-commit toggle ──────────────────────────────────────────
    Small pill in the header toolbar; default OFF (muted) with a clearly

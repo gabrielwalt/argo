@@ -1774,16 +1774,25 @@ function makeChangeRow(row) {
   return el
 }
 
-// A commit row expands (lazily, like a tree directory) to its changed files
-// via GET /commit-files/:hash. Message + relative time only — no hash shown
-// in the row (kept clean; the hash is still used internally for the fetch).
+// A commit row expands (lazily, like a tree directory) to a detail block
+// (full message + hash/date) followed by its changed files, fetched via
+// GET /commit-files/:hash. The folded row shows only the subject — no
+// hash/date/relative time (kept clean; those surface once expanded).
 function makeCommitRow(c) {
   const wrapper = document.createElement('div')
   wrapper.className = 'commit-node'
 
   const row = document.createElement('div')
   row.className = 'file-row commit-row'
-  row.innerHTML = `<span class="file-icon">▶</span><span class="file-name commit-message">${escHtml(c.message)}</span><span class="commit-relative">${escHtml(c.relative || '')}</span>`
+  row.innerHTML = `<span class="file-icon">▶</span><span class="file-name commit-message">${escHtml(c.message)}</span>`
+
+  const detail = document.createElement('div')
+  detail.className = 'commit-detail'
+  const fullMessage = c.body ? `${c.message}\n\n${c.body}` : c.message
+  const hash = (c.hash || c.short || '').slice(0, 8) || c.short || ''
+  const parsedDate = c.date ? new Date(c.date) : null
+  const dateText = parsedDate && !Number.isNaN(parsedDate.getTime()) ? parsedDate.toLocaleString() : (c.date || '')
+  detail.innerHTML = `<div class="commit-full-message">${escHtml(fullMessage)}</div><div class="commit-meta"><span class="commit-hash">${escHtml(hash)}</span><span class="commit-date">${escHtml(dateText)}</span></div>`
 
   const filesWrap = document.createElement('div')
   filesWrap.className = 'file-children'
@@ -1810,6 +1819,7 @@ function makeCommitRow(c) {
   })
 
   wrapper.appendChild(row)
+  wrapper.appendChild(detail)
   wrapper.appendChild(filesWrap)
   return wrapper
 }
