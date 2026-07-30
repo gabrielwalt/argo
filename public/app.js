@@ -706,18 +706,35 @@ function setStatus(state, text) {
   if (navCtx.classList.contains('open')) buildCtxDropdown()
 }
 
-// The outer layer always does the sail-past traverse; the inner layer rocks with one random
-// motion (roll is weighted so the stronger lean shows up most often). Cleared when off.
-const SAIL_ROCKS = ['roll', 'roll', 'pitch', 'yaw', 'bob']
+// The outermost layer (m1) always does the sail-past traverse. Each run randomly composes
+// 1-3 DISTINCT rock motions from ROCK_MOTIONS onto the nested m2/m3/m4 layers — multiple CSS
+// animations on the SAME element would just overwrite each other's `transform`, so each
+// chosen motion gets its own layer so their rotations COMPOSE. Both which motions are picked
+// and their order (which layer holds which) vary every time. Cleared when off.
+const ROCK_MOTIONS = ['roll', 'yaw', 'pitch1', 'pitch2', 'pitch3']
+const ROCK_LAYER_SELECTORS = ['.m2', '.m3', '.m4']
+
+function pickRockMotions() {
+  const count = 1 + Math.floor(Math.random() * 3)   // 1-3, inclusive
+  const pool = [...ROCK_MOTIONS]
+  const picked = []
+  for (let i = 0; i < count && pool.length; i++) {
+    picked.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0])
+  }
+  return picked
+}
+
 function setSailing(on) {
   const m1 = sendBoat.querySelector('.m1')
-  const m2 = sendBoat.querySelector('.m2')
-  if (!m1 || !m2) return
+  const layers = ROCK_LAYER_SELECTORS.map(sel => sendBoat.querySelector(sel))
+  if (!m1 || layers.some(l => !l)) return
   m1.classList.remove('a-sail')
-  for (const r of ['roll', 'pitch', 'yaw', 'bob']) m2.classList.remove('a-' + r)
+  for (const layer of layers) {
+    for (const motion of ROCK_MOTIONS) layer.classList.remove('a-' + motion)
+  }
   if (!on) return
   m1.classList.add('a-sail')
-  m2.classList.add('a-' + SAIL_ROCKS[Math.floor(Math.random() * SAIL_ROCKS.length)])
+  pickRockMotions().forEach((motion, i) => layers[i].classList.add('a-' + motion))
 }
 
 function setBusy(val) {
@@ -726,9 +743,10 @@ function setBusy(val) {
   inputEl.placeholder = val ? 'Queue a prompt… (Enter to queue)' : originalPlaceholder
 
   if (val) {
-    // The boat stays visible and sails while the agent runs: setSailing picks 1-2 random
-    // motions (pitch/roll/yaw/bob/sway) across the two nested layers so their transforms
-    // cumulate. Hovering the button swaps the boat for the stop square (hover handlers).
+    // The boat stays visible and sails while the agent runs: setSailing randomly composes
+    // 1-3 rock motions (roll/yaw/pitch variants) across the nested layers so their
+    // transforms cumulate. Hovering the button swaps the boat for the stop square (hover
+    // handlers).
     sendBoat.classList.remove('hidden')
     sendStop.classList.add('hidden')
     setSailing(true)
