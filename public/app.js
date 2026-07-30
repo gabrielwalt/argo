@@ -930,14 +930,17 @@ async function viewContext() {
 
 function renderContext(data) {
   let html = ''
+  // Right-aligned wall-clock time (when the message entered the model context, from the
+  // backend WeakMap via getContext). Omitted when unknown (e.g. messages restored from disk).
+  const timeTag = (ts) => ts != null ? `<span class="ctx-time">${escHtml(new Date(ts).toLocaleTimeString())}</span>` : ''
   if (data.compaction != null) {
     const c = data.compaction
     const text = typeof c === 'string' ? c : JSON.stringify(c, null, 2)
-    html += `<div class="ctx-msg ctx-ledger"><div class="ctx-role">Compaction ledger</div><div class="ctx-content">${escHtml(text)}</div></div>`
+    html += `<div class="ctx-msg ctx-ledger"><div class="ctx-role"><span>Compaction ledger</span>${timeTag(data.compactionTs)}</div><div class="ctx-content">${escHtml(text)}</div></div>`
   }
   for (const m of (data.messages ?? [])) {
     const role = String(m.role ?? '')
-    html += `<div class="ctx-msg"><div class="ctx-role ctx-role-${escHtml(role)}">${escHtml(role)} · ${(m.chars ?? 0).toLocaleString()} chars</div><div class="ctx-content">${escHtml(m.content ?? '')}</div></div>`
+    html += `<div class="ctx-msg"><div class="ctx-role ctx-role-${escHtml(role)}"><span>${escHtml(role)} · ${(m.chars ?? 0).toLocaleString()} chars</span>${timeTag(m.ts)}</div><div class="ctx-content">${escHtml(m.content ?? '')}</div></div>`
   }
   return html || '<div class="ctx-msg"><div class="ctx-content">(empty context)</div></div>'
 }

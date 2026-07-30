@@ -392,6 +392,10 @@ header::after {
   overflow: hidden;
 }
 #diff-content .ctx-role {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
   padding: 5px 10px;
   font-size: 11px;
   font-weight: 600;
@@ -400,6 +404,15 @@ header::after {
   background: rgba(255,255,255,.03);
   border-bottom: 1px solid var(--border);
   color: var(--muted);
+}
+#diff-content .ctx-time {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--muted);
+  white-space: nowrap;
 }
 #diff-content .ctx-role-user      { color: var(--accent); }
 #diff-content .ctx-role-assistant { color: var(--green); }

@@ -295,6 +295,15 @@ export class Agent {
   // Mutation-aware loop-recovery ladder state (ARGO_LOOP). Reset per chat() run like
   // recentCalls — a legitimately repeated action in a later run starts clean.
   private loopState: LoopState = createLoopState()
+  // Records when each this.history message entered the live context, keyed on the
+  // message object itself (not its index/content) so it survives compaction's
+  // splice/rebuild of this.history as long as surviving messages keep the same
+  // object reference. Purely a UI concern for the context viewer (getContext) —
+  // NEVER read by the model call path, so it cannot affect what is sent to Ollama.
+  private historyTs = new WeakMap<object, number>()
+  // Wall-clock time the most recent compaction finished, for the context viewer's
+  // "Compaction ledger" box. null until the first compaction of this Agent instance.
+  private lastCompactedAt: number | null = null
   // Harness-owned plan for the current run (objective + steps + revision). Recited
   // into the tail of context each iteration to fight goal-drift, and surfaced to
   // the UI as a 'plan' event. NEVER written to /workspace (not a committed
@@ -446,6 +455,13 @@ export class Agent {
   private chatRetryDelayMs = config.chatRetryDelayMs
   setChatRetryDelayMs(ms: number) { this.chatRetryDelayMs = Math.max(0, Math.trunc(ms)) }
 
+  // Push a message into the live context and record when it entered, so the
+  // context viewer can show per-message timestamps. Same semantics as history.push.
+  private pushCtx(m: Message): void {
+    this.history.push(m)
+    this.historyTs.set(m, Date.now())
+  }
+
   // Lets the user force compaction between turns (server.ts's POST /compact-now,
   // guarded the same way /reset is — only when the agent isn't mid-run). Reuses
   // compactHistory exactly as the automatic 66.7%-threshold path does: the most
@@ -557,6 +573,8 @@ export class Agent {
       ...split.activeTail,
     ]
 
+    this.lastCompactedAt = Date.now()
+    for (const m of [priorMessage, ...activeStateMessages]) this.historyTs.set(m, this.lastCompactedAt)
     const newRunStart = 1 + split.antecedent.length
     const msgsAfter = this.history.length
 
@@ -860,7 +878,7 @@ export class Agent {
       const guidanceText = critique.guidance ? `\n${critique.guidance}` : ''
       const steer = `CRITIC (${checkpoint}) — revise before continuing.${guidanceText}${issuesText}${tamperReminder}`
       emitAndLog({ type: 'warning', message: steer })
-      this.history.push({ role: 'tool', content: steer })
+      this.pushCtx({ role: 'tool', content: steer })
     }
     return critique
   }
@@ -941,7 +959,7 @@ export class Agent {
         : ''
       const steer = `GROUNDING CHECK (pre-done) — fix before finishing, then stop.${guidanceText}${issuesText}${conflictText}\nFor EACH flagged specific: if the SOURCES below support it, KEEP it exactly; if they do NOT, either web_search/fetch_url to verify it (and keep it with that source) or generalize JUST that one phrase. Do NOT delete or water down content the sources DO support — the document must stay as rich and specific as it was, only more accurate. Reconcile any restated number to a single value used everywhere.${srcBlock}`
       emitAndLog({ type: 'warning', message: steer })
-      this.history.push({ role: 'tool', content: steer })
+      this.pushCtx({ role: 'tool', content: steer })
     }
     return critique
   }
@@ -958,7 +976,7 @@ export class Agent {
       this.emit(event, logger.getSeq())
     }
 
-    this.history.push({ role: 'user', content: userMessage })
+    this.pushCtx({ role: 'user', content: userMessage })
     // The index of the message that started this run — compactHistory() always
     // keeps history[currentRunStart] verbatim, however many iterations follow it.
     // Reassigned (not recomputed) after each compaction, since compaction replaces
@@ -1024,7 +1042,7 @@ export class Agent {
             ? `STALL: ${iterNum} iterations without finishing — your approach is not converging. Call update_plan now with a revised plan that lists ONLY the remaining work as concrete steps, then carry it out. Do not repeat what has not worked.`
             : `PROGRESS CHECK: ${iterNum} iterations in and not finished. Objective: "${objective}". State which steps are DONE and which REMAIN, then make the single most important remaining change now — if you have been searching or re-reading without editing, stop and implement the next concrete step; if the approach is wrong, call update_plan to revise.`
           emitAndLog({ type: 'warning', message: stall })
-          this.history.push({ role: 'tool', content: stall })
+          this.pushCtx({ role: 'tool', content: stall })
           // ON-STALL critic checkpoint: reuse the existing stall/progress trigger
           // (no parallel plumbing). The critic reviews the recent trace + latest
           // test output and returns a CONCRETE corrective, injected as a steer.
@@ -1099,7 +1117,7 @@ export class Agent {
         const hasCalls = nativeCalls.length > 0 || fallbackCalls.length > 0
 
         if (!hasCalls) {
-          this.history.push(msg)
+          this.pushCtx(msg)
           // ── HARNESS TASK LEDGER: per-task verify-then-advance (this.tasks). A no-tool
           // call while tasks REMAIN means the model believes the CURRENT task is done.
           // First time for a task → inject a verify nudge and CONTINUE (don't advance
@@ -1117,7 +1135,7 @@ export class Agent {
               this.taskVerifyNudged.add(cur.id)
               const nudge = `CURRENT TASK "${cur.title}" — before moving on, confirm it is genuinely complete and STATE how you verified it (the check + result). If not truly done, keep working on THIS task only. If done, say so and I'll advance you.`
               emitAndLog({ type: 'warning', message: nudge })
-              this.history.push({ role: 'tool', content: nudge })
+              this.pushCtx({ role: 'tool', content: nudge })
               continue
             }
             if (cur) {
@@ -1139,7 +1157,7 @@ export class Agent {
                 // the recited tail (chatCall).
                 const adv = `Task complete. NEXT TASK "${nextActive.title}". Work only on this task now; the full plan is in the recited ledger. Refine via update_plan only if the work contradicts it.`
                 emitAndLog({ type: 'warning', message: adv })
-                this.history.push({ role: 'tool', content: adv })
+                this.pushCtx({ role: 'tool', content: adv })
                 continue
               }
               // allDone after advancing → do NOT continue; fall through to the existing
@@ -1185,7 +1203,7 @@ export class Agent {
             regrounded = true
             const nudge = `Before finishing, re-ground against your plan. Objective: "${activePlan.objective}". Think critically: is the objective TRULY met — not just that a command exited 0, with no corner cut and the real request satisfied? State how you verified it (the check you ran and its result). If it is not genuinely met, keep working toward THIS objective (do not drift to a different one). If it is met, give your final answer as: (1) a brief summary of what you did to achieve the objective, and (2) only if there is a clear, sensible next step for this project, one short suggestion of what to do next.`
             emitAndLog({ type: 'warning', message: nudge })
-            this.history.push({ role: 'tool', content: nudge })
+            this.pushCtx({ role: 'tool', content: nudge })
             continue
           }
           emitAndLog({ type: 'message', role: 'assistant', content: msg.content })
@@ -1194,7 +1212,7 @@ export class Agent {
           return msg.content
         }
 
-        this.history.push(msg)
+        this.pushCtx(msg)
 
         const callsToRun = nativeCalls.length > 0
           ? nativeCalls.map(tc => ({ name: tc.function.name as ToolName, args: tc.function.arguments as Record<string, unknown> }))
@@ -1206,7 +1224,7 @@ export class Agent {
           // repetition guard. It IS a tool call, so recording/refining a plan can
           // never be mistaken for "no tool call = done".
           if (name === 'update_plan') {
-            this.history.push({ role: 'tool', content: this.handleUpdatePlan(args, emitAndLog) })
+            this.pushCtx({ role: 'tool', content: this.handleUpdatePlan(args, emitAndLog) })
             // POST-PLAN critic checkpoint: right after a plan is recorded, judge
             // whether it actually addresses the objective and is complete/ordered;
             // if weak, inject guidance BEFORE execution. Reuses the steer-injection
@@ -1227,7 +1245,7 @@ export class Agent {
           if (!this.currentPlan && isProjectMutation(name, args)) {
             const gate = `Before changing the project (\`${name}\` on ${typeof args.path === 'string' ? args.path : 'a file'}) you must record a plan. Read the relevant files if you haven't, then call update_plan with one concrete, verifiable objective and the steps to reach it — then make this change. Recording a plan does not end your turn.`
             emitAndLog({ type: 'warning', message: gate })
-            this.history.push({ role: 'tool', content: gate })
+            this.pushCtx({ role: 'tool', content: gate })
             continue
           }
           // Loop steering (see REPEAT_* above): recentCalls holds calls actually
@@ -1251,7 +1269,7 @@ export class Agent {
                 }
               }
               emitAndLog({ type: 'warning', message: action.message })
-              this.history.push({ role: 'tool', content: action.message })
+              this.pushCtx({ role: 'tool', content: action.message })
               continue
             }
           } else {
@@ -1265,7 +1283,7 @@ export class Agent {
               loopSteers++
               const steer = loopSteerMessage(name, priorRepeats, loopSteers, (this.currentPlan as { objective: string } | null)?.objective ?? '')
               emitAndLog({ type: 'warning', message: steer })
-              this.history.push({ role: 'tool', content: steer })
+              this.pushCtx({ role: 'tool', content: steer })
               continue
             }
           }
@@ -1284,7 +1302,7 @@ export class Agent {
             duration_ms,
           })
 
-          this.history.push({
+          this.pushCtx({
             role: 'tool',
             content: result.error
               ? `Error: ${result.error}\n${result.output}`
@@ -1344,7 +1362,7 @@ export class Agent {
               noProgressSteers++
               const rg = regroundSteer(noProgPlan.objective, `${callsSinceMutation} tool calls without changing any file`)
               emitAndLog({ type: 'warning', message: rg })
-              this.history.push({ role: 'tool', content: rg })
+              this.pushCtx({ role: 'tool', content: rg })
             }
           }
         }
@@ -1401,11 +1419,12 @@ export class Agent {
   // by the context/compaction UI. Defensive: coerces non-string content, caps
   // per-message content so the payload stays bounded, and never throws.
   getContext(): {
-    messages: Array<{ role: string; content: string; chars: number }>
+    messages: Array<{ role: string; content: string; chars: number; ts: number | null }>
     messageCount: number
     totalChars: number
     numCtx: number | null
     compaction: string | null
+    compactionTs: number | null
   } {
     const MAX = 4000
     let totalChars = 0
@@ -1415,7 +1434,7 @@ export class Agent {
       const content = full.length > MAX
         ? `${full.slice(0, MAX)}…(+${full.length - MAX} more chars)`
         : full
-      return { role: m.role, content, chars: full.length }
+      return { role: m.role, content, chars: full.length, ts: this.historyTs.get(m) ?? null }
     })
 
     let compaction: string | null = null
@@ -1445,6 +1464,7 @@ export class Agent {
       totalChars,
       numCtx: this.options.num_ctx ?? null,
       compaction,
+      compactionTs: this.lastCompactedAt,
     }
   }
 
