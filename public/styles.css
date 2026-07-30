@@ -52,12 +52,16 @@ body {
   overflow: hidden;
 }
 
-/* ── Header ── */
+/* ── Header — unified toolbar, two sections ──────────────────────────
+   A CHAT section (left, sized to mirror #chat-panel's width so the divider
+   below it lines up with the boundary between #chat-panel and #files-panel)
+   and a FILE/CHANGE section (right, mirrors #files-panel) — the latter is a
+   reserved container for a later task (Files/Changes toggle + file path). */
 header {
   display: flex;
-  align-items: center;
+  align-items: stretch;
   gap: 0;
-  padding: 0 16px;
+  padding: 0;
   height: 42px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
@@ -72,6 +76,34 @@ header::after {
   background: linear-gradient(90deg, transparent, var(--gold), transparent);
   opacity: .2;
   pointer-events: none;
+}
+
+/* CHAT section — same width as #chat-panel below it. */
+#toolbar-chat {
+  display: flex;
+  align-items: center;
+  width: var(--chat-width, 50%);
+  min-width: 240px;
+  flex-shrink: 0;
+  padding: 0 16px;
+}
+
+/* Divider between the two toolbar sections, aligned with the chat/files
+   panel boundary. */
+#toolbar-div {
+  width: 1px;
+  flex-shrink: 0;
+  background: var(--border);
+  margin: 8px 0;
+}
+
+/* FILE/CHANGE section — mirrors #files-panel; reserved for a later task. */
+#toolbar-files {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  min-width: 200px;
 }
 
 /* ── Breadcrumb nav ── */
@@ -300,21 +332,23 @@ header::after {
 .nav-drop-attach button:hover { opacity: .85; }
 .nav-drop-attach button:disabled { opacity: .4; }
 
-/* ── Model area ── */
-#model-area {
+/* ── Combined context + status indicator ──────────────────────────────
+   Lives in the header's CHAT section (#indicator-area), at the right end of
+   #toolbar-chat. Donut ring = context usage, tick = auto-compaction
+   threshold, core = agent state (green/yellow/flashing-violet), center text
+   = current iteration while running. Precise numbers + status/model text
+   live in the dropdown (#ctx-dropdown). */
+#indicator-area {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 12px;
+  gap: 6px;
+  padding-left: 10px;
+  margin-left: auto;
   border-left: 1px solid var(--border);
   flex-shrink: 0;
   height: 100%;
 }
 
-
-/* Context indicator — a small donut showing prompt_tokens / num_ctx, with a
-   radial tick marking the auto-compaction threshold. Always visible; precise
-   numbers live in the dropdown (#ctx-dropdown). */
 #token-counter {
   display: inline-flex;
   align-items: center;
@@ -329,26 +363,20 @@ header::after {
 #token-counter .ctx-donut { display: block; }
 #token-counter .ctx-tick { opacity: .85; }
 
-/* Donut relocated into the composer's upper-right corner (Phase 3), mirroring the
-   gold send coin at the bottom-right — two round controls, one per corner of the
-   textarea. Enlarged to 34px + 2px padding = 38px so it matches the send coin.
-   The dropdown (#ctx-dropdown is position:fixed, JS-positioned) is unaffected by
-   the DOM move. */
-#input-wrap > #nav-ctx { position: absolute; top: 8px; right: 8px; z-index: 2; }
-#input-wrap > #nav-ctx > #token-counter { padding: 2px; background: rgba(17, 21, 32, .55); }
-#input-wrap > #nav-ctx > #token-counter .ctx-donut { width: 34px; height: 34px; }
+/* Core (agent-state dot) — flashes while compacting. */
+@keyframes ctx-core-flash { 0%, 100% { opacity: 1; } 50% { opacity: .2; } }
+.ctx-core.compacting { animation: ctx-core-flash .9s ease-in-out infinite; }
+.ctx-center-text {
+  font-family: var(--font-mono);
+  font-size: 7px;
+  font-weight: 700;
+  fill: #0a0b10;
+  pointer-events: none;
+}
 
 /* Context dropdown (reuses .nav-dropdown chrome) */
-#ctx-dropdown { min-width: 240px; }
-.ctx-drop-header {
-  font-family: var(--font-mono);
-  color: var(--text);
-  opacity: 1;
-  text-transform: none;
-  letter-spacing: 0;
-  font-size: 11px;
-  padding: 8px 14px 6px;
-}
+#ctx-dropdown { min-width: 260px; }
+.ctx-drop-status { font-family: var(--font-mono); }
 .nav-drop-item.disabled {
   opacity: .4;
   cursor: not-allowed;
@@ -393,45 +421,33 @@ header::after {
   color: var(--text);
 }
 
+/* #settings-btn shares .icon-btn's sizing (14px glyph, 1 line-height) for
+   visual consistency with the other bare-glyph header/panel buttons (↻ ✕). */
 #settings-btn {
-  background: none;
   border: 1px solid var(--border);
-  color: var(--muted);
-  padding: 3px 10px;
-  font-size: 13px;
-  cursor: pointer;
   border-radius: 4px;
 }
-#settings-btn:hover { color: var(--text); }
 
-/* ── Status ── */
-#status {
-  font-size: 12px;
-  color: var(--muted);
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding-left: 12px;
-  border-left: 1px solid var(--border);
-  height: 100%;
-  flex-shrink: 0;
-}
+/* ── Status (legacy) — hidden; folded into the combined indicator ── */
+#status { display: none; }
 
-/* ── Settings panel ── */
+/* ── Settings panel — vertical list, opened by the gear or the indicator's
+   status row. Order: Model, Context size, Grounding, Temperature, Top-p,
+   Top-k, Max iterations, Reset. */
 #settings-panel {
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 24px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
   padding: 0 20px;
   max-height: 0;
   overflow: hidden;
   transition: max-height 0.15s ease, padding 0.15s ease;
 }
-#settings-panel.open { max-height: 56px; padding: 8px 20px; }
+#settings-panel.open { max-height: 420px; overflow-y: auto; padding: 14px 20px; }
 
 .setting-group {
   display: flex;
@@ -441,8 +457,17 @@ header::after {
   color: var(--muted);
   white-space: nowrap;
 }
-.setting-group label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
-.setting-group input[type="range"] { width: 100px; accent-color: var(--gold); cursor: pointer; }
+.setting-group label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  width: 190px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.setting-group input[type="range"] { width: 160px; accent-color: var(--gold); cursor: pointer; }
 .setting-group input[type="number"] {
   width: 56px;
   background: var(--bg);
@@ -459,24 +484,62 @@ header::after {
   background: var(--bg);
   border: 1px solid var(--border);
   color: var(--text);
-  padding: 2px 6px;
+  padding: 3px 8px;
   font-size: 12px;
   border-radius: 4px;
   cursor: pointer;
   outline: none;
+  min-width: 200px;
 }
 .setting-group select:focus { border-color: rgba(201, 162, 39, .4); }
 .opt-val { font-family: var(--font-mono); font-size: 12px; color: var(--text); min-width: 32px; }
+
+/* Model select is the first row — a little more breathing room, no uppercase
+   truncation since model names are long/mixed-case. */
+.setting-model select { min-width: 260px; font-family: var(--font-mono); }
+
+/* Grounding's label is a full sentence, not a short field name — let it wrap
+   instead of forcing the shared 190px column + nowrap. */
+.setting-grounding { align-items: flex-start; white-space: normal; }
+.setting-grounding label {
+  width: auto;
+  max-width: 420px;
+  white-space: normal;
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: 12px;
+  padding-top: 1px;
+}
+
+/* Grounding info affordance — small "ⓘ" with a native tooltip (title attr)
+   explaining what the check does. */
+.info-affordance {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+  cursor: help;
+  flex-shrink: 0;
+  text-transform: none;
+}
+.info-affordance:hover, .info-affordance:focus-visible { color: var(--text); border-color: var(--text); outline: none; }
 
 #settings-reset {
   background: none;
   border: 1px solid var(--border);
   color: var(--muted);
-  padding: 2px 10px;
+  padding: 4px 12px;
   font-size: 11px;
   cursor: pointer;
   border-radius: 4px;
-  margin-left: auto;
+  align-self: flex-start;
+  margin-top: 4px;
 }
 #settings-reset:hover { color: var(--text); }
 
@@ -952,13 +1015,19 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   opacity: .65;
 }
 
+/* Shared bare-glyph button size (⚙ ↻ ✕ etc.) — unified to 14px/line-height:1
+   so every icon-only header/panel control reads the same visual weight;
+   previously settings-btn (13px, its own rule) and .icon-btn (13px) matched
+   by coincidence but were declared independently — settings-btn now uses
+   this class directly (index.html) instead of duplicating the rule. */
 .icon-btn {
   background: none;
   border: none;
   color: var(--muted);
   cursor: pointer;
-  padding: 2px 6px;
-  font-size: 13px;
+  padding: 3px 8px;
+  font-size: 14px;
+  line-height: 1;
   font-weight: 400;
   border-radius: 3px;
   transition: color .15s, background .15s;
@@ -1352,7 +1421,22 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
 }
+
+#diff-header-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+/* "Compact now" in the context viewer's title bar — replaces the old dropdown
+   item; only meaningfully actionable while idle (see viewContext() in app.js). */
+#diff-compact-now {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--gold);
+  padding: 4px 12px;
+  font-size: 12px;
+}
+#diff-compact-now:hover:not(:disabled) { border-color: var(--gold); }
+#diff-compact-now:disabled { color: var(--muted); opacity: .45; cursor: not-allowed; }
 
 #diff-content {
   overflow: auto;
@@ -1524,6 +1608,8 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   gap: 2px;
   flex-shrink: 0;
 }
+/* Deliberately smaller than the shared 14px .icon-btn size — these sit inside
+   a dense per-row queue card, not the header/panel chrome. */
 .queue-item-btn {
   font-size: 12px;
   line-height: 1;

@@ -18,16 +18,36 @@ const tokenCounter = $('token-counter')
 const settingsBtn = $('settings-btn')
 const settingsPanel = $('settings-panel')
 
-// ── Context indicator (donut) ─────────────────────────────────────
+// ── Combined context + status indicator (donut) ────────────────────
 // Latest context size the model saw, plus the fraction at which auto-compaction
-// fires (fetched once from /status on boot). The donut is drawn from these and
-// redrawn on every token_usage; precise numbers live only in the dropdown.
+// fires (fetched once from /status on boot). The donut's ring+tick are drawn
+// from these and redrawn on every token_usage; precise numbers live in the
+// dropdown. The donut's CENTER communicates agent state (see indicatorState).
 let ctxState = { promptTokens: 0, numCtx: 0, pct: 0 }
 let compactThreshold = 0.667
 // True while a user-triggered /compact-now is in flight — used to (a) disable the
-// dropdown action and (b) let compaction trace events render even when they'd
-// otherwise be suppressed (e.g. while viewing a past session).
+// dropdown/modal action and (b) let compaction trace events render even when
+// they'd otherwise be suppressed (e.g. while viewing a past session).
 let manualCompacting = false
+
+// Drives the donut's core color: 'ready' (green) / 'busy' (yellow, running) /
+// 'compacting' (flashing violet) / 'error' (red). Set by setStatus(), except
+// while compactingNow is true, which always wins (a compaction can happen
+// mid-run, and should visually override "Running").
+let indicatorState = 'ready'
+// Current iteration number, shown in the donut's center while busy/running.
+let currentIteration = null
+// True from 'compact_start' until 'compact' (or a safety-net clear on the next
+// 'iteration'/'error') — independent of `busy` since manual compaction can run
+// between agent runs.
+let compactingNow = false
+let compactStartTime = null
+// Live progress from 'compact_progress' (precise, while available); falls back
+// to the previous compaction's duration as a rough estimate.
+let compactElapsedS = null
+let compactTimeoutS = null
+let compactStep = null
+let lastCompactionDurationS = null
 
 // Arc color mirrors the old ctx-ok/ctx-warn/ctx-danger thresholds, read from the
 // same CSS custom properties so the palette stays in one place (styles.css).
@@ -39,7 +59,7 @@ function ctxArcColor(pct) {
 }
 
 function renderDonut() {
-  const size = 22, cx = 11, cy = 11, r = 8, sw = 3
+  const size = 24, cx = 12, cy = 12, r = 8, sw = 3
   const pct = Math.max(0, Math.min(100, ctxState.pct))
   const circ = 2 * Math.PI * r
   const dash = circ * (pct / 100)
@@ -52,17 +72,28 @@ function renderDonut() {
   const rIn = r - sw / 2 - 1, rOut = r + sw / 2 + 1
   const tx1 = (cx + rIn * Math.cos(ang)).toFixed(2), ty1 = (cy + rIn * Math.sin(ang)).toFixed(2)
   const tx2 = (cx + rOut * Math.cos(ang)).toFixed(2), ty2 = (cy + rOut * Math.sin(ang)).toFixed(2)
+
+  // Core: solid state color, filling the middle of the ring. Flashes while compacting.
+  const coreColor = { ready: 'var(--green)', busy: 'var(--yellow)', compacting: 'var(--purple)', error: 'var(--red)' }[indicatorState] || 'var(--green)'
+  const coreClass = indicatorState === 'compacting' ? 'ctx-core compacting' : 'ctx-core'
+  const coreR = r - sw / 2 - 2.5
+  // Iteration number, shown only while actually running (not idle/compacting).
+  const centerText = (indicatorState === 'busy' && currentIteration) ? String(currentIteration) : ''
+
   tokenCounter.innerHTML =
     `<svg class="ctx-donut" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">`
     + `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--border)" stroke-width="${sw}"/>`
     + `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${color}" stroke-width="${sw}"`
     + ` stroke-dasharray="${dash.toFixed(2)} ${(circ - dash).toFixed(2)}" transform="rotate(-90 ${cx} ${cy})"/>`
     + `<line class="ctx-tick" x1="${tx1}" y1="${ty1}" x2="${tx2}" y2="${ty2}" stroke="var(--text)" stroke-width="1.5"/>`
+    + `<circle class="${coreClass}" cx="${cx}" cy="${cy}" r="${coreR.toFixed(2)}" fill="${coreColor}"/>`
+    + (centerText ? `<text x="${cx}" y="${cy}" class="ctx-center-text" text-anchor="middle" dominant-baseline="central">${escHtml(centerText)}</text>` : '')
     + `</svg>`
 }
 
-// Update stored context size + redraw. Never touches textContent (the donut is
-// the only always-on display; numbers show in the dropdown).
+// Update stored context size + redraw. Precise numbers show in the dropdown;
+// the donut itself only ever shows the ring (usage), tick (threshold) and
+// core+center-text (agent state / iteration).
 function updateCtx(promptTokens, numCtx) {
   const pct = numCtx ? Math.round(promptTokens / numCtx * 100) : 0
   ctxState = { promptTokens, numCtx, pct }
@@ -325,15 +356,19 @@ function handleEvent(event) {
   switch (event.type) {
     case 'start':
       currentRunModel = event.model
+      currentIteration = null
       startTraceBlock(event.model)
       setStatus('busy', `Running · ${event.model}`)
       break
 
     case 'iteration':
+      currentIteration = event.current
       iterLabel.textContent = `${event.current}`
       addTraceItem('iteration', null, `── Iteration ${event.current} ──`, false)
       // Safety net: if compaction failed last iteration, only a 'warning' fires
-      // (no 'compact'), so this is what clears "Compacting context…" from the status bar.
+      // (no 'compact'), so this is what clears "Compacting context…" from the
+      // indicator/status bar.
+      compactingNow = false
       setStatus('busy', `Running · ${currentRunModel}`)
       break
 
@@ -379,6 +414,7 @@ function handleEvent(event) {
       finalizeTraceBlock()
       setBusy(false)
       iterLabel.textContent = ''
+      currentIteration = null
       refreshGitLog()
       refreshFiles()
       // Browser notification on a clean finish (with the workspace name), when the tab is
@@ -404,6 +440,14 @@ function handleEvent(event) {
     case 'compact_start':
       // Compaction involves separate LLM calls (update + validate) that can take
       // up to a couple minutes total — without this the run just looks stalled.
+      // compactingNow (checked by setStatus) makes the indicator's core flash
+      // violet and its dropdown status row show compaction progress, regardless
+      // of whether this happens mid-run or as a standalone manual compaction.
+      compactingNow = true
+      compactStartTime = Date.now()
+      compactElapsedS = null
+      compactTimeoutS = null
+      compactStep = null
       setStatus('busy', 'Compacting context…')
       addTraceItem('compact', '📦 Compacting context', `${event.messageCount} messages, ${Math.round(event.contextUsagePct * 100)}% context — updating working memory…`, false)
       break
@@ -414,20 +458,29 @@ function handleEvent(event) {
       // working and not just hung, since compact_start only fires once at the start.
       const elapsedS = Math.round(event.elapsedMs / 1000)
       const timeoutS = Math.round(event.timeoutMs / 1000)
+      compactElapsedS = elapsedS
+      compactTimeoutS = timeoutS
+      compactStep = event.step
       setStatus('busy', `Compacting context… ${event.step} (${elapsedS}s / ${timeoutS}s)`)
       break
     }
 
     case 'compact':
-      // A manually triggered compaction (see #token-counter's click handler)
-      // has no run following it to eventually fire 'done' and restore status —
-      // reflect that here instead of leaving the dot stuck on "Running".
+      // A manually triggered compaction (see the indicator dropdown / context
+      // viewer's "Compact now") has no run following it to eventually fire
+      // 'done' and restore status — reflect that here instead of leaving the
+      // dot/indicator stuck on "Running"/"Compacting".
+      compactingNow = false
+      if (compactStartTime) {
+        lastCompactionDurationS = Math.round((Date.now() - compactStartTime) / 1000)
+        compactStartTime = null
+      }
       if (event.manual) setStatus('ready', 'Ready')
       else setStatus('busy', `Running · ${currentRunModel}`)
       addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}${event.activeWorkingStateSummary ? `\n\n--- Active working state (unvalidated) ---\n${event.activeWorkingStateSummary}` : ''}`, true)
       // A user-triggered manual compaction (no run to fire 'done') finalizes its
       // own trace block here; an in-run auto-compaction leaves the block open for
-      // the run to keep filling. The donut keeps showing the last known size.
+      // the run to keep filling. The donut's ring keeps showing the last known size.
       if (manualCompacting) {
         finalizeTraceBlock()
         manualCompacting = false
@@ -445,6 +498,7 @@ function handleEvent(event) {
 
     case 'error':
       addTraceItem('error-item', '⚠ Error', event.message, false)
+      compactingNow = false
       setStatus('error', 'Error')
       finalizeTraceBlock()
       setBusy(false)
@@ -522,9 +576,18 @@ function handleEventForSession(event) {
 }
 
 // ── UI helpers ───────────────────────────────────────────────────
+// Drives BOTH the legacy (now hidden) #status dot/text and the combined
+// indicator: state is 'ready' | 'busy' | 'error'; compactingNow (module state,
+// set/cleared around the compact_start/compact events) overrides to
+// 'compacting' regardless of what's passed here, since a compaction can occur
+// either mid-run or standalone between runs.
 function setStatus(state, text) {
   statusDot.className = state === 'ready' ? '' : state
   statusText.textContent = text
+  indicatorState = compactingNow ? 'compacting' : state
+  renderDonut()
+  // Keep an open dropdown's status/context rows live rather than stale text.
+  if (navCtx.classList.contains('open')) buildCtxDropdown()
 }
 
 // The outer layer always does the sail-past traverse; the inner layer rocks with one random
@@ -545,8 +608,6 @@ function setBusy(val) {
   busy = val
   // Leave the textarea enabled while the agent runs so the user can queue prompts.
   inputEl.placeholder = val ? 'Queue a prompt… (Enter to queue)' : originalPlaceholder
-  const nb = $('new-session-btn')
-  if (nb) nb.disabled = val
 
   if (val) {
     // The boat stays visible and sails while the agent runs: setSailing picks 1-2 random
@@ -575,45 +636,71 @@ async function stopAgent() {
   try { await fetch(`${API_BASE}/stop`, { method: 'POST' }) } catch { /* ignore */ }
 }
 
-// ── Context dropdown ──────────────────────────────────────────────
-// Clicking the donut opens a dropdown (never compacts directly — that avoids
-// accidental triggers). Reuses the .nav-crumb / .nav-dropdown pattern, so
-// closeAllDropdowns() (outside-click + Escape) closes it for free.
+// ── Combined indicator dropdown ───────────────────────────────────
+// Clicking the indicator opens a dropdown with three rows: status+model
+// (opens the settings panel), precise context numbers (opens the context
+// viewer), and "Clear conversation" (replaces the old standalone new-session
+// button). Reuses the .nav-crumb / .nav-dropdown pattern, so
+// closeAllDropdowns() (outside-click + Escape) closes it for free. "Compact
+// now" lives in the context viewer's title bar instead of here (see
+// viewContext()).
 const navCtx = $('nav-ctx')
 const ctxDropdown = $('ctx-dropdown')
+
+function compactStatusText() {
+  if (indicatorState === 'compacting') {
+    if (compactElapsedS != null) {
+      return `Compacting…${compactStep ? ' ' + compactStep : ''} (${compactElapsedS}s / ${compactTimeoutS}s)`
+    }
+    return lastCompactionDurationS ? `Compacting… (~${lastCompactionDurationS}s)` : 'Compacting…'
+  }
+  if (indicatorState === 'error') return 'Error'
+  const model = selectedModel || '—'
+  return indicatorState === 'busy' ? `Running · ${model}` : `Ready · ${model}`
+}
 
 function buildCtxDropdown() {
   ctxDropdown.innerHTML = ''
 
-  const header = document.createElement('div')
-  header.className = 'nav-drop-label ctx-drop-header'
-  header.textContent = ctxState.numCtx
+  // Row 1 — textual status + model. Click opens the LLM settings panel.
+  const statusRow = document.createElement('div')
+  statusRow.className = 'nav-drop-item ctx-drop-status'
+  statusRow.innerHTML = `<span>${escHtml(compactStatusText())}</span>`
+  statusRow.addEventListener('click', () => {
+    navCtx.classList.remove('open')
+    settingsPanel.classList.add('open')
+  })
+  ctxDropdown.appendChild(statusRow)
+
+  // Row 2 — precise context numbers. Click opens the context viewer.
+  const ctxRow = document.createElement('div')
+  ctxRow.className = 'nav-drop-item'
+  const ctxTxt = ctxState.numCtx
     ? `${ctxState.promptTokens.toLocaleString()} / ${ctxState.numCtx.toLocaleString()} tokens · ${ctxState.pct}%`
     : 'No context usage yet'
-  ctxDropdown.appendChild(header)
-
-  // Compaction only makes sense between runs — disabled while busy or already
-  // compacting, with a hint explaining why.
-  const disabled = busy || manualCompacting
-  const compactItem = document.createElement('div')
-  compactItem.className = `nav-drop-item${disabled ? ' disabled' : ''}`
-  compactItem.innerHTML = `<span>⚡ Compact context now</span>${disabled ? '<span class="ctx-hint">available between runs</span>' : ''}`
-  if (!disabled) {
-    compactItem.addEventListener('click', () => {
-      navCtx.classList.remove('open')
-      compactNow()
-    })
-  }
-  ctxDropdown.appendChild(compactItem)
-
-  const viewItem = document.createElement('div')
-  viewItem.className = 'nav-drop-item'
-  viewItem.innerHTML = `<span>🔍 View context</span>`
-  viewItem.addEventListener('click', () => {
+  ctxRow.innerHTML = `<span>🔍 ${escHtml(ctxTxt)}</span>`
+  ctxRow.addEventListener('click', () => {
     navCtx.classList.remove('open')
     viewContext()
   })
-  ctxDropdown.appendChild(viewItem)
+  ctxDropdown.appendChild(ctxRow)
+
+  const sep = document.createElement('div')
+  sep.className = 'nav-drop-sep'
+  ctxDropdown.appendChild(sep)
+
+  // Row 3 — clear conversation (was the standalone "＋" button in the breadcrumb).
+  const clearDisabled = busy
+  const clearRow = document.createElement('div')
+  clearRow.className = `nav-drop-item${clearDisabled ? ' disabled' : ''}`
+  clearRow.innerHTML = `<span>＋ Clear conversation</span>${clearDisabled ? '<span class="ctx-hint">running…</span>' : ''}`
+  if (!clearDisabled) {
+    clearRow.addEventListener('click', () => {
+      navCtx.classList.remove('open')
+      newSession()
+    })
+  }
+  ctxDropdown.appendChild(clearRow)
 }
 
 tokenCounter.addEventListener('click', (e) => {
@@ -624,16 +711,11 @@ tokenCounter.addEventListener('click', (e) => {
     buildCtxDropdown()
     navCtx.classList.add('open')
     const r = tokenCounter.getBoundingClientRect()
-    // The donut now lives in the composer at the bottom of the panel, so open the
-    // dropdown UPWARD when there isn't room below it (fall back to downward otherwise).
-    ctxDropdown.style.left = Math.max(8, r.right - 240) + 'px'
-    if (window.innerHeight - r.bottom < 320) {
-      ctxDropdown.style.top = 'auto'
-      ctxDropdown.style.bottom = (window.innerHeight - r.top + 6) + 'px'
-    } else {
-      ctxDropdown.style.bottom = 'auto'
-      ctxDropdown.style.top = (r.bottom + 6) + 'px'
-    }
+    // The indicator now lives at the top of the viewport, so there's always
+    // room below it — always open downward (no upward fallback needed).
+    ctxDropdown.style.left = Math.max(8, r.right - 260) + 'px'
+    ctxDropdown.style.bottom = 'auto'
+    ctxDropdown.style.top = (r.bottom + 6) + 'px'
   }
 })
 
@@ -686,9 +768,15 @@ function cleanupManualCompaction(createdBlock) {
 }
 
 // View the exact context the model currently sees. Read-only; reuses #diff-modal.
+// The modal's title bar carries a "Compact now" action (replacing the old
+// dropdown item), enabled only when the agent is idle and not already
+// compacting.
 async function viewContext() {
   diffTitle.textContent = 'Context'
   diffContent.textContent = 'Loading…'
+  diffCompactBtn.classList.remove('hidden')
+  diffCompactBtn.disabled = busy || manualCompacting
+  diffCompactBtn.textContent = '⚡ Compact now'
   diffModal.classList.add('open')
   try {
     const resp = await fetch(`${API_BASE}/context`)
@@ -1077,6 +1165,8 @@ async function newSession() {
   renderQueue()
 
   iterLabel.textContent = ''
+  currentIteration = null
+  compactingNow = false
   setStatus('ready', 'Ready')
   // Track the new live session id so its events are the ones replayed later.
   const st = await fetch(`${API_BASE}/status`).then(r => r.json()).catch(() => ({}))
@@ -1091,61 +1181,43 @@ document.addEventListener('click', closeAllDropdowns)
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAllDropdowns() })
 
 // ── Model selector ───────────────────────────────────────────────
+// Model selection now lives inside the settings panel (#opt-model), as the
+// first control — the old standalone toolbar "#nav-model" crumb is gone; the
+// combined indicator's status row opens this same settings panel instead.
 function selectModel(name) {
   selectedModel = name
-  $('model-label').textContent = name
-  // update active state in dropdown
-  $('model-dropdown').querySelectorAll('.nav-drop-item').forEach(el => {
-    el.classList.toggle('active', el.dataset.model === name)
-  })
+  const sel = $('opt-model')
+  if (sel && sel.value !== name) sel.value = name
+  // The indicator's dropdown status row shows the model name — keep it live
+  // if the dropdown happens to be open while the model changes.
+  if (navCtx.classList.contains('open')) buildCtxDropdown()
 }
 
 async function loadModels() {
-  const dropdown = $('model-dropdown')
-  const navModel = $('nav-model')
+  const select = $('opt-model')
 
-  // Toggle open/close — position fixed so it's never clipped by a parent overflow
-  $('model-btn').addEventListener('click', e => {
-    e.stopPropagation()
-    const wasOpen = navModel.classList.contains('open')
-    closeAllDropdowns()
-    if (!wasOpen) {
-      navModel.classList.add('open')
-      const r = $('model-btn').getBoundingClientRect()
-      dropdown.style.top  = (r.bottom + 6) + 'px'
-      dropdown.style.left = (r.right - 220) + 'px'
-    }
-  })
+  select.addEventListener('change', e => selectModel(e.target.value))
 
   try {
     const resp = await fetch(`${API_BASE}/models`)
     const models = await resp.json()
-    dropdown.innerHTML = ''
+    select.innerHTML = ''
     models.forEach(name => {
-      const item = document.createElement('div')
-      item.className = 'nav-drop-item'
-      item.dataset.model = name
-      const toolBadge = (name.startsWith('qwen3') || name.startsWith('devstral')) ? ' <span class="model-tool-badge" title="Validated for tool use">🔧</span>' : ''
-      const noToolBadge = (name.startsWith('gemma') ) ? ' <span class="model-tool-badge" title="No tool support — will not work in Argo">⚠️</span>' : ''
-      item.innerHTML = `${escHtml(name)}${toolBadge}${noToolBadge}`
-      item.addEventListener('click', () => {
-        selectModel(name)
-        navModel.classList.remove('open')
-      })
-      dropdown.appendChild(item)
+      const opt = document.createElement('option')
+      opt.value = name
+      const toolBadge = (name.startsWith('qwen3') || name.startsWith('devstral')) ? ' 🔧' : ''
+      const noToolBadge = (name.startsWith('gemma')) ? ' ⚠️ no tool support' : ''
+      opt.textContent = `${name}${toolBadge}${noToolBadge}`
+      select.appendChild(opt)
     })
     if (models.length) selectModel(models[0])
   } catch {
     const fallback = 'llama3.1:8b'
-    const item = document.createElement('div')
-    item.className = 'nav-drop-item active'
-    item.dataset.model = fallback
-    item.textContent = fallback
-    item.addEventListener('click', () => {
-      selectModel(fallback)
-      navModel.classList.remove('open')
-    })
-    dropdown.appendChild(item)
+    select.innerHTML = ''
+    const opt = document.createElement('option')
+    opt.value = fallback
+    opt.textContent = fallback
+    select.appendChild(opt)
     selectModel(fallback)
   }
 }
@@ -1216,6 +1288,7 @@ async function refreshGitLog() {
 async function showDiff(hash) {
   diffContent.textContent = 'Loading…'
   diffTitle.textContent = hash.slice(0, 7)
+  diffCompactBtn.classList.add('hidden')
   diffModal.classList.add('open')
 
   try {
@@ -1240,6 +1313,23 @@ function colorize(text) {
 $('refresh-git').addEventListener('click', refreshGitLog)
 $('close-diff').addEventListener('click', () => diffModal.classList.remove('open'))
 diffModal.addEventListener('click', (e) => { if (e.target === diffModal) diffModal.classList.remove('open') })
+
+// "Compact now" in the context viewer's title bar — replaces the old
+// dropdown item. Only meaningfully enabled when idle (see viewContext()); the
+// busy/manualCompacting guard here is a defensive backstop.
+const diffCompactBtn = $('diff-compact-now')
+diffCompactBtn.addEventListener('click', async () => {
+  if (busy || manualCompacting) return
+  diffCompactBtn.disabled = true
+  diffCompactBtn.textContent = 'Compacting…'
+  await compactNow()
+  diffCompactBtn.disabled = busy || manualCompacting
+  diffCompactBtn.textContent = '⚡ Compact now'
+  // Refresh the numbers shown if the context viewer is still the open modal.
+  if (diffModal.classList.contains('open') && diffTitle.textContent.startsWith('Context')) {
+    viewContext()
+  }
+})
 
 // ── Files tab ────────────────────────────────────────────────────
 // A single tree rooted at the container's real filesystem (or the mounted
@@ -1550,12 +1640,8 @@ $('refresh-files').addEventListener('click', refreshFiles)
 
 // ── Nav init ─────────────────────────────────────────────────────
 async function initNav() {
-  // New session button — always visible; clears the conversation
-  const newSessionBtn = $('new-session-btn')
-  newSessionBtn.addEventListener('click', () => {
-    if (busy) return
-    newSession()
-  })
+  // "Clear conversation" now lives in the combined indicator's dropdown (see
+  // buildCtxDropdown) — the old standalone "＋" breadcrumb button is gone.
 
   // Workspace crumb — only in central/worker mode
   if (!window.__WS__) return

@@ -13,40 +13,78 @@
 </head>
 <body>
 
+<!-- Unified toolbar: CHAT section (left, mirrors #chat-panel's width) + a
+     divider + a FILE/CHANGE section (right, mirrors #files-panel) — a later
+     task fills the file section with the Files/Changes toggle + file path. -->
 <header>
-  <!-- Breadcrumb: Argo › workspace › session -->
-  <nav id="breadcrumb">
-    <a id="nav-home" href="/" title="All workspaces"><span class="flip-h">⛵</span><span class="wordmark"> Argo</span></a>
+  <div id="toolbar-chat">
+    <!-- Breadcrumb: Argo › workspace -->
+    <nav id="breadcrumb">
+      <a id="nav-home" href="/" title="All workspaces"><span class="flip-h">⛵</span><span class="wordmark"> Argo</span></a>
 
-    <span class="nav-sep" id="sep-ws" style="display:none">›</span>
-    <div class="nav-crumb" id="nav-ws" style="display:none">
-      <button class="nav-crumb-btn" id="ws-btn"><span id="ws-name-label"></span></button>
-      <div class="nav-dropdown" id="ws-dropdown"></div>
+      <span class="nav-sep" id="sep-ws" style="display:none">›</span>
+      <div class="nav-crumb" id="nav-ws" style="display:none">
+        <button class="nav-crumb-btn" id="ws-btn"><span id="ws-name-label"></span></button>
+        <div class="nav-dropdown" id="ws-dropdown"></div>
+      </div>
+    </nav>
+
+    <!-- Combined context + status indicator — center shows agent state
+         (green=ready / yellow=running, with iteration number / flashing
+         violet=compacting); ring shows context usage; tick marks the
+         auto-compaction threshold. Click opens a dropdown: status+model,
+         context detail, clear conversation. -->
+    <div id="indicator-area">
+      <div class="nav-crumb" id="nav-ctx">
+        <span id="token-counter" title="Status &amp; context — click for details"></span>
+        <div class="nav-dropdown" id="ctx-dropdown"></div>
+      </div>
+      <button id="settings-btn" class="icon-btn" title="Model &amp; parameters">⚙</button>
     </div>
-
-    <span class="nav-sep">›</span>
-    <button id="new-session-btn" class="icon-btn" title="New session (clear the conversation)">＋</button>
-  </nav>
-
-  <!-- Model + params — applies to next message in current session, no restart needed -->
-  <div id="model-area">
-    <div class="nav-crumb" id="nav-model">
-      <button class="nav-crumb-btn" id="model-btn"><span id="model-label">—</span></button>
-      <div class="nav-dropdown" id="model-dropdown"></div>
-    </div>
-    <button id="settings-btn" title="Model parameters — applied to next message in current session">⚙</button>
   </div>
 
-  <div id="status">
-    <div id="status-dot"></div>
-    <span id="status-text">Connecting…</span>
-    <span id="iter-label"></span>
-  </div>
+  <div id="toolbar-div" aria-hidden="true"></div>
+
+  <!-- File/Change section — reserved container + divider; populated by a
+       later task with the Files/Changes toggle and current file path. -->
+  <div id="toolbar-files"></div>
 </header>
+
+<!-- Legacy status readout — kept in the DOM (some code paths still write to
+     it) but visually folded into the combined indicator above; not shown. -->
+<div id="status" class="hidden">
+  <div id="status-dot"></div>
+  <span id="status-text">Connecting…</span>
+  <span id="iter-label"></span>
+</div>
 
 <div id="env-banner" class="hidden"></div>
 
+<!-- LLM settings — vertical list, opened by the gear (or the indicator's
+     status row). Order: Model, Context size, Grounding, Temperature, Top-p,
+     Top-k, Max iterations, Reset. -->
 <div id="settings-panel">
+  <div class="setting-group setting-model">
+    <label for="opt-model">Model</label>
+    <select id="opt-model"></select>
+  </div>
+  <div class="setting-group">
+    <label for="opt-num-ctx">Context size</label>
+    <select id="opt-num-ctx">
+      <option value="2048">2,048</option>
+      <option value="4096">4,096</option>
+      <option value="8192">8,192</option>
+      <option value="16384">16,384</option>
+      <option value="32768">32,768</option>
+      <option value="65536" selected>65,536</option>
+    </select>
+  </div>
+  <div class="setting-group setting-grounding">
+    <label for="opt-grounding">Fact-check writing before finishing
+      <span class="info-affordance" tabindex="0" title="On writing/research tasks, before finishing, Argo re-checks the drafted document's facts and figures against the sources it actually fetched, and blocks completion until unsupported claims are fixed.">ⓘ</span>
+    </label>
+    <input type="checkbox" id="opt-grounding" checked>
+  </div>
   <div class="setting-group">
     <label for="opt-temperature">Temperature</label>
     <input type="range" id="opt-temperature" min="0" max="2" step="0.05" value="0.8">
@@ -62,24 +100,9 @@
     <input type="number" id="opt-top-k" min="0" max="200" value="40">
   </div>
   <div class="setting-group">
-    <label for="opt-num-ctx">Context window</label>
-    <select id="opt-num-ctx">
-      <option value="2048">2,048</option>
-      <option value="4096">4,096</option>
-      <option value="8192">8,192</option>
-      <option value="16384">16,384</option>
-      <option value="32768" selected>32,768</option>
-      <option value="65536">65,536</option>
-    </select>
-  </div>
-  <div class="setting-group">
     <label for="opt-max-iterations">Max iterations</label>
     <input type="range" id="opt-max-iterations" min="10" max="1000" step="10" value="1000">
     <span class="opt-val" id="opt-max-iterations-val">1000</span>
-  </div>
-  <div class="setting-group">
-    <label for="opt-grounding">Grounding check (writing tasks)</label>
-    <input type="checkbox" id="opt-grounding" checked>
   </div>
   <button id="settings-reset">Reset</button>
 </div>
@@ -96,10 +119,6 @@
     <form id="chat-form">
       <div id="input-wrap">
         <textarea id="input" placeholder="Ask anything… (Shift/Alt+Enter for newline)" rows="3"></textarea>
-        <div class="nav-crumb" id="nav-ctx">
-          <span id="token-counter" title="Context usage — click for details"></span>
-          <div class="nav-dropdown" id="ctx-dropdown"></div>
-        </div>
         <button id="send-btn" type="submit" title="Send">
           <span class="send-icon" id="send-boat"><span class="m1"><span class="m2"><span class="boat-glyph">⛵</span></span></span></span>
           <span class="send-stop hidden" id="send-stop"></span>
@@ -164,12 +183,15 @@
 <!-- Toast notifications — replaces native alert() -->
 <div id="toast-container"></div>
 
-<!-- Diff / file preview modal -->
+<!-- Diff / file preview / context viewer modal -->
 <div id="diff-modal">
   <div id="diff-box">
     <div id="diff-box-header">
       <span id="diff-title" class="diff-title"></span>
-      <button id="close-diff">✕ Close</button>
+      <div id="diff-header-actions">
+        <button id="diff-compact-now" class="hidden" title="Compact context now">⚡ Compact now</button>
+        <button id="close-diff">✕ Close</button>
+      </div>
     </div>
     <div id="diff-content"></div>
   </div>
