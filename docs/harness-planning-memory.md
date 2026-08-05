@@ -1,11 +1,20 @@
 # Follow-up plan: harness-owned planning, task decomposition, and AGENTS.md/MEMORY.md instrumentation
 
-Status: Stages 1-4 (tasks + AGENTS.md/MEMORY.md memory) and the loop-recovery ladder are BUILT, wired
-into `agent.ts`, and eval'd OFF vs ON — non-regressive (2026-07-30 e2e A/B; see `docs/eval-log.md`).
-All flags stay OFF by default pending an n≥3 multi-run + the adversarial pass below (see Testing
-plan). This doc is now the design record + remaining checklist, not a future plan. It documents how
-Argo's *harness* — not the model — owns planning, task management, and memory, so a small local
-model just takes the next step against a tiny, freshly-curated window.
+For a plain-language description of every harness behavior plus critiques and current
+defaults, see `docs/harness-instrumentation.md`.
+
+Status (2026-08-04): Stages 1-4 (tasks + AGENTS.md/MEMORY.md memory) and the loop-recovery
+ladder are BUILT, wired into `agent.ts`, eval'd OFF vs ON non-regressive (2026-07-30 e2e A/B;
+see `docs/eval-log.md`), and now **ON BY DEFAULT** — `ARGO_TASKS`, `ARGO_MEMORY`, and
+`ARGO_LOOP` are enabled out of the box (env `=0/false/off` forces off), matching grounding
+(also on). Re-validated non-regressive at the new defaults: full suite 175/175, integrated
+smoke 2/2. `ARGO_CRITIC` stays OFF (inconclusive value + latency; executable verification is
+the preferred lever). `ARGO_AUTOCOMMIT` stays OFF (opt-in). Since the OFF-default checklist
+below was written, the biggest verification gap it flagged has been CLOSED — see "Executable
+per-task verification + reconciliation" below. This doc is now the design record + remaining
+checklist, not a future plan. It documents how Argo's *harness* — not the model — owns
+planning, task management, and memory, so a small local model just takes the next step
+against a tiny, freshly-curated window.
 
 ## Why (grounding)
 `docs/research.md` (memory report) settled the key question: **small local models cannot reliably
@@ -83,8 +92,9 @@ The harness runs the memory loop; the model never has to decide to page memory:
    see the ARGO_MEMORY section below.
 
 Each stage is flag-gated (byte-identical when off — `ARGO_TASKS`/`ARGO_MEMORY`); the 2026-07-30 e2e
-A/B (see Integration design + Testing plan below) was non-regressive, but flags stay OFF by default
-pending the n≥3 + adversarial validation still open.
+A/B (see Integration design + Testing plan below) was non-regressive. Flags are now **ON by default**
+(2026-08-04; env `=0/false/off` forces off) — see the Status note at the top; the n≥3 + adversarial
+validation remains open.
 
 ## Integration design (research-informed, 2026-07-30)
 Pure cores AND their wiring into `agent.ts` are BUILT + tested + eval'd (2026-07-30 e2e A/B,
@@ -93,7 +103,7 @@ reconcile-on-refine, 25 tests). Below is that wiring, informed by
 `/shared/argo-harness/decomposition-research.md` (Manus recitation, LangGraph plan-execute-replan,
 Reflexion verify-loop, Plan-and-Solve, Anthropic gates, Qwen function-calling docs).
 
-Two independent flags (compose; each A/B-able), OFF by default = **byte-identical baseline**:
+Two independent flags (compose; each A/B-able), now **ON by default** (were OFF = **byte-identical baseline** for the initial A/B):
 - **`ARGO_TASKS`** (`config.tasks`) — sequential task ledger.
 - **`ARGO_MEMORY`** (`config.memory`) — AGENTS.md/MEMORY.md instrumentation.
 
@@ -117,7 +127,26 @@ Two independent flags (compose; each A/B-able), OFF by default = **byte-identica
   the verify gate. Only when `allDone` (or no ledger) does the existing run-level done-gate
   (critic → grounding → re-ground) fire and finish the run.
 
-### Loop detection & recovery ladder — ✅ BUILT (`src/loop.ts`, flag `ARGO_LOOP`, default OFF; user-directed 2026-07-30 — the robustness backbone)
+### Executable per-task verification + per-task summaries + final reconciliation — ✅ BUILT (2026-08-04, closes the biggest verification gap)
+- **Executable `verify` per task:** `update_plan` steps can now carry a `verify` shell command
+  (`src/tasks.ts` + `src/agent.ts` + `src/tools/index.ts`). At the per-task gate the harness
+  RUNS it and only advances the ledger on exit 0; on failure the output is fed back to the
+  model as the next turn instead of advancing. A consecutive-failure escalation guard
+  (`VERIFY_FAIL_ESCALATE = 3`) prevents an infinite verify-fail loop. This replaces the old
+  prompt-only "confirm task complete + how you verified" nudge with a real oracle — the model
+  can no longer talk its way past a task it hasn't actually finished.
+- **Per-task summaries:** once a task passes its `verify` (or has none and the model reports
+  done), the model produces a short what/how summary that is stored on the ledger (`Task.summary`)
+  and carried across re-plans (`reconcile` preserves summaries on frozen/done tasks).
+- **Final reconciliation:** when all tasks are done, a one-time FINAL RECONCILIATION step feeds
+  the top-level objective + every per-task summary back to the model to check for gaps; it can
+  re-open work via `update_plan` if something is missing. If complete, the model's user-facing
+  final summary is grounded in those per-task records rather than being a free-form recollection.
+  This upgrades the old prompt-only conclusion described in `docs/harness-instrumentation.md`.
+- Also fixed alongside this pass: AGENTS.md per-task section-selection (previously listed as the
+  Stage-4 fix below) is confirmed still per-task, not frozen once at the initial request.
+
+### Loop detection & recovery ladder — ✅ BUILT (`src/loop.ts`, flag `ARGO_LOOP`, now ON by default; user-directed 2026-07-30 — the robustness backbone)
 Built **mutation-aware**, refined from the original design below: block the 2nd identical (tool+args)
 call only when no project mutation (`edit_file`/`write_file` success) has happened since it last ran —
 a legitimate re-check after an edit is never blocked, only genuine no-progress churn is.

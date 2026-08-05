@@ -1,5 +1,10 @@
 # Argo — improvement roadmap (hypothesis-driven)
 
+For a plain-language description of every harness behavior (plan gate, task ledger,
+loop-recovery ladder, the verification stack, progress trace, conclusion, context
+management, AGENTS.md/MEMORY.md) plus critiques and current defaults, see
+`docs/harness-instrumentation.md`.
+
 A pragmatic, iterative plan for making Argo a genuinely good **contained coding harness for
 locally-running LLMs** (Qwen, …), while staying true to its mission: local, lean,
 means-not-ends (Ollama/Docker are swappable tools, not goals), observability-first.
@@ -226,5 +231,29 @@ Two Phase 4 items landed, both flag-gated OFF by default and validated together 
   overrides for all four flags above, and `/status` reports them, so any can be flipped without a
   rebuild once validated.
 
-Both harness flags stay **OFF by default** pending (a) the n≥3 multi-run above and (b) an adversarial
-pass that actually exercises the loop ladder — see `docs/harness-planning-memory.md`'s Testing plan.
+**Update (2026-08-04): the harness levers are now ON by default.** `ARGO_TASKS`, `ARGO_MEMORY`, and
+`ARGO_LOOP` were flipped on (env `=0/false/off` forces off), re-validated non-regressive (full suite
+175/175; integrated smoke 2/2). `ARGO_CRITIC` and `ARGO_AUTOCOMMIT` stay off. Still pending before we
+rely on them fully: (a) an n≥3 multi-run, and (b) an adversarial/looping pass that exercises the loop
+ladder live — see `docs/harness-planning-memory.md`'s Testing plan.
+
+## 2026-08-04 — Enabled the tested levers + closed the verification gaps
+
+Plain-language description of every behavior + critiques now lives in `docs/harness-instrumentation.md`.
+
+- **Defaults ON** (above): tasks + memory + loop-recovery, matching grounding; validated non-regressive.
+- **Executable per-task verification** — a task can carry a `verify` shell command; at the per-task
+  gate the harness RUNS it and only advances on exit 0 (else feeds the failure back), with a
+  consecutive-failure escalation guard. Replaces the old self-check nudge with a real oracle — the
+  biggest verification lever. (`src/tasks.ts`/`src/agent.ts`/`src/tools/index.ts`.)
+- **Per-task summaries + final reconciliation** — after a task passes verify the model summarizes
+  what/how (stored on the ledger, carried across re-plans); when all tasks are done a one-time
+  reconciliation feeds the objective + all summaries back to find gaps (can re-open work) and, if
+  complete, writes the grounded final summary. Upgrades the old prompt-only conclusion.
+- **Vision layout-judge** (`ARGO_LAYOUT`, default OFF) — renders an HTML artifact, screenshots it, and
+  has `qwen2.5vl` flag layout problems pre-done (fail-open). Off pending a live validation.
+- **Web UI overhaul** (public/) — two-column layout, combined context/status indicator + dropdown,
+  Files/Changes view with git history, home-screen status dots, boat-on-submit, and more (live on refresh).
+
+Still open: the n≥3 + adversarial eval (exercise the verify oracle + loop ladder live), a live
+layout-judge check, and smaller items (stable task IDs, semantic memory selection, faster compaction).
