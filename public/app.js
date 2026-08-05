@@ -799,35 +799,55 @@ function setSailing(on) {
   pickRockMotions().forEach((motion, i) => layers[i].classList.add('a-' + motion))
 }
 
-// On run start the idle boat first SAILS OUT to the right (a one-shot depart), and only
-// once it has left do the running animations begin (a-sail re-enters from the left). This
-// replaces the old abrupt jump (a-sail starts at translateX(-130%), so the resting boat
-// appeared to vanish off-left). departTimer bridges the depart → loop; it's cancelled if
-// the run ends (stop) mid-depart so the loop never starts after the fact.
+// ── Depart transition ────────────────────────────────────────────
+// On run start the boat doesn't jump straight into the sailing loop: it first departs
+// one-shot to the right (`.departing`, ~450ms, see styles.css), and only once that's
+// finished does the looping sail+rock animation begin (re-entering from the left via
+// the existing sailthrough keyframe). departTimer/departHandler track the in-flight
+// transition so a second submit or a run ending mid-depart can cancel it cleanly instead
+// of stacking timeouts/listeners or leaving the boat stuck off-screen.
 let departTimer = null
+let departHandler = null
 
-function startSailing() {
-  const m1 = sendBoat.querySelector('.m1')
-  if (!m1) { setSailing(true); return }
-  if (departTimer) { clearTimeout(departTimer); departTimer = null }
-  m1.classList.remove('a-sail', 'departing')
-  // Reduced motion: skip the depart, just run.
-  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) { setSailing(true); return }
-  // 1) sail the resting boat out to the right, 2) once gone, start the running loop.
-  void m1.offsetWidth  // restart the animation cleanly on a re-submit
-  m1.classList.add('departing')
-  departTimer = setTimeout(() => {
-    departTimer = null
-    m1.classList.remove('departing')
-    setSailing(true)
-  }, 470)
+function prefersReducedMotion() {
+  return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches
 }
 
-function stopSailing() {
-  if (departTimer) { clearTimeout(departTimer); departTimer = null }
-  const m1 = sendBoat.querySelector('.m1')
-  if (m1) m1.classList.remove('departing')
-  setSailing(false)
+function clearDepart() {
+  if (departTimer !== null) {
+    clearTimeout(departTimer)
+    departTimer = null
+  }
+  if (departHandler) {
+    sendBoat.removeEventListener('animationend', departHandler)
+    departHandler = null
+  }
+  sendBoat.classList.remove('departing')
+}
+
+function beginDepart() {
+  // Always clear any prior in-flight depart first so rapid re-submits can't stack
+  // listeners/timeouts or leave leftover classes.
+  clearDepart()
+  if (prefersReducedMotion()) {
+    setSailing(true)
+    return
+  }
+  sendBoat.classList.add('departing')
+  const finish = () => {
+    clearDepart()
+    // Only start the loop if the run is still active — it may have ended while the
+    // boat was departing.
+    if (busy) setSailing(true)
+  }
+  departHandler = (e) => {
+    if (e.target !== sendBoat) return
+    finish()
+  }
+  sendBoat.addEventListener('animationend', departHandler)
+  // Matches the ~450ms depart animation duration as a fallback in case animationend
+  // doesn't fire (e.g. the element was hidden mid-transition).
+  departTimer = setTimeout(finish, 480)
 }
 
 function setBusy(val) {
@@ -836,14 +856,20 @@ function setBusy(val) {
   inputEl.placeholder = val ? 'Queue a prompt… (Enter to queue)' : originalPlaceholder
 
   if (val) {
-    // The boat departs right, then sails while the agent runs (setSailing composes 1-3 rock
-    // motions across the nested layers). Hovering the button swaps the boat for the stop square.
+    // The boat stays visible: it first departs to the right (beginDepart), and only once
+    // that one-shot transition finishes does it start sailing — setSailing randomly
+    // composes 1-3 rock motions (roll/yaw/pitch variants) across the nested layers so their
+    // transforms cumulate. Hovering the button swaps the boat for the stop square (hover
+    // handlers).
     sendBoat.classList.remove('hidden')
     sendStop.classList.add('hidden')
-    startSailing()
+    beginDepart()
     sendBtn.title = 'Stop'
   } else {
-    stopSailing()
+    // Cancel any in-flight depart transition so the boat doesn't get stuck off-screen or
+    // start the sailing loop after the run has already ended.
+    clearDepart()
+    setSailing(false)
     sendBoat.classList.remove('hidden')
     sendStop.classList.add('hidden')
     sendBtn.title = 'Send'
