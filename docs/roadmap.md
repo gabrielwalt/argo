@@ -765,6 +765,41 @@ caught the Planner trap before it cost three hypotheses.
 | H24 long-horizon for free | [`01`](research/01-context-management.md) §4(iii) — **note: fix H15's write path first; the write path lives inside the compaction branch, so H24 multiplies it** |
 | H25 cross-turn memory needs multi-turn tasks | [`04`](research/04-memory.md) §4(v) |
 | H26 Implementer frames rebuild context | [`08`](research/08-agent-communication.md) §4(v) |
+| Cross-cutting: what would help a *small* model generally (H01, H05, H13, H15, H19, H20, H23, H24, H25) | [`09-small-model-scaffolding.md`](research/09-small-model-scaffolding.md) — and its §0 for what Ollama actually exposes |
+
+**2026-09-03 (later still) — broader research mandate: `docs/research/09-small-model-scaffolding.md`.**
+Not "what does Argo do" but "what is known about making a small local model punch above its weight on
+long complex work, and which of it applies here." Fourteen ideas, several never considered here, each with
+a smallest-sufficient implementation, what it would let us delete, and a validation plan; plus a ranked
+shortlist. Its §0 records what Ollama **actually** exposes, read from Ollama's own source and docs, and
+four register assumptions do not survive it:
+
+- **Schema-constrained decoding is available and unused.** `format` accepts a full JSON schema, not only
+  `json`. Argo passes `format: 'json'` at exactly three sites (`compaction.ts:234,274`, `critic.ts:199`,
+  `grounding.ts:196`) and never on a frame-verdict path — while `critic.ts:168` already records that JSON
+  mode is insufficient (*"qwen sometimes emits either despite format:\"json\""*). This targets the Boss
+  marker loss, `parseTesterVerdict`, `parseBossVerdict` and `parseTaskGraph` **by construction**, and
+  would let the marker-loss retry (`dispatch.ts:302`) be deleted. Caveat: on a thinking model, `format`
+  triggers Ollama's "structured outputs via double request" (`server/routes.go:2759-2790`) — a second full
+  prompt evaluation — unless `think` is explicitly false. **One unverified dependency gates the design:
+  whether `format` and `tools` compose in one request. Probe it before scheduling** (`09` §1).
+- **Speculative decoding is no longer correctly filed under "park, unproven".** `draft_num_predict`
+  documents both a separate draft model and **embedded MTP tensors** — i.e. speculation with **no second
+  resident model** ([modelfile.mdx](https://raw.githubusercontent.com/ollama/ollama/main/docs/modelfile.mdx)).
+  Whether this build has them is one `ollama show`. Still speed-only, so still low priority; the *reason*
+  for parking it has changed.
+- **Local LoRA on our own traces is blocked on toolchain, not merely cost.** Ollama's `ADAPTER` supports
+  Llama/Mistral/Gemma only, and `mlx_lm.fuse --export-gguf` is limited to Mistral/Mixtral/Llama. A Qwen
+  adapter cannot be loaded by Ollama nor exported to GGUF by MLX. Revisit only if Ollama adds Qwen adapter
+  support — a checkable condition (`09` §13).
+- **Sampler-level repetition control cannot fix the loop problem.** `repeat_last_n` defaults to **64
+  tokens**; Argo's repeats occur hundreds of tokens apart. This forecloses a knob that H19/H20 work would
+  otherwise invite (`09` §13).
+
+Also: `prompt_eval_cached_count` is a documented response field Argo has never read, and it prices H23's
+anchor and may explain the unexplained 5-8× per-iteration slowdown (`09` §6, §15). `num_ctx = 65536` is a
+**client-side default in `public/app.js:202`**, not a hardware ceiling — Ollama's own default for a
+≥48 GiB machine is 256 k — though context-rot evidence argues against raising it (`09` §12).
 
 **Three dated corrections to claims in this register, recorded here rather than edited away:**
 
@@ -1217,3 +1252,69 @@ Diagnosis and a buildable replacement suite: see the eval-strategy work and the 
 The three changes that must land first, in order: per-mechanism firing counters (Item 0); the
 integrity gate and a seeded-test-only correctness denominator; and `EVAL_RUNS ≥ 3`, since every
 current conclusion about a high-variance task rests on a single sample.
+
+---
+
+## ★ PRIORITY 1 — Keep the context ~50% free (supersedes the ordering of the items above)
+
+**Origin:** Gabriel, 2026-09-03, after we measured that Hermes compresses at **50%** of its context
+window while Argo compacts at **~94%** (`compactThreshold` 0.9375). If qwen degrades with context
+length — which his manual testing and the context-rot literature both indicate — then Hermes never
+enters the degraded regime and Argo lives there permanently. This is the most plausible explanation
+we have for why the runaway-frame failure has never been observed in Hermes, and it is a
+configuration change to test rather than a feature to build.
+
+**The measured failure this targets.** On `bigproj-observability`, 46 of 75 model calls and
+785 018 of 930 342 input tokens (**61%** and **84%**) went to a single Implementer frame that never
+concluded, its prompt growing from 3 117 to roughly 30 600 tokens per call. Argo is not uniformly
+turn-expensive; one frame runs away and nothing stops it.
+
+### The target
+The window should be held at roughly **50% free**, i.e. eviction triggers near 50% occupancy rather
+than 94%.
+
+### Two constraints that must ship WITH it — either omitted makes this actively harmful
+
+**1. Hysteresis is mandatory. Do not evict down to the trigger.** Measured prompt-cache behaviour:
+a 3 985-token prefix costs **1 445 ms** cold, **34 ms** when only the tail changed, and **1 416 ms
+again if anything near the head is mutated**. Eviction rewrites history in place, so **every
+eviction pays a full prompt re-evaluation**. If the trigger and the target are the same number, the
+window sits at the boundary and evicts on almost every turn — turning a 34 ms append into a
+~1 400 ms rewrite, repeatedly. Trigger near 50% and evict down to roughly 25-30%, so evictions are
+infrequent and each one does real work. Evict rarely, evict a lot.
+
+**2. The pinned anchor is a PREREQUISITE, not a companion.** `renderPinnedAnchor` (`eviction.ts:70`)
+retains the objective and plan across eviction and currently has **zero call sites**. Evicting more
+aggressively without it removes goal context faster — that would *accelerate* the drift this item
+exists to prevent. Wire the anchor first, then lower the threshold. Per the same cache measurement:
+**immutable anchor at the head, mutable recitation at the tail** — an anchor regenerated each turn
+(carrying a changing "current step", say) would invalidate the entire prompt every turn and is the
+worst available choice.
+
+### Also fix while in here
+The eviction **budget** is 60 000 *characters* (~15 k tokens) while its **trigger** is 61 440
+*tokens* — a 4× mismatch, so the first threshold firing is a cliff rather than a policy. The 60 000
+is a fossil of a **Devstral** probe; qwen3.6 runs correctly to 64 266 tokens. Set both from one
+coherent policy expressed in tokens.
+
+### How this is validated
+`compactThreshold` / the eviction trigger is now a **recorded dimension of every run**, so a battery
+can be run at Argo's default and at ~50% with distinguishable rows. Pre-registered signals, on the
+large-task `commander` suite:
+- **Primary:** does any single frame still consume >50% of a run's model calls? That is the runaway
+  signature, and it is the thing being fixed.
+- peak prompt tokens per run, and where growth accelerates
+- model calls per frame (the metric that made the runaway visible in the first place)
+- eviction firing count — and it must not be near the call count, or hysteresis has failed
+- prompt-eval cost distribution, to confirm the rewrite tax did not replace the drift
+- **Falsifier:** if holding the window at 50% free does not reduce runaway frames at k≥3, the
+  context-length hypothesis is wrong and the cause lies elsewhere (plan quality and the absent
+  global iteration budget are the standing alternatives).
+
+### Relationship to existing items
+Absorbs and re-prioritises H23 (pin the anchor) as its prerequisite. Note it runs **opposite** to
+H24, which deliberately lowered `COMPACT_RESERVE_TOKENS` to make the window *smaller* in order to
+force long-horizon behaviour for testing — the two must not be run in the same battery without
+being recorded as separate conditions. H15 (durable memory writing garbage) must be fixed before
+either, since the memory write path sits inside the compaction branch and more compaction means
+more sludge into a file re-injected every iteration.
