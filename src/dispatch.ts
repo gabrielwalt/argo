@@ -224,6 +224,18 @@ interface RoutedTaskStart {
 // finish with room to spare as an exhausted, incomplete attempt.
 const TASK_START_MAX_ITERATIONS = 10
 
+// One-shot corrective retry (docs/roadmap.md, 2026-09-03): observed repeatedly in eval
+// (3+/11 eval-suite2 tasks) — on a genuinely trivial question the Boss answers directly
+// ("408") and skips the required marker line entirely, even though the checkpoint prompt
+// explicitly demands one. A targeted recovery, not a blind retry (Self-Healing Agentic
+// Orchestrators for Tool-Augmented LLM Systems, arXiv:2606.01416): the diagnosis is
+// exact (marker missing, answer otherwise already given), so the nudge asks for
+// precisely that — reformat, don't re-derive.
+const TASK_START_MARKER_RETRY_NUDGE =
+  'Your last answer didn\'t end with one of the four required lines. Reply again, and end ' +
+  'your answer with exactly one of: ANSWER: <...>, TRIVIAL: <...>, SIMPLE: <...>, or ' +
+  'OBJECTIVE: <...> — nothing else after it.'
+
 // Boss, checkpoint task-start: a FOUR-way router (docs/subagents-plan.md, "skippable
 // phases" + the 2026-09-03 redesign). Never re-fires within one dispatch — the
 // objective is set exactly once per task by construction (setObjective's own
@@ -268,9 +280,26 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
   }
   const before = await gitStatusShort(root())
   const { agent, result } = await spawnFrame(req, emit)
+  let finalResult = result
+  let verdict = parseTaskStartVerdict(result.summary)
+
+  // Retry once, only when there's genuinely room left (a frame that already hit its cap
+  // has no budget to spend re-asking) and the model didn't already commit to a mode —
+  // if verdict.text is set the marker WAS found, nothing to fix.
+  if (!verdict.text && agent.getIterationCount() < TASK_START_MAX_ITERATIONS) {
+    const retry = await resumeFrame(result.frameId, agent, TASK_START_MARKER_RETRY_NUDGE)
+    const retryVerdict = parseTaskStartVerdict(retry.summary)
+    if (retryVerdict.text) {
+      verdict = retryVerdict
+      finalResult = retry
+    }
+  }
+
+  // Snapshot AFTER any retry above — a retry turn can in principle also call a tool,
+  // so the dirty-check below must reflect everything the frame actually did, not just
+  // its first pass.
   const after = await gitStatusShort(root())
   const hitCap = agent.getIterationCount() >= TASK_START_MAX_ITERATIONS
-  const verdict = parseTaskStartVerdict(result.summary)
   const base = verdict.text ? verdict : { mode: 'objective' as const, text: userMessage }
   const dirty = after !== before && after.trim() !== ''
 
@@ -291,11 +320,11 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
     return {
       mode: (hitCap || suspiciouslyLarge) ? 'preempted-incomplete' : 'preempted',
       text: base.text,
-      frameId: result.frameId,
+      frameId: finalResult.frameId,
       agent,
     }
   }
-  return { ...base, frameId: result.frameId, agent }
+  return { ...base, frameId: finalResult.frameId, agent }
 }
 
 interface BossOutcome {
@@ -303,6 +332,20 @@ interface BossOutcome {
   message: string
 }
 
+// Finding 8 (docs/overnight-log.md, 2026-09-03): parseBossVerdict's fail-open default
+// (action:'none') is correct for "the Boss reviewed and found nothing wrong," but a
+// Boss checkpoint that hits its OWN iteration cap without producing a parseable verdict
+// at all collapses to that exact same 'none' — the harness then proceeds as if nothing
+// were wrong, even when the Tester handed the Boss a clear, itemized FAIL right before
+// it stalled. A real overnight run reached the user as "done" with 3/6 new tests still
+// failing because both the standup AND final Boss checkpoints stalled blank and 'none'
+// was silently read as "all clear." Fixed the same way task-start's own hitCap check
+// works (dispatch.ts, runBossTaskStart): a harness-level iteration-count comparison,
+// not a text convention the model has to remember to use. A stalled checkpoint is
+// escalated (forces a replan/re-verify) rather than treated as a clean verdict — the
+// SAME conservative direction this project always resolves an ambiguous outcome in
+// (Finding 4/5/6/7's "fail-open must not mean invisible"), just applied one checkpoint
+// later in the pipeline than any prior finding caught it.
 async function runBoss(
   checkpoint: 'standup' | 'final',
   contextText: string,
@@ -313,8 +356,18 @@ async function runBoss(
     parentFrameId: null,
     assignment: `CHECKPOINT: ${checkpoint}\n${contextText}`,
   }
-  const { result } = await spawnFrame(req, emit)
-  return parseBossVerdict(result.summary)
+  const { agent, result } = await spawnFrame(req, emit)
+  const verdict = parseBossVerdict(result.summary)
+  const hitCap = agent.getIterationCount() >= ROLE_MAX_ITERATIONS.boss
+  if (verdict.action === 'none' && hitCap) {
+    return {
+      action: 'escalate',
+      message: `Boss ${checkpoint} checkpoint hit its iteration cap (${ROLE_MAX_ITERATIONS.boss}) without ` +
+        'producing a parseable verdict — treating as unresolved rather than "nothing wrong," since a stalled ' +
+        'checkpoint never actually reviewed anything. Last raw output: ' + capSummary(result.summary),
+    }
+  }
+  return verdict
 }
 
 // Lynceus verifies a claim (an Implementer step's, or — 2026-09-03 — the Boss's own
