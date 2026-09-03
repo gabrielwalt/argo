@@ -26,12 +26,47 @@ npm run eval:e2e    # slow, truthful end-to-end — needs Argo running + workspa
   `git reset --hard` between runs).
 - Each run prints its harness SHA and a ready-to-paste `eval-log entry` block —
   drop it under **Runs** below and fill in the Notes line.
+- `npm run eval:hermes` runs the same task catalog through Hermes (`hermes chat -q`)
+  instead of Argo's own API, for a same-model comparative baseline.
+- `npm run eval:judge` runs the LLM quality judge (goal completeness, wasted
+  actions, drift/hallucination, orchestration sanity) against a saved ledger+diff.
+
+## Workspaces (`~/Sources/test/`)
+
+| workspace | tier | purpose |
+|---|---|---|
+| `test-one` | floor/medium | small hand-authored task-store module; `store-addTask`/`store-removeTask`/`store-deps` |
+| `bigproj` | large | self-authored `tasklab` project (~827 LOC / 11 modules); `bigproj-deps`/`bigproj-effort`/`bigproj-duedate-bug` — the large-tier real-codebase stand-in (chosen over downloading an external repo — see `docs/roadmap.md`'s 2026-09 entries) |
+| `eval-suite2` | floor → ceiling | 11 tasks spanning a Q&A floor case through real ported benchmarks (Exercism, QuixBugs) to a custom large `task-queue` ceiling case — see the Task catalog below |
+| `test-two` | (kept, not currently in `tasks.mjs`) | reserved for manual/ad-hoc testing |
+| `booklet` | (historical) | real project history referenced in `docs/grounding.md`/`docs/roadmap.md`; not part of the automated eval catalog |
+
+All eval workspaces are git repos tagged `eval-baseline` at their clean, green
+commit — `baselineOf()` (`scripts/eval/tasks.mjs`) prefers that tag over bare
+`HEAD` so an interrupted run's auto-commit can never pollute the next baseline.
+
+## Artifact layout
+
+Everything an eval run produces outside the workspace itself lives under
+`~/.local/share/argo/eval-runs/`:
+
+```
+eval-runs/
+  ledgers/<taskId>.jsonl     # multi-agent's per-workspace ledger, copied out before
+                             # the next resetWs() wipes it (git-clean removes gitignored .argo/)
+  diffs/<taskId>.diff        # unified diff of the run's actual change, against the task's
+                             # OWN baseline ref — never bare HEAD (autoCommit() can move HEAD)
+  judgments/<taskId>.json    # quality-judge.mjs verdicts
+```
+
+Override any of the three via `EVAL_LEDGER_DIR`/`EVAL_DIFF_DIR`/`EVAL_JUDGE_DIR`,
+or the whole root via `EVAL_RUNS_DIR`.
 
 ---
 
 ## What each harness measures
 
-### Fast probe (`scripts/eval.mjs`)
+### Fast probe (`scripts/eval/probe.mjs`)
 One turn per cell against `/api/chat` with Argo's real `SYSTEM_PROMPT` (read live
 from `src/agent.ts`) and full tool set. **Metric: native-tool-call reliability** —
 did the model emit a *native* tool call (so the ReAct loop can act), or stall by
@@ -43,12 +78,14 @@ the prompt and context budget without slow runs.
 Tasks: `simple-question` (Q&A, direct answer allowed), `simple-edit` (one-line
 change), `web-search`, `complex-plan` (plan + implement).
 
-### E2E (`scripts/eval-e2e.mjs`)
+### E2E (`scripts/eval/e2e.mjs`)
 Real Argo loops on **self-verifying** tasks: a `setup` step seeds a *failing* test
 (a spec for a function that doesn't exist yet), the agent runs, then a `check`
 command must exit 0. **Metric: task completion** — the agent cannot pass by doing
 nothing. Also scrapes per-run behaviour from the JSONL (see glossary). ⚠️
-Destructive: `git reset --hard <baseline> && git clean -fd` between runs.
+Destructive: `git reset --hard <baseline> && git clean -fdx` between runs (`-x` also
+clears gitignored cruft such as multi-agent's `.argo/` ledger — copied out by
+`saveLedger()` first, see Artifact layout above).
 
 ---
 
@@ -61,12 +98,29 @@ Destructive: `git reset --hard <baseline> && git clean -fd` between runs.
 | `store-deps` | test-one | **hard, multi-fn:** `addDependency` (+ cycle rejection), `getReadyTasks`, `hasCycle` | `npm test` |
 | `bigproj-deps` | bigproj (tasklab, ~827 LOC / 11 modules) | **big, cross-cutting:** dependency graph on `TaskService` — `addDependency/removeDependency/getDependencies/getDependents/scheduleOrder/readyTasks`, with topological order + cycle detection + typed errors | `npm test` |
 
-Fixtures live in `scripts/eval-fixtures/`. `bigproj` is the `tasklab` project; its
-baseline must be green with the dependency feature **unimplemented** (the eval
-seeds `test/dependencies.test.js`).
+This table shows a representative sample — `scripts/eval/tasks.mjs` is the
+authoritative, single-source-of-truth task list (18 tasks as of 2026-09-03,
+spanning `test-one`/`bigproj`/`eval-suite2`; both `e2e.mjs` and `hermes.mjs`
+import it). Fixtures live in `scripts/eval/fixtures/`. `bigproj` is the `tasklab`
+project; its baseline must be green with each feature **unimplemented** (the eval
+seeds the relevant test file per task). `oracle-bait-inventory` (the newest, an
+oracle-gaming-bait task) is piloted but not yet calibrated — see `docs/roadmap.md`'s
+2026-09-03 eval-strategy entry.
+
+## Rubric score (0-100) — see `docs/roadmap.md`'s 2026-09-03 eval-strategy entry
+
+E2E and Hermes runs now print a `score` alongside `DONE`/`FAIL`: 70 pts test-case
+fraction (parsed from Node's own `# pass`/`# fail` summary — free partial credit, not
+a single exit-code boolean), 15 pts integrity (full marks unless the task's own test
+file was modified — the oracle-gaming guard), 15 pts speed-ratio against the other
+harness's most recent wall-clock on the same task (full marks at <=1.5x, decaying
+above that). `completed` (binary pass/fail) stays authoritative everywhere it already
+was — the score is a gradient alongside it, never a replacement. `npm run eval:trend`
+reports it per harness plus the speed ratio with an explicit target verdict.
 
 ## Metrics glossary (E2E per-run columns)
 
+- **score** — the 0-100 rubric above.
 - **iters** — iterations to done (or the max-iteration cap).
 - **tools** — total tool calls.
 - **plan** — number of `update_plan` calls (`0` = never planned).
@@ -246,3 +300,246 @@ Four changes, `src/dispatch.ts`/`src/frames.ts`/`src/agent.ts`/`src/loop.ts`:
 
 **Result — same 11-task battery, re-run end to end**: 11/11 still pass. Shared-8 total wall-clock **592s**, down from 1276s pre-redesign and now BELOW Hermes's 775s (still ~1.6x the pre-multi-agent baseline's 380s, not at parity yet). Per-task: sanity-pool 192s→**39s** (now matches the 55s single-loop baseline almost exactly), aider-transpose 490s→**124s**, circular-buffer 124s→77s, kth 222s→77s, race-semaphore **86s** (was a 1801s TIMEOUT before the `preempted` fix, 111s right after it — now stable and fast with the hard task-start cap on top). `plan=0` or `1` on 6 of 8 shared tasks confirms `SIMPLE` mode is now correctly bypassing the Planner for genuine single-file work, which is most of what this battery contains.
 **One live example of the still-open question**: on `large-task-queue`, the Boss attempted it directly, hit its (10-iteration, clamped) cap without finishing, correctly triggered `preempted-incomplete` — but the handoff went to ONE large Implementer frame (39 tool calls, 1011s) rather than real Planner decomposition, because a single hard-capped Boss attempt never invokes Tiphys at all. The system recovered correctly (5/5 tests, no failure) but this is not yet the "Planner earns its cost on genuine complexity" evidence the architecture needs — it's evidence the safety net works. Confirms the next real step is a task big/ambiguous enough that the Boss's own task-start judgment reaches `OBJECTIVE` on the first try.
+
+### 2026-09-03 (overnight) — Real-codebase large-task ladder on `bigproj` — Findings 7+8, first comparative evidence multi-agent beats the baseline on a genuinely hard task
+Overnight session (plan: `~/.claude/plans/polished-sniffing-dragonfly.md`; full run-by-run detail
+and every root-cause trace folded into this entry below). Continued the
+weakness-driven fix loop from the 2026-09-02 entry above, using `bigproj` (tasklab, ~827 LOC / 11
+modules — already-vetted, already had large-task fixtures and historical drift evidence, so reused
+instead of vetting a new external repo) as the real-codebase large tier. Harness `cb850aa+dirty`.
+
+**Findings 1/4/5/6 (Boss over-verification, Planner budget too tight, a destructive Boss
+self-rewrite via its only tool being `bash`) were found and fixed earlier in the same session on
+`bigproj-deps` and `bigproj-duedate-bug`** — summary:
+`bigproj-duedate-bug` it=22→11 / wall=171s→52s after Finding 1's fix; `bigproj-deps` went
+FAIL→FAIL→**PASS** (it=174, wall=1616s) across three fix iterations (Findings 4/5/6), the FAILs
+being progressively less severe (a destructive full-API-breaking rewrite, then just some
+unrequested refactoring-but-tests-pass).
+
+**Finding 7 — the central question, now settled empirically as an open gap, not a hypothesis: the
+Planner has NEVER ONCE produced a real task graph on a genuinely large task, across every attempt
+measured (4-for-4 tonight: `bigproj-deps` x2 post-fix, `bigproj-effort` x2).** Every large task has
+been solved entirely by the harness's fail-open default — one big Implementer frame absorbing the
+whole objective — not by Tiphys's intended decomposition. A real, separate bug contributed: the
+generic stall-checkpoint was telling a stalled Planner to "call `update_plan`," a tool that belongs
+to the Implementer's task-ledger mechanism, not the Planner's actual job (emit a JSON graph as its
+own final text answer) — actively confusing advice. **Fix** (`src/agent.ts`): `hasUpdatePlan` now
+requires `write_file` in `allowedTools` too, correctly excluding the Planner (has `update_plan`, not
+`write_file`) from that wording. Confirmed harmless but insufficient — re-running `bigproj-effort`
+after this fix still showed the Planner hitting its 20-iteration cap with zero graph output (Finding
+7's confirmation run, below) — the fail-open default is still doing 100% of the real work.
+
+**Finding 8 (more severe, found BY the Finding-7 confirmation run) — `parseBossVerdict`'s fail-open
+default made a stalled Boss checkpoint indistinguishable from a Boss that reviewed and found nothing
+wrong, and a real run reached "done" with 3/6 new tests still failing as a result.** The first
+`bigproj-effort` confirmation run: Implementer honestly self-reported failure at its 60-iter cap (3
+of 6 new effort-estimate tests still red); an independent Tester frame verified this PRECISELY —
+itemized exactly which 3 assertions failed and why (`getEstimate` returns `undefined`;
+`remainingEffort` returns `0` instead of `40`; `estimateByAssignee` double-counts a done task) and
+concluded "the conclusion of failure is CORRECT" — genuinely excellent, correct verification work.
+But BOTH the Boss standup checkpoint AND the Boss final checkpoint then hit their own 15-iteration
+caps with a **completely empty answer** — ledger conclusion for both, verbatim: `"Reached maximum
+iterations (15) without a final answer."` — yet both recorded `status:"success"`, and
+`parseBossVerdict`'s fail-open default (`{action:'none'}`) collapsed "Boss never actually looked" and
+"Boss looked and found nothing wrong" into the exact same signal, so the harness proceeded as if
+everything were fine despite the Tester's clear FAIL sitting unread in the ledger the Boss was
+handed. Root-caused precisely via direct ledger inspection (6 frames, 147 episodes): the deterministic
+`npm test` check is what actually caught this — not the harness, not the quality judge (which scored
+`goal_completeness:9/10` on the CODE's shape without weighting the test outcome enough) — exactly the
+"deterministic check first, judge second, never instead of" discipline this project's eval already
+follows.
+**Fix** (`src/dispatch.ts`, `runBoss`): after `spawnFrame`, compare `agent.getIterationCount()`
+against `ROLE_MAX_ITERATIONS.boss` — the same harness-level, model-independent idiom
+`runBossTaskStart`'s own `hitCap` check already uses. If the parsed verdict is `'none'` AND the
+frame hit its cap, override to `action:'escalate'` (forces a replan/re-verify) instead of silently
+passing through. Both existing `'escalate'` call sites already handle it correctly with no further
+wiring — a pure classification fix. `tsc --noEmit` clean; no new unit test added (`runBoss` is
+unexported, and refactoring to test it was judged a bigger lift than this narrow, already
+precisely-diagnosed fix warranted under the overnight time budget) — confirmed instead via
+`docker build` + a live re-run + the 11-task regression battery (below).
+
+**Finding 7+8 confirmation run (`bigproj-effort`, proper run via `scripts/eval-e2e.mjs` this time):
+PASS, 1/1 (100%), it=84, tools=95, frames=7, plan=6, wall=820s, tok/s=79, ctx≈24766, rss=27318MB,
+100% GPU.** Quality judge: `goal_completeness:10/10, orchestration_sane:true` — the only
+`wasted_actions` entry flagged was the Planner's own 20-iteration no-output run, i.e. **Finding 7 is
+now confirmed persisting a 4th time** even as the rest of the pipeline (Implementer→Tester→Boss
+standup→Boss final, both Boss checkpoints concluding cleanly and CORRECTLY within budget this time)
+converged well. Finding 8's fix did not misfire (no false escalate on a healthy run) but also wasn't
+exercised by an actual stall this run — n=1 temp=0.8 variance meant this attempt simply didn't stall;
+logged honestly as code-review-level + non-regression confirmation, not a live "caught it in the
+act" re-confirmation.
+
+**11-task regression battery (post Finding-8 fix): 11/11 PASS, total wall-clock 578s** — within
+(slightly better than) the previously-recorded 592-999s noisy band, no new failures, `plan=0` on all
+but `large-task-queue` (`plan=4`, as expected). Finding 8's `runBoss` change is confirmed safe across
+the full small/medium range, not just the one large-task re-run.
+
+**Phase 6 — comparative battery, Argo (multi-agent) vs Hermes vs pre-multi-agent Argo baseline, on
+the two large bigproj tasks (same model `qwen3.6:latest`, same Ollama instance, identical prompts —
+`scripts/eval-bigproj-hermes.mjs` copies the exact task prompts from `scripts/eval-e2e.mjs`):**
+
+| task | Hermes | pre-multi-agent baseline (`ARGO_AGENTS=0`) | Argo multi-agent |
+|---|---|---|---|
+| bigproj-deps | 256s (PASS) | 815s (**FAIL**, hit 60-iter cap) | 1616s (PASS) |
+| bigproj-effort | 177s (PASS) | 246s (PASS) | 820s (PASS) |
+
+**Headline: on `bigproj-deps` — the one task in this project's entire eval history hard enough to
+reliably break a lone frame — the pre-multi-agent single-loop baseline FAILED outright, while both
+Hermes and Argo's multi-agent harness passed.** This is the first time any eval in this project has
+shown the plain baseline actually losing to an alternative on a real (not synthetic-worst-case) task.
+**But the win comes from the harness's OTHER structural advantages — independent Tester verification,
+Boss fresh-eyes checkpoints, the Finding-6 diff-size guard — not from the Planner, which still hasn't
+decomposed anything for real (Finding 7).** Cost: multi-agent was the slowest path on both tasks
+(1616s/820s vs. Hermes's 256s/177s, and even 2x the baseline's OWN failing attempt) — real
+correctness headroom on the hardest case, bought at a substantial, consistent time premium.
+
+**Caveats stated plainly**: n=1 per cell throughout (this session's design, not an oversight — see
+the plan's own token/time-budget discipline); Hermes runs with direct host access, not
+Docker-isolated (its own driver's docstring); the pre-multi-agent baseline was run FRESH this session
+(`ARGO_AGENTS=0` via a full detach/reattach cycle, confirmed via `/status`, since the flag is not a
+per-`/chat`-request override unlike model/maxIterations/tasks/memory/loop) so it's a fair
+current-code comparison, but still one sample of a documented high-variance task
+(`bigproj-effort` alone has ranged 96-174it / 177-1616s across different harnesses/sessions
+tonight and previously). **Next**: n≥3 confirmation of this specific comparison before leaning on it
+for an architectural decision — the single most important follow-up this session leaves open,
+alongside Finding 7's still-unanswered question (does Planner decomposition ever fire for real, and
+does a bigger/more-tangled task or a different output contract — not just a bigger budget, already
+tried in Finding 5 — ever get it to).
+
+### 2026-09-03 — E2E, full 17-task catalog — Boss task-start marker retry fix — harness `cb850aa+dirty`
+Models: qwen3.6:latest · 1 run/task · max_iter 60 · task completion + cost. Validates the one-shot
+corrective retry in `runBossTaskStart` (`src/dispatch.ts`) proposed in `docs/roadmap.md`'s prior
+"Log analysis" entry and `MEMORY.md`'s "Multi-agent mode gotchas": when the Boss's task-start
+checkpoint answers directly (e.g. "408") without the required `ANSWER:`/`TRIVIAL:`/`SIMPLE:`/
+`OBJECTIVE:` marker line, and the frame hasn't exhausted its iteration budget, `resumeFrame` is
+called once with a targeted reformat nudge ("your last answer didn't end with one of the four
+required lines, reply again ending with exactly one now") before falling back to the old
+full-`OBJECTIVE`-reroute safety net. Rebuilt via the documented path (`node
+node_modules/typescript/bin/tsc` — `pnpm build` still hits the known broken-`.bin` gotcha; `argo
+rebuild`; full detach/reattach of `bigproj`/`eval-suite2`/`test-one` to actually pick up the new
+image, confirmed via fresh container timestamps).
+
+**Scorecard: 16/17 completed (94%).** One FAIL: `bigproj-duedate-bug` (TIMEOUT, it=104, plan=19,
+wall=903s) — investigated below; not attributable to this fix. All 3 `test-one` tasks, both other
+bigproj tasks, and all 11 eval-suite2 tasks passed cleanly.
+
+**Fix confirmed working, exactly on its target metric.** `trivial-qa-arithmetic`: **frames=2** (was
+5 historically — `docs/eval-log.md`'s 2026-09-02 entry and the prior "Log analysis" entry both
+recorded 5 frames/4 iters/17s for this exact task) — it=1, tool=0, wall=5s. Quality judge
+(`node scripts/eval/quality-judge.mjs trivial-qa-arithmetic`): **`orchestration_sane: true`** (was
+`false` before the fix) — `"Direct delegation to Boss for a straightforward QA prompt avoids
+unnecessary multi-agent overhead and matches the task's trivial scope."` `trivial-fix-greeting-typo`
+(the other previously-flagged case) also stayed cheap (it=12, frames=4, wall=27s), in line with its
+prior numbers. n=1 so far — the standing open item (n≥3 to rule out temp=0.8 stochasticity on
+exactly how reliably the retry succeeds) is not yet done; time-permitting next step.
+
+**Investigated the one FAIL — genuine thrash, not a fix-induced regression.** `bigproj-duedate-bug`
+has always been fast historically (7-22 it, 52-171s, `plan=0-1` across every prior recorded run,
+including this session's own earlier runs). Traced the actual sequence via the raw session logs
+(the eval's own `saveLedger` never ran for this task since it timed out before completion — the
+`/stop`-on-timeout fix from a prior session correctly fired regardless, confirmed no cascading
+`409 Agent is busy` onto the 11 tasks that ran immediately after):
+1. Boss task-start self-attempted the fix (TRIVIAL path), then handed off via
+   `preempted-incomplete` to a real Implementer with the standard "review and possibly revert the
+   prior attempt" prompt (Finding 6's existing guard, unrelated to this session's fix).
+2. **That Implementer frame is where the real thrash happened** — 373 log lines, the full guard
+   stack firing in sequence exactly as designed (exact-match repeat warnings on `read_file`/`bash`,
+   a near-duplicate-tool-call nudge at 3 consecutive `bash` calls, "12 tool calls without changing
+   any file" re-anchor, a PROGRESS CHECK at 35 iterations, a STALL at 45, a mid-run compaction) —
+   but never actually converging, racking up **17 `update_plan` calls** in the process (this is
+   where the scorecard's `plan=19` mostly comes from, not top-level harness replans).
+3. **Exactly ONE top-level `replan` event fired** (grepped the dispatch-level session log directly),
+   and its reason is this session's OWN Finding-8 fix working correctly: `"Boss escalation during
+   standup: Boss standup checkpoint hit its iteration cap (15) without producing a parseable
+   verdict — treating as unresolved rather than 'nothing wrong'..."` — the Boss standup genuinely
+   stalled blank while reviewing the still-thrashing Implementer, and Finding 8's `runBoss` fix
+   correctly refused to read that silence as "all clear," forcing exactly the re-verification the
+   situation warranted. This is the fix behaving exactly as designed, not misfiring.
+**Conclusion: the root failure is upstream, real Implementer-level thrash on a task that has never
+shown this behavior before** — consistent with this project's own extensively-documented temp=0.8
+n=1 variance (the same phenomenon `bigproj-effort` has shown all along, ranging 23-174+ iterations
+across different sessions on identical code). Not a regression from this session's fix; logging
+plainly rather than either dismissing it or over-attributing it. A re-run to distinguish "this task
+newly has bad luck sometimes" from "something about the current harness state provokes it" would be
+the natural n≥3 confirmation step, bundled with the standing open item above rather than run
+separately tonight.
+
+**Net assessment**: the task-start marker retry fix does exactly what it was designed to do, cheaply
+and with no observed regression elsewhere in the 17-task catalog. The one failure present is a
+known-shape variance event on an unrelated code path, and — notably — is also live evidence that
+the PRIOR session's Finding-8 fix (Boss-stall-vs-clean-verdict) is holding correctly in production
+under real thrash conditions, not just in its original synthetic confirmation.
+
+### 2026-09-03 — Deep-dive re-assessment of the above run: a sharper root cause than "variance," a real eval-framework bug, and a new tracking framework
+
+Revisited the prior entry's "genuine thrash, not a regression, consistent with documented temp=0.8
+variance" conclusion by tracing raw per-frame logs turn-by-turn instead of accepting the aggregate
+numbers. Two things came out of this that change the picture.
+
+**1. A real measurement bug in `scripts/eval/e2e.mjs`'s own metrics collector — found and fixed.**
+`runMetrics` selected which `.jsonl` files belong to a task by an mtime window (`>= sinceMs - 2000`).
+Proven wrong on this run's own data: `quixbugs-kth` was reported as **frames=6**, but only 4 files
+actually belong to it (traced by frameId via the saved ledger) — the other 2 are the tail-end async
+flush of the *immediately preceding* task, whose file already existed (was created) before
+`quixbugs-kth`'s own `POST /chat` fired, but got a late mtime bump from `SessionLogger`'s async write
+queue finishing just after. An mtime window cannot distinguish "created late" from "written to late,"
+so it silently attributes a few of one task's tool calls/iterations to its neighbor whenever two
+tasks run back-to-back with a small gap — which is every task in this eval. **Fixed**: `runMetrics`
+now takes an explicit file list computed as a filename-existence snapshot diff (`listJsonlFiles`
+before `POST /chat`, again after `waitIdle`, set difference) — immune to the flush race because it
+keys on existence, not timestamp. Wall-clock and pass/fail were never affected (computed
+independently of file aggregation); only frame/iteration/tool-call counts carried this noise, and
+only by 1-2 files' worth per boundary.
+
+**2. A small tracking framework, built to stop re-deriving history by hand.** Answering "has this
+task always been this variable" required manually grepping raw session logs for 20+ minutes during
+this re-assessment — exactly the kind of thing that should be mechanical. Added:
+`~/.local/share/argo/eval-runs/history.jsonl` — one JSON line per (model, task, run), appended by
+every `e2e.mjs` run (`ts`, `harnessSha`, `completed`, `iters`, `toolCalls`, `frames`, `plan`, `wallMs`,
+etc.) — and `scripts/eval/trend.mjs` (`npm run eval:trend`), which reads it and prints per-task pass
+rate + wall/iteration min/mean/max, flagging any task whose max/min ratio crosses a threshold (default
+2x). This is a queryable **complement** to this file's prose, not a replacement — narrative
+root-cause analysis (like the rest of this entry) still belongs here. Backfilled with this run's own
+17 rows (flagged `backfilled: true`, noting the pre-fix metrics-window caveat above) so the tool has
+signal from day one instead of starting empty.
+
+**3. The sharper root cause: an "almost done" chain of harness gates can eat the LAST iterations of a
+frame's budget on a fresh round-trip, with no runway left to report the result.** Traced
+`bigproj-duedate-bug`'s Implementer frame (the FAIL from the prior entry) event-by-event for its
+final ~10 iterations, then independently traced `bigproj-effort`'s Implementer (a PASS, but one that
+also hit "Reached maximum iterations (60) without a final answer" per its own ledger) the same way, to
+check whether the pattern generalizes rather than trusting one trace:
+
+- `bigproj-effort`'s Implementer: iter 59 — model reports the fix is done ("I added three pure-query
+  functions..."), but the per-task gate wants the NEXT task (a final "verify all tests pass" step)
+  confirmed first → nudges "Task complete. NEXT TASK: Verify all 6 effort tests..." → iter 60 (the
+  LAST allowed iteration) — model makes a fresh tool call to run that verification → **no iteration
+  left afterward to report the result**, so the frame ends in "Reached maximum iterations (60)
+  without a final answer" even though (per the Tester's later, independent check) the work was
+  correct.
+- `bigproj-duedate-bug`'s Implementer shows the identical shape, compounded: iter 58 the model
+  *redundantly re-verifies a check it had already confirmed* (the exact "repeated re-verification"
+  pattern this project's own checkpoint prompts already warn against, just not strongly enough here)
+  → iter 59 the re-ground-before-finishing gate fires → iter 60 the ALL-TASKS-DONE final-reconciliation
+  gate fires → cap hit, no final answer. Three consecutive iterations, each individually reasonable
+  (re-ground, then reconcile), each demanding one more round-trip the frame could no longer afford.
+- This is not a one-off: `grep -rl "Reached maximum iterations (60)" ~/.local/share/argo/logs/bigproj/`
+  turns up hits going back to **2026-07-27** — the same failure signature recurring across sessions,
+  previously absorbed into "temp=0.8 variance" without being traced to a mechanism.
+
+**Why this is a better explanation than "variance," and where it leaves the prior entry's
+conclusion**: the prior entry's claim that Finding-8's Boss-stall-escalation fix is working correctly
+still stands (verified independently, unaffected by this). But "genuine thrash, unexplained variance"
+undersells what's actually happening — the THRASH (17 `update_plan` calls, exact-match repeat
+warnings) is real and IS variance-flavored, but the specific reason THIS run ended in TIMEOUT rather
+than a normal (if slow) pass is the mechanical gate-chain-hits-the-wall pattern above, which is
+diagnosable and fixable, not merely "bad luck." Ranked plan for the fix: see `docs/roadmap.md`'s
+matching 2026-09-03 entry.
+
+**Cross-check, still forming**: a same-day Hermes re-run of the full 17-task catalog (in progress at
+the time of writing) ALSO failed `bigproj-duedate-bug` (109s, not a timeout — a different failure
+shape). Hermes has no iteration-chain mechanism of the kind described above, so a shared failure on
+the identical task hints at a possible task-level contributing factor (something about the current
+state of `bigproj`'s dueDate-sort code/test) independent of the harness-level bug found here — flagged
+honestly rather than claimed as confirmation; needs the Hermes run's own failure detail (not yet
+available) before drawing a real conclusion. Do not over-attribute either finding to the other.

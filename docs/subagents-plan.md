@@ -412,6 +412,69 @@ zoomed-out one.
   elsewhere in this project (autoCommit's own dirty-check). The prompt instruction
   stays (cheap, sometimes still prevents it happening at all) but is no longer the
   only line of defense.
+- **Still open, now the central empirical question, not a hypothesis — the Planner has
+  NEVER converged on a real task graph on a genuinely large task.** Overnight session
+  (2026-09-03, folded into `docs/eval-log.md`'s overnight entry, Finding 7): across every large-task attempt this
+  project has measured (`bigproj-deps` x2, `bigproj-effort` x2 — 4-for-4), Tiphys hit its
+  iteration budget with zero JSON graph output every single time; the fail-open default
+  (one big Implementer frame absorbs the whole objective) did 100% of the real work on
+  every large task run so far. A real, separate confusing-advice bug was found and fixed
+  (`src/agent.ts`'s stall-checkpoint was telling a stalled Planner to call `update_plan`
+  — the Implementer/baseline's own task-ledger tool, unrelated to the Planner's actual
+  job of emitting a task graph as its final text answer; `hasUpdatePlan` now requires
+  `write_file` too, correctly excluding the Planner) — confirmed harmless but
+  insufficient: the Planner still didn't converge after the fix. A budget increase
+  (15→20 iterations, Finding 5) also didn't fix it. **Two budget-style fixes have now
+  been tried and both failed to make the Planner converge — the next attempt should not
+  be a third budget tweak; it likely needs either a fundamentally different output
+  contract (the Planner's job — read a real codebase AND draft a structured plan AND
+  format it as fenced JSON, all within one budget — may simply be asking too much of one
+  frame) or a genuinely larger/more-tangled task than bigproj's 11 files/827 LOC ever
+  provides, regardless of how hard the FEATURE being asked for is within it.**
+- **Resolved — the Boss's OWN checkpoints (standup, final) could stall blank and be
+  silently read as "nothing wrong."** Found immediately after the Finding-7 fix above,
+  by the very re-run meant to confirm it (2026-09-03, folded into `docs/eval-log.md`'s
+  overnight entry, Finding 8) — more severe than Finding 7's framing, since it's not "the Planner's decomposition
+  is unproven," it's "a genuinely FAILING run can reach the user marked done." A real
+  run: the Implementer honestly self-reported failure (3 of 6 new tests still red at its
+  60-iter cap); an independent Tester frame verified this precisely, itemizing the exact
+  3 root causes and concluding "the conclusion of failure is CORRECT" — the Tester did
+  its job well. But both the Boss standup AND Boss final checkpoints then hit their OWN
+  15-iteration caps with a completely empty answer (`"Reached maximum iterations (15)
+  without a final answer."`, recorded `status:"success"`) — and `parseBossVerdict`'s
+  fail-open default (`action:'none'`) cannot distinguish that from "the Boss reviewed
+  the Tester's clear FAIL and had nothing to add," so the run proceeded as if everything
+  were fine, with the Tester's correct FAIL verdict sitting unread. The deterministic
+  `npm test` check is what actually caught this — not the harness, and only partially
+  the quality judge (which scored the CODE's completeness at 9/10 without weighting the
+  actual test outcome enough) — exactly why this project's eval design always runs the
+  deterministic check first and treats the judge as a second, non-replacing signal.
+  **Fix** (`runBoss`, dispatch.ts): after `spawnFrame`, compare
+  `agent.getIterationCount()` against `ROLE_MAX_ITERATIONS.boss` — the SAME
+  harness-level, model-independent idiom `runBossTaskStart`'s own `hitCap` check
+  already uses (this file's task-start section above). A `'none'` verdict alongside a
+  hit cap is overridden to `action:'escalate'`, forcing a replan/re-verify instead of
+  silently passing through as "all clear." Both existing `'escalate'` handlers
+  (`runStandup`'s branch, the final-verify loop) already do the right thing with no
+  further wiring — this is a pure classification fix, the same shape as every other
+  "fail-open must not mean invisible" fix in this project (Finding 4/5/6/7 above), just
+  caught one checkpoint later in the pipeline than any prior instance, with no
+  downstream safety net left to catch it if missed again. Confirmed via a live re-run
+  (PASS, `orchestration_sane:true`) and the 11-task regression battery (11/11, 578s, no
+  regression) — not yet confirmed against an ACTUAL stall recurrence, since the
+  confirmation run happened not to stall; the fix's correctness rests on direct trace
+  analysis of the original failing run plus reuse of an already-validated pattern, not
+  on having caught a second live stall in the act.
+- **New evidence (2026-09-03 overnight, Phase 6 comparative battery) — the first real
+  case where multi-agent beats the pre-multi-agent baseline, though not via the Planner.**
+  On `bigproj-deps` — the one task in this project's history hard enough to reliably
+  break a lone frame — the plain single-loop baseline FAILED outright (60-iter cap, suite
+  still red, 815s) while Argo's multi-agent harness PASSED (1616s) and so did Hermes
+  (256s). The win comes from the harness's OTHER structural advantages (independent
+  Tester verification, Boss checkpoints, the Finding-6 diff-size guard), not from
+  Planner decomposition (still unproven per the finding above) — and it costs real time:
+  multi-agent was 2-6x slower than Hermes on both large tasks measured. n=1; full numbers
+  in `docs/eval-log.md`'s 2026-09-03 (overnight) entry.
 
 ## v1 scope
 

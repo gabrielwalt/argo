@@ -16,7 +16,7 @@ Each behavior is tagged:
 
 The environment flags: `ARGO_TASKS`, `ARGO_MEMORY`, `ARGO_LOOP` (all **on**, set to `0/false/off`
 to disable), `ARGO_GROUNDING` (**on**), `ARGO_CRITIC` (**off**), `ARGO_LAYOUT` (**off**),
-`ARGO_AUTOCOMMIT` (**off**). Source: `src/config.ts`.
+`ARGO_AUTOCOMMIT` (**off**), `ARGO_AGENTS` (**off** by code default, see §9). Source: `src/config.ts`.
 
 ---
 
@@ -174,6 +174,26 @@ reduces context less than it theoretically could).
 
 ---
 
+## 9. Multi-agent mode  *(optional — `ARGO_AGENTS`, off by code default)*
+
+**What it does.** Everything in sections 1-8 describes the single-loop harness — one `Agent`
+instance running the whole task. `ARGO_AGENTS` switches to a Boss/Planner/Implementer/Tester
+architecture (`src/dispatch.ts`) instead: a harness-code Orchestrator that never itself calls the
+model, routing each task through a Boss that classifies it (ANSWER / TRIVIAL / SIMPLE / OBJECTIVE)
+and — for anything beyond a trivial fix — delegates to dedicated Planner/Implementer/Tester call
+frames, each its own scoped `Agent`. Hard invariant: exactly one LLM call runs at a time (one GPU,
+one resident model), so this is sequencing, not real parallelism.
+
+**Why.** Built to prevent the single-loop harness from either doing real work without planning
+(when multiple frames are clearly going to be needed) or running away in an endless loop with no
+independent check on its own progress — a second set of "eyes" (Tester, Boss standups) that a lone
+loop structurally cannot have on itself.
+
+**Status.** This is a substantial architecture, not a small flag — full design, the task-start
+router, standup/escalation triggers, and every harness-level guard (iteration caps, the diff-size
+guard on Boss self-attempts) live in `docs/subagents-plan.md`. Comparative eval results (vs. the
+single-loop baseline and vs. Hermes) are in `docs/eval-log.md` and `docs/roadmap.md`.
+
 ## Task verification — all the systems
 
 This deserves its own section because "did it actually do the task, or just say it did?" is where
@@ -258,7 +278,7 @@ to make sure the agent is genuinely done, not just claiming to be.
 ## Current defaults (summary)
 On by default: task ledger, memory (AGENTS.md/MEMORY.md), loop-recovery ladder, grounding
 fact-check, executable per-task verification + summaries + final reconciliation (all part of
-tasks mode). Off by default: critic, layout judge, auto-commit. Always on: the plan/act gate,
+tasks mode). Off by default: critic, layout judge, auto-commit, multi-agent mode. Always on: the plan/act gate,
 no-progress + stall guards, progress trace, context compaction + recitation, whole-run conclusion
 gate.
 

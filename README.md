@@ -227,6 +227,20 @@ To add any model: `ollama pull <name>` — appears in the UI immediately without
 
 ---
 
+## Multi-agent mode
+
+Off by default (`ARGO_AGENTS`, set `=1/true/on` to enable). The default is a single `Agent` loop
+running the whole task. Turning this on switches to a Boss/Planner/Implementer/Tester
+architecture (`src/dispatch.ts`): a harness-code Orchestrator that never itself calls the model,
+routing each task through a Boss that classifies it (ANSWER / TRIVIAL / SIMPLE / OBJECTIVE) and,
+for anything beyond a trivial fix, delegates to dedicated Planner/Implementer/Tester call frames —
+each its own scoped `Agent`, giving the run a second set of "eyes" (independent Tester
+verification, Boss checkpoints) that a lone loop structurally can't have on itself. Still
+sequential, not concurrent: exactly one LLM call runs at a time (one GPU, one resident model).
+Full design, guards, and comparative eval results: `docs/subagents-plan.md`, `docs/eval-log.md`.
+
+---
+
 ## Agent tools
 
 | Tool | Description | When it's used |
@@ -495,7 +509,7 @@ The containment model and logging infrastructure point toward more ambitious use
 - **Agent memory** — persistent knowledge of the codebase across sessions, built from the structured JSONL logs already being written
 - **Visual trace** — Playwright screenshots streamed into the trace panel so you can see what the agent saw, not just the text it returned
 - **Specialised agent roles** — distinct system prompts and tool subsets for test writer, code reviewer, documenter, and migrator roles
-- **Multi-agent delegation** — multi-workspace support extended to multi-agent workflows: specialised agents running concurrently on different parts of a larger project, coordinated by an orchestrator
+- **Multi-agent delegation** — ✅ built (`ARGO_AGENTS`, off by default — see "Multi-agent mode" above); a Boss/Planner/Implementer/Tester architecture, sequential (one LLM call at a time), not concurrent — see `docs/subagents-plan.md`
 - **MCP integration** — expose Argo workspaces as MCP servers so agents can delegate to each other across tool boundaries
 - **Agent-to-agent communication** — a local message bus for agents to hand off tasks, share results, and build context cooperatively
 
