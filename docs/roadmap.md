@@ -257,3 +257,38 @@ Plain-language description of every behavior + critiques now lives in `docs/harn
 
 Still open: the n≥3 + adversarial eval (exercise the verify oracle + loop ladder live), a live
 layout-judge check, and smaller items (stable task IDs, semantic memory selection, faster compaction).
+
+## 2026-09-02 — Multi-agent architecture planned (call frames + ledger + structured eviction + Boss)
+
+Design agreed as a buildable v1 spec, not yet built — full design in
+`docs/subagents-plan.md`. Motivated by three confirmed gaps: `agent.ts` today has exactly
+one shared context per session (so a plan's reasoning gets buried under implementation
+noise); `loop.ts`'s repeat detection is purely mechanical (catches identical repeats, not
+semantic drift); and LLM-summarization compaction is itself a documented hallucination
+source. The plan: each role (Planner/Implementer/Tester/Boss — Researcher deferred to v2)
+gets its own **call frame** — reusing the existing loop with a different prompt/tool set —
+with hand-off summaries (never raw transcripts); `src/compaction.ts` is **replaced** by a
+CWL-style deterministic episode-eviction policy pinned to an immutable objective + mutable
+plan; a persistent **ledger** at `/workspace/.argo/ledger.jsonl` (gitignored by default)
+records every delegation/conclusion/standup/injection/episode; and the **Boss** is qwen3.6
+itself (no second model), running as a real verification-capable frame at three checkpoints
+(task-start, action-episode-paced standups, final), never at every frame conclusion, with
+four possible actions (none/inject/restart/escalate). Hard rule: no two LLM calls ever run
+concurrently, for any role. Ships behind one flag, `ARGO_AGENTS`. Full spec, file manifest,
+and open risks are in `docs/subagents-plan.md`.
+
+**2026-09-02 — first full multi-agent eval battery, skippable phases (ANSWER/TRIVIAL/
+OBJECTIVE/preempted), 11/11 passing but not yet a win.** All phases are now genuinely
+skippable per-request (a pure question can return with zero frames spawned; a one-line fix
+skips Planner+Tester) rather than always running the full pipeline — plus a harness-level
+`'preempted'` mode that detects (via a git-status diff, not a text convention) when the Boss
+solved the task itself during classification instead of just routing it, and short-circuits
+straight to the final check instead of forcing an expensive redo. That last fix turned a
+30-minute TIMEOUT into 111s on one eval task. Net result on the current 11-task range
+(nothing yet large/ambiguous enough to need real Planner decomposition): multi-agent is
+**3.4x the pre-multi-agent baseline's wall-clock and 1.6x Hermes's**, at equal 100%
+correctness — the architecture has not yet demonstrated the benefit it exists for. Full
+numbers, the two concrete bugs found and fixed, and what's still open: `docs/eval-log.md`
+(2026-09-02 entry). Next: a genuinely large/ambiguous task (real 10-30 min horizon) that
+forces actual multi-frame decomposition — nothing built so far has exercised that path,
+since the Boss keeps pre-empting it by just solving smaller tasks directly.
