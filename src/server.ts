@@ -358,6 +358,16 @@ app.get('/status', (req, res) => {
     tasks: config.tasks,
     memory: config.memory,
     loop: config.loopRecovery,
+    // Dispatch-path flags (src/dispatch.ts, src/frames.ts, src/schema.ts). Unlike the four
+    // above these are PROCESS-level, not per-run overridable via the /chat body, because
+    // they are read inside the dispatch pipeline at frame-spawn time rather than set on an
+    // Agent instance. They are reported here so an eval arm can be attributed from the
+    // WORKER ITSELF instead of from ~/.config/argo/env — the env file has silently
+    // diverged from code defaults three times, and 17 of 33 rows in the old eval ledger
+    // were unattributable for exactly this reason. Adding a flag to the pipeline without
+    // adding it here makes every run using it unverifiable after the fact.
+    schemaControlPlane: config.schemaControlPlane,
+    verbatimRequest: config.verbatimRequest,
     autoCommit: config.autoCommit,
     // MULTI-AGENT ARCHITECTURE (docs/subagents-plan.md). Lets the settings panel hide
     // controls that don't apply to the dispatch path (e.g. grounding isn't wired to

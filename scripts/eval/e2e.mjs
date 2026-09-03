@@ -297,6 +297,9 @@ for (const model of MODELS) {
           model: st.model ?? null, agents: st.agents ?? null, tasks: st.tasks ?? null,
           memory: st.memory ?? null, loop: st.loop ?? null, grounding: st.grounding ?? null,
           autoCommit: st.autoCommit ?? null, compactReserveTokens: st.compactReserveTokens ?? null,
+          // Dispatch-path flags, PROCESS-level (not per-run /chat overridable). Recorded so an
+          // arm is attributable from the worker itself, never from ~/.config/argo/env.
+          schemaControlPlane: st.schemaControlPlane ?? null, verbatimRequest: st.verbatimRequest ?? null,
           // The context-management dimension, recorded per run (see EXPECT_COMPACT_THRESHOLD).
           // /status computes this as (65536 - compactReserveTokens)/65536 and it is the number
           // to compare against Hermes's 0.5.
