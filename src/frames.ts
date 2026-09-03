@@ -159,6 +159,67 @@ export function systemPromptFor(role: Role): string {
 const SUMMARY_CHAR_CAP = 2000
 const DEP_SUMMARY_CHAR_CAP = 500
 
+// VERBATIM REQUEST THREADING (config.verbatimRequest; docs/research/
+// 10-hermes-differential.md, finding 1). Argo's Boss task-start checkpoint paraphrases
+// the user's raw message into one `OBJECTIVE:` line, and until now that paraphrase was
+// the ONLY thing any downstream frame (Planner/Implementer/Tester) ever saw —
+// `userMessage` was referenced in dispatch.ts's task-start path and nowhere else. Traced
+// twice: on `bigproj-observability` the paraphrase dropped the pointer to the seeded
+// test files and "read them first", so the Planner invented `test/service.test.js` as a
+// target and tripped the eval's integrity gate (score zeroed regardless of code
+// correctness); on `commander-count-option` the paraphrase dropped the seeded-spec
+// pointer entirely, so the Implementer never read `tests/eval-count-option.test.js` and
+// shipped against its own invented verification (4/10 targeted assertions passed).
+//
+// The fix: dispatch.ts's spawnFrame attaches the run's raw user message to EVERY frame's
+// assignment via buildAssignment below, unconditionally and by construction (no per-call-
+// site opt-in to forget) — never replacing the objective (setObjective's immutability
+// guard is untouched; the objective still exists and still matters as the harness's
+// stable restatement of the work), only sitting alongside it as a second, unparaphrased
+// source of truth.
+//
+// Cap rationale: PROJECT_CONTEXT_CHAR_CAP (agent.ts) is 8000 chars for a whole file read
+// ONCE per frame. This block is different: it repeats in EVERY frame's assignment for the
+// whole run, and the anchor pair that motivates this fix is exactly a run with 75 frames
+// — so a per-frame cost multiplies by frame count in a way loadProjectContext's doesn't.
+// Set to half that (4000) for the same reason a pathological essay-length user message
+// must not blow up 75x. Truncation is head-and-tail, not a plain head cut: both traced
+// failures had their load-bearing detail (a seed-file pointer, a "do NOT modify tests"
+// clause) at DIFFERENT positions in the raw message — one mid-message, one at the very
+// end — so a head-only cut would have preserved one failure mode's fix and reproduced the
+// other. An explicit marker names exactly how much was dropped, rather than silently
+// splicing two halves together.
+export const VERBATIM_REQUEST_CHAR_CAP = 4000
+// Exported alongside the cap (rather than kept private) so verbatim.test.ts can assert
+// the truncation arithmetic exactly, not just "it got shorter" — a silently wrong
+// dropped-chars count in the marker would be worse than no count at all.
+export const VERBATIM_REQUEST_HEAD_CHARS = 2800
+export const VERBATIM_REQUEST_TAIL_CHARS = 1000
+
+// Pure and exported so the truncation behavior is directly testable (verbatim.test.ts)
+// without needing a pathological live request.
+export function capVerbatimRequest(text: string): string {
+  if (text.length <= VERBATIM_REQUEST_CHAR_CAP) return text
+  const dropped = text.length - VERBATIM_REQUEST_HEAD_CHARS - VERBATIM_REQUEST_TAIL_CHARS
+  const head = text.slice(0, VERBATIM_REQUEST_HEAD_CHARS)
+  const tail = text.slice(text.length - VERBATIM_REQUEST_TAIL_CHARS)
+  return `${head}\n\n...[${dropped} chars truncated — original request exceeded the ${VERBATIM_REQUEST_CHAR_CAP}-char cap]...\n\n${tail}`
+}
+
+// Bracketed-label convention, matching the existing `[CURRENT PLAN — ...]` (agent.ts)
+// and `[OBJECTIVE — immutable, set once by the Boss; never redefine it]` (eviction.ts)
+// blocks, not a novel format — the same recitation shape a frame already sees elsewhere
+// in this codebase, so it reads as one more instance of a known convention rather than a
+// new kind of thing to parse. "Authoritative" and "governs" are the operative words: this
+// is not one more piece of context to weigh against the others, it is the tie-breaker
+// when the objective/plan/step prompt below it turns out to have paraphrased something
+// away.
+export function renderVerbatimRequestBlock(userMessage: string): string {
+  const text = capVerbatimRequest(userMessage)
+  return '[ORIGINAL REQUEST — verbatim, authoritative; where the objective or plan below conflicts with or omits '
+    + `something present here, this block governs]\n${text}`
+}
+
 // Caps a frame's own final-answer text before it's stored as a ledger conclusion's
 // `summary` — keeps dependency hand-offs small by construction (buildAssignment below
 // only ever forwards THIS capped text, never a dependency's raw episode graph).
@@ -170,7 +231,29 @@ export function capSummary(s: string): string {
 // a dependency contributes its capped conclusion summary + file pointers, NEVER its raw
 // episode graph or transcript. If a frame needs more, it calls `ledger` with action
 // "getFrameTrail" itself — explicit, on-demand, never automatic.
-export async function buildAssignment(root: string, req: FrameSpawnRequest): Promise<string> {
+//
+// `verbatimRequest` (config.verbatimRequest; see the block comment above
+// renderVerbatimRequestBlock) is the run's raw user message, passed by dispatch.ts's
+// spawnFrame — the ONE call site that builds every frame's assignment — so attaching it
+// here makes it apply to every role by construction, not by each dispatch.ts call site
+// remembering to add it. undefined/empty is a no-op (`filter(Boolean)` below drops it),
+// which is what keeps config.verbatimRequest OFF byte-identical to the pre-existing
+// behavior: dispatch.ts only ever passes a non-empty string here when the flag is on.
+//
+// Placement is deliberately FIRST in the array, ahead of dependency summaries and the
+// step-specific assignment. Ollama's prefix cache on this machine is aggressive and
+// cheap to lose (docs/research/09-small-model-scaffolding.md §6, "prefix-cache
+// economics": every turn re-sends the whole message array, so cache reuse is decided by
+// whether the HEAD of that array is byte-stable; measured directly on this box for this
+// change: 34ms warm vs 1445ms cold for an identical prefix, and 1416ms — i.e. no better
+// than cold — for the SAME tokens with one mutated LEADING token). This block is the one
+// piece of a frame's assignment that is identical across every frame of the SAME dispatch
+// run (unlike dependency summaries and the step prompt, which differ per frame by
+// construction) — putting it at the head maximizes how much of the assignment message's
+// own prefix is byte-identical across sibling frames of one run, rather than burying an
+// immutable block after content that already varies frame to frame, where it could never
+// anchor a cache hit at all.
+export async function buildAssignment(root: string, req: FrameSpawnRequest, verbatimRequest?: string): Promise<string> {
   const deps = await Promise.all(
     (req.dependsOn ?? []).map(async id => {
       const c = await getConclusion(root, id)
@@ -179,7 +262,8 @@ export async function buildAssignment(root: string, req: FrameSpawnRequest): Pro
       return `PRIOR WORK (frame ${id}, ${c.status}): ${summary}\nFiles: ${c.filesWritten.join(', ') || 'none'}`
     }),
   )
-  return [...deps, req.assignment].filter(Boolean).join('\n\n')
+  const verbatimBlock = verbatimRequest ? renderVerbatimRequestBlock(verbatimRequest) : ''
+  return [verbatimBlock, ...deps, req.assignment].filter(Boolean).join('\n\n')
 }
 
 // ── Tester / Boss verdict parsing ──────────────────────────────────────────────────
@@ -203,6 +287,20 @@ export async function buildAssignment(root: string, req: FrameSpawnRequest): Pro
 // it is NOT the default where the pessimistic reading is (Tester approval, Planner
 // decomposition), and it is never the default when the frame's own run ended in a cap
 // hit or an error — dispatch.ts consults Agent.getLastRunOutcome() for that.
+//
+// SCHEMA-CONSTRAINED CONTROL PLANE (config.schemaControlPlane; src/schema.ts;
+// docs/research/09-small-model-scaffolding.md §1/§7). These four parse functions stay
+// EXACTLY as they are — pure regexes, tried first, at zero cost — even with the flag on.
+// What changes is what dispatch.ts does with a `parsed: false` result: instead of (or
+// before, for the Boss's benign default) burning a whole extra frame turn on a free-text
+// reformat retry (TASK_START_MARKER_RETRY_NUDGE / TESTER_VERDICT_NUDGE / dispatch.ts's
+// PLANNER_FORMAT_RETRY_NUDGE), dispatch.ts hands the frame's own final answer to
+// schema.ts's extractX functions — one bounded, schema-constrained, tool-free,
+// think:false call that restates the SAME decision as the required object, or returns
+// null. A null there falls through to this module's existing conservative behaviour
+// unchanged (the Tester/Planner hard stop, the Boss's benign 'none') — this module's own
+// parsers and fail-open/fail-safe defaults are the backstop schema.ts relies on, not
+// something it replaces.
 export interface TesterVerdict {
   // 'escalate' = no verdict could be read at all. Deliberately NOT collapsed into
   // 'release': a Tester that never said RELEASE has not approved anything.

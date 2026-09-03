@@ -29,6 +29,14 @@ import type { AgentEvent, FrameSpawnRequest, FrameResult, FrameStatus, ModelOpti
 import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, systemPromptFor, buildAssignment, capSummary, parseTesterVerdict, parseBossVerdict, parseTaskStartVerdict, policyFor, TESTER_VERDICT_NUDGE, type TaskStartVerdict } from './frames.js'
 import * as ledger from './ledger.js'
 import { createTaskGraph, readyGroups, allStepsDone, type TaskGraph, type TaskStep } from './tasks.js'
+// SCHEMA-CONSTRAINED CONTROL PLANE (config.schemaControlPlane, docs/research/
+// 09-small-model-scaffolding.md §1/§7; see src/schema.ts for the full design rationale).
+// A single restatement call, tried after the cheap regex parse fails, in place of (or —
+// for the Boss stand-up, which has no existing retry — ahead of) the old free-text
+// format-retry resume. NEVER used to invent a decision: every extractX function here
+// returns null on any doubt, and every call site below falls through to the SAME
+// hard-stop / conservative default the flag-off path already uses on that null.
+import { extractTaskGraph, extractTaskStart, extractTesterVerdict, extractBossVerdict } from './schema.js'
 
 // The workspace root — config.workspacePath (NOT a literal '/workspace') because
 // standalone dev mode runs this Node process directly on the HOST while `bash`
@@ -97,6 +105,25 @@ const MAX_FINAL_VERIFY_ROUNDS = 3
 // makes "no two LLM calls ever run concurrently" hold in the first place.
 let currentModel: string | undefined
 let currentOptions: ModelOptions | undefined
+// VERBATIM REQUEST THREADING (config.verbatimRequest; docs/research/
+// 10-hermes-differential.md, finding 1 — full rationale in frames.ts, above
+// renderVerbatimRequestBlock). The CURRENT dispatch run's raw user message, captured
+// once at the top of runDispatchLoop from the exact same `userMessage` runBossTaskStart
+// paraphrases into an OBJECTIVE line — never recomputed per frame, so every frame of one
+// run quotes byte-identical text (load-bearing for the prefix-cache argument: see
+// buildAssignment's placement comment). undefined whenever config.verbatimRequest is
+// off, which is what makes spawnFrame's buildAssignment call a no-op and the pipeline
+// byte-identical to pre-existing behavior in that state.
+let currentVerbatimRequest: string | undefined
+
+// The model schema.ts's extraction calls should use — the SAME model the run's frames are
+// already using (config.model as the fallback, exactly like runDispatchLoop's own `model`
+// local), never a second model: this is a restatement of a decision the run's own model
+// just made, not a job for a different model, and the whole point of reusing qwen3.6 for
+// side calls elsewhere (critic.ts) is zero extra resident memory.
+function effectiveModel(): string {
+  return currentModel ?? config.model
+}
 
 // Matches Agent's own constructor param exactly (agent.ts), so a tagged emit can be
 // handed straight to `new Agent(...)` — the optional `seq` is what the SSE/JSONL replay
@@ -124,7 +151,9 @@ function checkAborted(): void {
   if (stopRequested) throw new DispatchAborted()
 }
 
-interface SpawnedFrame {
+// Exported so ctrlplane.test.ts can build a fixture (a fake Agent + a FrameResult) without
+// re-declaring the shape.
+export interface SpawnedFrame {
   agent: Agent
   result: FrameResult
 }
@@ -178,7 +207,7 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit): Promise<SpawnedFr
   agent.setSessionId(frameId) // isolates history/compaction-state files per frame
   applyFramePolicy(agent, req.role) // H17 — never inherit the single-loop baseline's mechanisms
 
-  const assignment = await buildAssignment(root(), req)
+  const assignment = await buildAssignment(root(), req, currentVerbatimRequest)
   activeFrameAgent = agent
   const finalAnswer = await agent.chat(assignment)
   activeFrameAgent = null
@@ -314,6 +343,25 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
     maxIterations: TASK_START_MAX_ITERATIONS,
     assignment:
       `CHECKPOINT: task-start\nThe user asked: "${userMessage}"\n` +
+      // VERBATIM REQUEST THREADING (config.verbatimRequest): this checkpoint's whole
+      // reason for existing was to compress the request into one OBJECTIVE line for
+      // everything downstream — under that pressure, two traced eval failures came from
+      // the compression silently dropping a seeded-test-file pointer and a "do NOT
+      // modify existing tests" clause (docs/research/10-hermes-differential.md, finding
+      // 1). With the flag on, this checkpoint is no longer that request's only surviving
+      // record (spawnFrame attaches the raw message to every downstream frame's
+      // assignment too — see frames.ts), so telling the model that changes what its
+      // OBJECTIVE line should optimize for: a concise, readable digest rather than a
+      // defensive transcription attempt. Flag-gated so the OFF path's prompt text is
+      // byte-identical to before this existed.
+      (config.verbatimRequest
+        ? 'Note: the user\'s request above is ALSO threaded verbatim to every downstream frame (Planner, ' +
+          'Implementer, Tester) alongside whatever you write below — this checkpoint is no longer the only place ' +
+          'it survives. Your ANSWER/TRIVIAL/SIMPLE/OBJECTIVE line can therefore be a concise, readable digest of ' +
+          'the request rather than an exhaustive transcription of every file path and clause — just enough for a ' +
+          'reader to know what the work is at a glance; the original is preserved separately for anyone who needs ' +
+          'the exact wording.\n'
+        : '') +
       'Ground this if it references project specifics, current facts, or anything you cannot already verify — ' +
       'check real files or the web where it matters, rather than answering from assumption. ' +
       `You have a hard budget of ${TASK_START_MAX_ITERATIONS} iterations for this checkpoint — plenty for reading ` +
@@ -357,11 +405,28 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
   // H14 breaks: the counter is now cumulative across a frame's turns, so a count at or
   // above the cap no longer implies a stall.
   if (!verdict.parsed && !agent.hitIterationCap()) {
-    const retry = await resumeFrame(result.frameId, agent, TASK_START_MARKER_RETRY_NUDGE)
-    const retryVerdict = parseTaskStartVerdict(retry.summary)
-    if (retryVerdict.parsed) {
-      verdict = retryVerdict
-      finalResult = retry
+    if (config.schemaControlPlane) {
+      // Replaces the resumeFrame retry entirely (see the module-header comment on the
+      // import above): a single bounded, schema-constrained restatement of the SAME
+      // final answer, no extra frame turn, no tools, think:false. finalResult/the ledger
+      // conclusion are deliberately left untouched — nothing about the frame's own run
+      // changes, only how the harness reads what it already said.
+      const extracted = await extractTaskStart(effectiveModel(), result.summary)
+      if (extracted) {
+        verdict = { mode: extracted.mode, text: extracted.text, parsed: true }
+        emit({
+          type: 'warning',
+          message: `schema-extraction recovered a task-start classification for frame ${result.frameId} `
+            + `(mode: ${extracted.mode}) after the marker line was missing.`,
+        })
+      }
+    } else {
+      const retry = await resumeFrame(result.frameId, agent, TASK_START_MARKER_RETRY_NUDGE)
+      const retryVerdict = parseTaskStartVerdict(retry.summary)
+      if (retryVerdict.parsed) {
+        verdict = retryVerdict
+        finalResult = retry
+      }
     }
   }
 
@@ -432,7 +497,7 @@ async function runBoss(
     assignment: `CHECKPOINT: ${checkpoint}\n${contextText}`,
   }
   const { agent, result } = await spawnFrame(req, emit)
-  const verdict = parseBossVerdict(result.summary)
+  let verdict = parseBossVerdict(result.summary)
   // H13: the same "did this checkpoint actually finish?" question, now answered from the
   // frame's terminal state instead of an iteration-count comparison (which H14's
   // cumulative counter invalidates), and extended from 'cap' to any non-clean ending.
@@ -440,6 +505,27 @@ async function runBoss(
   // for an explicit NONE (a real all-clear, which must be honoured even if the frame then
   // stalled) and for an unparseable reply.
   const outcome = agent.getLastRunOutcome()
+  // SCHEMA-CONSTRAINED CONTROL PLANE: this site has no existing retry to replace — the
+  // Boss stand-up/final checkpoint's fail-open default (action:'none' below) is a
+  // DELIBERATE, benign default for genuinely markerless-but-clean prose (Finding 8's "the
+  // SAME conservative direction"), not a defect to remove. So the extraction call here
+  // PRECEDES that default rather than replacing it: only attempted when the frame
+  // concluded cleanly with no marker (outcome === 'ok' && !verdict.parsed), and a failed
+  // or unavailable extraction falls straight through to the EXISTING 'none' default below
+  // — never to an invented action. This recovers real verdicts the model reached but
+  // failed to mark (the same 3-of-22 no-keyword stand-ups the research doc measured)
+  // without weakening the benign default for the cases where it is genuinely correct.
+  if (!verdict.parsed && outcome === 'ok' && config.schemaControlPlane) {
+    const extracted = await extractBossVerdict(effectiveModel(), result.summary)
+    if (extracted) {
+      verdict = { action: extracted.verdict, message: extracted.reason ?? '', parsed: true }
+      emit({
+        type: 'warning',
+        message: `schema-extraction recovered a Boss ${checkpoint} verdict for frame ${result.frameId} `
+          + `(action: ${extracted.verdict}) after no NONE/INJECT/RESTART/ESCALATE line was found.`,
+      })
+    }
+  }
   if (!verdict.parsed && outcome !== 'ok') {
     const why = outcome === 'cap'
       ? `hit its iteration cap (${ROLE_MAX_ITERATIONS.boss})`
@@ -506,12 +592,9 @@ async function runTesterRounds(frame: SpawnedFrame, combinedPrompt: string, emit
         message: `Tester frame ${testerResult.frameId} ${how} — no verdict to act on. A missing verdict is NOT `
           + 'a release; the reviewed work is not being accepted on the strength of it.',
       })
-      if (verdictRetries === 0 && round < MAX_TESTER_ROUNDS - 1) {
-        verdictRetries++
-        verdictNudge = `\n\n${TESTER_VERDICT_NUDGE}`
-        continue
-      }
-      const unverified: FrameResult = {
+      // Builds the SAME "unverified" terminal FrameResult either path below falls to —
+      // factored out only to avoid writing it twice, not a behavior change.
+      const buildUnverified = (): FrameResult => ({
         ...frame.result,
         status: frame.result.status === 'success' ? 'partial' : frame.result.status,
         summary: capSummary(
@@ -520,7 +603,41 @@ async function runTesterRounds(frame: SpawnedFrame, combinedPrompt: string, emit
           + 'independently verified.',
         ),
         issues: [...(frame.result.issues ?? []), 'tester-verdict-unparseable'],
+      })
+      if (config.schemaControlPlane) {
+        // Replaces the TESTER_VERDICT_NUDGE resume entirely (see the import comment at the
+        // top of this file): one bounded, schema-constrained restatement of the SAME final
+        // answer, attempted only when the frame actually concluded (a capped Tester's
+        // final answer is agent.ts's own cap-hit notice, nothing to restate — resuming it
+        // would just re-hit the same cap, H14). On failure, go straight to the SAME
+        // "unverified" terminal state the flag-off path reaches once ITS OWN retry budget
+        // is spent (never straight to release) — a further free-text nudge is not expected
+        // to succeed where a schema-constrained one already failed.
+        const extracted = testerAgent.getLastRunOutcome() === 'ok'
+          ? await extractTesterVerdict(effectiveModel(), testerResult.summary)
+          : null
+        if (extracted) {
+          emit({
+            type: 'warning',
+            message: `schema-extraction recovered a Tester verdict for frame ${testerResult.frameId} `
+              + `(verdict: ${extracted.verdict}) after the RELEASE/REDO line was missing.`,
+          })
+          if (extracted.verdict === 'release') break
+          const resumed = await resumeFrame(frame.result.frameId, frame.agent, extracted.reason ?? TESTER_VERDICT_NUDGE)
+          frame = { agent: frame.agent, result: resumed }
+          continue
+        }
+        const unverified = buildUnverified()
+        await ledger.recordConclusion(root(), unverified)
+        frame = { agent: frame.agent, result: unverified }
+        break
       }
+      if (verdictRetries === 0 && round < MAX_TESTER_ROUNDS - 1) {
+        verdictRetries++
+        verdictNudge = `\n\n${TESTER_VERDICT_NUDGE}`
+        continue
+      }
+      const unverified = buildUnverified()
       await ledger.recordConclusion(root(), unverified)
       frame = { agent: frame.agent, result: unverified }
       break
@@ -538,7 +655,9 @@ async function runTesterRounds(frame: SpawnedFrame, combinedPrompt: string, emit
 // executed graphs had exactly one step, so the graphs were being parsed away, and "the
 // whole objective goes to one Implementer" looked like a working system. A fallback that
 // is indistinguishable from success is worse than no fallback.
-function parseTaskGraph(objective: string, plannerAnswer: string): TaskGraph | null {
+// Exported for unit tests (ctrlplane.test.ts): the cheap regex parse is the pure logic the
+// schema-extraction wiring sits on top of, and it needs no Ollama/ledger/git to exercise.
+export function parseTaskGraph(objective: string, plannerAnswer: string): TaskGraph | null {
   const m = /```json\s*([\s\S]*?)```/i.exec(plannerAnswer)
   if (m) {
     try {
@@ -571,7 +690,7 @@ function parseTaskGraph(objective: string, plannerAnswer: string): TaskGraph | n
 // an invented single-step plan. The Planner is the one checkpoint whose OUTPUT IS THE PLAN
 // — there is no conservative default available to it, so this is the one place in the
 // pipeline that stops rather than degrades.
-class PlanningFailed extends Error {}
+export class PlanningFailed extends Error {}
 
 // The Planner's format-retry nudge — the same targeted-recovery shape as task-start's
 // marker retry (the plan may be fine and only the fenced block missing/mangled), not a
@@ -585,7 +704,10 @@ const PLANNER_FORMAT_RETRY_NUDGE =
 // format-only nudge before giving up. Returns the graph and the (possibly updated) frame
 // result; throws PlanningFailed rather than inventing a plan. The retry is a resume of the
 // SAME Planner frame, so it keeps the reasoning it already did (H14).
-async function graphFromPlanner(
+// Exported for unit tests (ctrlplane.test.ts) — this is the site the schema-constrained
+// control plane idea was ranked top priority for (docs/research/09-small-model-
+// scaffolding.md §1: the `commander-option-requires` failure, pfail=1, zero progress).
+export async function graphFromPlanner(
   objective: string,
   frame: SpawnedFrame,
   emit: Emit,
@@ -599,6 +721,48 @@ async function graphFromPlanner(
       + `(frame ended: ${frame.agent.getLastRunOutcome()}) — asking once for the JSON block only. `
       + 'An unreadable plan is NOT a one-step plan.',
   })
+
+  if (config.schemaControlPlane) {
+    // Replaces the resumeFrame format retry entirely (see the import comment at the top
+    // of this file). This is the site the schema-constrained control plane idea was
+    // ranked top priority for (docs/research/09-small-model-scaffolding.md §1) — a real
+    // measured failure, `commander-option-requires`, had the Planner fail to emit a
+    // readable graph EVEN AFTER its one format retry (pfail=1) and the run ended in 87
+    // seconds with zero progress. Only attempted when the frame actually concluded
+    // (getLastRunOutcome() === 'ok'): a capped Planner's "final answer" is agent.ts's own
+    // cap-hit notice, not a decision — there is nothing in it to restate, and resuming it
+    // would just re-hit the same cap (H14).
+    const extracted = frame.agent.getLastRunOutcome() === 'ok'
+      ? await extractTaskGraph(effectiveModel(), frame.result.summary)
+      : null
+    if (extracted) {
+      // TaskStep.dependsOn is a required string[] (see tasks.ts); ExtractedTaskStep's is
+      // optional (schema.ts never fabricates an empty array just to satisfy this shape) —
+      // default it here, the same mapping parseTaskGraph itself does for the regex path.
+      const graph = createTaskGraph(objective, extracted.steps.map(s => ({
+        role: s.role,
+        prompt: s.prompt,
+        dependsOn: s.dependsOn ?? [],
+        ...(s.frameGroup ? { frameGroup: s.frameGroup } : {}),
+        ...(s.skipTest ? { skipTest: true } : {}),
+      })))
+      if (graph.steps.length > 0) {
+        emit({
+          type: 'warning',
+          message: `schema-extraction recovered a ${graph.steps.length}-step task graph for Planner frame `
+            + `${frame.result.frameId} (${context}) after the fenced JSON block was missing or unreadable.`,
+        })
+        return { graph, result: frame.result }
+      }
+    }
+    throw new PlanningFailed(
+      `Planning failed: the Planner produced no readable task graph for this objective, and the `
+      + `schema-constrained extraction pass could not recover one either (${context}; frame `
+      + `${frame.result.frameId} ended: ${frame.agent.getLastRunOutcome()}). No plan was invented in its `
+      + `place. Objective: ${objective}\nLast raw output:\n${frame.result.summary}`,
+    )
+  }
+
   const retry = await resumeFrame(frame.result.frameId, frame.agent, PLANNER_FORMAT_RETRY_NUDGE)
   const second = parseTaskGraph(objective, retry.summary)
   if (second) return { graph: second, result: retry }
@@ -627,6 +791,13 @@ export async function runDispatchLoop(
   currentOptions = overrides?.options
   stopRequested = false
   activeFrameAgent = null
+  // See the module-level currentVerbatimRequest declaration above. Deliberately the
+  // SAME raw userMessage runBossTaskStart is about to paraphrase, captured before that
+  // paraphrase happens — there is no other candidate text this could be, and capturing
+  // it here (once) rather than threading a parameter through every downstream function
+  // is what makes it apply to every frame spawned below without any of them having to
+  // ask for it.
+  currentVerbatimRequest = config.verbatimRequest ? userMessage : undefined
   const model = currentModel ?? config.model
 
   // The dispatch run's own top-level narrative (start/objective/task_graph/

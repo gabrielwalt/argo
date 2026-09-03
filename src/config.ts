@@ -91,9 +91,16 @@ export const config = {
   memory:           !['0', 'false', 'no', 'off'].includes((process.env.ARGO_MEMORY ?? '').trim().toLowerCase()),
   // LOOP-RECOVERY LADDER (docs/harness-planning-memory.md "Loop detection & recovery
   // ladder"). ON by default (env ARGO_LOOP=0/false/off forces OFF). When on, a mutation-aware
-  // repeat detector REPLACES the count-based REPEAT_THRESHOLD steer: it blocks the 2nd
-  // identical tool call when nothing changed since it last ran, and escalates
-  // L0 steer -> L1 compaction -> L2 stop-and-reframe (forced re-plan). See src/loop.ts.
+  // repeat detector REPLACES the count-based REPEAT_THRESHOLD steer: it keys on a
+  // NORMALISED call (same tool + a cosmetically-insensitive form of its args — see
+  // loop.ts's normalizeCallKey for exactly what that collapses/refuses to), and on
+  // the 2nd such call with nothing changed since, serves back the CACHED result of
+  // the earlier call (labeled as a repeat) rather than a bare block, before
+  // escalating L0 replay/steer -> L1 compaction -> L2 stop-and-reframe (forced
+  // re-plan). See src/loop.ts. (2026-09 redesign, H19/H20: the previous raw-args key
+  // was evaded by a cosmetic re-issue in 46 of 143 observed blocks, and the separate
+  // near-duplicate "same tool, any args" guard this flag used to also gate — 180
+  // firings, 0 with any observed effect — was deleted outright, not folded in here.)
   loopRecovery:     !['0', 'false', 'no', 'off'].includes((process.env.ARGO_LOOP ?? '').trim().toLowerCase()),
   // AUTO-COMMIT. OFF by default — the agent used to ALWAYS commit after every run; this
   // makes it opt-in (per-run overridable via agent.setAutoCommit(), mirroring the other
@@ -111,4 +118,32 @@ export const config = {
   // switches from LLM-summarization compaction to deterministic episode eviction
   // (src/eviction.ts). No two LLM calls ever run concurrently, for any role.
   agents:           ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_AGENTS ?? '').trim().toLowerCase()),
+  // SCHEMA-CONSTRAINED CONTROL PLANE (src/schema.ts). OFF by default (env
+  // ARGO_SCHEMA_CONTROL_PLANE=1 to enable) — new and unmeasured, so the pipeline stays
+  // byte-identical to today until an eval says otherwise. When on, a control-plane
+  // decision the cheap regex parsers could NOT read (the Planner's task graph, the Boss's
+  // task-start classification, the Tester's verdict, the Boss's stand-up verdict) gets ONE
+  // bounded no-tools call with Ollama `format` set to a full JSON Schema and `think: false`,
+  // which RESTATES the frame's own already-made decision in the shape the harness needs —
+  // it never decides anything itself. Never fails open: schema.ts returns null on any
+  // structural doubt and the caller keeps its existing hard stop (PlanningFailed) or
+  // conservative default, because a fail-open default here would recreate the H13 defect
+  // (84 of 85 executed graphs were a silently-invented one-step plan). Verified on the host
+  // 2026-09-03: `format` + `tools` + `think:false` compose, content is schema-conformant,
+  // no <think> wrapper, 0.37s warm eval. See docs/research/09-small-model-scaffolding.md §1.
+  schemaControlPlane: ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_SCHEMA_CONTROL_PLANE ?? '').trim().toLowerCase()),
+  // VERBATIM REQUEST THREADING (frames.ts buildAssignment, dispatch.ts spawnFrame). OFF
+  // by default (env ARGO_VERBATIM_REQUEST=1 to enable) — new, unmeasured. When on, the
+  // run's raw user message threads, verbatim and capped (4000 chars, head-and-tail), into
+  // EVERY spawned frame's assignment, alongside (never replacing) the Boss's OBJECTIVE
+  // paraphrase. Motivated by docs/research/10-hermes-differential.md finding 1: the
+  // paraphrase was previously the ONLY statement of the request any downstream frame saw
+  // (userMessage was never referenced again after the task-start checkpoint), and it dropped
+  // load-bearing detail in both traced eval failures — bigproj-observability's seeded-test-
+  // file pointer, and commander-count-option's "do NOT modify existing tests" constraint,
+  // which sat at the very end of the message (hence head-AND-tail truncation, not head-only).
+  // Placed FIRST in the assignment: it is the one part byte-identical across every sibling
+  // frame of a run, and Ollama prefix-caching measured on this machine is 34ms warm vs
+  // 1445ms cold, with a mutated leading token costing the full 1416ms.
+  verbatimRequest:  ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_VERBATIM_REQUEST ?? '').trim().toLowerCase()),
 }
