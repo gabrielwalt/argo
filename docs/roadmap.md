@@ -691,3 +691,446 @@ conflated with a multi-agent test. Fixed `ARGO_AGENTS=1` and did a full detach/r
 counts for Finding 7's question and is recorded separately once that run completes. General lesson
 recorded in `MEMORY.md`: **always check `/status`'s `agents` field before trusting an eval run
 against a workspace that outlived an earlier `ARGO_AGENTS` toggle.**
+
+# — append to `docs/roadmap.md` —
+
+## 2026-09-03 — Hypothesis register: ideas from the driving prompts, with falsification tests
+
+This entry records the ideas that shaped Argo's recent direction as **hypotheses, not commitments**.
+Nothing here is scheduled. Each is an idea that has to earn its place from the eval and from
+observed agent behaviour — priority follows from what the traces show, not from how good the idea
+sounds. Several are already partly built; that is recorded per item with `file:line` evidence, along
+with the evidence for and against the idea mattering, the concrete test that would falsify it, and a
+rough cost.
+
+### The framing observation: designed ≠ wired ≠ fires ≠ works
+
+The recurring failure mode in this project is not design quality — the designs are good and the
+write-ups are careful. It is that **nobody verifies a mechanism actually fires**. Five designed
+pieces are currently in that state, and two more are in the measurement layer:
+
+- **`renderPinnedAnchor`** (`src/eviction.ts:70`) — implements the immutable-objective anchor, has
+  **zero call sites**. Its own comment claims the objective is "always present, recited at the tail,
+  NEVER subject to eviction". It is not present at all.
+- **Episode eviction** (`src/eviction.ts`, called at `src/agent.ts:645`) — wired, but reached only
+  from the near-full context threshold (`prompt_eval_count ≥ num_ctx − 4096` = 61 440) or from an L1
+  loop-recovery block. Across all 567 run logs it has fired **3 times, all via L1, never once via
+  the threshold** — while its own budget (`maxLiveChars = 60 000` ≈ 15 k tokens) is crossed on 1 849
+  of 5 003 recorded turns. So it fires rarely and, when it does, stubs ~15 episodes at once. Its
+  comment claims it "runs every turn"; it does not.
+- **`ledger.recordStandup`** (`src/ledger.ts:145`) — dead. Stand-ups are written as `injection`
+  entries, and only when the verdict is `inject`/`restart`, so **16 of 22 recorded stand-ups left no
+  ledger trace at all** — including for a Boss that is supposed to detect drift by reading the
+  ledger.
+- **Durable memory persistence** (`src/agent.ts:758`) — the only call site sits inside the
+  LLM-compaction branch, so it can only write when a compaction happens. It has fired **twice**, both
+  in `test-two` on 2026-07-30, and what it wrote is a verbatim transcript replay
+  (`- Called bash({"command":"ls /workspace/tests/"}) Result: …`) in a file whose stated purpose is
+  "durable, reusable facts … never one-off task state" (`src/agent.ts:86`).
+- **`ask()`** — the Boss-asks-a-running-frame primitive. Never built, yet still carried in
+  `docs/subagents-plan.md`'s open questions as "the most novel/fragile piece here and should get the
+  heaviest testing before trusting it in the dispatch loop".
+
+The same pathology in the measurement layer, which is worse because it hides the rest:
+
+- **The eval's `gate` counter broke at `e045d0a`.** It greps `warning` events for
+  `/record a plan|changing the project/`; that commit's "unified tool-rejection surfacing" moved the
+  message to `tool_result.error`. The gate fired **49 times in July (counted) and 24 times in
+  September (invisible)**.
+- **The eval's `steer` counter has been blind since 2026-08-04.** Its regex
+  (`/no new information|STOP —/`) matches only the legacy count-based steer, which is dead code once
+  `ARGO_LOOP` defaults on. Meanwhile the ladder fired **158 L0 / 24 L1 / 13 L2** in September. Every
+  `s=0` in the eval log is an artifact, and at least two eval-log conclusions rest on it.
+
+Cost of this pathology, concretely: Finding 7 ("the Planner has never produced a task graph") was
+wrong. All eight large-task Planner frames produced valid 2-5-step JSON graphs; the harness discarded
+every one, because `update_plan` sits in `ROLE_TOOLS.planner` (`src/frames.ts:21`) and `spawnFrame`
+(`src/dispatch.ts:141`) never disables the default-ON task ledger, so the Planner's own `verify`
+command becomes an unsatisfiable gate on its no-tool-call final answer — which *is* its output
+contract. Three hypotheses and two eval sessions were spent on the wrong diagnosis. **43 frames in
+the recorded history ended blank at their iteration cap and were recorded as `status: "success"`.**
+
+Hence Item 0.
+
+---
+
+### Item 0 — Per-mechanism firing counters in every run record  *(prerequisite, not a mechanism)*
+
+**The idea.** Every harness intervention emits a structured event —
+`{type:'intervention', mechanism:'plan-gate'|'loop-L0'|'loop-L1'|'loop-L2'|'near-dup'|'no-progress'|'progress-check'|'stall'|'reground'|'task-advance'|'summary-ask'|'reconcile'|'verify-pass'|'verify-fail'|'role-reject'|'grounding'|'evict'|'compact'|'cap-hit'|'memory-select'|'recite', role, iteration, …}` —
+counted by field, not by prose regex, and aggregated into every `history.jsonl` row.
+
+**Status.** Not built. Interventions are surfaced as free-text `warning` messages or
+`tool_result.error` strings; `scripts/eval/e2e.mjs:180-186` scrapes three of them by regex and two of
+those three are broken. Nothing counts the other thirteen. The memory read paths
+(`src/agent.ts:830-849`) and the recited tail (`src/agent.ts:824`) emit **no event at all**, so they
+are unobservable in principle.
+
+**Evidence for.** It would have caught all five unwired mechanisms above and both broken counters.
+It also unblocks every other item here: none of items 1-8 can be prioritised without knowing which
+existing mechanisms fire and with what effect. Direct measurement made possible by this pass —
+461 firings of the three steer mechanisms with no way to link any of them to a run outcome — is the
+argument in one number.
+
+**Evidence against.** None found. It is instrumentation, not behaviour, so it cannot regress the
+agent.
+
+**Falsification test.** Not applicable in the usual sense; the test is that it works. Concretely:
+after landing it, re-run the current battery and confirm the per-mechanism counts match the counts
+derivable by hand from the raw logs. If they diverge, the emitter is wrong.
+
+**Cost.** Small: one event type, ~16 call-site edits, a counter dictionary in `runMetrics`, and a
+`mechanisms` object per `history.jsonl` row.
+
+---
+
+### Item 1 — Wire the pinned anchor and force eviction to run  *(highest priority of 1-8)*
+
+**The idea.** The sliding window must retain not the original prompt but **the plan**: an objective
+that becomes immutable once the first planning cycle formulates it, plus an execution plan that stays
+refinable at any time. Both pinned outside eviction and recited at the tail.
+
+**Status.** `renderPinnedAnchor(objective, plan)` (`src/eviction.ts:70`) implements exactly this and
+is **called from nowhere**. `ledger.setObjective` has an immutability guard and is used
+(`src/dispatch.ts`), so the objective *is* stored immutably — it is simply never re-surfaced into
+context. `src/frames.ts:9-15` admits the v1 simplification: the anchor is folded into the frame's
+first assignment message instead, "so a long-running frame's recitation of the LEDGER-level plan may
+fade the same way any other context does without eviction re-surfacing it."
+
+**Evidence for.** Eviction *does* run (3 firings), so context is already being trimmed with no
+pinned objective — the precise configuration the anchor exists to prevent. The failure that motivated
+this whole project was a 90-iteration run that quietly solved a different problem; that is the
+failure mode this addresses. The baseline path has an analogous mechanism (plan recitation at
+`src/agent.ts:824`) which the docs call "the #1 lever for holding a small model on the current task",
+so the pattern is already believed in — it just was not extended to the ledger-level objective.
+
+**Evidence against.** Peak context is 64 266 tokens of 65 536 and only **6 of 5 003** recorded turns
+reach the compaction threshold, so on today's tasks the window rarely slides far enough for drift by
+eviction to be the binding problem. This item may be solving a problem the current task set does not
+produce — which is why it is paired with forcing eviction to run.
+
+**Falsification test.** Lower `COMPACT_RESERVE_TOKENS` so the threshold lands near ~16 k, which turns
+every existing hard task into a long-horizon task at zero authoring cost. Then A/B on
+`bigproj-effort` and `bigproj-deps`, n≥3, anchor ON vs OFF, measuring: objective-drift incidence
+(does the final answer still address the recorded objective — the quality judge already scores
+`goal_completeness`), pass rate, and iterations. **Falsified if** drift incidence and pass rate are
+indistinguishable with the anchor off — i.e. the model holds the goal without it.
+
+**Cost.** Small for the anchor (one call site in the recitation block, mirroring the existing task
+ledger push). Trivial for the eviction condition (an env var in the eval driver).
+
+---
+
+### Item 2 — Multi-turn task sequences in the eval
+
+**The idea.** A multi-step scenario in which several **equally difficult** follow-up tasks are
+prompted in sequence on the same workspace, rather than one prompt per task.
+
+**Status.** Not built. `scripts/eval/tasks.mjs` has no follow-up support: every task is a single
+`prompt` string, `e2e.mjs:216` posts it once, and `resetWs` wipes the workspace between tasks. The
+`sessionId` plumbing to support multiple runs in one session already exists (`src/server.ts`,
+`SessionLogger`), so the harness side is ready.
+
+**Evidence for.** This is the only way to test cross-turn memory, and cross-turn memory is where the
+north star lives. Durable persistence has fired twice in the project's history and wrote garbage
+(see the framing observation), and the MEMORY.md/AGENTS.md **read** paths are unreachable in all four
+eval workspaces because none of them contains either file — so `ARGO_MEMORY` being "ON by default"
+has contributed nothing to any eval result recorded to date. A multi-turn task is also the cheapest
+route to a genuinely long context, which nothing else in the catalog produces.
+
+**Evidence against.** None on the merits. The practical objection is cost: k runs × N turns
+multiplies wall-clock, and the suite is already slow. Mitigated by keeping the sequence short (3-4
+turns) and applying it to one or two tasks, not the whole catalog.
+
+**Falsification test.** Author one workspace with three or four follow-ups of comparable difficulty
+(e.g. add feature A; then feature B that must respect A's convention; then a bug fix that touches
+both). Primary metric: **tool calls before the first edit on turn N** — if the agent benefits from
+turn N−1, that number should fall across turns. Secondary: does it re-derive facts it already
+established. **Falsified if** turn 3 costs the same discovery effort as turn 1 with memory ON, or if
+memory ON is indistinguishable from memory OFF.
+
+**Cost.** Medium: `tasks.mjs` needs a `turns: [...]` shape and `e2e.mjs` a loop that skips the reset
+between turns; plus authoring the workspace and its oracles.
+
+---
+
+### Item 3 — Implementer context inheritance from the last 1-3 implementer frames
+
+**The idea.** A new Implementer frame inherits distilled context from recent Implementer frames via
+tag-based retrieval from the ledger, prioritising the most recent, walking further back only when
+what it has is insufficient.
+
+**Status.** Only the explicit `dependsOn` → `contextGiven` path exists: `buildAssignment`
+(`src/frames.ts:118-134`) forwards each dependency's capped conclusion summary plus its file list,
+and nothing else. The retrieval substrate is already there and unused for this purpose —
+`getFrameTrail`, `getRecent`, `expand` (`src/ledger.ts:218,227,237`), all exposed to the model via
+the `ledger` tool (`src/tools/index.ts:224`).
+
+**Evidence for.** Suggestive rather than direct: 180 near-duplicate-tool nudges and 102
+role-restriction rejections across the corpus are consistent with frames rebuilding the same
+understanding from scratch. Frames are genuinely isolated by design (each gets its own `sessionId`,
+history file and compaction state), so there is no accidental sharing to fall back on.
+
+**Evidence against — and this is why it ranks third rather than first.** The mechanism is nearly
+untestable today: **84 of 85 executed task graphs have exactly one step**, and `dependsOn` context
+has been supplied to just **5 frames** in the whole history. With one Implementer per run there is no
+"previous Implementer frame" to inherit from. This item is therefore *blocked behind the Planner
+fix*, not independently schedulable. There is also a real risk it re-imports the noise that frame
+isolation exists to remove — the durable-memory result (transcript sludge scoring as "verified
+facts") is a warning about automatic distillation.
+
+**Falsification test.** Once multi-step graphs actually execute: measure **tool calls to first edit
+per Implementer frame**, and the count of files re-read that a prior frame in the same run already
+read, with inheritance ON vs OFF. **Falsified if** neither number falls, or if inherited context
+increases drift (the quality judge's `drift_or_hallucination` list grows).
+
+**Cost.** Medium. Retrieval and capping are the easy part; deciding what "insufficient" means without
+a model self-report is the design work.
+
+---
+
+### Item 4 — Artifact-by-reference for frame conclusions
+
+**The idea.** A frame that produces a substantial result writes it to a **file** and returns a short
+summary plus a pointer, so the orchestrator's context is never overwhelmed by a subordinate's output.
+
+**Status.** Partially honoured. `capSummary` caps a conclusion at 2 000 chars and dependency
+hand-offs at 500 (`src/frames.ts:106-110`), and `buildAssignment` forwards only the capped summary,
+never the raw episode graph. But the cap is a truncation, not a reference: the observed Boss
+conclusion on `bigproj-observability` embeds a full markdown status table in its `summary` field, and
+the dispatch loop's final return concatenates every step's summary
+(`doneSummary`, `src/dispatch.ts:756`). There is no artifact directory and no pointer convention
+(`.argo/reports/` was deferred to v2 with the Researcher role).
+
+**Evidence for.** Cheap, and it composes with Item 5: a stand-up that reads pointers rather than
+prose stays cheap as a run grows.
+
+**Evidence against.** No measured harm yet. Boss frames are short (94 task-starts, 86 finals, all
+well inside their 10-15 iteration budgets) and peak context in a Boss frame is nowhere near the
+limit. **Truncation at 2 000 chars is already doing the job the cap exists for** — the honest
+statement is that this is prophylactic, aimed at a scale the system has not reached.
+
+**Falsification test.** Instrument Boss-frame peak prompt tokens per checkpoint (Item 0 gives this
+for free), then run a task with ≥4 Implementer frames after the Planner fix. **Falsified if** Boss
+context stays flat as frame count grows — in which case the cap is sufficient and the pointer
+convention is unnecessary complexity.
+
+**Cost.** Small-to-medium: a `.argo/reports/` convention, a write in `deriveFrameResult`, and a
+pointer in the summary.
+
+---
+
+### Item 5 — Rolling stand-up summaries in the ledger at a ~20-iteration cadence
+
+**The idea.** The Boss detects drift by reading the ledger cheaply — a brief daily stand-up — rather
+than by re-investigating from scratch. Summaries accumulate in the ledger at a regular cadence.
+
+**Status.** The stand-up *frame* exists and fires (22 times), but: **`ledger.recordStandup`
+(`src/ledger.ts:145`) is never called**, so 16 of 22 healthy stand-ups left no trace; the trigger is
+**10 action episodes** plus a >25-iteration frame plus a `hadTrouble()` signal
+(`src/dispatch.ts:711-719`), not an iteration cadence; and the Boss re-investigates with real tools
+each time rather than reading accumulated summaries — 8 tool calls in the observed
+`bigproj-observability` stand-up.
+
+**Evidence for.** Magentic-One's ablation (cited in `docs/subagents-plan.md`) attributes 31 % of
+performance to the ledger alone. And the current stand-up is measurably weak: of 22, **16 returned
+`NONE`, 3 stalled blank at their cap, 3 produced no keyword** — so 27 % produced no usable verdict,
+and across the entire corpus exactly **one** `boss_verdict` event exists (an `escalate`). `INJECT`
+and `RESTART` have never fired. Whatever the current stand-up is doing, it is not catching drift.
+
+**Evidence against.** 22 stand-ups producing one actionable verdict is also an argument that
+stand-ups are simply not earning their cost at this task size — a cheaper stand-up might just be a
+cheaper way to produce nothing. That has to be tested, not assumed.
+
+**Falsification test.** Land `recordStandup`, switch the trigger to an iteration cadence (~20
+iterations of cumulative frame work), and have the stand-up prompt read the accumulated summaries
+first and use tools only if they are insufficient. Measure: Boss tokens and tool calls per stand-up,
+and — the real question — whether a drift event is caught earlier. Needs a drift-trap task (the
+adversarial taxonomy's, still unbuilt). **Falsified if** cheaper stand-ups still produce `NONE`
+every time on a task where drift demonstrably occurred.
+
+**Cost.** Small for `recordStandup` and the cadence; medium for the read-first prompt redesign; the
+drift-trap task is separate authoring work.
+
+---
+
+### Item 6 — The Boss must verify against artifacts, not self-reports
+
+**The idea.** The Boss should not rely on what the agents tell it; it should verify for itself
+whether what they claim is grounded.
+
+**Status.** The prompt already says exactly this ("Verify independently (read files, run checks,
+search the web) rather than trusting self-reports", `src/frames.ts` Boss suffix), and the Boss has
+`read_file`/`bash`, so it *can*. What is missing is any structural guarantee, and the evidence says
+the prompt is not enough.
+
+**Evidence for — direct, and damning.** The quality judge on `bigproj-deps` recorded:
+*"Boss final frame hallucinated 'All 9 tests pass' and claimed work was 'already complete from the
+previous frame' after multiple timeout failures"* — on a run scored PASS by the deterministic check.
+Separately: `parseTesterVerdict` (`src/frames.ts:152`) fails open to `RELEASE`, and **the Tester has
+released 29 of 29 times with zero REDO ever recorded**, so a stalled Tester is indistinguishable from
+a satisfied one. And `filesTouched`/`filesWritten` — documented as "diff-derived, not self-reported"
+(`src/types.ts:135`) — are derived from `edit_file`/`write_file` call tracking, so **4 of 9
+Implementer conclusions carry an empty file list** for work that demonstrably changed `src/` via
+`bash`. The Boss and Tester are handed the fallback string *"none (or made via bash, not tracked)"*
+and must rediscover the change.
+
+**Evidence against.** None. The only counter-consideration is cost: the Boss already accounts for
+**202 of ~317 role frames (64 %)** and 53 of 102 role-restriction rejections, so "verify more" must
+not mean "spend more Boss iterations". The fix should make the *evidence cheaper to obtain*, not the
+checkpoint longer.
+
+**Falsification test.** Author a trap task in which a frame's conclusion is deliberately false (a
+partial implementation reported as complete, or a false conclusion injected into the ledger before
+the Tester spawns) and measure whether the Boss/Tester catch it. **Falsified if** they catch it
+reliably without any change — in which case the `bigproj-deps` hallucination was an outlier.
+Cheapest structural companion: make `filesWritten` genuinely diff-derived (a `git status` snapshot
+per frame) so verification starts from a real diff.
+
+**Cost.** Small for the diff-derived file list; small for the cap-hit fail-open fixes; the trap task
+is authoring work and doubles as an eval item (see `EVAL-PLAN.md`).
+
+---
+
+### Item 7 — Explicit, measurable delegation thresholds
+
+**The idea.** Concrete criteria instead of prompt judgment: spawn a sub-agent when a group of roughly
+20-40 iterations of work would otherwise share one context; the Boss does real work only for one or
+two iterations; planning begins only when multiple sub-agents are anticipated.
+
+**Status.** All three exist as **prompt text**, not harness policy. The Planner suffix says isolation
+is "only worth paying when that step's own work would otherwise run about 20-40+ iterations"
+(`src/frames.ts`). The Boss's self-attempt bound is the closest thing to a real policy and it *is*
+harness-enforced: `TASK_START_MAX_ITERATIONS = 10` plus a `git status` diff plus
+`TRIVIAL_DIFF_LINE_LIMIT = 15` (`src/dispatch.ts:78,222`). Nothing measures anticipated work before
+spawning.
+
+**Evidence for.** The measured routing distribution is sane where the harness enforces
+(`TRIVIAL` 14, `ANSWER` 13, `SIMPLE` 2, `OBJECTIVE` 3 — fast paths in 84 % of marked classifications)
+and unmeasurable where it does not. The Boss's own bound is the mechanism the project already credits
+with turning a 1801 s timeout into 86 s.
+
+**Evidence against — the strongest of any item here.** "Spawn when 20-40 iterations are anticipated"
+requires *predicting* effort before doing the work, which is exactly the class of judgment the
+project's own design principles say not to depend on a small local model for. The Boss's bound works
+precisely because it is a post-hoc, model-independent check (`git status`, a diff line count, an
+iteration count) rather than a prediction. A threshold expressed as a prediction may be
+unimplementable as stated; a post-hoc equivalent ("this frame has now run 25 iterations — the next
+group should have been split") is implementable and is arguably what `LARGE_FRAME_ITERATIONS = 25`
+already is.
+
+**Falsification test.** With Item 0's counters, measure **frames spawned per difficulty tier**. The
+trivial tier should show near-zero framing overhead (`trivial-qa-arithmetic` is already at 2 frames,
+which is the target); the hard tier should show frames scaling with genuine work rather than with
+routing accidents. **Falsified if** frames per tier are already well-calibrated — in which case
+prompt judgment is sufficient and the policy is unnecessary. Also worth measuring: how often the
+Boss's 1-2-iteration bound is exceeded in spirit (23 of 94 task-starts left the workspace dirty).
+
+**Cost.** Small to measure; medium to enforce, and the design question above should be settled first.
+
+---
+
+### Item 8 — File-size discipline  *(explicitly speculative)*
+
+**The idea.** Keep long documents split into chapters and source modules small, so that no single
+file swamps a small model's context. Possibly a harness nudge above N lines.
+
+**Status.** Not implemented in any form. Related machinery exists for the symptom rather than the
+cause: `read_file` truncates, `TOOL_RESULT_COLLAPSE_OVER` collapses older tool output
+(`src/agent.ts:806`), and `PROJECT_CONTEXT_CHAR_CAP = 8000` bounds AGENTS.md/MEMORY.md injection.
+
+**Evidence for.** None from the logs. Marking this plainly: **I looked and found no supporting
+evidence.** The largest single file the agent has worked on is `test-two/index.html`, and its
+recorded failures there are edit-matching failures (stale `old_string` matches), not context
+exhaustion — which the workspace's own hand-written AGENTS.md/MEMORY.md "Editing convention" section
+already addresses with a re-read-before-edit rule.
+
+**Evidence against.** Peak context is 64 266 of 65 536 tokens, reached on **6 of 5 003** turns, so
+file size is not currently the binding constraint. Any nudge risks the fragile-heuristic pile the
+project's own system-prompt philosophy argues against.
+
+**Falsification test.** Wait for the signal rather than testing pre-emptively: once Item 0's
+counters exist, watch for runs where a single `read_file`/`bash cat` result exceeds a large fraction
+of the turn's prompt tokens, or where truncation precedes a failure. **Adopt only if** that pattern
+appears. Cheapest first step is a guideline in `AGENTS.md`, not harness code.
+
+**Cost.** Trivial as a guideline; small as a nudge. **Low priority until the logs point at it.**
+
+---
+
+### Deliberately NOT adopted
+
+- **A fifth `researcher` role.** Confirmed absent from `ROLE_TOOLS` (`src/frames.ts:21-27`);
+  deferred to v2 in `docs/subagents-plan.md`. Keep it deferred. Premature for a specific reason:
+  decomposition has never been observed working (84 of 85 graphs are single-step), so there is zero
+  evidence that even **four** roles earn their coordination cost — and the cited "bag of agents"
+  research puts the coordination plateau at ~4 agents, which is where we already are. Mechanism count
+  is already producing correctness bugs, not just complexity: the default-ON task ledger destroys 39 %
+  of Planner frames. Source attribution and confidence scoring, the parts of the Researcher idea with
+  real value, belong folded into the existing grounding guard — which already does exactly this and
+  does it well (it caught a fabricated citation and two invented specifics on a real writing task).
+- **An asynchronous or weak-model Boss.** Reversed by Gabriel himself, correctly. A weaker model
+  policing a stronger one is the failure the supervisor eval already measured (only qwen3.6 flags
+  oracle-gaming stably, 3/3; every other candidate fails the gate), and a second resident model costs
+  real memory on a 48 GB machine for no measured gain. The one accidental test of this — two
+  multi-agent sessions on `test-two` that ran `qwen2.5-coder:14b` on 2026-09-02 — produced a Tester
+  burning all 20 iterations with a single tool call and a Boss final checkpoint stalling blank for 15.
+- **Speculative decoding.** Park. Unproven in this setup, and speed is being demoted out of the eval
+  score (`EVAL-PLAN.md` §3.1) because the only measurable speed signal today is confounded by Docker
+  isolation. Revisit if and when quality is measurable and cost becomes the binding constraint.
+- **Reopening LLM parallelism.** Settled. `src/dispatch.ts:7` records it as a hard invariant: "no two
+  LLM calls ever run concurrently, for any reason — one GPU, one resident model." Not a deferral, a
+  ruling.
+
+---
+
+### The iteration-budget directive: ~20 as a chunk, ~200 as a hard boundary
+
+Two concepts the code currently conflates, recorded here because neither exists yet:
+
+**(a) ~20 iterations is an IDEAL CHUNK and a stand-up cadence, not a hard limit.** The Planner should
+size each sub-agent task to roughly that much work, and the harness should trigger a Boss stand-up
+around that interval. Today `ROLE_MAX_ITERATIONS` (`src/frames.ts:38-43`) is a set of hard kills, not
+target sizes: at the cap, `src/agent.ts:1801` makes `"Reached maximum iterations (N) without a final
+answer."` the frame's *final answer*. The stand-up cadence is an action-episode count of 10, not an
+iteration interval (`src/dispatch.ts:79`).
+
+**(b) ~200 iterations is a HARD GLOBAL boundary for the whole run, all frames combined — not per
+sub-agent.** Sized to the observation that the agent has never been driven past roughly 200
+iterations without ending in hallucination. **No cross-frame total exists anywhere.** Frames are
+independent `Agent` instances with independent counters; observed totals already reach 104 (8 frames)
+and there is no mechanism that would notice 300.
+
+**Ordering constraint — this matters.** Making the per-role caps *soft* requires fixing the cap-hit
+fail-open **first**. Today a cap-hit produces a frame whose conclusion is an error string recorded as
+`status: "success"` (`src/dispatch.ts:191`); 43 frames in the recorded history have ended that way,
+including 39 % of all Planner frames and 13 % of all Boss frames. The global ~200 limit *will* be hit
+sometimes, and if the same fail-open handles it, the harness will discard an entire run's result
+exactly as it currently discards a Planner's task graph. So: fix `deriveFrameResult` to distinguish a
+capped frame (`status: 'partial'`), make `parseTesterVerdict` and `parseTaskGraph` stop failing open
+on a capped frame, and only then convert the per-role caps into soft targets with a hard global
+ceiling and a "you are near the global limit — summarise now" yield.
+
+**One analytical caveat on the ~200 figure.** It is best read as a measurement of Argo *without* its
+anti-drift machinery, not as a property of the model. The pinned anchor has never been called, durable
+memory has written twice and wrote transcript noise, eviction has fired three times and never with a
+pinned objective, and the MEMORY.md/AGENTS.md read paths are unreachable in every eval workspace.
+Whether ~200 is a ceiling or an artifact of running without those is an **open experiment**, and it is
+the same experiment as Item 1's falsification test — which is a reason to run that one first.
+
+---
+
+### Sequencing constraint
+
+**None of items 1-8 should be built before the measurement layer and Item 0's firing counters are
+fixed.** The current instrument cannot resolve their effects: the integrity gate cannot fire at all
+(`testFileTampered` greps `git diff --name-only`, and every seeded test file is untracked), the
+correctness term has returned a single value (70/70) in all twelve real scored runs, over half the
+`history.jsonl` rows carry no harness label, and two of three intervention counters are broken.
+Anything added now would be unmeasurable — which is precisely how five mechanisms came to be built
+without anyone noticing they never run.
+
+Diagnosis and a buildable replacement suite: see the eval-strategy work and the companion analysis.
+The three changes that must land first, in order: per-mechanism firing counters (Item 0); the
+integrity gate and a seeded-test-only correctness denominator; and `EVAL_RUNS ≥ 3`, since every
+current conclusion about a high-variance task rests on a single sample.
