@@ -82,12 +82,10 @@ export const WARNING_INTERVENTIONS = [
     sample: 'ALL PLANNED TASKS ARE DONE — final check before finishing. Objective: "x". What was done per task:\n- a\nVerify this FULLY addresses the objective.' },
   { key: 'reground', re: /^Before finishing, re-ground against your plan\./, src: 'agent.ts:1580 (nudge)',
     sample: 'Before finishing, re-ground against your plan. Objective: "x". Think critically: is the objective TRULY met — not just that a command exited 0, with no corner cut and the real request satisfied?' },
-  { key: 'loopL0', re: /^You just issued the EXACT same `[^`]+` call that already ran/, src: 'loop.ts:148 l0SteerMessage',
-    sample: 'You just issued the EXACT same `bash` call that already ran, with nothing changed since. STOP repeating it — take a DIFFERENT concrete action toward the current task, or, if it is truly already done, say so.\n\nrecite' },
-  { key: 'loopL1', re: /^Your context was just compacted to help you refocus\./, src: 'loop.ts:158 l1SteerMessage',
-    sample: 'Your context was just compacted to help you refocus. You have repeated the same `bash` call several times with no progress. You must change your approach now — do not repeat this call again.\n\nrecite' },
-  { key: 'loopL2', re: /^You have repeatedly looped on `[^`]+` without any progress\. ABANDON this approach\./, src: 'loop.ts:167 l2ReframeMessage',
-    sample: 'You have repeatedly looped on `bash` without any progress. ABANDON this approach. Produce a revised plan now for solving the current task a different way.\n\nrecite' },
+  // loopL0 / loopL1 / loopL2 USED to live here as three prose patterns. BATCH 2 added the
+  // structured `warning.level` field, so they are gone from the primary path and survive
+  // only in LADDER_FALLBACK below (pre-`6884852` logs). This is the one counter change in
+  // this file that removes a regex rather than adding one.
   { key: 'nearDup', re: /^You have now called `[^`]+` \d+ times in a row \(different arguments each time/, src: 'loop.ts:89 checkSameToolStreak',
     sample: 'You have now called `bash` 3 times in a row (different arguments each time, but the same kind of action, with nothing changed in between). If you already have what you need, commit to your verdict or answer now — otherwise take a genuinely different kind of action.' },
   // Both of the next two are regroundSteer(); they differ only in the `detail` clause,
@@ -103,10 +101,57 @@ export const WARNING_INTERVENTIONS = [
   // reverted. This is the exact string the old, now-dead `gate` counter matched.
   { key: 'legacyPlanGate', re: /^Before changing the project \(`/, src: 'pre-e045d0a agent.ts (removed); still present in 2026-07..09 logs',
     sample: 'Before changing the project (`edit_file` on /workspace/src/kth.js) you must record a plan first.' },
-  // Plumbing/failure warnings — real events, but not interventions. Bucketed so they do
-  // not inflate warnUnmatched and hide a genuine wording drift.
-  { key: 'infraWarn', re: /^(?:Marking episode evicted failed|MEMORY\.md persist failed|Ollama request failed|Critic \([^)]*\) (?:failed|returned no parseable verdict)|Grounding guard (?:failed|returned no parseable verdict)|Context compaction failed|Loop-recovery compaction failed|Episode record failed|Auto-commit)/, src: 'agent.ts 656/764/885/1054/1058/1129/1133/1394/1656/1743/1947/1967',
+  // ── BATCH 2 (`6884852`) — three new warning channels ──────────────────────────────
+  // The first of these is why `warnUnmatched` fired on the first live run after Batch 2
+  // landed. The tripwire doing its job is the point; leaving it firing is not.
+  //
+  // H17, the Planner format retry. Direct evidence about the Planner's first-attempt
+  // reliability: one firing means the first plan was unreadable and the frame was resumed
+  // once for the JSON block only. On the first live run this fired ONCE on a run that then
+  // produced a 3-step graph — first-attempt success 0/1, final success 1/1. That ratio is
+  // the number this counter exists to accumulate.
+  { key: 'plannerFormatRetry', re: /^Planner frame \S+ \([^)]*\) produced no readable task graph /, src: 'dispatch.ts:597-600',
+    sample: 'Planner frame planner-mtlrl70h-8 (initial plan) produced no readable task graph (frame ended: ok) — asking once for the JSON block only. An unreadable plan is NOT a one-step plan.' },
+  // H13, the Tester fail-open fix. A missing RELEASE/REDO verdict used to be read as
+  // "release" (ASSESSMENT §5.2a); it now says so out loud. Two wordings from the same
+  // emit site, distinguished only by `how`, so the pattern anchors on the shared tail.
+  { key: 'testerNoVerdict', re: /^Tester frame \S+ [\s\S]*— no verdict to act on\./, src: 'dispatch.ts:504-507',
+    sample: 'Tester frame tester-abc-20 stalled at its iteration cap (25) — no verdict to act on. A missing verdict is NOT a release; the reviewed work is not being accepted on the strength of it.' },
+  // The durable-memory write filter (BATCH 3 territory, but it emits now). Non-zero means
+  // the distillation prompt produced transcript rather than durable facts and the filter
+  // caught it before it reached MEMORY.md — i.e. the mechanism degrading its own future
+  // input, which is exactly the failure it was added to stop.
+  { key: 'memoryFiltered', re: /^MEMORY\.md write filtered \d+ non-durable item\(s\): /, src: 'agent.ts:877-881',
+    sample: 'MEMORY.md write filtered 2 non-durable item(s): looks like transcript — I then ran npm test | too specific — line 40 of query.js' },
+  // Split OUT of infraWarn (below) because it is a MODEL CALL, not plumbing noise.
+  // agent.ts:1510 emits `ollama_request` once per main-loop iteration, BEFORE
+  // chatWithRetry; a retry re-issues the identical HTTP request but emits no second
+  // `ollama_request`. So every one of these is a model call that the `ollama_request`
+  // count misses, and modelCallsTotal (below) adds them back.
+  { key: 'ollamaRetry', re: /^Ollama request failed \(/, src: 'agent.ts:1005 (chatWithRetry)',
     sample: 'Ollama request failed (socket hang up) — retrying once' },
+  // Plumbing/failure warnings — real events, but not interventions. Bucketed so they do
+  // not inflate warnUnmatched and hide a genuine wording drift. NOTE the ordering: this
+  // matches `MEMORY.md persist failed`, while `memoryFiltered` above matches `MEMORY.md
+  // write filtered` — different events, and `memoryFiltered` is listed first so the more
+  // specific claim wins. `Ollama request failed` was REMOVED from this alternation when
+  // `ollamaRetry` was split out; leaving it in both would have double-counted.
+  { key: 'infraWarn', re: /^(?:Marking episode evicted failed|MEMORY\.md persist failed|Critic \([^)]*\) (?:failed|returned no parseable verdict)|Grounding guard (?:failed|returned no parseable verdict)|Context compaction failed|Loop-recovery compaction failed|Episode record failed|Auto-commit)/, src: 'agent.ts 761/884/1174/1178/1249/1253/1560/1822/1914/2125/2145',
+    sample: 'MEMORY.md persist failed (EACCES) — continuing' },
+];
+
+// The three ladder rungs are NO LONGER counted from prose on the primary path — see the
+// `warning` case in runMetrics, which reads the structured `warning.level` field added by
+// BATCH 2 (types.ts:85, emitted at agent.ts:1830). These patterns are retained ONLY as a
+// labelled fallback for logs written before `6884852`, which have no `level` field: 211
+// ladder events across the July+September corpus would otherwise become `warnUnmatched`
+// and the cross-epoch validation would stop being possible. Every use of the fallback is
+// counted as `ladderFromProse`, so "is the field doing the work" is answerable from the
+// data rather than by inspection: on any run of `6884852` or later it must be 0.
+export const LADDER_FALLBACK = [
+  { key: 'loopL0', re: /^You just issued the EXACT same `[^`]+` call that already ran/, src: 'loop.ts l0SteerMessage (pre-6884852 logs only)' },
+  { key: 'loopL1', re: /^Your context was just compacted to help you refocus\./, src: 'loop.ts l1SteerMessage (pre-6884852 logs only)' },
+  { key: 'loopL2', re: /^You have repeatedly looped on `[^`]+` without any progress\. ABANDON this approach\./, src: 'loop.ts l2ReframeMessage (pre-6884852 logs only)' },
 ];
 
 // Mechanisms surfaced as a REJECTED tool call (tool_result.rejected === true) rather
@@ -152,9 +197,144 @@ export const REJECTION_INTERVENTIONS = [
 // 44 of 44 September `error` events are this, and one September `replan.reason` quotes it
 // verbatim as the cause of a Boss standup escalation.
 export const CAP_HIT_RE = /^Reached maximum iterations \(\d+\) without a final answer\.$/;
+// BATCH 2 / H13: planning that could not produce a graph now STOPS rather than inventing a
+// one-step plan (dispatch.ts:605-609, surfaced as an `error` at dispatch.ts:675). Counted
+// separately from `errorsOther`, because "the Planner could not be read even after a format
+// retry" is a specific, actionable outcome and the whole point of the change is that it is
+// no longer indistinguishable from a successful single-step plan.
+export const PLANNING_FAILED_RE = /^Planning failed: the Planner produced no readable task graph/;
+// Crash class: agent.ts:1992 and dispatch.ts:679. Split out because it should always be 0
+// and a non-zero value means a real defect rather than agent behaviour.
+export const UNEXPECTED_ERROR_RE = /^Unexpected error: /;
 // eviction and LLM compaction share the `compact` event; only the summary distinguishes
 // them (agent.ts:663).
 export const EVICTION_RE = /^deterministic eviction:/;
+
+// ── THE MODEL-CALL COUNT, defined exactly ─────────────────────────────────────────────
+// This is the primary cost metric, so the definition matters more than the number. A
+// comparison of two differently-defined "turns" is worse than no comparison.
+//
+// ARGO. Three components, counted separately and summed:
+//
+//   modelCalls     count of `ollama_request` events, summed over every frame's log.
+//                  agent.ts:1510 emits exactly one immediately before each main-loop
+//                  model call. Verified identity over the September corpus: 2874
+//                  `ollama_request` and 2874 `iteration` events — one model call per
+//                  loop turn, so this is a true model-call count and not a proxy.
+//   ollamaRetries  agent.ts:1005. chatWithRetry re-issues the IDENTICAL request after a
+//                  failure but emits no second `ollama_request`, so each retry is a real
+//                  model call invisible to the count above.
+//   auxModelCalls  one per `critic` event. runCritic (critic.ts:197) and
+//                  runGroundingCritic (grounding.ts:194) each make exactly one
+//                  ollama.chat call and emit exactly one `critic` event, and neither
+//                  goes through the main loop, so neither produces an `ollama_request`.
+//                  35 such calls in July; 0 in September (the critic was off).
+//
+//   modelCallsTotal = modelCalls + ollamaRetries + auxModelCalls
+//
+// HERMES. `sessions.api_call_count` from ~/.hermes/state.db (see hermes.mjs). Hermes's own
+// count of model API calls for the session. It has no critic-equivalent, so its total has
+// no aux component.
+//
+// modelCallsTotal is therefore the number to compare, and it is what both drivers write to
+// `cost.modelCallsTotal`. The components are recorded alongside so nobody has to trust a
+// single opaque figure.
+//
+// KNOWN LIMIT, stated rather than papered over. 34 of 200 sampled September logs contain
+// no `ollama_request` at all: they are the top-level DISPATCH narrative
+// (start/objective/task_graph/boss_verdict/done), which runs no ReAct loop of its own.
+// Their contribution of 0 is correct — the 2874/2874 identity holds across the whole
+// corpus, so no model call is lost by summing per file. But it means "frames" and "model
+// calls" are not proportional, and a per-frame average computed off `frames` will be wrong
+// by that factor. Use `framesWithModelCalls` for any such average.
+//
+// PREFIX-CACHE PROXY, and why it is a proxy. Ollama's `prompt_eval_duration` and
+// `load_duration` are NOT logged: `token_usage` (agent.ts:1527) carries only
+// prompt_tokens, generated_tokens, num_ctx, eval_duration_ms, total_duration_ms —
+// confirmed, all 2948 September events have exactly those keys. `prompt_eval_cached_count`
+// is null in this Ollama build. So the requested prompt_eval_duration/prompt_eval_count
+// ratio cannot be computed cleanly. The closest derivable quantity is
+//
+//   promptMsPerToken ≈ (total_duration_ms − eval_duration_ms) / prompt_tokens
+//
+// which is an UPPER BOUND: the numerator also contains load_duration and any queueing.
+// Sanity-checked over all 2948 September events — 0 negatives, mean 0.41 ms/token, min
+// ~0.0000 (the cache-hit signature), max 62.3 (a cold model load dominating). Bucketed
+// below so cache reuse is visible as a distribution rather than a single mean. A clean
+// measurement needs one line added to agent.ts:1534's event: `prompt_eval_duration_ms`
+// and `load_duration_ms` from the same `response` object that already supplies the other
+// two. Until then this field is labelled `promptMsPerTokenUpperBound`.
+export const CACHE_BUCKETS = [
+  ['reuseNearTotal', 0, 0.02],   // prompt eval essentially free — prefix served from cache
+  ['reuseHigh', 0.02, 0.1],
+  ['reuseMid', 0.1, 0.5],
+  ['reuseLow', 0.5, 2],
+  ['reuseNone', 2, Infinity],    // cold prefix, or a model load inside the window
+];
+
+// ── Frame outcomes, read from the LEDGER (BATCH 2 / H13) ─────────────────────────────
+// `deriveFrameResult` (dispatch.ts:242) now maps the frame's TERMINAL STATE to a status:
+// cap → 'partial', error → 'failed', aborted → 'killed', ok → 'gave_up'|'success'. That
+// status reaches disk only in `.argo/ledger.jsonl` as a `conclusion` entry
+// (types.ts:191-201) — it is NOT in the JSONL event stream — so it must be read from the
+// ledger copy e2e.mjs already saves per run.
+//
+// THIS IS THE DIRECT FIELD MEASUREMENT OF H13. The baseline it replaces: 43 frames across
+// the September corpus ended blank at their iteration cap and were recorded `success`
+// (Planner 9/23 = 39%, Boss 26/204, Implementer 6/61, Tester 2/85, single-loop 7/194).
+// Any `partial` count above zero is a frame that would previously have been credited.
+//
+// Note conclusions are counted per RECORD, not per frame: a Planner that needed the H17
+// format retry writes TWO conclusions for the same frameId (observed on the first live
+// run), so `conclusions` and `distinctFrames` legitimately differ, and `resumed` is their
+// difference. A delegation with no conclusion at all means the frame never returned — on
+// the first live run the second Implementer delegation was still running when the eval
+// timeout fired, so `delegationsWithoutConclusion` is 1 there. That is a real signal about
+// truncation and is reported rather than smoothed over.
+export const FRAME_STATUSES = ['success', 'partial', 'failed', 'gave_up', 'killed', 'restarted'];
+
+export function frameOutcomes(ledgerPath) {
+  const out = {
+    available: false, conclusions: 0, distinctFrames: 0, resumed: 0,
+    delegations: 0, delegationsWithoutConclusion: 0, standups: 0, injections: 0, episodes: 0,
+    byStatus: Object.fromEntries(FRAME_STATUSES.map(s => [s, 0])),
+    unknownStatus: [], byRole: {},
+  };
+  if (!ledgerPath) return out;
+  let lines;
+  try { lines = readFileSync(ledgerPath, 'utf8').split('\n'); } catch { return out; }
+  out.available = true;
+  const concludedFrames = new Set(), delegatedFrames = new Set();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let e; try { e = JSON.parse(line); } catch { continue; }
+    switch (e.kind) {
+      case 'conclusion': {
+        out.conclusions++;
+        if (e.frameId) concludedFrames.add(e.frameId);
+        const st = e.status;
+        if (Object.prototype.hasOwnProperty.call(out.byStatus, st)) out.byStatus[st]++;
+        else if (out.unknownStatus.length < 5) out.unknownStatus.push(String(st));
+        // Role is the frameId prefix (frames.ts ids are `<role>-<rand>-<n>`), which lets
+        // "which ROLE hits its cap" be answered — the September breakdown showed the
+        // Planner failing this way 4x more often than any other role.
+        const role = typeof e.frameId === 'string' ? e.frameId.split('-')[0] : 'unknown';
+        out.byRole[role] = out.byRole[role] || Object.fromEntries(FRAME_STATUSES.map(s => [s, 0]));
+        if (Object.prototype.hasOwnProperty.call(out.byRole[role], st)) out.byRole[role][st]++;
+        break;
+      }
+      case 'delegation': out.delegations++; if (e.frameId) delegatedFrames.add(e.frameId); break;
+      case 'standup': out.standups++; break;
+      case 'injection': out.injections++; break;
+      case 'episode': out.episodes++; break;
+      default: break;
+    }
+  }
+  out.distinctFrames = concludedFrames.size;
+  out.resumed = Math.max(0, out.conclusions - concludedFrames.size);
+  out.delegationsWithoutConclusion = [...delegatedFrames].filter(f => !concludedFrames.has(f)).length;
+  return out;
+}
 
 /**
  * Assert every pattern against its own known sample, and assert first-match uniqueness.
@@ -165,15 +345,41 @@ export function selfCheckCounters() {
   const failures = [];
   const check = (list, label) => {
     for (const spec of list) {
+      if (!spec.sample) continue;   // LADDER_FALLBACK carries no sample: see below
       if (!spec.re.test(spec.sample)) failures.push(`${label}.${spec.key}: pattern does not match its own sample (src ${spec.src})`);
-      const firstHit = list.find(s => s.re.test(spec.sample));
+      const firstHit = list.find(s => s.sample && s.re.test(spec.sample));
       if (firstHit && firstHit.key !== spec.key) failures.push(`${label}.${spec.key}: sample is claimed first by ${label}.${firstHit.key} — reorder or tighten`);
     }
   };
   check(WARNING_INTERVENTIONS, 'warning');
   check(REJECTION_INTERVENTIONS, 'rejection');
-  if (!CAP_HIT_RE.test('Reached maximum iterations (60) without a final answer.')) failures.push('capHit: pattern does not match its own sample (agent.ts:1801)');
+  // The ladder fallback is asserted against its own historical samples, and — the point of
+  // the BATCH 2 change — the primary path is asserted to be the FIELD, by checking that no
+  // ladder key remains in WARNING_INTERVENTIONS. If someone re-adds a prose ladder pattern
+  // there, this fails loudly rather than quietly shadowing the field.
+  const ladderSamples = {
+    loopL0: 'You just issued the EXACT same `bash` call that already ran, with nothing changed since. STOP repeating it — take a DIFFERENT concrete action toward the current task, or, if it is truly already done, say so.\n\nrecite',
+    loopL1: 'Your context was just compacted to help you refocus. You have repeated the same `bash` call several times with no progress. You must change your approach now — do not repeat this call again.\n\nrecite',
+    loopL2: 'You have repeatedly looped on `bash` without any progress. ABANDON this approach. Produce a revised plan now for solving the current task a different way.\n\nrecite',
+  };
+  for (const spec of LADDER_FALLBACK) {
+    const s = ladderSamples[spec.key];
+    if (!s) { failures.push(`ladder.${spec.key}: no historical sample defined`); continue; }
+    if (!spec.re.test(s)) failures.push(`ladder.${spec.key}: fallback pattern does not match its own historical sample (src ${spec.src})`);
+  }
+  for (const k of ['loopL0', 'loopL1', 'loopL2']) {
+    if (WARNING_INTERVENTIONS.some(s => s.key === k)) {
+      failures.push(`warning.${k}: the loop ladder must be read from warning.level (types.ts:85), not from prose — remove this pattern from WARNING_INTERVENTIONS`);
+    }
+  }
+  if (!CAP_HIT_RE.test('Reached maximum iterations (60) without a final answer.')) failures.push('capHit: pattern does not match its own sample (agent.ts:1978)');
+  if (!PLANNING_FAILED_RE.test('Planning failed: the Planner produced no readable task graph for this objective, even after an explicit format retry (initial plan; frame planner-x-8 ended: ok). No plan was invented in its place.')) failures.push('planningFailed: pattern does not match its own sample (dispatch.ts:606)');
+  if (!UNEXPECTED_ERROR_RE.test('Unexpected error: socket hang up')) failures.push('unexpectedError: pattern does not match its own sample (agent.ts:1992 / dispatch.ts:679)');
   if (!EVICTION_RE.test('deterministic eviction: stubbed 3 episode(s) (recoverable via ledger expand)')) failures.push('eviction: pattern does not match its own sample (agent.ts:663)');
+  // Frame statuses must stay in step with types.ts:125's FrameStatus union.
+  for (const s of ['success', 'partial', 'failed', 'gave_up', 'killed', 'restarted']) {
+    if (!FRAME_STATUSES.includes(s)) failures.push(`frameStatus: ${s} missing from FRAME_STATUSES (types.ts:125)`);
+  }
   return { ok: failures.length === 0, failures };
 }
 
@@ -204,15 +410,26 @@ export function runMetrics(logsDir, ws, newFiles) {
   // Structured-field counters (see the block above) — no pattern, no rot.
   for (const k of ['tasksPlanned', 'tasksReplanned', 'tasksAdvanced', 'bossInject', 'bossRestart',
     'bossEscalate', 'dispatchReplan', 'criticRevise2', 'criticGamedOracle', 'criticTotal',
-    'itersDisagree']) counts[k] = 0;
+    'itersDisagree', 'modelCallsVsItersDisagree', 'ollamaRetry',
+    // BATCH 2: ladder rungs are now field-derived; `ladderFromProse` must be 0 on any run
+    // of `6884852` or later, and non-zero only when re-scraping older logs.
+    'loopL0', 'loopL1', 'loopL2', 'ladderFromProse',
+    'planningFailed', 'unexpectedError']) counts[k] = 0;
 
   let plan = 0, iters = 0, toolCalls = 0, errors = 0, frames = 0;
   let maxCtx = 0, compactions = 0, evictions = 0, genTokens = 0, genMs = 0, topStatus, finalAnswer = '';
   let taskGraphs = 0, taskGraphMaxSteps = 0, taskGraphSingleStep = 0;
+  // MODEL CALLS + TOKEN COST (see the definition block above).
+  let modelCalls = 0, framesWithModelCalls = 0, promptTokens = 0, promptMsSum = 0, promptMsTokens = 0;
+  const cacheBuckets = Object.fromEntries(CACHE_BUCKETS.map(([n]) => [n, 0]));
   const unmatchedSamples = new Set();
+  // Unclassified ERROR messages get the same treatment as unclassified warnings: recorded
+  // verbatim (60 chars) rather than aggregated into an anonymous count, so a new terminal
+  // failure mode is legible from the row instead of needing a log dig.
+  const errorSamples = new Set();
 
   for (const f of newFiles) {
-    let meta = {}, fileIters = 0;
+    let meta = {}, fileIters = 0, fileModelCalls = 0;
     let lines;
     try { lines = readFileSync(path.join(dir, f), 'utf8').split('\n'); } catch { continue; }
     for (const line of lines) {
@@ -225,21 +442,52 @@ export function runMetrics(logsDir, ws, newFiles) {
         case 'compact':
           if (EVICTION_RE.test(e.summary || '')) evictions++; else compactions++;
           break;
-        case 'token_usage':
+        case 'ollama_request': modelCalls++; fileModelCalls++; break;
+        case 'token_usage': {
           maxCtx = Math.max(maxCtx, e.prompt_tokens || 0);
           genTokens += e.generated_tokens || 0;
           genMs += e.eval_duration_ms || 0;
+          // SUMMED prompt tokens — the analogue of Hermes's sessions.input_tokens. Distinct
+          // from maxCtx (the PEAK single-prompt size), which is what the old cost vector
+          // reported and which says nothing about total input cost.
+          const pt = Number(e.prompt_tokens) || 0;
+          promptTokens += pt;
+          if (pt > 0 && e.total_duration_ms != null && e.eval_duration_ms != null) {
+            const d = Number(e.total_duration_ms) - Number(e.eval_duration_ms);
+            if (d >= 0) {
+              const r = d / pt;
+              promptMsSum += d; promptMsTokens += pt;
+              for (const [name, lo, hi] of CACHE_BUCKETS) { if (r >= lo && r < hi) { cacheBuckets[name]++; break; } }
+            }
+          }
           break;
+        }
         case 'error': {
           errors++;
-          if (CAP_HIT_RE.test(e.message || '')) bump('capHit'); else bump('errorsOther');
+          const msg = e.message || '';
+          if (CAP_HIT_RE.test(msg)) bump('capHit');
+          else if (PLANNING_FAILED_RE.test(msg)) bump('planningFailed');
+          else if (UNEXPECTED_ERROR_RE.test(msg)) bump('unexpectedError');
+          else { bump('errorsOther'); if (errorSamples.size < 5) errorSamples.add(msg.slice(0, 60)); }
           break;
         }
         case 'warning': {
           const msg = e.message || '';
+          // FIELD FIRST. `warning.level` (types.ts:85) carries the loop-recovery rung
+          // directly since BATCH 2, so the ladder is no longer reconstructed from prose —
+          // a field cannot silently stop matching. Only when the field is absent (a log
+          // written before `6884852`) does the labelled LADDER_FALLBACK run, and every
+          // such use is counted so the two paths stay distinguishable.
+          if (e.level === 'L0' || e.level === 'L1' || e.level === 'L2') {
+            bump(`loop${e.level}`);
+            break;
+          }
           const hit = WARNING_INTERVENTIONS.find(s => s.re.test(msg));
-          if (hit) bump(hit.key);
-          else { bump('warnUnmatched'); if (unmatchedSamples.size < 5) unmatchedSamples.add(msg.slice(0, 60)); }
+          if (hit) { bump(hit.key); break; }
+          const legacy = LADDER_FALLBACK.find(s => s.re.test(msg));
+          if (legacy) { bump(legacy.key); bump('ladderFromProse'); break; }
+          bump('warnUnmatched');
+          if (unmatchedSamples.size < 5) unmatchedSamples.add(msg.slice(0, 60));
           break;
         }
         case 'tool_result': {
@@ -310,6 +558,12 @@ export function runMetrics(logsDir, ws, newFiles) {
     const metaIters = Number(meta.iterations) || 0;
     if (fileIters && metaIters && fileIters !== metaIters) bump('itersDisagree');
     iters += Math.max(fileIters, metaIters);   // SUM across frames — total LLM-call volume
+    if (fileModelCalls > 0) framesWithModelCalls++;
+    // Third independent check on the same quantity: `ollama_request` events for this frame
+    // against its iteration count. The September corpus says these are equal by
+    // construction (2874 = 2874); a disagreement means the emit sites have diverged and
+    // `modelCalls` should be trusted over `iters`, since it counts the call itself.
+    if (fileModelCalls && fileIters && fileModelCalls !== fileIters) bump('modelCallsVsItersDisagree');
     toolCalls += meta.toolCalls || 0;          // == the frame's own tool_call count (verified 10 == 10)
     if (!FRAME_SESSION_ID.test(meta.sessionId || '')) topStatus = meta.status;
   }
@@ -329,7 +583,10 @@ export function runMetrics(logsDir, ws, newFiles) {
     loopSkip: counts.loopSkip,
     rejectedUnclassified: counts.rejectedUnclassified,
     rejectedUnflagged: counts.rejectedUnflagged,
+    // Field-derived since BATCH 2 (warning.level). `ladderFromProse` > 0 means these came
+    // from the legacy prose fallback, i.e. the log predates `6884852`.
     loopL0: counts.loopL0, loopL1: counts.loopL1, loopL2: counts.loopL2,
+    ladderFromProse: counts.ladderFromProse,
     nearDup: counts.nearDup,
     progressCheck: counts.progressCheck, stall: counts.stall, noProgress: counts.noProgress,
     verifyPass: counts.verifyPass, verifyFail: counts.verifyFail,
@@ -338,6 +595,16 @@ export function runMetrics(logsDir, ws, newFiles) {
     criticRevise: counts.criticRevise, groundingRevise: counts.groundingRevise, layoutRevise: counts.layoutRevise,
     legacySteer: counts.legacySteer, legacyPlanGate: counts.legacyPlanGate,
     capHit: counts.capHit,
+    // BATCH 2 terminal outcomes. `planningFailed` is H13 refusing to invent a one-step
+    // plan; `unexpectedError` is a crash and should always be 0.
+    planningFailed: counts.planningFailed,
+    unexpectedError: counts.unexpectedError,
+    errorsOther: counts.errorsOther,
+    errorsOtherSamples: [...errorSamples],
+    // BATCH 2 warning channels.
+    plannerFormatRetry: counts.plannerFormatRetry,
+    testerNoVerdict: counts.testerNoVerdict,
+    memoryFiltered: counts.memoryFiltered,
     gateRoundTrips,
     // Structured (field-matched, cannot rot). tasksAdvanced != taskAdvance by design —
     // see the note above the STRUCTURED block.
@@ -351,15 +618,41 @@ export function runMetrics(logsDir, ws, newFiles) {
     // being the integrity check this batch replaced. Now that the deterministic gate can
     // fire, disagreement between the two is informative in both directions.
     criticGamedOracle: counts.criticGamedOracle,
-    // Non-zero means the two independent LLM-turn sources disagreed — a log-integrity
-    // signal, not a harness behaviour. Should always be 0.
+    // Non-zero means two independent counts of the same quantity disagreed — a
+    // log-integrity signal, not a harness behaviour. Both should always be 0.
     itersDisagree: counts.itersDisagree,
+    modelCallsVsItersDisagree: counts.modelCallsVsItersDisagree,
+    ollamaRetry: counts.ollamaRetry,
     warnUnmatched: counts.warnUnmatched,
     warnUnmatchedSamples: [...unmatchedSamples],
     infraWarn: counts.infraWarn,
   };
 
-  const cost = { iters, toolCalls, frames, wallMs: null, genTokens, tokPerSec, maxCtx, compactions, evictions, peakRssMb: null };
+  // ── COST VECTOR ─────────────────────────────────────────────────────────────────────
+  // `modelCallsTotal` and `promptTokensTotal` are the two CONFOUND-FREE cost numbers: they
+  // do not care about Docker, host access, --yolo, CPU/GPU split, or a model reload, all of
+  // which corrupt wall-clock. Wall clock is still recorded, but it is now the aside and
+  // these are the headline.
+  const auxModelCalls = counts.criticTotal;          // one ollama.chat per `critic` event
+  const modelCallsTotal = modelCalls + counts.ollamaRetry + auxModelCalls;
+  const cost = {
+    // THE comparable number. Same field name and same definition on the Hermes side.
+    modelCallsTotal,
+    modelCalls,                     // `ollama_request` events (main-loop model calls)
+    ollamaRetries: counts.ollamaRetry,
+    auxModelCalls,                  // critic/grounding checkpoints, off the main loop
+    modelCallSource: 'argo: ollama_request events + chatWithRetry retries + critic events',
+    promptTokensTotal: promptTokens,   // analogue of Hermes sessions.input_tokens
+    genTokens,                         // analogue of Hermes sessions.output_tokens
+    maxCtx,                            // PEAK single prompt, not a total — kept, not conflated
+    // Upper bound: the numerator includes load_duration, which is not logged. See the
+    // definition block above for the one-line src/ change that would make it exact.
+    promptMsPerTokenUpperBound: promptMsTokens > 0 ? Math.round((promptMsSum / promptMsTokens) * 1000) / 1000 : null,
+    cacheReuse: cacheBuckets,
+    cacheReuseNote: 'derived from (total_duration_ms - eval_duration_ms)/prompt_tokens; prompt_eval_duration and prompt_eval_cached_count are not available in this Ollama build',
+    iters, toolCalls, frames, framesWithModelCalls,
+    wallMs: null, tokPerSec, compactions, evictions, peakRssMb: null,
+  };
 
   // Decomposition width, recorded now because it is free and because it is BATCH 2's exit
   // criterion (">= 2 steps and >= 2 implementer delegations"). Measured baseline to beat:
@@ -369,5 +662,6 @@ export function runMetrics(logsDir, ws, newFiles) {
   return {
     status: topStatus, finalAnswer, plan, errors, cost, friction, decomposition,
     iters, toolCalls, frames, maxCtx, compactions, evictions, tokPerSec,
+    modelCallsTotal, promptTokensTotal: promptTokens,
   };
 }

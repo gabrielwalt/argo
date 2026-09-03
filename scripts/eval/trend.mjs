@@ -152,19 +152,48 @@ for (const version of versionsPresent) {
       );
     }
 
-    // Speed ratio, reported only WITHIN one rubric version and only between rows that
-    // actually say which harness produced them. Wall-clock is no longer part of the score
-    // (EVAL-PLAN §3.1) — this is a cost comparison, and it is untrustworthy while the
-    // 5-8x per-iteration anomaly (§1.6a) is unexplained and Argo's turn budget is
-    // uncapped against Hermes's 60, so both caveats are printed with it.
+    // ── HEAD-TO-HEAD COST ──────────────────────────────────────────────────────────────
+    // MODEL CALLS and INPUT TOKENS first, wall clock demoted to a trailing aside.
+    //
+    // Why the demotion: wall clock is confounded by Docker-vs-host isolation, by Hermes's
+    // `--yolo --ignore-rules`, by the 900-vs-1800 timeout asymmetry (now equalised), and by
+    // a suspected Ollama model-reload slowdown that produced an unexplained 5-8x
+    // per-iteration swing in the same dataset (EVAL-PLAN §1.6a). Model calls and tokens are
+    // confound-free: they do not care about containers or hardware.
+    //
+    // The two harnesses' `modelCallsTotal` are defined to match, and BOTH definitions are
+    // stated in code rather than assumed — Argo's in metrics.mjs (ollama_request events +
+    // chatWithRetry retries + critic calls), Hermes's in hermes.mjs
+    // (sessions.api_call_count). `modelCallSource` on every row says which was used, and is
+    // printed here, because a comparison of two differently-defined "turns" would be worse
+    // than none.
     const argoRuns = taskRows.filter(r => harnessOf(r) === 'argo');
     const hermesRuns = taskRows.filter(r => harnessOf(r) === 'hermes');
     if (argoRuns.length && hermesRuns.length) {
+      const avg = (rs, f) => { const v = rs.map(r => r.cost?.[f]).filter(x => x != null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; };
+      const ac = avg(argoRuns, 'modelCallsTotal'), hc = avg(hermesRuns, 'modelCallsTotal');
+      const ai = avg(argoRuns, 'promptTokensTotal'), hi = avg(hermesRuns, 'promptTokensTotal');
+      const ratio = (a, b) => (a != null && b != null && b > 0 ? `${(a / b).toFixed(1)}x` : 'n/a');
+      if (ac != null || hc != null) {
+        console.log(pad('', 26) + `MODEL CALLS argo ${ac == null ? '?' : Math.round(ac)} vs hermes ${hc == null ? '?' : Math.round(hc)} = ${ratio(ac, hc)}`
+          + `   INPUT TOKENS argo ${ai == null ? '?' : Math.round(ai)} vs hermes ${hi == null ? '?' : Math.round(hi)} = ${ratio(ai, hi)}`);
+        const srcs = [...new Set([...argoRuns, ...hermesRuns].map(r => r.cost?.modelCallSource).filter(Boolean))];
+        if (srcs.length) console.log(pad('', 26) + `  definitions: ${srcs.join(' | ')}`);
+        if (ac == null || hc == null) console.log(pad('', 26) + '  INCOMPLETE — one side has no model-call record; a null is not a 0.');
+      }
+      // Cache reuse on both sides, since a shared miss is a shared inefficiency.
+      const hCache = avg(hermesRuns, 'cacheReadTokens');
+      const aNear = argoRuns.reduce((a, r) => a + (r.cost?.cacheReuse?.reuseNearTotal ?? 0), 0);
+      const aAll = argoRuns.reduce((a, r) => a + Object.values(r.cost?.cacheReuse ?? {}).reduce((x, y) => x + y, 0), 0);
+      if (hCache != null || aAll > 0) {
+        console.log(pad('', 26) + `  prefix-cache reuse: hermes cache_read_tokens ${hCache == null ? '?' : Math.round(hCache)}`
+          + `; argo ${aAll ? `${aNear}/${aAll} call(s) at near-total reuse (${Math.round(100 * aNear / aAll)}%)` : 'n/a'}`);
+      }
+      // Wall clock, last, with its caveats attached rather than implied.
       const a = last(argoRuns)?.wallMs, h = last(hermesRuns)?.wallMs;
       if (a && h) {
-        const ratio = a / h;
-        console.log(pad('', 26) + `cost ratio (argo/hermes wall): ${ratio.toFixed(2)}x (target <= ${SPEED_TARGET}x — ${ratio <= SPEED_TARGET ? 'OK' : 'OVER'});`
-          + ` UNTRUSTWORTHY unless the runs were not interleaved and turn budgets were equal (Argo turns=${last(argoRuns)?.iters ?? '?'} vs Hermes max_turns=${last(hermesRuns)?.maxIterations ?? '?'})`);
+        const r = a / h;
+        console.log(pad('', 26) + `  aside — wall ${r.toFixed(2)}x (target <= ${SPEED_TARGET}x, ${r <= SPEED_TARGET ? 'OK' : 'OVER'}): CONFOUNDED by Docker vs host, --yolo, and the §1.6a reload anomaly. Prefer the call/token ratios above.`);
       }
     }
   }

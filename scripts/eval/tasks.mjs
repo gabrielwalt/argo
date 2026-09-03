@@ -213,6 +213,17 @@ export function rubricScore({ gate, targetedFraction, qualityPoints, passRate })
 //   allowFiles the source files the task legitimately asks to be changed. Feeds the
 //              unrequested-diff half of the quality score (gates.mjs). Absent ⇒ the paths
 //              are extracted from the prompt, which is weaker; prefer explicit.
+//   allowTrackedTestEdits
+//              exact paths of baseline-TRACKED test files this task may modify. DEFAULT
+//              (absent or []) IS NONE — any change to a tracked test file voids the run.
+//              Only `CHANGED` is ever permitted, never DELETED or RENAMED. Added after the
+//              gate correctly voided `bigproj-observability` for stripping `export` from
+//              `test/helpers.js`'s `makeService`, which the seeded audit-log spec imports:
+//              that void was right, but the same blanket rule would make a task that
+//              genuinely needs a helper change unsatisfiable, and an unsatisfiable task is
+//              worse than an absent gate. Widening it is therefore a per-file, reviewable
+//              declaration rather than a global setting. Nothing in the catalog declares
+//              any path today.
 //
 // `check` is LEGACY (rubric v1): it is still executed and recorded as `legacyCheck` so
 // binary pass/fail stays comparable with the 33 pre-BATCH-1 rows, but it no longer feeds
@@ -297,7 +308,15 @@ export const TASKS = [
   // exposed the Planner trap. Reproducible (src/export.js is committed at bigproj's
   // eval-baseline, verified byte-identical to the now-deleted fixtures/bigproj-export-
   // stub.js).
+  // allowTrackedTestEdits is deliberately EMPTY, verified on the host: the seeded
+  // audit-log spec imports `makeService` from the baseline `test/helpers.js`, and the
+  // baseline `makeService()` already returns what that spec needs — so the task is
+  // satisfiable with no helper change at all. The first live run stripped `export` from
+  // `makeService`/`advancingClock` there and appended its own tests to
+  // `test/service.test.js` instead of satisfying the three seeded specs; the integrity gate
+  // voided it, correctly. Do not widen this without re-verifying that claim.
   { id: 'bigproj-observability', ws: 'bigproj', band: 'mid', observed: 0.5,
+    allowTrackedTestEdits: [],
     allowFiles: ['src/export.js', 'src/service.js', 'src/store.js'],
     testFile: ['test/export.test.js', 'test/audit-log.test.js', 'test/event-hook.test.js'],
     setup: () => `cp "${path.join(FIXTURES, 'bigproj-export.test.js')}" test/export.test.js && cp "${path.join(FIXTURES, 'bigproj-audit-log.test.js')}" test/audit-log.test.js && cp "${path.join(FIXTURES, 'bigproj-event-hook.test.js')}" test/event-hook.test.js`,

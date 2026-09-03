@@ -25,7 +25,14 @@
  *   ARGO_PASSWORD=... npm run eval:e2e
  *   ARGO_PASSWORD=... EVAL_MODELS="qwen3.6:latest,<candidate>" EVAL_RUNS=2 npm run eval:e2e
  * Env: ARGO_URL(http://localhost:3000) ARGO_PASSWORD(req) ARGO_LOGS_DIR(~/.local/share/argo/logs)
- *   ARGO_WS_ROOT(~/Sources/test) EVAL_MODELS EVAL_RUNS EVAL_MAX_ITER(60) EVAL_TIMEOUT_S(900)
+ *   ARGO_WS_ROOT(~/Sources/test) EVAL_MODELS EVAL_RUNS(3) EVAL_MAX_ITER(60) EVAL_TIMEOUT_S(1800)
+ *
+ * EVAL_TIMEOUT_S defaults to 1800 here and in hermes.mjs — the SAME value, deliberately.
+ * It was 900 vs 1800, which handed Hermes twice Argo's wall clock in every default-
+ * configuration comparison, and it cut a real run off at 901s of a 900s budget and recorded
+ * it as TIMEOUT — an agent failure that was a measurement artefact. This is the timeout
+ * governing how long the eval WAITS for the worker to go idle; on expiry it also POSTs
+ * /stop, so it is a real cutoff, not just a polling limit.
  */
 import { readFileSync, readdirSync, statSync, mkdirSync, copyFileSync, existsSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -40,7 +47,7 @@ import {
   runTests, checkIntegrity, checkRegression, seedTargets,
   unrequestedDiffRatio, allowedFilesFor,
 } from './gates.mjs';
-import { runMetrics, listJsonlFiles, selfCheckCounters } from './metrics.mjs';
+import { runMetrics, listJsonlFiles, selfCheckCounters, frameOutcomes } from './metrics.mjs';
 import { judgeRun } from './quality-judge.mjs';
 
 const URL_BASE = process.env.ARGO_URL || 'http://localhost:3000';
@@ -62,7 +69,12 @@ const RUNS = Math.max(1, Number(process.env.EVAL_RUNS || 3));
 const JUDGE_ON = !['0', 'false', 'off', 'no'].includes((process.env.EVAL_JUDGE || '1').trim().toLowerCase());
 const STRICT_EXTRA_TESTS = ['1', 'true', 'on', 'yes'].includes((process.env.EVAL_STRICT_EXTRA_TESTS || '').trim().toLowerCase());
 const MAX_ITER = Number(process.env.EVAL_MAX_ITER || 60);
-const TIMEOUT_S = Number(process.env.EVAL_TIMEOUT_S || 900);
+// 1800 to MATCH hermes.mjs's default. It was 900 here against Hermes's 1800, so every
+// default-configuration comparison silently gave Hermes twice the wall clock — and a
+// bigproj-observability run was cut off at 901s of a 900s budget, recorded as TIMEOUT,
+// which looked like an agent failure and was a measurement artefact. Equal budgets are a
+// precondition for the comparison meaning anything; see docs/research/07-evaluation-methodology.md.
+const TIMEOUT_S = Number(process.env.EVAL_TIMEOUT_S || 1800);
 const LOGS_DIR = process.env.ARGO_LOGS_DIR || path.join(os.homedir(), '.local/share/argo/logs');
 // Multi-agent's per-workspace ledger (.argo/ledger.jsonl — delegation/conclusion/
 // standup/injection entries, the authoritative record of WHICH frames ran and what
@@ -238,7 +250,7 @@ for (const model of MODELS) {
       let gates = { ok: false, violations: ['gate-not-evaluated'], warnings: [], checks: {} };
       let targeted = null, targetedFraction = null, legacyCheck = null, quality = null;
       let effective = null, ledgerPath = null, diffInfo = { path: null, text: null }, judgment = null;
-      let ollamaAtStart = null, err = null;
+      let ollamaAtStart = null, err = null, frames = null;
       try {
         if (task.setup) sh(task.setup(wsDir), wsDir);  // seed the failing test
 
@@ -330,6 +342,11 @@ for (const model of MODELS) {
 
         // ── QUALITY (20 pts): saved artifacts must be captured BEFORE the final reset ──
         ledgerPath = saveLedger(task.ws, runId);
+        // FRAME OUTCOMES (BATCH 2 / H13). Read from the ledger, not the event stream —
+        // `deriveFrameResult`'s status is only written there. `partial` is the direct field
+        // measurement of H13: the baseline it replaces is 43 September frames that ended
+        // blank at their cap and were recorded `success`.
+        frames = frameOutcomes(ledgerPath);
         diffInfo = saveDiff(task.ws, runId, baselines[task.ws]);
         const allowed = allowedFilesFor(task);
         const unreq = diffInfo.text == null ? null
@@ -365,12 +382,33 @@ for (const model of MODELS) {
         + ` it=${pad(m.iters ?? '?', 3)} tool=${pad(m.toolCalls ?? '?', 3)} frames=${pad(m.frames ?? '?', 2)} plan=${m.plan ?? '?'}`
         + ` | g=${pad(f.planGate ?? '?', 2)} role=${pad(f.roleReject ?? '?', 3)} L0/1/2=${f.loopL0 ?? '?'}/${f.loopL1 ?? '?'}/${f.loopL2 ?? '?'}`
         + ` dup=${pad(f.nearDup ?? '?', 3)} v+/-=${f.verifyPass ?? '?'}/${f.verifyFail ?? '?'} rt=${pad(f.gateRoundTrips ?? '?', 3)} cap=${f.capHit ?? '?'} w?=${f.warnUnmatched ?? '?'}`
-        + ` | wall=${pad(secs(m.wallMs), 6)} tok/s=${pad(m.tokPerSec ?? '?', 4)} ctx≈${pad(m.maxCtx ?? '?', 6)} cmp/ev=${m.compactions ?? '?'}/${m.evictions ?? '?'} rss=${pad((m.peakRssMb ? m.peakRssMb + 'MB' : '?'), 7)}`
+        // BATCH 2 columns. part= is H13's field measurement (frames that hit their cap and
+        // are no longer credited as success); pretry= is H17's Planner format retry;
+        // tnv= is the Tester's missing-verdict escalation; pfail= is planning that stopped
+        // rather than inventing a one-step plan; steps= is decomposition width.
+        + ` | part=${pad(frames?.byStatus?.partial ?? '?', 2)} fail=${pad(frames?.byStatus?.failed ?? '?', 2)} nocon=${pad(frames?.delegationsWithoutConclusion ?? '?', 2)}`
+        + ` pretry=${f.plannerFormatRetry ?? '?'} tnv=${f.testerNoVerdict ?? '?'} pfail=${f.planningFailed ?? '?'} steps=${m.decomposition?.taskGraphMaxSteps ?? '?'}`
+        // COST — model calls and input tokens first, because they are confound-free; wall
+        // clock trails as the aside it now is.
+        + ` | calls=${pad(m.modelCallsTotal ?? '?', 3)} tok(in/out)=${pad(m.promptTokensTotal ?? '?', 7)}/${pad(m.cost?.genTokens ?? '?', 6)}`
+        + ` wall=${pad(secs(m.wallMs), 6)} tok/s=${pad(m.tokPerSec ?? '?', 4)} ctx≈${pad(m.maxCtx ?? '?', 6)} cmp/ev=${m.compactions ?? '?'}/${m.evictions ?? '?'} rss=${pad((m.peakRssMb ? m.peakRssMb + 'MB' : '?'), 7)}`
         + `${err ? '  ERR: ' + err : ''}`,
       );
       for (const v of gates.violations) console.log(`      GATE ${v}`);
       for (const w2 of gates.warnings) console.log(`      note ${w2}`);
-      if (f.warnUnmatched) console.log(`      unmatched warning prefixes: ${JSON.stringify(f.warnUnmatchedSamples)}`);
+      // Both of these are TRIPWIRES: an unmatched message means a counter has gone blind to
+      // a wording src/ now emits, which is how two metrics died silently for two months.
+      // They print the offending prefixes so the fix is a copy-paste into metrics.mjs.
+      if (f.warnUnmatched) console.log(`      !! UNMATCHED WARNING (counter blind spot) ${JSON.stringify(f.warnUnmatchedSamples)}`);
+      if (f.errorsOther) console.log(`      !! UNCLASSIFIED ERROR ${JSON.stringify(f.errorsOtherSamples)}`);
+      if (f.ladderFromProse) console.log(`      note loop ladder counted from PROSE (${f.ladderFromProse}) — this log predates 6884852's warning.level field`);
+      if (f.unexpectedError) console.log(`      !! ${f.unexpectedError} UNEXPECTED ERROR(S) — a crash, not agent behaviour`);
+      if (frames && frames.available) {
+        const st = Object.entries(frames.byStatus).filter(([, n]) => n > 0).map(([k, n]) => `${k}=${n}`).join(' ');
+        console.log(`      frames ${st || '(none concluded)'} · ${frames.delegations} delegation(s), ${frames.resumed} resume(s)`
+          + (frames.delegationsWithoutConclusion ? `, ${frames.delegationsWithoutConclusion} NEVER CONCLUDED` : '')
+          + (frames.unknownStatus.length ? ` · UNKNOWN STATUS ${JSON.stringify(frames.unknownStatus)} — types.ts FrameStatus changed` : ''));
+      }
 
       const row = {
         ts: new Date().toISOString(), batchId: BATCH_ID, runId, runIndex: i + 1, k: RUNS,
@@ -393,18 +431,26 @@ for (const model of MODELS) {
           ? { pass: targeted.pass, fail: targeted.fail, total: targeted.total, fraction: targeted.fraction, reporter: targeted.reporter, cmd: targeted.cmd }
           : { pass: null, fail: null, total: null, fraction: targetedFraction, reporter: null, cmd: null },
         quality,
+        // Spread metrics.mjs's cost vector rather than re-listing fields: it is the single
+        // definition of the cost metrics (modelCallsTotal, promptTokensTotal, cacheReuse,
+        // …) and re-enumerating them here is how a new field silently fails to reach the
+        // ledger. Only the host-sampled values, which metrics.mjs cannot see, are added.
         cost: {
-          wallMs: m.wallMs ?? null, iters: m.iters ?? null, toolCalls: m.toolCalls ?? null,
-          frames: m.frames ?? null, genTokens: m.cost?.genTokens ?? null, tokPerSec: m.tokPerSec ?? null,
-          maxCtx: m.maxCtx ?? null, compactions: m.compactions ?? null, evictions: m.evictions ?? null,
+          ...(m.cost ?? {}),
+          wallMs: m.wallMs ?? null,
           peakRssMb: m.peakRssMb ?? null, procSplit: m.procSplit ?? null, sizeStr: m.sizeStr ?? null,
           ollamaAtStart,
         },
         friction: m.friction ?? null,
         // Decomposition width — free to record, and it is BATCH 2's exit criterion.
         // Baseline to beat, measured over the September logs: 84 of 85 task graphs had
-        // exactly one step.
+        // exactly one step. First post-BATCH-2 live run: 3 steps.
         decomposition: m.decomposition ?? null,
+        // BATCH 2 / H13 frame outcomes, from the ledger. `frameOutcomes.byStatus.partial`
+        // is the first-class number: how many frames hit their cap and are no longer
+        // credited as `success`. Baseline being replaced: 43 such frames in September, all
+        // recorded success (Planner 9/23 = 39%).
+        frameOutcomes: frames,
         counterSelfCheck: counterCheck.ok ? 'ok' : 'FAIL',
         status: m.status ?? null, plan: m.plan ?? null,
         // Repaired in place under their ORIGINAL names so existing jq/eval-log recipes
@@ -432,7 +478,49 @@ for (const model of MODELS) {
 // else; that is the point.
 console.log('=== per-task scorecard (rubric v2: 60 targeted correctness + 20 quality + 20 reliability) ===');
 console.log(pad('model', 18) + pad('task', 24) + pad('band', 8) + pad('n', 3) + pad('pass', 6) + pad('c/60', 7) + pad('q/20', 7) + pad('rel/20', 8) + pad('TOTAL', 7) + 'wall mean  flags');
-const batchTotals = new Map(MODELS.map(mm => [mm, { scored: [], mid: 0, pass: 0, n: 0, voided: 0 }]));
+// ── Band verdicts (BATCH 1b item 3) ───────────────────────────────────────────────────
+// The first live run printed `out-of-band (declared mid), floor` for bigproj-observability.
+// Diagnosis: that was the FLAG being wrong, not the label. It ran at k=1, the single run was
+// gate-voided, so the measured pass rate was 0/1 — and declaring a task out of its band from
+// one sample is precisely the n=1 inference this whole programme exists to remove. A label
+// churned on n=1 evidence is worse than a stale label, because it destroys the record of
+// what the task was believed to be.
+//
+// So the verdict is now ESTIMABLE-GATED and, when estimable, LOUD:
+//   k < 3   → no band verdict at all, only `band n/e (k=<n>)`. Same rule as the composite
+//             score, which is already null below k=3 for the same reason.
+//   k >= 3  → the measured band is computed and compared with the declaration; a mismatch
+//             is its own console line, counted at batch level, and sets a non-zero exit
+//             code — the same treatment as the counter self-check, because a wrong band
+//             label makes the difficulty distribution unreadable and the distribution is
+//             the one thing the suite exists to show.
+// No declaration is edited here: `observed` values are priors from pre-BATCH-1 runs and
+// remain the best available until a k>=3 battery replaces them. When one does, the exit code
+// is how you find out which ones to change.
+//
+// The boundaries are EVAL-PLAN §3.2's, widened so that the four pass rates actually
+// achievable at k=3 each land in exactly one band. §3.2's literal ranges do not: at k=3 the
+// only possible values are 0, 1/3, 2/3 and 1, and 1/3 = 0.333 falls outside its `hard`
+// [0.1, 0.3] — so every hard task would have been reported as a mismatch by arithmetic
+// rather than by behaviour. `hard` is therefore [0.1, 0.35]. `floor` and `easy` both contain
+// 1.0 by design (a floor probe is an easy task that must never fail); they are disambiguated
+// by `scored`, not by the rate, so a task is judged only against ITS OWN declared range
+// instead of being assigned a single derived name.
+const BAND_RANGES = {
+  floor: [1.0, 1.0],
+  easy: [0.85, 1.0],
+  mid: [0.4, 0.7],
+  hard: [0.1, 0.35],
+  ceiling: [0.0, 0.05],
+};
+// null when the band name is unknown — an unknown declaration is a mismatch of a different
+// kind and is reported as such rather than silently passing.
+const inBand = (band, p) => {
+  const r = BAND_RANGES[band];
+  return r ? (p >= r[0] && p <= r[1]) : null;
+};
+const bandsContaining = (p) => Object.entries(BAND_RANGES).filter(([, r]) => p >= r[0] && p <= r[1]).map(([n]) => n);
+const batchTotals = new Map(MODELS.map(mm => [mm, { scored: [], mid: 0, pass: 0, n: 0, voided: 0, bandMismatch: [] }]));
 for (const model of MODELS) {
   for (const task of SUITE) {
     const rs = rows.filter(r => r.model === model && r.taskId === task.id);
@@ -450,9 +538,30 @@ for (const model of MODELS) {
     if (passRate === 1) flags.push('saturated');
     if (passRate === 0) flags.push('floor');
     if (passRate >= 0.4 && passRate <= 0.7) flags.push('MID BAND');
-    if (task.band && ((task.band === 'mid') !== (passRate >= 0.4 && passRate <= 0.7))) flags.push(`out-of-band (declared ${task.band})`);
+    // Band verdict: only when k >= 3 (see BAND_RANGES above for why).
+    let bandVerdict = null;
+    if (rs.length < 3) {
+      flags.push(`band n/e (k=${rs.length})`);
+    } else if (task.band) {
+      const ok = inBand(task.band, passRate);
+      if (ok === null) {
+        bandVerdict = `unknown band name "${task.band}"`;
+        flags.push(`BAND MISMATCH: declared band "${task.band}" is not one of ${Object.keys(BAND_RANGES).join('/')}`);
+      } else if (!ok) {
+        const also = bandsContaining(passRate);
+        bandVerdict = `p=${passRate.toFixed(2)}${also.length ? ` (in ${also.join('/')})` : ' (in no declared band)'}`;
+        flags.push(`BAND MISMATCH: declared ${task.band} [${BAND_RANGES[task.band].join('-')}], measured ${bandVerdict}`);
+      }
+    }
     if (agg.incomplete.length) flags.push(`no total: missing ${agg.incomplete.join('+')}`);
     if (rs.some(r => r.friction && r.friction.warnUnmatched > 0)) flags.push('unmatched warnings');
+    if (rs.some(r => r.friction && r.friction.unexpectedError > 0)) flags.push('CRASH');
+    const partials = rs.reduce((a, r) => a + (r.frameOutcomes?.byStatus?.partial ?? 0), 0);
+    if (partials) flags.push(`${partials} partial frame(s)`);
+    if (rs.some(r => r.friction && r.friction.plannerFormatRetry > 0)) {
+      const pr = rs.filter(r => r.friction && r.friction.plannerFormatRetry > 0).length;
+      flags.push(`planner format retry in ${pr}/${rs.length}`);
+    }
     console.log(
       pad(model, 18) + pad(task.id, 24) + pad(task.band ?? '?', 8) + pad(rs.length, 3)
       + pad(`${rs.filter(r => r.completed).length}/${rs.length}`, 6)
@@ -461,6 +570,7 @@ for (const model of MODELS) {
     );
     const bt = batchTotals.get(model);
     bt.n += rs.length; bt.pass += rs.filter(r => r.completed).length; bt.voided += voided;
+    if (bandVerdict) bt.bandMismatch.push(`${task.id}: declared ${task.band}, measured ${bandVerdict} (${rs.filter(r => r.completed).length}/${rs.length})`);
     if (isScored(task)) {
       if (agg.total != null) bt.scored.push(agg.total);
       if (passRate >= 0.4 && passRate <= 0.7) bt.mid++;
@@ -474,8 +584,60 @@ for (const model of MODELS) {
   console.log(`${pad(model, 22)} ${bt.pass}/${bt.n} run(s) completed · ${bt.voided} voided by a gate · batch score ${batchMean == null ? 'NOT COMPUTABLE' : `${batchMean}/100`} over ${bt.scored.length} scored task(s) · mid-band tasks: ${bt.mid}`);
   // PLAN standing rule: "If the mid-band count is 0, the batch is not a measurement."
   if (bt.mid === 0) console.log(`${pad('', 22)} !! mid-band count is 0 — this batch discriminates nothing. Do not draw conclusions from it (EVAL-PLAN §4.3).`);
-  if (RUNS < 3) console.log(`${pad('', 22)} !! k=${RUNS} < 3 — reliability is not estimable; treat this as a smoke test, never as evidence.`);
+  if (RUNS < 3) console.log(`${pad('', 22)} !! k=${RUNS} < 3 — reliability is not estimable, and no band verdict is issued; smoke test only, never evidence.`);
+  // A wrong band label makes the difficulty distribution unreadable, and the distribution is
+  // the one thing the suite exists to show — so this is not a soft note. Same exit-code
+  // treatment as the counter self-check.
+  if (bt.bandMismatch.length) {
+    console.log(`${pad('', 22)} !! ${bt.bandMismatch.length} BAND MISMATCH(ES) — correct the \`band\`/\`observed\` declarations in tasks.mjs from these measurements:`);
+    for (const b of bt.bandMismatch) console.log(`${pad('', 25)} ${b}`);
+    process.exitCode = 1;
+  }
 }
+// Counter blind spots and crashes get the same exit-code treatment, for the same reason: a
+// silent zero is the failure mode BATCH 1 was built to remove, so it must not be possible to
+// finish a green-looking battery with one in it.
+const anyUnmatched = rows.reduce((a, r) => a + (r.friction?.warnUnmatched ?? 0) + (r.friction?.errorsOther ?? 0), 0);
+const anyCrash = rows.reduce((a, r) => a + (r.friction?.unexpectedError ?? 0), 0);
+if (anyUnmatched) { console.log(`\n!! ${anyUnmatched} unmatched warning/error message(s) across this batch — metrics.mjs has a blind spot. Prefixes are printed per run above.`); process.exitCode = 1; }
+if (anyCrash) { console.log(`!! ${anyCrash} unexpected error(s) — a crash, not agent behaviour.`); process.exitCode = 1; }
+// H13/H17 batch summary — the two Batch 2 hypotheses, as one line each.
+const partialTotal = rows.reduce((a, r) => a + (r.frameOutcomes?.byStatus?.partial ?? 0), 0);
+const framesTotal = rows.reduce((a, r) => a + (r.frameOutcomes?.conclusions ?? 0), 0);
+const retryTotal = rows.reduce((a, r) => a + (r.friction?.plannerFormatRetry ?? 0), 0);
+const pfailTotal = rows.reduce((a, r) => a + (r.friction?.planningFailed ?? 0), 0);
+const graphRows = rows.filter(r => (r.decomposition?.taskGraphs ?? 0) > 0);
+const multiStep = graphRows.filter(r => (r.decomposition?.taskGraphMaxSteps ?? 0) >= 2).length;
+// ── COST SUMMARY (the primary metric) ─────────────────────────────────────────────────
+// Model calls and tokens, per task, in the same layout hermes.mjs prints — so the two
+// scorecards can be read side by side without a join. These are the confound-free numbers:
+// unaffected by Docker, host access, --yolo, CPU/GPU split, or a model reload.
+console.log('\n=== cost (per task, mean over k) — compare with the Hermes scorecard\'s calls/tok columns ===');
+console.log(pad('task', 26) + pad('calls', 8) + pad('tok in', 10) + pad('tok out', 9) + pad('ms/tok*', 9) + pad('tools', 7) + pad('wall', 7) + 'cache reuse (near/high/mid/low/none)');
+for (const task of SUITE) {
+  const rs = rows.filter(r => r.taskId === task.id && r.cost && r.cost.modelCallsTotal != null);
+  if (!rs.length) continue;
+  const avg = (f) => { const v = rs.map(r => r.cost[f]).filter(x => x != null); return v.length ? Math.round(mean(v)) : null; };
+  const cr = ['reuseNearTotal', 'reuseHigh', 'reuseMid', 'reuseLow', 'reuseNone']
+    .map(b => rs.reduce((a, r) => a + (r.cost.cacheReuse?.[b] ?? 0), 0)).join('/');
+  const msTok = mean(rs.map(r => r.cost.promptMsPerTokenUpperBound).filter(x => x != null));
+  console.log(pad(task.id, 26) + pad(avg('modelCallsTotal') ?? '?', 8) + pad(avg('promptTokensTotal') ?? '?', 10)
+    + pad(avg('genTokens') ?? '?', 9) + pad(msTok == null ? '?' : msTok.toFixed(2), 9)
+    + pad(avg('toolCalls') ?? '?', 7) + pad(`${Math.round((avg('wallMs') ?? 0) / 1000)}s`, 7) + cr);
+}
+const bCalls = rows.reduce((a, r) => a + (r.cost?.modelCallsTotal ?? 0), 0);
+const bIn = rows.reduce((a, r) => a + (r.cost?.promptTokensTotal ?? 0), 0);
+const bAux = rows.reduce((a, r) => a + (r.cost?.auxModelCalls ?? 0), 0);
+const bRetry = rows.reduce((a, r) => a + (r.cost?.ollamaRetries ?? 0), 0);
+console.log(`\nBATCH COST — ${bCalls} model call(s) (${bCalls - bAux - bRetry} main-loop + ${bRetry} retry + ${bAux} critic), ${bIn} input token(s) over ${rows.length} run(s).`);
+console.log(`  * ms/tok is an UPPER BOUND: (total_duration_ms - eval_duration_ms)/prompt_tokens, which also contains load_duration.`);
+console.log(`    A clean prefix-cache measurement needs prompt_eval_duration_ms added to the token_usage event (agent.ts:1534).`);
+if (rows.some(r => r.friction?.modelCallsVsItersDisagree > 0)) {
+  console.log('!! ollama_request and iteration counts disagreed on at least one frame — trust cost.modelCalls over cost.iters and check the emit sites.');
+  process.exitCode = 1;
+}
+console.log(`\nH13 (cap-hit visibility): ${partialTotal} partial of ${framesTotal} concluded frame(s). Baseline replaced: 43 September frames ended blank at their cap and were recorded success.`);
+console.log(`H17 (Planner readability): ${retryTotal} format retry/retries, ${pfailTotal} planning failure(s); ${multiStep}/${graphRows.length} run(s) produced a >=2-step graph. Baseline: 84 of 85 September graphs had exactly 1 step.`);
 
 // Ready-to-paste block for docs/eval-log.md — the flywheel's memory.
 const date = new Date().toISOString().slice(0, 10);

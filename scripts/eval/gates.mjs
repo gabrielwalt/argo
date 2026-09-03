@@ -141,6 +141,23 @@ const git = (cmd, cwd) => execSync(`git ${cmd}`, { cwd, stdio: 'pipe' }).toStrin
  */
 export function checkIntegrity({ task, wsDir, baseline, strictExtraTests = false }) {
   const violations = [], warnings = [], checks = {};
+  // Per-task escape hatch for check 2 (BATCH 1b item 2). DEFAULT IS NONE: a task may touch
+  // no baseline-tracked test file at all unless it says so explicitly, by path.
+  //
+  // Why it exists: on the first live run the gate correctly voided `bigproj-observability`
+  // for stripping `export` from `advancingClock` and `makeService` in `test/helpers.js` —
+  // `makeService` is imported by the seeded `bigproj-audit-log.test.js`, so that edit
+  // disabled part of the oracle. That was right. But the same rule would make a task that
+  // legitimately needs a helper change impossible to pass, and a gate that makes a task
+  // unsatisfiable is worse than no gate. So the strictness is now a per-task declaration
+  // rather than a global law.
+  //
+  // Deliberately NOT a glob and NOT a directory: an exact path list, so widening the gate
+  // is a visible, reviewable, per-file act. `bigproj-observability` declares NONE —
+  // verified on the host that the task is satisfiable without touching that helper
+  // (baseline `makeService()` already returns what the seeded test needs).
+  const allowTracked = new Set(Array.isArray(task.allowTrackedTestEdits) ? task.allowTrackedTestEdits : []);
+  checks.allowTrackedTestEdits = [...allowTracked];
 
   // 1. Seeded fixture bytes. The load-bearing check: independent of git entirely.
   let seeds;
@@ -192,14 +209,29 @@ export function checkIntegrity({ task, wsDir, baseline, strictExtraTests = false
   // 2. A test file that existed (tracked) at the baseline must not be modified/deleted/
   //    renamed. This is the case the old git-diff check was aiming at, kept because it
   //    catches tampering with the 36 tracked bigproj tests, which no fixture covers.
+  const allowedTouches = [];
   for (const { st, paths } of changedVsBaseline) {
     if (!/^[MDR]/.test(st)) continue;
     for (const p of paths) {
       if (!TEST_PATH_RE.test(p) || !trackedAtBaseline.has(p)) continue;
-      violations.push(`integrity: baseline-tracked test file ${st === 'D' ? 'DELETED' : st.startsWith('R') ? 'RENAMED' : 'CHANGED'} (${st}): ${paths.join(' -> ')}`);
+      const what = st === 'D' ? 'DELETED' : st.startsWith('R') ? 'RENAMED' : 'CHANGED';
+      // A DELETE or RENAME is never allowed, even for a declared path: removing a file the
+      // seeded specs import breaks the oracle just as thoroughly as editing it, and no task
+      // has a legitimate reason to delete a helper it was told it may edit.
+      if (allowTracked.has(p) && what === 'CHANGED') {
+        allowedTouches.push(p);
+      } else {
+        violations.push(`integrity: baseline-tracked test file ${what} (${st}): ${paths.join(' -> ')}`
+          + (allowTracked.has(p) ? ' — declared in allowTrackedTestEdits, but only CHANGED is permitted there, not DELETED/RENAMED' : ''));
+      }
       break;
     }
   }
+  checks.allowedTrackedTouches = allowedTouches;
+  // A declared allowance that was exercised is still worth seeing in the run output: it is
+  // the one place the oracle was legitimately modified, so it is where to look first if the
+  // score is surprising.
+  for (const p of allowedTouches) warnings.push(`integrity-warning: baseline-tracked test file changed under an explicit allowance: ${p}`);
 
   // 3. Test files that did not exist at the baseline and are not seeded by us.
   //    NOT a violation by default — DEVIATION from EVAL-PLAN §3.1, see BATCH1-APPLIED:
