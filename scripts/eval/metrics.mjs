@@ -385,6 +385,81 @@ export function selfCheckCounters() {
 
 const FRAME_SESSION_ID = /^(planner|implementer|tester|boss)-/;
 
+/**
+ * WHERE CONTEXT GROWTH ACCELERATED, defined explicitly rather than eyeballed.
+ *
+ * Input: one frame's `prompt_tokens` in call order. Output, all null for a series shorter
+ * than 4 (no trend is inferable from three points):
+ *
+ *   firstPromptTokens / lastPromptTokens / maxPromptTokens
+ *   growthFactor      last/first — the blunt summary. The runaway frame scored 9.8x.
+ *   medianDelta       median per-call increase, the frame's "normal" growth rate
+ *   accelAtCall       1-based index of the first call whose increase exceeded
+ *                     ACCEL_MULTIPLE x the median of the PRECEDING deltas — a RUNNING
+ *                     baseline, not the whole-series median. Whole-series was tried first
+ *                     and is wrong: on the real runaway frame it returned call 2, because
+ *                     the very first jump (3117 -> 5030 = +1913) already exceeds 3x the
+ *                     series median of 516. A running baseline needs MIN_BASELINE_DELTAS
+ *                     prior calls before it will flag anything, so it reports a knee rather
+ *                     than a start. null when growth never accelerated.
+ *   accelAtTokens     prompt size at that call — "it went wrong at ~N tokens", the number to
+ *                     compare against the compaction threshold.
+ *   biggestJump       the largest single-call increase, and where.
+ *   callsAbove50Pct / callsAbove75Pct / callsAbove94Pct
+ *                     how many calls had a prompt above that fraction of num_ctx. These
+ *                     exist to make the compaction-threshold hypothesis directly testable:
+ *                     Hermes compresses at 50% of its window, Argo compacts at ~94%
+ *                     (compactThreshold 0.9375), so if qwen degrades with length then
+ *                     Hermes never enters the degraded regime and Argo lives there. The
+ *                     counts say whether a given run actually spent time above each line.
+ *                     Measured on the real runaway frame: max prompt 31 287 of 65 536 =
+ *                     48%, so **0 calls above even the 50% line** — that particular failure
+ *                     happened BELOW Hermes's compression point, which is evidence against
+ *                     the threshold explanation for that run and is exactly why the counts
+ *                     are recorded rather than assumed.
+ *
+ * Median rather than mean because a single huge jump would drag a mean up and mask itself.
+ * ACCEL_MULTIPLE = 3 is a judgement call, deliberately loose: the point is to flag a knee
+ * for a human, not to classify. The raw series is not kept — 46 integers per frame would
+ * bloat every row — but every derived number here is reproducible from the run's own log.
+ */
+export const ACCEL_MULTIPLE = 3;
+export const MIN_BASELINE_DELTAS = 3;
+export function contextGrowth(series, numCtx) {
+  const nulls = {
+    firstPromptTokens: null, lastPromptTokens: null, maxPromptTokens: null,
+    growthFactor: null, medianDelta: null, accelAtCall: null, accelAtTokens: null,
+    biggestJump: null, biggestJumpAtCall: null,
+    numCtx: numCtx ?? null, callsAbove50Pct: null, callsAbove75Pct: null, callsAbove94Pct: null,
+  };
+  if (!Array.isArray(series) || series.length === 0) return nulls;
+  const first = series[0], lastV = series[series.length - 1];
+  const maxV = Math.max(...series);
+  const ctx = Number(numCtx) || 0;
+  const above = (pct) => (ctx > 0 ? series.filter(v => v > ctx * pct).length : null);
+  const base = {
+    ...nulls,
+    firstPromptTokens: first, lastPromptTokens: lastV, maxPromptTokens: maxV,
+    growthFactor: first > 0 ? Math.round((lastV / first) * 100) / 100 : null,
+    callsAbove50Pct: above(0.5), callsAbove75Pct: above(0.75), callsAbove94Pct: above(0.9375),
+  };
+  // A trend needs enough points that a running baseline exists at all.
+  if (series.length < MIN_BASELINE_DELTAS + 2) return base;
+  const deltas = series.slice(1).map((v, i) => v - series[i]);
+  const medianOf = (xs) => {
+    const s = [...xs].sort((a, b) => a - b), m = Math.floor(s.length / 2);
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  };
+  let accelAtCall = null, accelAtTokens = null;
+  for (let i = MIN_BASELINE_DELTAS; i < deltas.length; i++) {
+    const baseline = Math.max(1, Math.abs(medianOf(deltas.slice(0, i))));
+    if (deltas[i] > baseline * ACCEL_MULTIPLE) { accelAtCall = i + 2; accelAtTokens = series[i + 1]; break; }
+  }
+  let biggest = deltas[0], biggestAt = 2;
+  for (let i = 1; i < deltas.length; i++) if (deltas[i] > biggest) { biggest = deltas[i]; biggestAt = i + 2; }
+  return { ...base, medianDelta: medianOf(deltas), accelAtCall, accelAtTokens, biggestJump: biggest, biggestJumpAtCall: biggestAt };
+}
+
 export function listJsonlFiles(logsDir, ws) {
   try { return new Set(readdirSync(path.join(logsDir, ws)).filter(f => f.endsWith('.jsonl'))); } catch { return new Set(); }
 }
@@ -422,6 +497,14 @@ export function runMetrics(logsDir, ws, newFiles) {
   // MODEL CALLS + TOKEN COST (see the definition block above).
   let modelCalls = 0, framesWithModelCalls = 0, promptTokens = 0, promptMsSum = 0, promptMsTokens = 0;
   const cacheBuckets = Object.fromEntries(CACHE_BUCKETS.map(([n]) => [n, 0]));
+  // ── PER-FRAME BREAKDOWN — the runaway-frame detector ───────────────────────────────
+  // The aggregate hides the thing that matters. On the 2026-09-03 bigproj-observability
+  // run, 46 of 75 model calls and 785 018 of 930 342 input tokens (61% and 84%) went to a
+  // single Implementer frame that never concluded, its prompt growing 3 117 → ~30 600
+  // tokens per call. "Argo is turn-expensive" and "one frame ran away and nothing stopped
+  // it" are different diagnoses with different fixes, and only per-frame attribution tells
+  // them apart. So every frame's own totals and prompt-token trajectory are recorded.
+  const perFrame = [];
   const unmatchedSamples = new Set();
   // Unclassified ERROR messages get the same treatment as unclassified warnings: recorded
   // verbatim (60 chars) rather than aggregated into an anonymous count, so a new terminal
@@ -430,6 +513,8 @@ export function runMetrics(logsDir, ws, newFiles) {
 
   for (const f of newFiles) {
     let meta = {}, fileIters = 0, fileModelCalls = 0;
+    let filePromptTokens = 0, fileNumCtx = 0;
+    const filePromptSeries = [];   // prompt_tokens per model call, in order
     let lines;
     try { lines = readFileSync(path.join(dir, f), 'utf8').split('\n'); } catch { continue; }
     for (const line of lines) {
@@ -452,6 +537,11 @@ export function runMetrics(logsDir, ws, newFiles) {
           // reported and which says nothing about total input cost.
           const pt = Number(e.prompt_tokens) || 0;
           promptTokens += pt;
+          filePromptTokens += pt;
+          if (pt > 0) filePromptSeries.push(pt);
+          // num_ctx is per-call in the event but constant within a frame; kept so the
+          // context-fraction buckets do not hard-code 65536.
+          if (Number(e.num_ctx) > 0) fileNumCtx = Number(e.num_ctx);
           if (pt > 0 && e.total_duration_ms != null && e.eval_duration_ms != null) {
             const d = Number(e.total_duration_ms) - Number(e.eval_duration_ms);
             if (d >= 0) {
@@ -564,6 +654,17 @@ export function runMetrics(logsDir, ws, newFiles) {
     // construction (2874 = 2874); a disagreement means the emit sites have diverged and
     // `modelCalls` should be trusted over `iters`, since it counts the call itself.
     if (fileModelCalls && fileIters && fileModelCalls !== fileIters) bump('modelCallsVsItersDisagree');
+    perFrame.push({
+      log: f,
+      sessionId: meta.sessionId ?? null,
+      role: FRAME_SESSION_ID.test(meta.sessionId || '') ? String(meta.sessionId).split('-')[0] : 'dispatch',
+      status: meta.status ?? null,
+      modelCalls: fileModelCalls,
+      iterations: Math.max(fileIters, Number(meta.iterations) || 0),
+      toolCalls: Number(meta.toolCalls) || 0,
+      promptTokens: filePromptTokens,
+      ...contextGrowth(filePromptSeries, fileNumCtx),
+    });
     toolCalls += meta.toolCalls || 0;          // == the frame's own tool_call count (verified 10 == 10)
     if (!FRAME_SESSION_ID.test(meta.sessionId || '')) topStatus = meta.status;
   }
@@ -652,6 +753,17 @@ export function runMetrics(logsDir, ws, newFiles) {
     cacheReuseNote: 'derived from (total_duration_ms - eval_duration_ms)/prompt_tokens; prompt_eval_duration and prompt_eval_cached_count are not available in this Ollama build',
     iters, toolCalls, frames, framesWithModelCalls,
     wallMs: null, tokPerSec, compactions, evictions, peakRssMb: null,
+    // Per-frame attribution (see the perFrame comment above), heaviest first so the
+    // runaway frame is row[0] and needs no sorting to find.
+    perFrame: perFrame.slice().sort((a, b) => b.promptTokens - a.promptTokens),
+    // The single number that says "was this run dominated by one frame". 0.84 on the
+    // 2026-09-03 bigproj-observability run.
+    topFrameTokenShare: promptTokens > 0
+      ? Math.round((Math.max(0, ...perFrame.map(p => p.promptTokens)) / promptTokens) * 100) / 100
+      : null,
+    topFrameCallShare: modelCalls > 0
+      ? Math.round((Math.max(0, ...perFrame.map(p => p.modelCalls)) / modelCalls) * 100) / 100
+      : null,
   };
 
   // Decomposition width, recorded now because it is free and because it is BATCH 2's exit

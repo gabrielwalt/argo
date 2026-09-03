@@ -105,8 +105,34 @@ export const WS_SUITE_CMD = {
   // tracked `_seeds/*.test.js` mirror, whose `../src/...` imports do not resolve from
   // that directory.
   'eval-suite2': nodeTest('test/*.test.js'),
+  // commander (tj/commander.js v15, MIT) — the long-horizon substrate. 4 180 lines of
+  // source, lib/command.js alone 2 790 lines (~35 k tokens, over half a 65 k window in ONE
+  // file), 1 373 tests in 210 suites, ~2 s for the whole suite, zero runtime dependencies.
+  //
+  // NOT `npm test`: commander's test script is `node --test && npm run check:type:ts`, and
+  // the second half (`tsd && tsc -p tsconfig.ts.json`) is a TypeScript toolchain invocation
+  // whose output is not TAP and which cannot be name-keyed for the regression gate. The
+  // type check is available separately, per task, as `typesCheck` — measured at baseline and
+  // only enforced if it passes there (see typesCheckFor below).
+  'commander': nodeTest(''),
   'booklet': null,   // no test suite — regression gate reports n/a
 };
+
+// Optional per-task TYPE CHECK, for tasks whose asked-for work includes TypeScript
+// declarations. Not a rubric term — the research (07-evaluation-methodology §4(v)) is
+// explicit that the rubric's problem is item difficulty, not scoring resolution, so nothing
+// is added to the 60/20/20. It is ANDed into `completed`, because a task that says "update
+// the typings" is not complete if the typings no longer compile.
+//
+// BASELINE-CALIBRATED, exactly like the regression gate: the drivers run it once after
+// seeding and once after the run, and enforce it ONLY if it passed at baseline. commander's
+// devDependencies are installed but `node_modules/.bin` appeared empty through the eval
+// mount, so whether `tsc` is invocable on the host is unverified — and a task made
+// impossible by a missing toolchain is worse than no check at all.
+export const WS_TYPES_CHECK = {
+  'commander': process.env.EVAL_TYPES_CHECK_CMD || 'npx --no-install tsc -p tsconfig.ts.json --noEmit',
+};
+export const typesCheckFor = (ws) => WS_TYPES_CHECK[ws] ?? null;
 export const suiteCmdFor = (ws) => (Object.prototype.hasOwnProperty.call(WS_SUITE_CMD, ws) ? WS_SUITE_CMD[ws] : null);
 
 // The TARGETED check: only the test files this task seeded. This is what removes the
@@ -228,6 +254,43 @@ export function rubricScore({ gate, targetedFraction, qualityPoints, passRate })
 // `check` is LEGACY (rubric v1): it is still executed and recorded as `legacyCheck` so
 // binary pass/fail stays comparable with the 33 pre-BATCH-1 rows, but it no longer feeds
 // the score — correctness now comes from the seeded files only (seededCmdFor).
+// ── Shared commander prompt text ──────────────────────────────────────────────────────
+// The three feature specifications are declared ONCE and used by two tasks:
+// `commander-audit-trio` (all three in one prompt) and `commander-continuity` (the same
+// three as three prompts in one session). Identical wording is what makes that pair an A/B
+// on prompt SHAPE rather than on task difficulty — if the specs drifted apart the comparison
+// would be measuring the drift.
+//
+// Each spec pins the things the seeded oracle asserts exactly: the field name, the exact
+// warning string, and the POSITION of the new entry in help's extraInfo list. That last one
+// matters and is easy to miss — help.js builds `(a, b, c)` by joining extraInfo in order, so
+// "append last" is the difference between `(default: "d", requires: beta)` and
+// `(requires: beta, default: "d")`. An oracle that asserts exact help text is only fair if
+// the prompt says where the entry goes.
+const COMMANDER_FEATURE_DEPRECATED =
+  '- lib/option.js: a `deprecated(message)` method on Option that records the message in a `deprecatedMessage` field and returns `this`. `deprecatedMessage` is undefined by default.\n'
+  + '- lib/command.js: when a deprecated option is given a value FROM THE COMMAND LINE, write exactly this line (with a trailing newline) through the command\'s configured error writer:\n'
+  + "    warning: option '<flags>' is deprecated: <message>\n"
+  + '  using the Option\'s own `flags` string. Write it once per use. It is a warning, not an error: parsing continues and the option value is set exactly as it would be otherwise. Nothing is written when the option is not used.\n'
+  + '- lib/help.js: in `optionDescription()`, append `deprecated: <message>` to the extraInfo list. Append it LAST, after the existing env entry.\n'
+  + '- typings/index.d.ts: on the Option class, declare `deprecated(message: string): this;`.';
+
+const COMMANDER_FEATURE_ARG_ENV =
+  '- lib/argument.js: an `env(name)` method on Argument that records the name in an `envVar` field and returns `this`. `envVar` is undefined by default.\n'
+  + '- lib/command.js: in `_processArguments()`, when a positional argument has no value from the command line and its `envVar` is set and that environment variable is defined, use the environment variable\'s value. Precedence is command line, then environment, then the argument\'s `.default()` value.\n'
+  + '- lib/help.js: in `argumentDescription()`, append `env: <name>` to the extraInfo list. Append it LAST, after the existing default entry.\n'
+  + '- typings/index.d.ts: on the Argument class, declare `env(name: string): this;`.';
+
+const COMMANDER_FEATURE_SOURCES =
+  '- lib/command.js: an `optionValueSources()` method on Command returning a NEW plain object that maps each option attribute name to the source string of its current value, for every option that has a recorded source. Options with no recorded source are omitted, so a command whose options were never given a value returns `{}`. The command already tracks exactly this internally; keys are the same camelCase attribute names it uses (so `--dry-run` appears as `dryRun`).\n'
+  + '- typings/index.d.ts: on the Command class, declare `optionValueSources(): Record<string, string>;`.';
+
+const COMMANDER_TRIO_INTRO =
+  'In this commander.js repository, add THREE independent features. They do not interact with each other.\n'
+  + '\n(1) `Option.deprecated(message)`:\n' + COMMANDER_FEATURE_DEPRECATED
+  + '\n\n(2) `Argument.env(name)` — the positional-argument equivalent of the `Option.env()` that already exists:\n' + COMMANDER_FEATURE_ARG_ENV
+  + '\n\n(3) `Command.optionValueSources()`:\n' + COMMANDER_FEATURE_SOURCES;
+
 export const TASKS = [
   // RETIRED (EVAL-PLAN §2): "two near-identical trivial array functions add cost and no
   // information". Always passed, 7-19 iterations, both of them.
@@ -494,6 +557,129 @@ export const TASKS = [
   // Implementer frame risks running past LARGE_FRAME_ITERATIONS (dispatch.ts) and
   // Planner decomposition could plausibly help, if it helps at all — that is
   // precisely the open question this task exists to give real evidence on.
+  // ═════════════════════════════════════════════════════════════════════════════════════
+  // commander — THE LONG-HORIZON LADDER (see /shared/argo-program/COMMANDER-SUITE.md)
+  //
+  // Why a new workspace at all: every prior task lives in a codebase small enough to hold in
+  // context (tasklab 827 LOC), and the measured failure mode is the opposite regime — on
+  // 2026-09-03 a single Implementer frame consumed 46 of 75 model calls and 785 018 of
+  // 930 342 input tokens, prompt growing 3 117 -> ~30 600 per call, and never concluded.
+  // A suite where nothing grows cannot provoke that. commander is 4 180 lines with a single
+  // 2 790-line file (~35 k tokens), and its whole 1 373-test suite runs in ~2 s, so the
+  // oracle is cheap enough to run on every task.
+  //
+  // All four declare `allowTrackedTestEdits: []` — no tracked test file may be touched, and
+  // each has been checked to be satisfiable without touching one (per-task notes below).
+  // Bands are EXPECTATIONS, not measurements: they carry no verdict below k=3.
+  // ═════════════════════════════════════════════════════════════════════════════════════
+
+  // RUNG 1 — localisation in a large file. The whole change fits in lib/option.js, but you
+  // cannot know that without reading addOption() in the 2 790-line lib/command.js to find
+  // where an option's value is assigned. Repeated-flag parsing (-vvv) ALREADY works in
+  // parseOptions(); only the accumulation is missing. Expected 3-8 min.
+  // SATISFIABLE WITHOUT TOUCHING A TRACKED TEST: verified by reading lib/option.js and
+  // lib/command.js:671-724 — a `count()` builder that sets `parseArg` to an incrementing
+  // function is sufficient, because handleOptionValue calls parseArg even for a boolean
+  // option (val is `undefined`, and the guard is `val !== null`). No existing test asserts
+  // anything about a `count` method, so nothing tracked needs to change.
+  { id: 'commander-count-option', ws: 'commander', band: 'mid', observed: null,
+    allowTrackedTestEdits: [],
+    allowFiles: ['lib/option.js', 'lib/command.js'],
+    testFile: 'tests/eval-count-option.test.js',
+    setup: () => `cp "${path.join(FIXTURES, 'commander-count-option.test.js')}" tests/eval-count-option.test.js`,
+    prompt: 'In this commander.js repository, add a counted-flag feature: an `Option.count()` builder that makes a boolean flag report HOW MANY TIMES it appeared instead of `true`.\n'
+      + 'Requirements:\n'
+      + '- `count()` is a method on the Option class in lib/option.js. It returns `this` for chaining.\n'
+      + '- A counted option takes no option-argument; it stays a boolean flag.\n'
+      + '- Used once the value is 1, twice 2, and the combined short form `-vvv` gives 3. Short and long forms accumulate together.\n'
+      + '- If the option is never used, its value is whatever it would normally be (undefined, or its `.default()` value if one is set).\n'
+      + '- When a default is set, counting starts from it: `.default(0)` then `-v -v` gives 2.\n'
+      + '- Two independent counted options are counted separately.\n'
+      + 'A failing spec is seeded at tests/eval-count-option.test.js. Read it first, then read lib/option.js and the option-value handling in lib/command.js before changing anything. Do NOT modify any existing test file. Verify with `node --test tests/eval-count-option.test.js`, then make sure the whole suite still passes with `node --test`.',
+    check: 'node --test tests/eval-count-option.test.js' },
+
+  // RUNG 2 — CROSS-CUTTING BY CONSTRUCTION: four files that know nothing about each other
+  // (lib/option.js, lib/command.js, lib/help.js, typings/index.d.ts). The 17 seeded cases
+  // form a gradient: builder-only passes 5, builder+check passes 12, only a run that read
+  // all four files passes 17. Expected 8-20 min.
+  // SATISFIABLE WITHOUT TOUCHING A TRACKED TEST: the feature is entirely additive — a new
+  // builder, a new check called alongside _checkForConflictingOptions() (lib/command.js:1735),
+  // one more entry in help.js's optionDescription() extraInfo list, and two declarations in
+  // typings. No existing behaviour changes, so no tracked test can need editing. The typings
+  // assertion is a STRUCTURAL TEXT check rather than a type check, deliberately: tsd reads
+  // exactly one entry file (typings/index.test-d.ts, no tsd config in package.json) and that
+  // file is tracked, so a new tsd assertion cannot be seeded.
+  { id: 'commander-option-requires', ws: 'commander', band: 'hard', observed: null,
+    allowTrackedTestEdits: [],
+    allowFiles: ['lib/option.js', 'lib/command.js', 'lib/help.js', 'typings/index.d.ts'],
+    testFile: 'tests/eval-option-requires.test.js',
+    setup: () => `cp "${path.join(FIXTURES, 'commander-option-requires.test.js')}" tests/eval-option-requires.test.js`,
+    prompt: 'In this commander.js repository, add `Option.requires()` — the inverse of the existing `Option.conflicts()`. It declares that an option may only be used when a companion option is also present. Model it closely on how `conflicts()` is implemented across the codebase.\n'
+      + 'Requirements, in the four places they belong:\n'
+      + '1. lib/option.js — a `requiredWith` field initialised to `[]` in the constructor, and a `requires(names)` method taking a string or an array of strings, accumulating into `requiredWith` across repeated calls, returning `this`.\n'
+      + '2. lib/command.js — a parse-time check that walks the command hierarchy the same way `_checkForConflictingOptions()` does, and runs after it. For each option that has a value whose source is NOT `default`, take each name in its `requiredWith` in order; a companion counts as PRESENT only if some option with that attribute name (on this command or an ancestor) has a value whose source is not `default`. On the first unsatisfied companion, error out with exactly:\n'
+      + "   error: option '<flags of the option>' requires option '<flags of the missing companion>'\n"
+      + '   using each Option\'s own `flags` string, the same way `_conflictingOption()` does.\n'
+      + '3. lib/help.js — in `optionDescription()`, append `requires: <names joined by ", ">` to the extraInfo list. Append it LAST, after the existing env entry, so the rendered order is choices, default, preset, env, requires.\n'
+      + '4. typings/index.d.ts — on the Option class, declare `requires(names: string | string[]): this;` and the field `requiredWith: string[];`.\n'
+      + 'A failing spec is seeded at tests/eval-option-requires.test.js. Read it first, then read lib/option.js, the conflict checking in lib/command.js, and `optionDescription` in lib/help.js. Do NOT modify any existing test file. Verify with `node --test tests/eval-option-requires.test.js`, then make sure the whole suite still passes with `node --test`.',
+    check: 'node --test tests/eval-option-requires.test.js' },
+
+  // RUNG 3 — LONG-HORIZON, three genuinely INDEPENDENT features in one prompt. The
+  // independence is the point: EVAL-PLAN §3.3(a) and arXiv:2606.00953 both argue
+  // decomposition helps most on loosely-coupled subtasks, and every previous bigproj task was
+  // one cohesive concern, which a lone Implementer frame owns end to end regardless of
+  // difficulty. 25 seeded cases across three features give real partial credit — a run that
+  // finishes one feature and drifts scores ~1/3 rather than 0. Expected 15-35 min; this is
+  // the item expected to FAIL, and a task neither agent can finish is currently more
+  // informative than another both pass.
+  // SATISFIABLE WITHOUT TOUCHING A TRACKED TEST: all three features are additive (a new
+  // Option builder + warning, a new Argument builder consulted only when a positional is
+  // absent, and a new Command accessor over the existing `_optionValueSources` map). None
+  // changes existing behaviour.
+  { id: 'commander-audit-trio', ws: 'commander', band: 'ceiling', observed: null,
+    allowTrackedTestEdits: [],
+    allowFiles: ['lib/option.js', 'lib/argument.js', 'lib/command.js', 'lib/help.js', 'typings/index.d.ts'],
+    testFile: ['tests/eval-deprecated.test.js', 'tests/eval-argument-env.test.js', 'tests/eval-option-sources.test.js'],
+    setup: () => `cp "${path.join(FIXTURES, 'commander-deprecated.test.js')}" tests/eval-deprecated.test.js`
+      + ` && cp "${path.join(FIXTURES, 'commander-argument-env.test.js')}" tests/eval-argument-env.test.js`
+      + ` && cp "${path.join(FIXTURES, 'commander-option-sources.test.js')}" tests/eval-option-sources.test.js`,
+    prompt: COMMANDER_TRIO_INTRO
+      + '\nAll three failing specs are seeded: tests/eval-deprecated.test.js, tests/eval-argument-env.test.js and tests/eval-option-sources.test.js. Read them first. The three features are independent of each other and can be done in any order. Do NOT modify any existing test file. Verify each with `node --test <that file>`, then make sure the whole suite still passes with `node --test`.',
+    check: 'node --test tests/eval-deprecated.test.js tests/eval-argument-env.test.js tests/eval-option-sources.test.js' },
+
+  // RUNG 4 — MULTI-TURN (H25). The SAME three features as commander-audit-trio, byte-identical
+  // oracles, delivered as three prompts in ONE session with no reset between them. That makes
+  // the pair a clean A/B on prompt shape rather than on difficulty, and it is the only way
+  // cross-turn memory becomes testable at all: turn 2 and turn 3 both need the localisation
+  // work turn 1 did (help.js's extraInfo list, lib/command.js's value plumbing), so an agent
+  // that retained it should be cheaper per turn than one that re-derives it.
+  // ARGO ONLY — see `harnesses`. Hermes's `hermes chat -q` is one invocation per prompt and
+  // whether it continues a session across invocations in the same cwd is not something this
+  // scoop could verify; shipping it as a pair would be an unfair comparison presented as a
+  // fair one. Run it against Argo, report it as Argo-only, and add Hermes once continuity is
+  // confirmed on the host.
+  { id: 'commander-continuity', ws: 'commander', band: 'ceiling', observed: null,
+    harnesses: ['argo'],
+    allowTrackedTestEdits: [],
+    allowFiles: ['lib/option.js', 'lib/argument.js', 'lib/command.js', 'lib/help.js', 'typings/index.d.ts'],
+    testFile: ['tests/eval-deprecated.test.js', 'tests/eval-argument-env.test.js', 'tests/eval-option-sources.test.js'],
+    // Each turn declares its seeding with the SAME `setup` shape a single-turn task uses, so
+    // gates.mjs's parseSeeds() has one format to understand and the byte-comparison rule is
+    // identical for both kinds of task.
+    turns: [
+      { setup: () => `cp "${path.join(FIXTURES, 'commander-deprecated.test.js')}" tests/eval-deprecated.test.js`,
+        prompt: 'In this commander.js repository, add `Option.deprecated(message)`.\n' + COMMANDER_FEATURE_DEPRECATED
+          + '\nA failing spec is seeded at tests/eval-deprecated.test.js. Read it first, then read lib/option.js, the option-value handling in lib/command.js, and `optionDescription` in lib/help.js. Do NOT modify any existing test file. Verify with `node --test tests/eval-deprecated.test.js`, then make sure the whole suite still passes with `node --test`.' },
+      { setup: () => `cp "${path.join(FIXTURES, 'commander-argument-env.test.js')}" tests/eval-argument-env.test.js`,
+        prompt: 'Now add `Argument.env(name)` to the same repository — the positional-argument equivalent of the `Option.env()` that already exists.\n' + COMMANDER_FEATURE_ARG_ENV
+          + '\nA failing spec is seeded at tests/eval-argument-env.test.js. You have already worked in these files; reuse what you learned rather than re-reading everything. Do NOT modify any existing test file, and do not undo the previous change — the earlier seeded spec must keep passing. Verify with `node --test tests/eval-argument-env.test.js`, then make sure the whole suite still passes with `node --test`.' },
+      { setup: () => `cp "${path.join(FIXTURES, 'commander-option-sources.test.js')}" tests/eval-option-sources.test.js`,
+        prompt: 'Finally, add `Command.optionValueSources()` to the same repository.\n' + COMMANDER_FEATURE_SOURCES
+          + '\nA failing spec is seeded at tests/eval-option-sources.test.js. Do NOT modify any existing test file, and do not undo either previous change — both earlier seeded specs must keep passing. Verify with `node --test tests/eval-option-sources.test.js`, then make sure the whole suite still passes with `node --test`.' },
+    ],
+    check: 'node --test tests/eval-deprecated.test.js tests/eval-argument-env.test.js tests/eval-option-sources.test.js' },
+
   // KEPT as the current ceiling item (EVAL-PLAN §2), 26-36 it, 255-1011 s.
   { id: 'large-task-queue', ws: 'eval-suite2', band: 'hard', observed: 1.0, saturated: true,
     allowFiles: ['src/task-queue.js'],
@@ -535,3 +721,24 @@ export function selectTasks() {
 /** false ⇒ runs and reports, but excluded from the batch score (floor probes). */
 export const isScored = (task) => task.scored !== false;
 export const seededTestFiles = (task) => (task.testFile ? (Array.isArray(task.testFile) ? task.testFile : [task.testFile]) : []);
+
+/**
+ * Which harnesses may run this task. Absent `harnesses` means both — the default stays
+ * "identical for both harnesses", which is the requirement.
+ *
+ * `commander-continuity` declares `['argo']` because it is a multi-turn task and
+ * `hermes chat -q` is one invocation per prompt; whether Hermes continues a session across
+ * invocations in the same cwd is unverified here. Running it against Hermes as three
+ * independent one-shot prompts would measure something different from what Argo does and
+ * present it as the same measurement. Declaring the restriction and having hermes.mjs SKIP
+ * the task out loud is the honest handling — an unfair pair is worse than an absent one.
+ */
+export const runsOn = (task, harness) =>
+  (Array.isArray(task.harnesses) ? task.harnesses.includes(harness) : true);
+
+/** Turns for a multi-turn task, or a single synthetic turn for a normal one. */
+export const turnsOf = (task) =>
+  (Array.isArray(task.turns) && task.turns.length
+    ? task.turns
+    : [{ prompt: task.prompt, setup: task.setup }]);
+export const isMultiTurn = (task) => Array.isArray(task.turns) && task.turns.length > 1;

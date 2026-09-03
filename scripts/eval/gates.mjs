@@ -107,15 +107,28 @@ export function runTests(cmd, cwd) {
 // tampered with". A task that needs a non-`cp` setup should declare `seeds` explicitly.
 const CP_CLAUSE = /^cp\s+"([^"]+)"\s+(\S+)$/;
 
-export function parseSeeds(task, wsDir) {
-  if (Array.isArray(task.seeds)) return task.seeds.map(s => ({ ...s }));
-  if (!task.setup) return [];
-  const script = task.setup(wsDir);
+function parseSetupScript(taskId, script) {
   const seeds = [];
   for (const clause of script.split('&&').map(s => s.trim()).filter(Boolean)) {
     const m = CP_CLAUSE.exec(clause);
-    if (!m) throw new Error(`parseSeeds(${task.id}): unrecognised setup clause ${JSON.stringify(clause)} — declare task.seeds explicitly`);
+    if (!m) throw new Error(`parseSeeds(${taskId}): unrecognised setup clause ${JSON.stringify(clause)} — declare task.seeds explicitly`);
     seeds.push({ fixture: m[1], target: m[2] });
+  }
+  return seeds;
+}
+
+export function parseSeeds(task, wsDir) {
+  if (Array.isArray(task.seeds)) return task.seeds.map(s => ({ ...s }));
+  const seeds = [];
+  if (task.setup) seeds.push(...parseSetupScript(task.id, task.setup(wsDir)));
+  // MULTI-TURN tasks (H25) seed one file per turn, each declared with the same `setup` shape
+  // a single-turn task uses. The integrity gate must know about ALL of them: by the time it
+  // runs, every turn has been seeded, and a run that edited turn 1's oracle while working on
+  // turn 3 is exactly the tamper this gate exists to catch. Without this the declared
+  // `testFile` list and the parsed seed list would disagree and every multi-turn run would be
+  // voided by the cross-check for the wrong reason.
+  for (const turn of Array.isArray(task.turns) ? task.turns : []) {
+    if (turn.setup) seeds.push(...parseSetupScript(task.id, turn.setup(wsDir)));
   }
   return seeds;
 }
@@ -123,10 +136,14 @@ export function parseSeeds(task, wsDir) {
 /** Every path a seeded fixture is written to, as declared by the task. */
 export const seedTargets = (task, wsDir) => parseSeeds(task, wsDir).map(s => s.target);
 
-// A path that is part of the ORACLE rather than the implementation. Both forms matter:
-// `test/helpers.js` is not a `.test.js` file but is oracle infrastructure, and
-// eval-suite2's tracked `_seeds/*.test.js` mirror is caught by the suffix form.
-export const TEST_PATH_RE = /(^|\/)(test|tests|__tests__)\/|\.(test|spec)\.[cm]?[jt]s$/;
+// A path that is part of the ORACLE rather than the implementation. Three forms matter:
+// `test/helpers.js` is not a `.test.js` file but is oracle infrastructure; eval-suite2's
+// tracked `_seeds/*.test.js` mirror is caught by the suffix form; and `.test-d.ts` is tsd's
+// type-assertion file, which the `commander` workspace keeps at `typings/index.test-d.ts` —
+// OUTSIDE any `tests/` directory and not matching `.test.ts`, so before this it was an
+// unprotected oracle. tsd reads exactly that one path (it has no config here), so weakening
+// it is the cheapest way to make a typings task pass without doing the work.
+export const TEST_PATH_RE = /(^|\/)(test|tests|__tests__)\/|\.(test|spec)(-d)?\.[cm]?[jt]s$/;
 
 // ── The gates ───────────────────────────────────────────────────────────────────────
 

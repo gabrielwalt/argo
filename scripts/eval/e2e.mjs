@@ -42,6 +42,7 @@ import {
   TASKS, REPO, WS_ROOT, RUNS_DIR, wsPath, sh, shOk, baselineOf, resetWs,
   shScore, rubricScore, qualityScore, appendHistory, RUBRIC_VERSION,
   suiteCmdFor, seededCmdFor, selectTasks, isScored, seededTestFiles,
+  typesCheckFor, runsOn, turnsOf, isMultiTurn,
 } from './tasks.mjs';
 import {
   runTests, checkIntegrity, checkRegression, seedTargets,
@@ -223,7 +224,23 @@ if (!counterCheck.ok) {
   process.exitCode = 1;
 }
 
-const SUITE = selectTasks();
+const SUITE = selectTasks().filter(t => runsOn(t, 'argo'));
+// ── compactThreshold as a DECLARED, RECORDED dimension of a batch ──────────────────────
+// Hermes compresses at 50% of its context window; Argo compacts at ~94%
+// (compactThreshold = (65536 - compactReserveTokens)/65536 = 0.9375 with the default 4096
+// reserve). If qwen degrades with context length — which Gabriel's manual testing and the
+// Context Rot report both indicate — then Hermes never enters the degraded regime and Argo
+// lives there. That is a config change to test, not a build.
+//
+// This eval does NOT change the default: the threshold is a worker-side config value and the
+// /chat body cannot override it. What it does is (a) read the RESOLVED value from
+// /ws/<ws>/status per run and record it, so rows from batteries at different thresholds are
+// distinguishable rather than silently pooled, and (b) accept
+// EVAL_EXPECT_COMPACT_THRESHOLD so a battery intended to run at ~50% fails loudly if the
+// worker was not actually reconfigured. Getting the number wrong silently is the only way
+// this experiment can waste a night.
+const EXPECT_COMPACT_THRESHOLD = process.env.EVAL_EXPECT_COMPACT_THRESHOLD
+  ? Number(process.env.EVAL_EXPECT_COMPACT_THRESHOLD) : null;
 const BATCH_ID = `${new Date().toISOString().replace(/[:.]/g, '-')}_argo_${HARNESS_SHA}${DIRTY}`;
 const retiredCount = TASKS.length - TASKS.filter(t => !t.retired).length;
 
@@ -251,8 +268,20 @@ for (const model of MODELS) {
       let targeted = null, targetedFraction = null, legacyCheck = null, quality = null;
       let effective = null, ledgerPath = null, diffInfo = { path: null, text: null }, judgment = null;
       let ollamaAtStart = null, err = null, frames = null;
+      // Multi-turn bookkeeping. `perTurn` is per-prompt cost/context, which is what makes a
+      // cross-turn memory claim checkable: if the agent retained turn 1's localisation, turn 2
+      // should be cheaper than turn 1, not more expensive. Resource peaks are folded across
+      // turns because waitIdle samples per turn.
+      const perTurn = [];
+      let peakRss = 0, lastProcSplit = '', lastSizeStr = '';
+      let typesCmd = null, typesBaselineOk = null, typesAfter = null;
+      const turns = turnsOf(task);
       try {
-        if (task.setup) sh(task.setup(wsDir), wsDir);  // seed the failing test
+        // Turn 1's fixtures are seeded BEFORE the baseline suite is measured, so the
+        // do-nothing baseline includes them. Later turns seed just before their own prompt —
+        // a multi-turn task's turn-N spec must not exist while turn N-1 is being worked on,
+        // or the agent can see and satisfy work it was not yet asked for.
+        if (turns[0].setup) sh(turns[0].setup(wsDir), wsDir);
 
         // PRE-FLIGHT (EVAL-PLAN §4.3). Assert the worker is reachable and IDLE, and
         // capture the RESOLVED effective config (agents/tasks/memory/loop/grounding/
@@ -268,8 +297,17 @@ for (const model of MODELS) {
           model: st.model ?? null, agents: st.agents ?? null, tasks: st.tasks ?? null,
           memory: st.memory ?? null, loop: st.loop ?? null, grounding: st.grounding ?? null,
           autoCommit: st.autoCommit ?? null, compactReserveTokens: st.compactReserveTokens ?? null,
+          // The context-management dimension, recorded per run (see EXPECT_COMPACT_THRESHOLD).
+          // /status computes this as (65536 - compactReserveTokens)/65536 and it is the number
+          // to compare against Hermes's 0.5.
+          compactThreshold: st.compactThreshold ?? null,
           workspacePath: st.workspacePath ?? null,
         };
+        if (EXPECT_COMPACT_THRESHOLD != null && st.compactThreshold != null
+            && Math.abs(st.compactThreshold - EXPECT_COMPACT_THRESHOLD) > 0.01) {
+          throw new Error(`preflight: compactThreshold is ${st.compactThreshold} but EVAL_EXPECT_COMPACT_THRESHOLD=${EXPECT_COMPACT_THRESHOLD}`
+            + ' — the worker was not reconfigured for this condition, so the battery would be mislabelled. Refusing to start (no row recorded).');
+        }
         ollamaAtStart = sampleResources();
 
         // BASELINE SUITE for the regression gate — measured for real, in this workspace,
@@ -277,29 +315,72 @@ for (const model of MODELS) {
         // EVAL-PLAN §3.4 step 2 says nobody ever checked, which is why the 71-81 floor on
         // bigproj went unnoticed for a month.
         const baselineSuite = suiteCmd ? runTests(suiteCmd, wsDir) : null;
+        // TYPE CHECK, baseline-calibrated exactly like the regression gate: run it before the
+        // agent, and enforce it afterwards ONLY if it passed here. commander's `npm test` is
+        // `node --test && npm run check:type:ts`, so the type check is genuinely part of "the
+        // tests pass" for that repo — but if the toolchain is not invocable on this host, a
+        // task that asks for typings changes must not become impossible.
+        typesCmd = typesCheckFor(task.ws);
+        typesBaselineOk = typesCmd ? shScore(typesCmd, wsDir).exitOk : null;
 
+        // POST /reset ONCE, before the first turn only. For a multi-turn task (H25) the
+        // whole point is that turns 2..n share the agent's session — resetting between them
+        // would clear the history and turn a cross-turn memory test into three independent
+        // one-shot runs. This single line is the difference between the two.
         await post(task.ws, 'reset', {});
         const tRun = Date.now();
         const filesBefore = listJsonlFiles(LOGS_DIR, task.ws);
         const HARNESS = ['1', 'true', 'on', 'yes'].includes((process.env.EVAL_HARNESS || '').trim().toLowerCase());
-        await post(task.ws, 'chat', { message: task.prompt, model, options: OPTS, maxIterations: MAX_ITER, ...(HARNESS ? { tasks: true, memory: true, loop: true } : {}) });
-        started = true;
-        const w = await waitIdle(task.ws);
+        let idleAll = true;
+        for (let ti = 0; ti < turns.length; ti++) {
+          const turn = turns[ti];
+          // Turn 1 was seeded before the baseline measurement; seed each later turn now, so
+          // its spec does not exist while the previous turn is being worked on.
+          if (ti > 0 && turn.setup) sh(turn.setup(wsDir), wsDir);
+          const tTurn = Date.now();
+          const beforeTurn = listJsonlFiles(LOGS_DIR, task.ws);
+          await post(task.ws, 'chat', { message: turn.prompt, model, options: OPTS, maxIterations: MAX_ITER, ...(HARNESS ? { tasks: true, memory: true, loop: true } : {}) });
+          started = true;
+          const wt = await waitIdle(task.ws);
+          if (wt.peakRssMb > peakRss) peakRss = wt.peakRssMb;
+          if (wt.procSplit) lastProcSplit = wt.procSplit;
+          if (wt.sizeStr) lastSizeStr = wt.sizeStr;
+          const afterTurn = listJsonlFiles(LOGS_DIR, task.ws);
+          const turnFiles = [...afterTurn].filter(f => !beforeTurn.has(f));
+          const tm = runMetrics(LOGS_DIR, task.ws, turnFiles);
+          perTurn.push({
+            turn: ti + 1, idle: wt.idle, wallMs: Date.now() - tTurn,
+            status: tm.status ?? null,
+            modelCallsTotal: tm.cost?.modelCallsTotal ?? null,
+            promptTokensTotal: tm.promptTokensTotal ?? null,
+            maxCtx: tm.maxCtx ?? null, frames: tm.frames ?? null,
+            capHit: tm.friction?.capHit ?? null,
+            topFrameTokenShare: tm.cost?.topFrameTokenShare ?? null,
+          });
+          if (!wt.idle) {
+            idleAll = false;
+            // A timed-out run is NOT actually stopped server-side — waitIdle just gave
+            // up polling. Without this, the run keeps consuming the GPU in the
+            // background and every subsequent task's own `reset` 409s ("Agent is busy")
+            // for as long as the timed-out run happens to keep going — a real failure
+            // mode hit in practice (one 30-min timeout cascaded into 3 more FAILs).
+            try { await post(task.ws, 'stop', {}); } catch { /* best-effort */ }
+            await sleep(2000);
+            // Do not start a later turn on top of a run that had to be stopped: the session
+            // state is unknown and the remaining turns would measure noise.
+            break;
+          }
+        }
         const wallMs = Date.now() - tRun;
         const filesAfter = listJsonlFiles(LOGS_DIR, task.ws);
         const newFiles = [...filesAfter].filter(f => !filesBefore.has(f));
+        // Scraped over EVERY log the whole task produced, across all turns — so the cost and
+        // friction vectors describe the task, while `perTurn` above describes each turn.
         m = runMetrics(LOGS_DIR, task.ws, newFiles);
-        if (!w.idle) {
-          m.status = 'TIMEOUT';
-          // A timed-out run is NOT actually stopped server-side — waitIdle just gave
-          // up polling. Without this, the run keeps consuming the GPU in the
-          // background and every subsequent task's own `reset` 409s ("Agent is busy")
-          // for as long as the timed-out run happens to keep going — a real failure
-          // mode hit in practice (one 30-min timeout cascaded into 3 more FAILs).
-          try { await post(task.ws, 'stop', {}); } catch { /* best-effort */ }
-          await sleep(2000);
-        }
-        m.wallMs = wallMs; m.peakRssMb = w.peakRssMb; m.procSplit = w.procSplit; m.sizeStr = w.sizeStr;
+        if (!idleAll) m.status = 'TIMEOUT';
+        m.wallMs = wallMs;
+        // Resource peaks come from the per-turn waitIdle sampling; take the max across turns.
+        m.peakRssMb = peakRss; m.procSplit = lastProcSplit; m.sizeStr = lastSizeStr;
 
         // ── GATES ─────────────────────────────────────────────────────────────────────
         const integrity = checkIntegrity({ task, wsDir, baseline: baselines[task.ws], strictExtraTests: STRICT_EXTRA_TESTS });
@@ -336,9 +417,20 @@ for (const model of MODELS) {
         // with the 33 pre-BATCH-1 rows even though the score deliberately is not.
         legacyCheck = typeof task.check === 'function' ? task.check(m) : shScore(task.check, wsDir).exitOk;
 
+        // TYPE CHECK after the run. Enforced only where it held at baseline (see above), so
+        // `typesAfter.enforced` records whether it counted rather than leaving that implicit.
+        if (typesCmd) {
+          const ok = shScore(typesCmd, wsDir).exitOk;
+          typesAfter = { cmd: typesCmd, baselineOk: typesBaselineOk, ok, enforced: typesBaselineOk === true };
+        }
+
         // A gate violation forces completed:false as well as score 0 — a gamed run, or a
-        // run that broke something that passed at baseline, is not a pass.
-        completed = w.idle && gates.ok && targetedFraction === 1;
+        // run that broke something that passed at baseline, is not a pass. A task that asks
+        // for TypeScript declarations is likewise not complete if they stopped compiling.
+        // `idleAll` is false if ANY turn had to be stopped — a multi-turn task that timed out
+        // on turn 2 is not a pass even if turn 1's tests still pass.
+        completed = idleAll && gates.ok && targetedFraction === 1
+          && (typesAfter?.enforced ? typesAfter.ok : true);
 
         // ── QUALITY (20 pts): saved artifacts must be captured BEFORE the final reset ──
         ledgerPath = saveLedger(task.ws, runId);
@@ -352,7 +444,11 @@ for (const model of MODELS) {
         const unreq = diffInfo.text == null ? null
           : unrequestedDiffRatio(diffInfo.text, { allowFiles: allowed.files, ignoreFiles: targets });
         if (JUDGE_ON) {
-          judgment = await judgeRun({ runId, taskId: task.id, objective: task.prompt, ledgerPath, diffText: diffInfo.text });
+          // For a multi-turn task the objective is every turn's prompt in order — the judge is
+          // asked whether the DIFF accomplished what was asked, and only turn 1's prompt would
+          // make two thirds of the work look unrequested.
+          const objective = turns.map(t => t.prompt).filter(Boolean).join('\n\n--- next turn ---\n\n');
+          judgment = await judgeRun({ runId, taskId: task.id, objective, ledgerPath, diffText: diffInfo.text });
         }
         quality = qualityScore({ judgment, unrequestedRatio: unreq ? unreq.ratio : null });
         quality.allowFiles = allowed.files; quality.allowFilesSource = allowed.source;
@@ -403,6 +499,34 @@ for (const model of MODELS) {
       if (f.errorsOther) console.log(`      !! UNCLASSIFIED ERROR ${JSON.stringify(f.errorsOtherSamples)}`);
       if (f.ladderFromProse) console.log(`      note loop ladder counted from PROSE (${f.ladderFromProse}) — this log predates 6884852's warning.level field`);
       if (f.unexpectedError) console.log(`      !! ${f.unexpectedError} UNEXPECTED ERROR(S) — a crash, not agent behaviour`);
+      // ── CONTEXT / RUNAWAY-FRAME REPORT ──────────────────────────────────────────────
+      // The failure mode this suite exists to provoke is a frame whose context grows without
+      // bound until it never concludes. The aggregate hides it; these lines do not.
+      const pf = m.cost?.perFrame ?? [];
+      if (pf.length) {
+        const top = pf[0];
+        console.log(`      context: peak ${m.maxCtx ?? '?'} tok`
+          + ` · heaviest frame ${top.role}/${top.status ?? '?'} = ${top.promptTokens} tok in ${top.modelCalls} call(s)`
+          + ` (${Math.round(100 * (m.cost.topFrameTokenShare ?? 0))}% of tokens, ${Math.round(100 * (m.cost.topFrameCallShare ?? 0))}% of calls)`
+          + ` · growth ${top.firstPromptTokens ?? '?'}->${top.lastPromptTokens ?? '?'} (${top.growthFactor ?? '?'}x)`
+          + (top.accelAtCall ? ` · accelerated at call ${top.accelAtCall} (~${top.accelAtTokens} tok)` : ' · no acceleration knee'));
+        // Directly tests the compaction-threshold hypothesis: Hermes compresses at 50% of its
+        // window, Argo at ~94%. Counting calls above each line says whether a run actually
+        // spent time in the regime the hypothesis blames. On the 2026-09-03 runaway frame the
+        // answer was zero above even 50% — evidence AGAINST the threshold explanation for that
+        // failure, which is why the counts are printed rather than assumed.
+        const a50 = pf.reduce((a, p) => a + (p.callsAbove50Pct ?? 0), 0);
+        const a75 = pf.reduce((a, p) => a + (p.callsAbove75Pct ?? 0), 0);
+        const a94 = pf.reduce((a, p) => a + (p.callsAbove94Pct ?? 0), 0);
+        console.log(`      context regime: calls above 50%/75%/94% of num_ctx = ${a50}/${a75}/${a94}`
+          + ` · compactThreshold ${effective?.compactThreshold ?? '?'} (Hermes compresses at 0.5)`);
+      }
+      if (perTurn.length > 1) {
+        console.log(`      turns: ${perTurn.map(t => `#${t.turn} ${t.modelCallsTotal ?? '?'}call/${t.promptTokensTotal ?? '?'}tok/peak${t.maxCtx ?? '?'}${t.idle ? '' : ' TIMEOUT'}`).join('  ')}`);
+      }
+      if (typesAfter) {
+        console.log(`      typesCheck: ${typesAfter.ok ? 'ok' : 'FAIL'}${typesAfter.enforced ? '' : ' (not enforced — it did not pass at baseline either)'}`);
+      }
       if (frames && frames.available) {
         const st = Object.entries(frames.byStatus).filter(([, n]) => n > 0).map(([k, n]) => `${k}=${n}`).join(' ');
         console.log(`      frames ${st || '(none concluded)'} · ${frames.delegations} delegation(s), ${frames.resumed} resume(s)`
@@ -423,6 +547,11 @@ for (const model of MODELS) {
         maxIterations: MAX_ITER, timeoutS: TIMEOUT_S, harnessFlagsFromEval: ['1', 'true', 'on', 'yes'].includes((process.env.EVAL_HARNESS || '').trim().toLowerCase()),
         effectiveConfig: effective,
         completed, legacyCheck,
+        typesCheck: typesAfter,
+        // Multi-turn (H25). `turns` is 1 for every ordinary task, so a query can filter on it
+        // without special-casing. `perTurn` carries each prompt's own cost and peak context —
+        // the series that makes "did it retain turn N-1's understanding" answerable.
+        turns: turnsOf(task).length, multiTurn: isMultiTurn(task), perTurn,
         score: rubric.total,          // null until the batch aggregation supplies passRate
         runScore: rubric.runScore, runScoreMax: rubric.runScoreMax,
         scoreBreakdown: rubric,

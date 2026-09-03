@@ -58,6 +58,7 @@ import {
   REPO, RUNS_DIR, wsPath, sh, baselineOf, resetWs, shScore,
   rubricScore, qualityScore, appendHistory, RUBRIC_VERSION,
   suiteCmdFor, seededCmdFor, selectTasks, isScored, seededTestFiles,
+  typesCheckFor, runsOn, turnsOf, isMultiTurn,
 } from './tasks.mjs';
 import {
   runTests, checkIntegrity, checkRegression, seedTargets,
@@ -86,7 +87,20 @@ const DIFF_OUT_DIR = process.env.EVAL_DIFF_DIR || path.join(RUNS_DIR, 'diffs');
 
 // `EVAL_TASKS` is handled inside selectTasks(); argv[2] is kept for back-compat.
 if (!process.env.EVAL_TASKS && process.argv[2]) process.env.EVAL_TASKS = process.argv[2];
-const SUITE = selectTasks();
+// Tasks this harness may not run are SKIPPED WITH A PRINTED REASON, never silently dropped
+// and never run in a degraded form. `commander-continuity` is multi-turn and depends on the
+// agent keeping one session across prompts; `hermes chat -q` is one invocation per prompt and
+// whether it continues a session in the same cwd is unverified. Running it here as three
+// independent one-shot prompts would measure something different from what Argo does while
+// presenting it as the same measurement.
+// Multi-turn is excluded structurally as well as by declaration: this driver invokes
+// `hermes chat -q <prompt>` once per task and reads `task.prompt`, which a multi-turn task
+// does not have. Filtering on isMultiTurn() too means a future multi-turn task that forgot to
+// declare `harnesses` is skipped with a reason rather than crashing on an undefined argv entry.
+const ALL_SELECTED = selectTasks();
+const canRunHere = (t) => runsOn(t, 'hermes') && !isMultiTurn(t);
+const SUITE = ALL_SELECTED.filter(canRunHere);
+const SKIPPED = ALL_SELECTED.filter(t => !canRunHere(t));
 const BATCH_ID = `${new Date().toISOString().replace(/[:.]/g, '-')}_hermes_${HARNESS_SHA}`;
 
 const pad = (s, n) => { s = String(s); return s + ' '.repeat(Math.max(0, n - s.length)); };
@@ -346,7 +360,11 @@ if (!existsSync(HERMES_LOG)) {
 
 const baselines = Object.fromEntries([...new Set(SUITE.map(t => t.ws))].map(ws => [ws, baselineOf(ws)]));
 console.log(`Hermes baseline — rubric v${RUBRIC_VERSION} — ${SUITE.length} task(s) × ${RUNS} run(s) · max_turns ${MAX_TURNS} · timeout ${TIMEOUT_S}s · batch ${BATCH_ID}`);
-console.log('Do NOT interleave this with an Argo battery (EVAL-PLAN §1.6a).\n');
+console.log('Do NOT interleave this with an Argo battery (EVAL-PLAN §1.6a).');
+for (const t of SKIPPED) {
+  console.log(`SKIP  ${t.id} — declared harnesses ${JSON.stringify(t.harnesses)}${isMultiTurn(t) ? ' (multi-turn: needs session continuity across prompts, unverified for Hermes)' : ''}. Not run, and NOT recorded as a failure.`);
+}
+console.log('');
 for (const [ws, base] of Object.entries(baselines)) {
   if (!base) console.error(`!!! ${ws}: no baseline ref — every run in it will be voided by the integrity gate`);
 }
@@ -362,6 +380,11 @@ for (const task of SUITE) {
 
     const ollamaAtStart = sampleResources();
     const baselineSuite = suiteCmd ? runTests(suiteCmd, wsDir) : null;
+    // Same baseline-calibrated type check as e2e.mjs — identical command, identical
+    // enforcement rule, so a task whose asked-for work includes TypeScript declarations is
+    // judged the same way for both harnesses.
+    const typesCmd = typesCheckFor(task.ws);
+    const typesBaselineOk = typesCmd ? shScore(typesCmd, wsDir).exitOk : null;
 
     const t0 = Date.now();
     let raw = '', err = null;
@@ -411,7 +434,11 @@ for (const task of SUITE) {
       targetedFraction = task.check({ finalAnswer: raw }) ? 1 : 0;
     }
     const legacyCheck = typeof task.check === 'function' ? task.check({ finalAnswer: raw }) : shScore(task.check, wsDir).exitOk;
-    const completed = !err && gates.ok && targetedFraction === 1;
+    const typesAfter = typesCmd
+      ? { cmd: typesCmd, baselineOk: typesBaselineOk, ok: shScore(typesCmd, wsDir).exitOk, enforced: typesBaselineOk === true }
+      : null;
+    const completed = !err && gates.ok && targetedFraction === 1
+      && (typesAfter?.enforced ? typesAfter.ok : true);
 
     // ── QUALITY ─────────────────────────────────────────────────────────────────────
     mkdirSync(DIFF_OUT_DIR, { recursive: true });
@@ -460,7 +487,8 @@ for (const task of SUITE) {
         provider: 'ollama-launch', flags: ['-Q', '--yolo', '--ignore-rules', `--max-turns ${MAX_TURNS}`],
         terminalBackend: 'local', samplingPinned: false,
       },
-      completed, legacyCheck,
+      completed, legacyCheck, typesCheck: typesAfter,
+      turns: turnsOf(task).length, multiTurn: isMultiTurn(task), perTurn: null,
       score: rubric.total, runScore: rubric.runScore, runScoreMax: rubric.runScoreMax,
       scoreBreakdown: rubric, gates,
       targeted: targeted
