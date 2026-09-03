@@ -7,7 +7,7 @@ import { toolDefinitions, executeTool } from './tools/index.js'
 import { bash, NO_OUTPUT } from './tools/bash.js'
 import { truncateOutput } from './tools/truncate.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
-import type { AgentEvent, ToolName, ModelOptions } from './types.js'
+import type { AgentEvent, ToolName, ModelOptions, FramePolicy } from './types.js'
 import { runCritic, isTestOrSpecPath, type Critique, type CriticCheckpoint } from './critic.js'
 import { runGroundingCritic, isDocPath, findNumericConflicts } from './grounding.js'
 import { checkLayout, selectLayoutArtifact, type LayoutVerdict } from './layout.js'
@@ -274,6 +274,27 @@ export async function loadProjectContext(workspaceRoot = '/workspace'): Promise<
   return sections.join('\n\n')
 }
 
+// HOW A chat() TURN ENDED, as a fact rather than an inference (H13, 2026-09-04):
+//   'ok'      — the model produced a final answer (no tool call) and every pre-done gate
+//               (task ledger, grounding, layout, re-ground) let it through.
+//   'cap'     — the iteration budget ran out first. chat() still RETURNS a string (the
+//               "Reached maximum iterations (N) without a final answer." notice) and
+//               emits a terminal `error` event; that string is NOT a final answer and a
+//               frame that ends this way completed nothing it can be credited for.
+//   'error'   — an exception reached chat()'s outer catch (e.g. the per-iteration
+//               ollama.chat() rejecting after its one retry). The returned string is the
+//               error text.
+//   'aborted' — the stop button (abort()) ended the turn; chat() returned 'Stopped.'.
+export type RunOutcome = 'ok' | 'cap' | 'error' | 'aborted'
+
+// What chat() may be told about the turn it is starting. `resume: true` means "this is a
+// follow-up turn of the SAME frame" (dispatch.ts's resumeFrame: a Tester REDO, a Planner
+// replanning round, a task-start marker retry) — keep the frame's accumulated state and
+// keep counting iterations from where the last turn stopped.
+export interface ChatOptions {
+  resume?: boolean
+}
+
 export class Agent {
   private ollama: Ollama
   private history: Message[] = []
@@ -390,6 +411,23 @@ export class Agent {
   // decide whether a just-concluded frame was large enough to warrant an immediate
   // standup, on top of the aggregate action-episode counter (docs/subagents-plan.md).
   private lastIterationCount = 0
+  // RESUME (H14, 2026-09-04). chat(msg, { resume: true }) continues an EXISTING frame:
+  // iteration numbering picks up where the previous turn left off instead of restarting
+  // at 1 (a marker-retry resume was observed reporting "ITER 1/10" for a frame that had
+  // already spent iterations), and none of the per-run state below is wiped. This is
+  // the count already consumed by earlier turns of the same frame; 0 for a fresh chat().
+  private iterationBase = 0
+  // HOW THE LAST chat() TURN ACTUALLY ENDED (H13, 2026-09-04) — the single fact that
+  // used to be produced and then discarded at the frame boundary. 'cap' means the
+  // iteration budget ran out with no final answer, in which case chat() RETURNS the
+  // string "Reached maximum iterations (N) without a final answer." and also emits a
+  // terminal `error` event; dispatch.ts's deriveFrameResult used to see only "a string
+  // came back" and record status:'success' for it (measured: 43 blank cap-hit frames
+  // recorded as success — Planner 9/23, Boss 26/204, Implementer 6/61, Tester 2/85,
+  // baseline 7/194). Callers must consult this rather than re-deriving intent from the
+  // returned text or from an iteration-count comparison (which resume now breaks: the
+  // counter is cumulative across turns, so `count >= max` no longer means "stalled").
+  private lastRunOutcome: RunOutcome = 'ok'
   // this.loopState.mutationCount recorded at the last 20/35/45 stall/progress
   // checkpoint (see chat()) — lets that checkpoint tell "genuinely stuck" apart from
   // "still landing real edits, just needed more than 20 iterations for a bigger task,"
@@ -519,6 +557,27 @@ export class Agent {
     this.loop = on
   }
 
+  // PER-FRAME MECHANISM POLICY (H17, 2026-09-04). One call that states EVERY mechanism
+  // switch for this instance, instead of a scattering of optional setTasks/setMemory/
+  // setLoop/setGrounding calls that a spawn site can silently forget (dispatch.ts's
+  // spawnFrame forgot all four, so every role-scoped frame inherited the single-loop
+  // baseline's mechanism set — see types.ts's FramePolicy for the measured consequence).
+  // The individual setters above stay: they are how the web UI / server.ts toggle one
+  // mechanism per session, and how the existing unit tests drive one at a time.
+  setPolicy(policy: FramePolicy) {
+    this.tasks = policy.tasks
+    this.memory = policy.memory
+    this.loop = policy.loop
+    this.grounding = policy.grounding
+    this.layout = policy.layout
+  }
+
+  // The policy actually in force — what a test asserts on, and what a future /status
+  // endpoint should report per frame rather than re-reading config.*.
+  getPolicy(): FramePolicy {
+    return { tasks: this.tasks, memory: this.memory, loop: this.loop, grounding: this.grounding, layout: this.layout }
+  }
+
   setAutoCommit(on: boolean) {
     this.autoCommitEnabled = on
   }
@@ -548,8 +607,54 @@ export class Agent {
     return this.editedPaths
   }
 
+  // CUMULATIVE across a frame's turns (a resumed turn continues the count — see
+  // iterationBase), so this is "how many iterations has this frame spent", not "how many
+  // did its last turn spend". Do NOT compare it against getMaxIterations() to detect a
+  // stall: use hitIterationCap(), which reports what actually happened.
   getIterationCount(): number {
     return this.lastIterationCount
+  }
+
+  getLastRunOutcome(): RunOutcome {
+    return this.lastRunOutcome
+  }
+
+  // True ⇔ the last chat() turn ran out of iteration budget without producing a final
+  // answer. This is the fact H13 needs at the frame boundary; it stays true until the
+  // next chat() turn starts.
+  hitIterationCap(): boolean {
+    return this.lastRunOutcome === 'cap'
+  }
+
+  // A read-only snapshot of the per-frame state that a RESUME must preserve (H14) —
+  // instrumentation for tests and for a future frame-state view. Deliberately reports
+  // presence/counts rather than handing out the live objects, so nothing external can
+  // mutate this instance's run state.
+  getRunState(): {
+    hasPlan: boolean
+    hasTaskList: boolean
+    taskListRevision: number
+    episodes: number
+    editedPaths: string[]
+    iterationCount: number
+    finalReconciled: boolean
+    loopMutationCount: number
+    hadTrouble: boolean
+  } {
+    // Same narrowing cast the rest of this file uses around currentPlan.
+    const plan = this.currentPlan as { objective: string } | null
+    const tl = this.taskList
+    return {
+      hasPlan: plan !== null,
+      hasTaskList: tl !== null,
+      taskListRevision: tl ? tl.revision : 0,
+      episodes: this.episodes.length,
+      editedPaths: [...this.editedPaths],
+      iterationCount: this.lastIterationCount,
+      finalReconciled: this.finalReconciled,
+      loopMutationCount: this.loopState.mutationCount,
+      hadTrouble: this.hadTrouble(),
+    }
   }
 
   hadTrouble(): boolean {
@@ -759,7 +864,22 @@ export class Agent {
       const durable = [...this.compactionState.verifiedFacts, ...this.compactionState.decisionsMade]
       if (durable.length > 0) {
         try {
-          await persistToMemory(path.join('/workspace', 'MEMORY.md'), durable)
+          // persistToMemory now REJECTS non-durable items at the write boundary (H15,
+          // 2026-09-04): compaction's own distillation input is a rendered transcript
+          // (compaction.ts's messagesToText emits `Called bash({...})` / `Result: ...`),
+          // the prompt tells the model to copy tool-confirmed items verbatim, and this
+          // call wrote them straight to a file that is then re-injected into every later
+          // run in the workspace — the mechanism degraded its own future input. Surfaced
+          // as a warning rather than dropped silently: a rejection means the distillation
+          // prompt is producing transcript, which is worth seeing in the logs.
+          const res = await persistToMemory(path.join('/workspace', 'MEMORY.md'), durable)
+          if (res.rejected.length > 0) {
+            emitAndLog({
+              type: 'warning',
+              message: `MEMORY.md write filtered ${res.rejected.length} non-durable item(s): `
+                + res.rejected.map(r => `${r.reason} — ${r.item.slice(0, 80)}`).join(' | '),
+            })
+          }
         } catch (err) {
           emitAndLog({ type: 'warning', message: `MEMORY.md persist failed (${err instanceof Error ? err.message : String(err)}) — continuing` })
         }
@@ -1196,7 +1316,16 @@ export class Agent {
     return verdict
   }
 
-  async chat(userMessage: string): Promise<string> {
+  // RESUME (H14, 2026-09-04). `opts.resume` marks this turn as a continuation of the
+  // SAME frame rather than a new run. Before this existed, dispatch.ts's resumeFrame
+  // called plain chat(), which unconditionally cleared currentPlan, taskList, loopState,
+  // editedPaths, episodes, finalReconciled, the per-task verify/summary sets and the
+  // iteration counter — so a Tester REDO or a Planner replanning round restarted the
+  // frame from a blank slate while claiming to continue it (observed: a marker-retry
+  // resume reporting "ITER 1/10"). It was latent only because REDO/replan almost never
+  // fired; H13 makes REDO reachable, so it stops being latent in this same batch.
+  async chat(userMessage: string, opts?: ChatOptions): Promise<string> {
+    const resume = opts?.resume === true
     const logger = new SessionLogger(userMessage, this.model, this.options, this.sessionId)
 
     const emitAndLog = (event: AgentEvent) => {
@@ -1215,29 +1344,50 @@ export class Agent {
     // Reassigned (not recomputed) after each compaction, since compaction replaces
     // `this.history` wholesale and returns the prompt's new position in it.
     let currentRunStart = this.history.length - 1
-    // Loop-steering state, scoped to this run only (see REPEAT_WINDOW above).
-    this.recentCalls = []
-    this.loopState = createLoopState()
-    this.mutationCountAtLastStallCheck = 0
-    this.loopSteerEscalated = false
-    this.ollamaRetryCount = 0
-    this.currentPlan = null
-    // HARNESS TASK LEDGER + MEMORY per-run state (only used when this.tasks/this.memory
-    // are on; resetting them unconditionally is a harmless local write for the baseline).
-    this.taskList = null
-    this.taskVerifyPassed.clear()
-    this.taskSummaryAsked.clear()
-    this.taskVerifyFails.clear()
-    this.finalReconciled = false
-    this.agentsRaw = ''
-    this.memoryRaw = ''
-    // ACTOR-CRITIC per-run state (see field docs). Reset alongside the loop-steer
-    // state so a later run starts from a clean slate.
-    this.editedPaths = []
-    this.fetchedSources = []
-    this.lastCommandOutput = ''
-    this.actionTrace = []
-    this.episodes = []
+    // How this turn ends is decided by whichever exit path below runs; assume the good
+    // case so a normal final answer needs no bookkeeping, and overwrite on the cap /
+    // error / abort paths. Reset for a resumed turn too: it describes the LAST turn.
+    this.lastRunOutcome = 'ok'
+    if (resume) {
+      // RESUMED TURN (H14): keep every piece of frame state. Continue the iteration
+      // count from where the previous turn stopped, so a resumed frame reports "ITER
+      // 11/20" rather than starting over at 1 — and so a caller can still see the
+      // frame's TOTAL effort. Everything the fresh-run branch below clears
+      // (currentPlan, taskList + its verify/summary sets, loopState, editedPaths,
+      // episodes, finalReconciled, the grounding evidence and the trouble flags) is
+      // deliberately left in place: the follow-up message is a continuation of the
+      // same work, and wiping it made a REDO/replan restart from a blank slate while
+      // claiming to continue. Note loopSteerEscalated/ollamaRetryCount are STICKY per
+      // frame on purpose — friction that happened in an earlier turn of this frame is
+      // still friction dispatch.ts's standup trigger should see.
+      this.iterationBase = this.lastIterationCount
+    } else {
+      this.iterationBase = 0
+      this.lastIterationCount = 0
+      // Loop-steering state, scoped to this run only (see REPEAT_WINDOW above).
+      this.recentCalls = []
+      this.loopState = createLoopState()
+      this.mutationCountAtLastStallCheck = 0
+      this.loopSteerEscalated = false
+      this.ollamaRetryCount = 0
+      this.currentPlan = null
+      // HARNESS TASK LEDGER + MEMORY per-run state (only used when this.tasks/this.memory
+      // are on; resetting them unconditionally is a harmless local write for the baseline).
+      this.taskList = null
+      this.taskVerifyPassed.clear()
+      this.taskSummaryAsked.clear()
+      this.taskVerifyFails.clear()
+      this.finalReconciled = false
+      this.agentsRaw = ''
+      this.memoryRaw = ''
+      // ACTOR-CRITIC per-run state (see field docs). Reset alongside the loop-steer
+      // state so a later run starts from a clean slate.
+      this.editedPaths = []
+      this.fetchedSources = []
+      this.lastCommandOutput = ''
+      this.actionTrace = []
+      this.episodes = []
+    }
     let loopSteers = 0
     // No-progress detector: tool calls since the last actual change to the project.
     // A planned run that keeps inspecting without ever editing is stuck (the novel-arg
@@ -1271,21 +1421,34 @@ export class Agent {
     // typical config) this reduces to exactly the original fixed values (unchanged,
     // still "a first guess tuned against the eval"); for a short-budget role it
     // scales down proportionally instead of never firing at all.
+    // Offset by iterationBase on a RESUMED turn (H14) so the checkpoints keep firing at
+    // the same positions WITHIN this turn — the alternative (absolute numbering) would
+    // put every checkpoint in the past for a resumed frame and silently give it no
+    // mid-run steering at all, which is the same class of bug the scaling above fixed.
     const stallCheckpoints = [0.4, 0.65, 0.85].map((frac, idx) =>
-      Math.min([20, 35, 45][idx], Math.max(1, Math.round(frac * this.maxIterations))),
+      this.iterationBase + Math.min([20, 35, 45][idx], Math.max(1, Math.round(frac * this.maxIterations))),
     )
+    // A resumed turn gets its own full iteration allowance; what carries over is the
+    // COUNT (for reporting and for dispatch.ts's large-frame standup trigger), not the
+    // remaining budget — a targeted REDO/replan follow-up that inherited 2 leftover
+    // iterations could not act on the instruction it was given, which would defeat the
+    // point of resuming. `max` is reported cumulatively for the same reason, so the
+    // emitted iteration event never shows current > max.
+    const maxForRun = this.iterationBase + this.maxIterations
 
     try {
       for (let i = 0; i < this.maxIterations; i++) {
         if (this.aborted) {
           this.aborted = false
           const msg = 'Stopped.'
+          this.lastRunOutcome = 'aborted'
           emitAndLog({ type: 'done', content: msg })
           this.phase = 'idle'
           return msg
         }
-        emitAndLog({ type: 'iteration', current: i + 1, max: this.maxIterations })
-        this.lastIterationCount = i + 1
+        const iterCurrent = this.iterationBase + i + 1
+        emitAndLog({ type: 'iteration', current: iterCurrent, max: maxForRun })
+        this.lastIterationCount = iterCurrent
 
         // Stall re-ground (Magentic-One style). On a long run that is drifting, the
         // loop-steer guard can't help — its churn has novel args — and the reground
@@ -1293,8 +1456,11 @@ export class Agent {
         // (well above normal convergence — observed passing tasks ≤13 iters), scaled
         // to THIS run's own budget (stallCheckpoints, above), inject a non-terminating
         // re-ground toward the objective, then force a re-plan at the top. Each fires
-        // once (iterNum is strictly increasing).
-        const iterNum = i + 1
+        // once (iterNum is strictly increasing). Cumulative across a frame's turns
+        // (H14) — stallCheckpoints are offset by the same base, so the comparison and
+        // the "N iterations without finishing" wording both refer to the frame's own
+        // total effort rather than resetting on every resume.
+        const iterNum = iterCurrent
         if (stallCheckpoints.includes(iterNum)) {
           // Real edits landing since the LAST checkpoint (not since run start — a
           // stretch of pure investigation right after an earlier burst of edits
@@ -1656,7 +1822,12 @@ export class Agent {
                   emitAndLog({ type: 'warning', message: `Loop-recovery compaction failed (${err instanceof Error ? err.message : String(err)}) — continuing` })
                 }
               }
-              emitAndLog({ type: 'warning', message: action.message })
+              // Carry the ladder rung as a STRUCTURED field (H16, 2026-09-04), not just
+              // inside the prose: action.level is already L0/L1/L2 here and was being
+              // discarded at exactly this line, which forced every consumer (the eval's
+              // loop counters, the UI) to recover it by regex over the message wording —
+              // the defect class that left two counters silently broken for months.
+              emitAndLog({ type: 'warning', message: action.message, level: action.level })
               this.rejectToolCall(name, args, `SKIPPED — identical to a call already run with nothing new since. ${action.message}`, emitAndLog)
               continue
             }
@@ -1798,6 +1969,12 @@ export class Agent {
         }
       }
 
+      // CAP HIT. The returned string is a NOTICE, not a final answer, and this is the
+      // one place that knows the difference — record it (H13) so the frame boundary
+      // (dispatch.ts's deriveFrameResult) can stop reading "a string came back" as
+      // success. The terminal `error` event was already emitted here and then discarded
+      // one layer up; lastRunOutcome is that same fact, in a form code can read.
+      this.lastRunOutcome = 'cap'
       const errMsg = `Reached maximum iterations (${this.maxIterations}) without a final answer.`
       emitAndLog({ type: 'error', message: errMsg })
       this.phase = 'idle'
@@ -1811,6 +1988,7 @@ export class Agent {
       // Confirmed via a real incident: a run left hanging after a host
       // sleep/wake produced a run log with no 'error'/'done' event, and the
       // --rm'd container was later found gone with no way to recover its logs.
+      this.lastRunOutcome = 'error'
       const message = `Unexpected error: ${err instanceof Error ? err.message : String(err)}`
       emitAndLog({ type: 'error', message })
       this.phase = 'error'

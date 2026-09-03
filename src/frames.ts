@@ -14,11 +14,20 @@
 // does without eviction re-surfacing it. Re-threading ledger state into per-turn
 // recitation is a real refinement, not a correctness requirement for v1.
 
-import type { Role, ToolName, FrameSpawnRequest } from './types.js'
+import type { Role, ToolName, FrameSpawnRequest, FramePolicy } from './types.js'
 import { getConclusion } from './ledger.js'
 
 export const ROLE_TOOLS: Record<Role, ToolName[]> = {
-  planner: ['read_file', 'web_search', 'fetch_url', 'ledger', 'update_plan'],
+  // Deliberately NO update_plan (removed 2026-09-04). The Planner's deliverable is the
+  // task graph it returns as its FRAME'S FINAL ANSWER (a no-tool-call turn — see
+  // dispatch.ts's parseTaskGraph), not a harness plan ledger: dispatch.ts owns the
+  // graph, ledger.setPlan persists it, and nothing ever read a Planner's own
+  // this.currentPlan. Holding the tool was actively harmful, not merely redundant —
+  // combined with harness task sequencing (which spawnFrame never disabled, see
+  // types.ts FramePolicy) an update_plan call built a task ledger whose per-task verify
+  // gate then refused to let the frame conclude, so the graph was never delivered. The
+  // 6 Planner frames that never called it concluded in two messages.
+  planner: ['read_file', 'web_search', 'fetch_url', 'ledger'],
   implementer: ['read_file', 'write_file', 'edit_file', 'bash', 'fetch_url', 'web_search', 'browser_fetch', 'ledger', 'update_plan'],
   // Deliberately no write_file/edit_file — Tester directs fixes, never makes them.
   tester: ['read_file', 'bash', 'ledger'],
@@ -40,6 +49,43 @@ export const ROLE_MAX_ITERATIONS: Record<Role, number> = {
   implementer: 60,
   tester: 20,
   boss: 15,
+}
+
+// PER-ROLE MECHANISM POLICY (2026-09-04). See types.ts's FramePolicy for why this is a
+// declared object rather than a few setter calls at the spawn site. Justification per
+// cell, since "why is this false" is the whole point:
+//
+//   tasks (harness task sequencing) — ON only for the Implementer. It is the one role
+//     that does multi-step work, holds update_plan, and produces the file mutations the
+//     per-task verify gate exists to check. For every other role the mechanism cannot
+//     help and can only trap: the deliverable of a Planner/Tester/Boss frame IS its
+//     no-tool-call final answer (a task graph, a RELEASE/REDO verdict, a NONE/INJECT/
+//     RESTART/ESCALATE verdict), and task sequencing reinterprets that exact signal as
+//     "current task might be done — run its verify, then ask for a summary", which
+//     costs iterations at best and blocks the verdict at worst.
+//   memory — ON only for the Implementer: MEMORY.md persistence at compaction (memory.ts
+//     persistToMemory) is a WRITE to the workspace, and the read-only roles must not
+//     write. Turning it off does not blind them: agent.ts falls back to the baseline
+//     whole-file AGENTS.md + MEMORY.md injection, which for a short-budget role is
+//     strictly more context than task-scoped retrieval.
+//   loop — ON for every role. The failure it prevents (a small local model repeating an
+//     identical call forever with nothing changed since) is role-independent, and its
+//     escalation flag is what dispatch.ts's `hadTrouble()` standup trigger reads.
+//   grounding / layout — ON only for the Implementer: both are PRE-DONE gates on an
+//     ARTIFACT the frame produced (a document, an HTML page). A role that never writes
+//     files can only ever be delayed by them, and a gate on a verdict-shaped final
+//     answer is the same trap shape as `tasks` above. (layout is off in config by
+//     default anyway; stated explicitly so a future default flip cannot re-open this.)
+export const ROLE_POLICY: Record<Role, FramePolicy> = {
+  planner:     { tasks: false, memory: false, loop: true, grounding: false, layout: false },
+  implementer: { tasks: true,  memory: true,  loop: true, grounding: true,  layout: true  },
+  tester:      { tasks: false, memory: false, loop: true, grounding: false, layout: false },
+  boss:        { tasks: false, memory: false, loop: true, grounding: false, layout: false },
+}
+
+// Returned as a fresh object so a caller can never mutate the table above.
+export function policyFor(role: Role): FramePolicy {
+  return { ...ROLE_POLICY[role] }
 }
 
 // Display names — the Argonauts, matched to each role's actual function rather than
@@ -139,21 +185,50 @@ export async function buildAssignment(root: string, req: FrameSpawnRequest): Pro
 // ── Tester / Boss verdict parsing ──────────────────────────────────────────────────
 // Tester and Boss are real Agent-based frames (their own ReAct loop, real tools),
 // not single-shot JSON-mode critic calls — so their verdict comes from a simple text
-// convention at the end of their final answer (see ROLE_SYSTEM_SUFFIX above), parsed
-// with regexes that fail open to a safe default rather than blocking on an
-// unparseable reply (same "fail open" principle as every other checkpoint in this
-// project — critic.ts, grounding.ts, layout.ts).
-
+// convention at the end of their final answer (see ROLE_SYSTEM_SUFFIX above).
+//
+// FOUR parse sites live in this pipeline — parseTesterVerdict, parseTaskStartVerdict,
+// parseBossVerdict (here) and parseTaskGraph (dispatch.ts) — and until 2026-09-04 they
+// each "failed open to a safe default" in their own way, with no way for a caller to
+// tell "the model said this" from "nothing was parseable". Two of those defaults were
+// not safe at all: an unparseable TESTER reply became RELEASE, i.e. work accepted with
+// no review (measured: 85 Tester frames, ZERO REDOs ever issued, 2 of them stalled
+// blank at their cap and still read as approval), and an unparseable PLANNER reply
+// became a one-step graph, i.e. decomposition silently discarded.
+//
+// The convention now: every parse site returns an explicit `parsed` flag, so
+// "unparseable" is a fact the caller can act on rather than something laundered into a
+// positive verdict. Fail-open remains the default for a CLEAN, parseable-but-markerless
+// reply where the benign reading is genuinely the likely one (Boss "nothing wrong");
+// it is NOT the default where the pessimistic reading is (Tester approval, Planner
+// decomposition), and it is never the default when the frame's own run ended in a cap
+// hit or an error — dispatch.ts consults Agent.getLastRunOutcome() for that.
 export interface TesterVerdict {
-  action: 'release' | 'redo'
+  // 'escalate' = no verdict could be read at all. Deliberately NOT collapsed into
+  // 'release': a Tester that never said RELEASE has not approved anything.
+  action: 'release' | 'redo' | 'escalate'
   followUp: string // only meaningful when action === 'redo'
+  parsed: boolean  // false ⇔ action === 'escalate'
 }
 
 export function parseTesterVerdict(finalAnswer: string): TesterVerdict {
   const redo = /REDO\s*:\s*([\s\S]+)/i.exec(finalAnswer)
-  if (redo) return { action: 'redo', followUp: redo[1].trim() }
-  return { action: 'release', followUp: '' }
+  if (redo) return { action: 'redo', followUp: redo[1].trim(), parsed: true }
+  // RELEASE must be stated, not assumed. Word-boundary matched (not a substring) so
+  // "released"/"releasing" in prose cannot be mistaken for the verdict marker; the
+  // colon is optional because the prompt asks the model to end with the bare word.
+  if (/\bRELEASE\b/i.test(finalAnswer)) return { action: 'release', followUp: '', parsed: true }
+  return { action: 'escalate', followUp: '', parsed: false }
 }
+
+// The nudge dispatch.ts sends when a Tester frame produced no readable verdict and
+// there is still a round left — a targeted reformat request (the diagnosis is exact:
+// the review may well have happened, the marker line is missing), mirroring
+// TASK_START_MARKER_RETRY_NUDGE rather than a blind "try again".
+export const TESTER_VERDICT_NUDGE =
+  'Your last answer did not end with a verdict line, so it cannot be acted on. Reply again and end your ' +
+  'answer with exactly one of: RELEASE (you accept the conclusion, success or failure) or ' +
+  'REDO: <specific follow-up instruction> — nothing else after it.'
 
 // Task-start checkpoint, a FOUR-way fork rather than always producing an objective +
 // full plan (docs/subagents-plan.md, "skippable phases" + the Magentic-One-grounded
@@ -166,17 +241,18 @@ export function parseTesterVerdict(finalAnswer: string): TesterVerdict {
 export interface TaskStartVerdict {
   mode: 'answer' | 'trivial' | 'simple' | 'objective'
   text: string // the final answer (mode 'answer') or the objective statement (otherwise)
+  parsed: boolean // false ⇔ no marker line was found (text is then '')
 }
 
 export function parseTaskStartVerdict(finalAnswer: string): TaskStartVerdict {
   const answer = /ANSWER\s*:\s*([\s\S]+)/i.exec(finalAnswer)
-  if (answer) return { mode: 'answer', text: answer[1].trim() }
+  if (answer) return { mode: 'answer', text: answer[1].trim(), parsed: true }
   const trivial = /TRIVIAL\s*:\s*([\s\S]+)/i.exec(finalAnswer)
-  if (trivial) return { mode: 'trivial', text: trivial[1].trim() }
+  if (trivial) return { mode: 'trivial', text: trivial[1].trim(), parsed: true }
   const simple = /SIMPLE\s*:\s*([\s\S]+)/i.exec(finalAnswer)
-  if (simple) return { mode: 'simple', text: simple[1].trim() }
+  if (simple) return { mode: 'simple', text: simple[1].trim(), parsed: true }
   const objective = /OBJECTIVE\s*:\s*([\s\S]+)/i.exec(finalAnswer)
-  if (objective) return { mode: 'objective', text: objective[1].trim() }
+  if (objective) return { mode: 'objective', text: objective[1].trim(), parsed: true }
   // No marker found at all — do NOT fall back to the raw final answer text. A real
   // failure observed in eval: the Boss did the fix itself via bash instead of just
   // classifying, then reported that as free-form prose with no ANSWER/TRIVIAL/
@@ -186,21 +262,31 @@ export function parseTaskStartVerdict(finalAnswer: string): TaskStartVerdict {
   // project structure trying to find something to do. Returning empty text here
   // signals "unparseable" so the caller (dispatch.ts's runBossTaskStart) falls back
   // to the ORIGINAL user message instead — always a valid objective by construction,
-  // unlike the Boss's free-form answer.
-  return { mode: 'objective', text: '' }
+  // unlike the Boss's free-form answer. `parsed: false` says the same thing explicitly;
+  // note this site was ALREADY not failing open (the fallback objective is the user's
+  // own words, not the model's prose), so only the flag is new here.
+  return { mode: 'objective', text: '', parsed: false }
 }
 
 export interface BossVerdict {
   action: 'none' | 'inject' | 'restart' | 'escalate'
   message: string
+  // false ⇔ no NONE/INJECT/RESTART/ESCALATE marker was found. Unlike the Tester's,
+  // this default STAYS benign ('none' = reviewed, nothing wrong) for a run that ended
+  // cleanly: the Boss is a periodic health check whose overwhelmingly common outcome
+  // is "carry on", and escalating every markerless-but-complete review would replan on
+  // formatting. dispatch.ts's runBoss escalates when !parsed AND the frame's own run
+  // did not end cleanly (cap hit / error) — the case where nothing was reviewed at all.
+  parsed: boolean
 }
 
 export function parseBossVerdict(finalAnswer: string): BossVerdict {
   const inject = /INJECT\s*:\s*([\s\S]+)/i.exec(finalAnswer)
-  if (inject) return { action: 'inject', message: inject[1].trim() }
+  if (inject) return { action: 'inject', message: inject[1].trim(), parsed: true }
   const restart = /RESTART\s*:\s*([\s\S]+)/i.exec(finalAnswer)
-  if (restart) return { action: 'restart', message: restart[1].trim() }
+  if (restart) return { action: 'restart', message: restart[1].trim(), parsed: true }
   const escalate = /ESCALATE\s*:\s*([\s\S]+)/i.exec(finalAnswer)
-  if (escalate) return { action: 'escalate', message: escalate[1].trim() }
-  return { action: 'none', message: '' }
+  if (escalate) return { action: 'escalate', message: escalate[1].trim(), parsed: true }
+  if (/\bNONE\b/.test(finalAnswer)) return { action: 'none', message: '', parsed: true }
+  return { action: 'none', message: '', parsed: false }
 }

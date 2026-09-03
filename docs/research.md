@@ -4,6 +4,55 @@ Consolidated background research behind Argo's harness design, merged from two
 surveys. Sources are cited inline. Part 1 covers getting local models to plan
 before implementing; Part 2 covers compaction and context/memory management.
 
+> ## 2026-09-03 â€” PARTIALLY SUPERSEDED. Read this before acting on anything below.
+>
+> This document was written on 2026-07-25 / 2026-07-27, **before Argo had any measurements of its own
+> mechanisms firing.** Those measurements now exist: 567 run logs, ~5 000 model turns, 32 mechanisms
+> graded. The consolidated body that merges this survey with that evidence is
+> [`docs/research/`](research/README.md) â€” one document per concept, each with a *simplest sufficient
+> implementation*, known traps, and a validation plan, plus
+> [`docs/research/interaction-matrix.md`](research/interaction-matrix.md).
+>
+> **Most of this document survives.** The recommendations that were adopted and are confirmed by our own
+> data: lexical retrieval over vectors; auto-inject the digest rather than relying on self-recall;
+> plan-as-state rather than plan-as-prompt; recite the plan at the tail; deterministic tool-result
+> collapsing as the cheapest context win; no parallel coding subagents. Nothing found since argues
+> against any of them.
+>
+> **Four specific claims are superseded. Do not follow them without reading the replacement.**
+>
+> 1. **Part 2's framing finding â€” "keep the LIVE context near the low-thousands of chars" (400â€“3 000
+>    chars).** That probe was **Devstral**, and the same paragraph records that "Qwen3 was robust to
+>    larger context; Devstral fragile". Argo now runs `qwen3.6` exclusively (H02, VALIDATED 4/4) and has
+>    driven it correctly to **64 266 tokens of 65 536**. The target does not apply to the current model.
+>    It survives in the code as `DEFAULT_EVICTION_BUDGET.maxLiveChars = 60 000` (~15 k tokens), which
+>    sits **four times below** the 61 440-token compaction trigger â€” so the first time eviction takes the
+>    threshold path it will stub essentially every evictable episode at once. See
+>    [`research/01-context-management.md`](research/01-context-management.md) Â§3(d), Â§4(ii).
+> 2. **Part 2 Â§D Tier 1 â€” "one small-model call extracts durable facts into the structured ledger".**
+>    Built, and it wrote transcript sludge into the only `MEMORY.md` that exists: `Called bash({â€¦})
+>    Result: 2 passed, 3 failed`, twice, in a file re-injected every iteration. The design is not wrong
+>    in principle; the implementation shares **one** extraction between in-run working memory and
+>    cross-run durable knowledge, which are incompatible consumers. The simplest correct version is
+>    *less* machinery, not more. See [`research/04-memory.md`](research/04-memory.md) â€” H15.
+> 3. **Part 1's implicit optimism about self-critique as a convergence device.** The stronger result is
+>    that LLMs cannot reliably self-correct reasoning without external feedback and sometimes degrade
+>    after trying ([arXiv 2310.01798](https://arxiv.org/abs/2310.01798)), and same-model evaluators show
+>    self-preference ([arXiv 2404.13076](https://arxiv.org/abs/2404.13076)). Ours agrees: Argo's Tester
+>    has issued **0 REDOs in 85 frames** while reading a truncated self-report. The value is in
+>    executable feedback, not second opinions. See
+>    [`research/03-supervision-and-verification.md`](research/03-supervision-and-verification.md).
+> 4. **Part 1's per-model tool-call handling advice (Qwen vs Devstral vs Llama templates).** Correct at
+>    the time, now moot: H02 settled on one model, and multi-model support is not being pursued. Keep it
+>    as background if the model ever changes.
+>
+> Two further corrections that touch documents citing this one: the Magentic-One "31 % from the ledger"
+> figure is real but is the value of the **whole orchestrator**, not the ledger
+> ([arXiv 2411.04468](https://arxiv.org/abs/2411.04468) Â§5.3); and the loop-guard advice below
+> ("escalating steer is the right instinct") needs qualifying â€” Manus recommends a *nudge with variation*,
+> and Argo *blocks*, with a measured desired effect in **6 of 143** blocks. See
+> [`research/05-drift-and-loop-control.md`](research/05-drift-and-loop-control.md) â€” H19, H20.
+
 ---
 
 # Getting Small/Local LLMs to Plan-Before-Implementing Without Losing Versatility
@@ -32,11 +81,11 @@ Prepared: 2026-07-25. All non-obvious claims carry a source URL. Primary sources
 
 ### 1. Claude Code  "Plan mode"
 
-**(a) How plan/act is mechanized.** Plan mode is a **permission mode**, not a prompt. It is entered with `claude --permission-mode plan` or by pressing **Shift+Tab** mid-session to cycle `default ’ acceptEdits ’ plan`; the status bar shows "ø plan mode on." In plan mode "Claude reads files and proposes a plan but makes no edits until you approve" ([common-workflows](https://docs.anthropic.com/en/docs/claude-code/common-workflows)). The documented flow is explicit: **Explore** (enter plan mode; Claude "reads files and answers questions without making changes") ’ **Plan** ("create a detailed implementation plan"; user can open the plan in a text editor with Ctrl+G to edit before proceeding) ’ **Code** ("switch out of plan mode and let Claude code, verifying against its plan") ([best practices](https://www.anthropic.com/engineering/claude-code-best-practices)).
+**(a) How plan/act is mechanized.** Plan mode is a **permission mode**, not a prompt. It is entered with `claude --permission-mode plan` or by pressing **Shift+Tab** mid-session to cycle `default ï¿½ acceptEdits ï¿½ plan`; the status bar shows "ï¿½ plan mode on." In plan mode "Claude reads files and proposes a plan but makes no edits until you approve" ([common-workflows](https://docs.anthropic.com/en/docs/claude-code/common-workflows)). The documented flow is explicit: **Explore** (enter plan mode; Claude "reads files and answers questions without making changes") ï¿½ **Plan** ("create a detailed implementation plan"; user can open the plan in a text editor with Ctrl+G to edit before proceeding) ï¿½ **Code** ("switch out of plan mode and let Claude code, verifying against its plan") ([best practices](https://www.anthropic.com/engineering/claude-code-best-practices)).
 
 **(b) Grounding in the real codebase.** Grounding happens *during* the read-only explore phase  Claude reads relevant files first. Anthropic also recommends delegating research to sub-agents ("use subagents to investigate X") that "explore the codebase, read relevant files, and report back," keeping the main context clean for implementation ([best practices](https://www.anthropic.com/engineering/claude-code-best-practices)). The critical anti-pattern they name is exactly Argo's Problem 2: planning before reading produces plans that "solve the wrong problem."
 
-**(c) Convergence / stop.** Two mechanisms: (i) human approval gates the plan’code transition; (ii) verification against the plan  e.g., "review the & diff against PLAN.md," or a `/code-review` subagent that checks the diff in a fresh context ([best practices](https://www.anthropic.com/engineering/claude-code-best-practices)).
+**(c) Convergence / stop.** Two mechanisms: (i) human approval gates the planï¿½code transition; (ii) verification against the plan  e.g., "review the & diff against PLAN.md," or a `/code-review` subagent that checks the diff in a fresh context ([best practices](https://www.anthropic.com/engineering/claude-code-best-practices)).
 
 **(d) Sources.** https://docs.anthropic.com/en/docs/claude-code/common-workflows ; https://www.anthropic.com/engineering/claude-code-best-practices
 
@@ -120,13 +169,13 @@ Prepared: 2026-07-25. All non-obvious claims carry a source URL. Primary sources
 | System | Plan trigger | Read-only during plan? | Adaptive to task size? | Grounds plan in repo? | Convergence / stop mechanism |
 |---|---|---|---|---|---|
 | **Claude Code** | User: `--permission-mode plan` or Shift+Tab cycle | **Yes** (reads files, no edits) | Guidance only ("skip plan if 1-sentence diff"); user decides | Yes  read-only explore + subagent research | Human approval gate; verify diff vs PLAN.md; `/code-review` subagent |
-| **Cline** | User toggles Plan”Act | **Yes** (no file edits, no commands) | Recommended by scenario table; user decides | Yes  explore files in Plan mode | User switch when confident; re-enter Plan on new complexity |
+| **Cline** | User toggles Planï¿½Act | **Yes** (no file edits, no commands) | Recommended by scenario table; user decides | Yes  explore files in Plan mode | User switch when confident; re-enter Plan on new complexity |
 | **Roo Code** | Slash cmd / keyboard cycle / model suggestion; per-mode | **Architect/Ask: yes** (Ask read-only; Architect can write markdown only) | Mode-per-task; user or model-suggested | Yes  read access + info-gathering step | Orchestrator/Boomerang delegates & collects subtasks |
 | **Aider (architect/editor)** | `/architect` or `--architect`; per-message or sticky | Ask mode read-only; architect proposes then editor applies | Manual mode selection | **Yes  repo-map (ranked, tree-sitter-style signatures)** | Editor constrained to apply architect's proposal; edit-format validation |
 | **OpenHands / CodeAct** | Always-on ReAct-style code loop | No dedicated plan mode | No | Interactive (executes exploration code) | Self-debug via interpreter feedback |
 | **SWE-agent** | Always-on ACI loop | No dedicated plan mode | No | Via LM-legible navigation commands | ACI guardrails + concise feedback reduce malformed loops |
 | **Manus / gptme** | Automatic `todo.md` on complex tasks | No (executes) | Implicit (only complex tasks get todo.md) | Yes  file lives in workspace, updated live | **Recite todo.md into tail** + logit-mask state machine; keep failures in context |
-| **Magentic-One** | Orchestrator plans at start | Planning is a reasoning step (no edits) | No explicit gate | Yes  Task Ledger (facts+guesses) | **Progress Ledger self-check + stall counter ’ re-plan** |
+| **Magentic-One** | Orchestrator plans at start | Planning is a reasoning step (no edits) | No explicit gate | Yes  Task Ledger (facts+guesses) | **Progress Ledger self-check + stall counter ï¿½ re-plan** |
 
 ---
 
@@ -145,7 +194,7 @@ Prepared: 2026-07-25. All non-obvious claims carry a source URL. Primary sources
 - **Tool-call parsing is model-specific.** Qwen-Agent parses tool calls itself and adjusts its Function-Call template per model family (Qwen2.5 vs QwQ/Qwen3 vs Qwen3-Coder differ in whether to use the vLLM built-in `hermes` parser) ([Qwen-Agent](https://github.com/QwenLM/Qwen-Agent)). **Implication:** a single hard-coded tool-call format across qwen/devstral/llama will produce malformed calls on some models; Argo needs per-model tool-call handling or a tolerant parser.
 
 - **What causes small models to drift/loop, and what mitigates it (synthesis):**
-  - *Cause: repetitive context ’ few-shot mimicry.* Manus: identical action-observation pairs make models "fall into a rhythm & drift, overgeneralization, or & hallucination." *Mitigation:* inject diversity / vary phrasing  Argo's escalating steer is the right instinct ([Manus](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus)).
+  - *Cause: repetitive context ï¿½ few-shot mimicry.* Manus: identical action-observation pairs make models "fall into a rhythm & drift, overgeneralization, or & hallucination." *Mitigation:* inject diversity / vary phrasing  Argo's escalating steer is the right instinct ([Manus](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus)).
   - *Cause: goal falls out of recent attention over a long loop.* *Mitigation:* recite the objective near the tail (todo.md)  Manus's core anti-drift device ([Manus](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus)).
   - *Cause: no definition-of-done to converge against* (Argo's 90-iteration run). *Mitigation:* Magentic-One's Progress Ledger self-check + stall counter forces re-plan/stop ([Microsoft](https://www.microsoft.com/en-us/research/articles/magentic-one-a-generalist-multi-agent-system-for-solving-complex-tasks/)).
   - *Cause: prose emitted instead of action.* *Mitigation:* mode-as-state that requires a tool call (Cline/Roo permissions; Manus logit-masking) ([Cline](https://docs.cline.bot/features/plan-and-act), [Manus](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus)).
@@ -160,7 +209,7 @@ Argo's hard constraints: **single local model**, **custom ReAct loop where a tur
 
 *Two separate runs: run 1 produces a plan (read-only); the harness then auto-starts run 2 with the plan injected to execute.*
 
-- **Is it used in the wild?** The *phase separation* is universal (Claude Code/Cline/Roo all separate plan from act). The *automated restart with fresh context* is closest to Aider's architect’editor handoff and Claude Code's "delegate research to a subagent, then implement in main context" ([Claude best practices](https://www.anthropic.com/engineering/claude-code-best-practices), [Aider architect](https://aider.chat/2024/09/26/architect.html)). So the pattern has precedent  but always the plan is *carried across*, not thrown away.
+- **Is it used in the wild?** The *phase separation* is universal (Claude Code/Cline/Roo all separate plan from act). The *automated restart with fresh context* is closest to Aider's architectï¿½editor handoff and Claude Code's "delegate research to a subagent, then implement in main context" ([Claude best practices](https://www.anthropic.com/engineering/claude-code-best-practices), [Aider architect](https://aider.chat/2024/09/26/architect.html)). So the pattern has precedent  but always the plan is *carried across*, not thrown away.
 - **Pros:** Clean separation makes the "no-tool-call = done" problem *disappear* for the planning run  plan run 1 is *expected* to end with prose (the plan) and that ending is the trigger to start run 2, so the current bug is actually *harnessed as a feature*. Read-only run 1 physically prevents thrash. Fresh context for run 2 avoids the "few-shot rut." Easy to stream as two visibly distinct phases in the trace UI.
 - **Cons (Argo-specific):** (1) **Context loss / re-grounding cost**  if run 2 starts fresh it must re-read files the planner already read, wasting scarce local-model context and re-introducing the "plan before reading" risk unless the plan file carries file paths + findings. (2) **Double the cold-start** on a slow local model. (3) **Deciding *when* to run phase 1 at all** still requires an adaptive gate, or you've broken versatility. (4) The plan itself, produced by a weak model, may be generic (Argo's observed defect)  needs the read-only phase to actually read files first, i.e. it's not just "state a plan," it's "explore then write plan."
 - **Verdict:** Workable and it neatly turns the fatal invariant into the transition signal  but the "restart with fresh context" variant is wasteful for local models. The **best version keeps a persistent plan artifact** so run 2 isn't blind. That converges toward Option C.
@@ -184,7 +233,7 @@ Argo's hard constraints: **single local model**, **custom ReAct loop where a tur
 
 ### Option D  Separate planner sub-agent hands a plan to an executor
 
-*Two roles (à la Aider architect/editor, Roo Orchestrator, Magentic-One): a planner model produces a plan; an executor model implements.*
+*Two roles (ï¿½ la Aider architect/editor, Roo Orchestrator, Magentic-One): a planner model produces a plan; an executor model implements.*
 
 - **Pros:** Cleanest cognitive separation; the executor is constrained to the plan (reduces scope drift). Proven at SOTA on Aider polyglot ([Aider architect](https://aider.chat/2024/09/26/architect.html)).
 - **Cons (Argo-specific):** (1) **Argo is single-local-model**  the main payoff of the split (route reasoning to a strong model, editing to a cheap one) evaporates when both roles are the same 7-24B model. (2) Two models loaded in Ollama doubles VRAM or forces model-swapping latency. (3) Sub-agent orchestration is exactly the kind of ad-hoc complexity Argo's hand-written loop avoids. (4) Aider itself notes the strongest architect configs are "quite slow, not practical for interactive use" ([architect post](https://aider.chat/2024/09/26/architect.html)).
@@ -233,7 +282,7 @@ Argo's hard constraints: **single local model**, **custom ReAct loop where a tur
 ## Source list
 
 - Claude Code  common workflows / plan mode: https://docs.anthropic.com/en/docs/claude-code/common-workflows
-- Claude Code  best practices (explore’plan’code, adaptive planning, subagents): https://www.anthropic.com/engineering/claude-code-best-practices
+- Claude Code  best practices (exploreï¿½planï¿½code, adaptive planning, subagents): https://www.anthropic.com/engineering/claude-code-best-practices
 - Cline  Plan & Act mode: https://docs.cline.bot/features/plan-and-act
 - Roo Code  Using Modes (Architect/Ask/Orchestrator, tool-group permissions, sticky models): https://docs.roocode.com/basic-usage/using-modes
 - Aider  Architect/Editor: https://aider.chat/2024/09/26/architect.html
@@ -244,7 +293,7 @@ Argo's hard constraints: **single local model**, **custom ReAct loop where a tur
 - OpenHands / CodeAct paper: https://arxiv.org/abs/2402.01030
 - OpenHands  Local LLMs (context size, "acts like a chatbot"): https://docs.all-hands.dev/usage/llms/local-llms
 - SWE-agent  ACI paper: https://arxiv.org/abs/2405.15793 ; background: https://swe-agent.com/latest/background/
-- Magentic-One  Microsoft Research article (Task/Progress Ledger, stall’re-plan): https://www.microsoft.com/en-us/research/articles/magentic-one-a-generalist-multi-agent-system-for-solving-complex-tasks/ ; paper: https://arxiv.org/abs/2411.04468
+- Magentic-One  Microsoft Research article (Task/Progress Ledger, stallï¿½re-plan): https://www.microsoft.com/en-us/research/articles/magentic-one-a-generalist-multi-agent-system-for-solving-complex-tasks/ ; paper: https://arxiv.org/abs/2411.04468
 - Manus  Context Engineering lessons (todo.md recitation, keep-wrong-stuff-in, don't-get-few-shotted, mask-don't-remove): https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus
 - Mistral  Devstral (agent scaffolds, local deployment): https://mistral.ai/news/devstral
 - Qwen-Agent (per-model tool-call parsing): https://github.com/QwenLM/Qwen-Agent
@@ -283,7 +332,7 @@ This report evaluates seven borrowed mechanisms against three hard constraints: 
 
 **Evidence on small/local models.** The whole system is **gated on function-calling quality.** In the paper's nested key-value task, GPT-3.5 hits **0% at one nesting level** because it fails to chain enough lookups; even GPT-4 Turbo/3.5 drop off, and only GPT-4 is robust ([full paper](https://ar5iv.labs.arxiv.org/html/2310.08560)). Letta's own docs: "We recommend first-time users use a large frontier model& since **weaker models can cause the agent to behave in unexpected ways**" ([Letta/Ollama docs](https://docs.letta.com/guides/server/providers/ollama)). Letta's memory-management leaderboard shows the difficulty concretely  frontier models 8493%, but `gpt-5-mini` 67%, `claude-haiku` 43%, open-weights (`glm-5` 39%, `minimax-m2.5` 37%) ([leaderboard.letta.com](https://leaderboard.letta.com)). Memory *self-management* is exactly where small models are weakest.
 
-**Pitfalls for weak models.** (a) Self-paging requires reliably emitting native tool calls under growing context  precisely Argo's failure mode. (b) Nested/sequential memory ops (search ’ page ’ decide ’ search again) compound failure. (c) The XML-like block wrapper is fine, but relying on the model to *decide when* to edit blocks is fragile.
+**Pitfalls for weak models.** (a) Self-paging requires reliably emitting native tool calls under growing context  precisely Argo's failure mode. (b) Nested/sequential memory ops (search ï¿½ page ï¿½ decide ï¿½ search again) compound failure. (c) The XML-like block wrapper is fine, but relying on the model to *decide when* to edit blocks is fragile.
 
 **Transfer verdict  PARTIAL.** *Steal the data model, reject the autonomy.* The **memory-block idea** (a small, labeled, always-visible, harness-managed state section) is excellent and lean. The **self-directed paging** (model calls functions to move memory in/out) is the wrong bet for Devstral/Qwen-class models. In Argo, the harness  not the model  should own when blocks are populated and injected.
 
@@ -314,7 +363,7 @@ This report evaluates seven borrowed mechanisms against three hard constraints: 
 
 ### 4. Retrieval over past work  lexical (BM25/grep/ripgrep) vs vector embeddings
 
-**Mechanics.** Lexical/structural: `ripgrep`/`grep` keyword search, plus a **repo map**  Aider parses the repo with **tree-sitter** and ranks symbols/files with a **graph algorithm (PageRank-style)** to fit a token budget, then lets the LLM ask for specific files ([Aider repomap](https://aider.chat/docs/repomap.html)). Vector: chunk ’ embed ’ store in a vector DB ’ nearest-neighbor retrieve.
+**Mechanics.** Lexical/structural: `ripgrep`/`grep` keyword search, plus a **repo map**  Aider parses the repo with **tree-sitter** and ranks symbols/files with a **graph algorithm (PageRank-style)** to fit a token budget, then lets the LLM ask for specific files ([Aider repomap](https://aider.chat/docs/repomap.html)). Vector: chunk ï¿½ embed ï¿½ store in a vector DB ï¿½ nearest-neighbor retrieve.
 
 **Practitioner evidence (strong, primary).** **Cline explicitly refuses to index/embed the codebase.** Their reasoning: (1) **code doesn't chunk**  a call is in one chunk, its definition in another, its rationale scattered; "naive chunking& struggle[s] with& meaningful segments of code"; (2) **indexes decay** while code changes, so the agent "confidently suggests calling functions that no longer exist"; (3) embeddings **double your security surface** (a second copy of your IP). Instead Cline does "**Discovery, Not Retrieval**": reads a file, follows its imports, builds connected understanding  "No index. No embeddings& just intelligence applied directly to your code" ([Cline](https://cline.ghost.io/why-cline-doesnt-index-your-codebase-and-why-thats-a-good-thing/)). Anthropic concurs that agentic `glob`/`grep` "bypass[es] the issues of stale indexing," and that embedding-based pre-retrieval is giving way to just-in-time strategies ([Anthropic ctx-eng](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)).
 
@@ -335,7 +384,7 @@ This report evaluates seven borrowed mechanisms against three hard constraints: 
 - **Structured (non-prose) state:** Manus's `todo.md` and Letta's labeled blocks are structured state, not prose narratives  cheaper to produce, easier to validate, and more stable in context ([Manus](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus); [Letta](https://docs.letta.com/guides/core-concepts/memory/memory-blocks)).
 - **A dedicated small model for compression:** Cognition runs "a new LLM model whose key purpose is to compress a history of actions & conversation into key details, events, and decisions," and notes they even **fine-tuned a smaller model** for this ([Cognition](https://cognition.ai/blog/dont-build-multi-agents)).
 
-**Transfer verdict  ADOPT, restructured.** For Argo, in priority order: (1) **Deterministic tool-result clearing/collapsing**  drop the biggest cost with zero LLM calls; keep a one-line stub + path so it's restorable (Manus principle). (2) **Summarize only durable facts into a structured ledger** (decisions, open bugs, file’purpose map, next steps) rather than prose  one small/fast-model call, not two big-model calls; **drop the separate "validate" pass** (structured schema + keeping raw traces on disk makes validation cheap/unnecessary). (3) **Route summarization to a smaller/faster local model** (e.g., a 78B) off the critical path if it holds quality on extraction-style tasks. (4) **Recursive roll-ups** only for very long tasks. The "async/background" idea is attractive but adds concurrency complexity to a single loop  treat as optional.
+**Transfer verdict  ADOPT, restructured.** For Argo, in priority order: (1) **Deterministic tool-result clearing/collapsing**  drop the biggest cost with zero LLM calls; keep a one-line stub + path so it's restorable (Manus principle). (2) **Summarize only durable facts into a structured ledger** (decisions, open bugs, fileï¿½purpose map, next steps) rather than prose  one small/fast-model call, not two big-model calls; **drop the separate "validate" pass** (structured schema + keeping raw traces on disk makes validation cheap/unnecessary). (3) **Route summarization to a smaller/faster local model** (e.g., a 78B) off the critical path if it holds quality on extraction-style tasks. (4) **Recursive roll-ups** only for very long tasks. The "async/background" idea is attractive but adds concurrency complexity to a single loop  treat as optional.
 
 ---
 
@@ -344,14 +393,14 @@ This report evaluates seven borrowed mechanisms against three hard constraints: 
 **Question:** do small models reliably call a recall tool when they need memory, or must the harness auto-inject?
 
 **Evidence that self-recall is fragile.** This is the crux where the sources converge against small models:
-- MemGPT's self-paging **collapses without strong function-calling** (GPT-3.5 ’ 0% on nested lookups) ([MemGPT](https://ar5iv.labs.arxiv.org/html/2310.08560)).
+- MemGPT's self-paging **collapses without strong function-calling** (GPT-3.5 ï¿½ 0% on nested lookups) ([MemGPT](https://ar5iv.labs.arxiv.org/html/2310.08560)).
 - Letta warns weaker models "behave in unexpected ways" and its memory-management leaderboard shows even `gpt-5-mini`/`haiku`/open-weights at 3767% ([Letta docs](https://docs.letta.com/guides/server/providers/ollama); [leaderboard](https://leaderboard.letta.com))  i.e., *deciding when and what to remember/recall* is hard even above Argo's weight class.
 - Function-calling reliability itself is model- and context-dependent; BFCL evaluates exactly this (including multi-turn and hallucinated/irrelevant-call detection), and small open models trail ([BFCL](https://gorilla.cs.berkeley.edu/leaderboard.html)).
 - **Argo's own probe** is the decisive local evidence: as context grows, Devstral stops emitting native tool calls at all. A model that won't reliably call *any* tool cannot be trusted to call a *recall* tool at the right moment.
 
 **Evidence for auto-inject / hybrid.** Anthropic's Claude Code **auto-injects `CLAUDE.md` up front** (always-on context) and *also* offers grep/glob for on-demand pulls  an explicit **hybrid** ([Anthropic ctx-eng](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)). Letta memory blocks are "**always visible  no retrieval needed**," i.e., auto-injected by construction ([Letta](https://docs.letta.com/guides/core-concepts/memory/memory-blocks)). Anthropic's memory tool auto-checks memory before a task ([memory-tool docs](https://docs.claude.com/en/docs/agents-and-tools/tool-use/memory-tool)). The pattern that works: **the small, always-needed state is auto-injected; bulky/optional detail is left on disk behind a recall tool.**
 
-**Transfer verdict  AUTO-INJECT the digest; OFFER (don't rely on) recall.** For Argo: the harness must always inject a tiny, structured **live digest** (current plan/todo, key decisions, file’purpose map, last error)  never assume the model will fetch it. Additionally offer a `recall`/`grep`/`read_file` tool for detail. Do **not** build a design whose correctness depends on the model choosing to recall.
+**Transfer verdict  AUTO-INJECT the digest; OFFER (don't rely on) recall.** For Argo: the harness must always inject a tiny, structured **live digest** (current plan/todo, key decisions, fileï¿½purpose map, last error)  never assume the model will fetch it. Additionally offer a `recall`/`grep`/`read_file` tool for detail. Do **not** build a design whose correctness depends on the model choosing to recall.
 
 ---
 
@@ -375,9 +424,9 @@ The through-line: **the harness does the memory/context management; the model ju
 
 **Mechanics.** A fresh-context sub-run explores/searches, then returns only a **condensed summary** (Anthropic reports subagents burning tens of thousands of tokens internally but returning **~1,0002,000 tokens** to the lead), keeping the main context clean ([Anthropic ctx-eng](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)). Anthropic's multi-agent research system had **Opus lead + Sonnet subagents outperform single-agent Opus by 90.2%** on their internal research eval, and found **token usage alone explains ~80% of performance variance**  sub-agents mainly help by *spending more tokens in parallel with separate context windows* ([Anthropic multi-agent](https://www.anthropic.com/engineering/multi-agent-research-system)).
 
-**Critical counter-evidence.** The wins are for **breadth-first research**, not coding. Anthropic themselves: "most coding tasks involve fewer truly parallelizable [sub]tasks& agents are not yet great at coordinating," and multi-agent systems burn **~15× the tokens** of a chat ([Anthropic multi-agent](https://www.anthropic.com/engineering/multi-agent-research-system)). Cognition's *Don't Build Multi-Agents* is blunt: parallel subagents make **conflicting implicit decisions** and produce inconsistent output ("build a Flappy Bird clone" ’ mismatched bird and background); their principles are **"share context / share full agent traces"** and **default to a single-threaded linear agent**. They note Claude Code's subagent (as of mid-2025) **only answers questions, never writes code, and never runs in parallel**, precisely because a subagent lacks the main agent's context  its sole benefit is keeping investigation out of the main history ([Cognition](https://cognition.ai/blog/dont-build-multi-agents)).
+**Critical counter-evidence.** The wins are for **breadth-first research**, not coding. Anthropic themselves: "most coding tasks involve fewer truly parallelizable [sub]tasks& agents are not yet great at coordinating," and multi-agent systems burn **~15ï¿½ the tokens** of a chat ([Anthropic multi-agent](https://www.anthropic.com/engineering/multi-agent-research-system)). Cognition's *Don't Build Multi-Agents* is blunt: parallel subagents make **conflicting implicit decisions** and produce inconsistent output ("build a Flappy Bird clone" ï¿½ mismatched bird and background); their principles are **"share context / share full agent traces"** and **default to a single-threaded linear agent**. They note Claude Code's subagent (as of mid-2025) **only answers questions, never writes code, and never runs in parallel**, precisely because a subagent lacks the main agent's context  its sole benefit is keeping investigation out of the main history ([Cognition](https://cognition.ai/blog/dont-build-multi-agents)).
 
-**Transfer verdict  ADOPT NARROWLY (read-only investigation only).** The valuable, low-risk pattern for Argo: spawn a **fresh-context sub-run to investigate a bounded question** ("where is X handled? summarize how auth works") and return a short summary into the main context  this keeps the main window lean and matches Claude Code's actual usage. **Do NOT** run parallel coding subagents that make edits: token-hungry, coordination-heavy, and the conflicting-decisions failure mode is worst for small models that already misinterpret instructions (Cognition observed even a *large*’*small* model hand-off failing on "slight ambiguities"). Keep Argo single-threaded for anything that writes code.
+**Transfer verdict  ADOPT NARROWLY (read-only investigation only).** The valuable, low-risk pattern for Argo: spawn a **fresh-context sub-run to investigate a bounded question** ("where is X handled? summarize how auth works") and return a short summary into the main context  this keeps the main window lean and matches Claude Code's actual usage. **Do NOT** run parallel coding subagents that make edits: token-hungry, coordination-heavy, and the conflicting-decisions failure mode is worst for small models that already misinterpret instructions (Cognition observed even a *large*ï¿½*small* model hand-off failing on "slight ambiguities"). Keep Argo single-threaded for anything that writes code.
 
 ---
 
@@ -388,13 +437,13 @@ The through-line: **the harness does the memory/context management; the model ju
 ### A. What lives in the tiny LIVE context (target: keep it near the low-thousands of chars)
 1. **System prompt**  minimal, stable prefix (protect KV-cache; no per-second timestamps) ([Manus](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus)).
 2. **Tool schemas**  a *small, non-overlapping* set. Don't add/remove tools mid-task (breaks cache; confuses the model)  mask/gate instead ([Manus](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus)).
-3. **The Ledger (auto-injected, structured, small):** current goal, `todo` with checkboxes, key decisions, a compact `file ’ purpose` map for touched files, and the **last error** (if any). Placed at the **end** of the prompt for recency (recitation) ([Manus](https://manus.im/blog/...); [Lost in the Middle](https://arxiv.org/abs/2307.03172)).
+3. **The Ledger (auto-injected, structured, small):** current goal, `todo` with checkboxes, key decisions, a compact `file ï¿½ purpose` map for touched files, and the **last error** (if any). Placed at the **end** of the prompt for recency (recitation) ([Manus](https://manus.im/blog/...); [Lost in the Middle](https://arxiv.org/abs/2307.03172)).
 4. **Recent turns only**  last N action/observation pairs, with **older tool results collapsed to a one-line stub + restorable path** (deterministic context editing) ([Anthropic](https://www.anthropic.com/news/context-management)).
 
 ### B. What is externalized to files (restorable, grep-able)
-- Full tool outputs, file reads, web fetches ’ written to `.argo/` (or sandbox paths); context keeps only the path/handle ([Manus](https://manus.im/blog/...); [Anthropic memory tool](https://docs.claude.com/en/docs/agents-and-tools/tool-use/memory-tool)).
-- The durable ledger/notes ’ a file that survives compaction and sessions.
-- A **repo map** (symbols + file’purpose), built once with `ripgrep`/tree-sitter/`ctags`, refreshed on file change  dropped in like `CLAUDE.md` for coding tasks.
+- Full tool outputs, file reads, web fetches ï¿½ written to `.argo/` (or sandbox paths); context keeps only the path/handle ([Manus](https://manus.im/blog/...); [Anthropic memory tool](https://docs.claude.com/en/docs/agents-and-tools/tool-use/memory-tool)).
+- The durable ledger/notes ï¿½ a file that survives compaction and sessions.
+- A **repo map** (symbols + fileï¿½purpose), built once with `ripgrep`/tree-sitter/`ctags`, refreshed on file change  dropped in like `CLAUDE.md` for coding tasks.
 
 ### C. Retrieval  **lexical/structural, chosen deliberately over vectors**
 - Primary: `ripgrep`/`grep` + `read_file` + the repo map (just-in-time, always fresh) ([Cline](https://cline.ghost.io/...); [Anthropic](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents); [Aider](https://aider.chat/docs/repomap.html)).
@@ -422,7 +471,7 @@ The through-line: **the harness does the memory/context management; the model ju
 
 - **Don't add a vector database / embedding model.** Weight, staleness, security surface, and poor fit for code  grep + repo map wins for a lean local agent ([Cline](https://cline.ghost.io/...); [Anthropic](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)).
 - **Don't rely on the model to self-page / self-recall memory.** It's the failure mode of small models under load ([MemGPT](https://ar5iv.labs.arxiv.org/html/2310.08560); [Letta](https://docs.letta.com/guides/server/providers/ollama); Argo probe).
-- **Don't run parallel coding subagents.** Conflicting implicit decisions, 15× tokens, worst on small models ([Cognition](https://cognition.ai/blog/dont-build-multi-agents); [Anthropic multi-agent](https://www.anthropic.com/engineering/multi-agent-research-system)).
+- **Don't run parallel coding subagents.** Conflicting implicit decisions, 15ï¿½ tokens, worst on small models ([Cognition](https://cognition.ai/blog/dont-build-multi-agents); [Anthropic multi-agent](https://www.anthropic.com/engineering/multi-agent-research-system)).
 - **Don't add/remove tools mid-task or inject per-second timestamps.** Breaks KV-cache and confuses the model into schema violations/hallucinated actions ([Manus](https://manus.im/blog/...)).
 - **Don't over-compress irreversibly.** Aggressive prose summaries lose context whose importance surfaces later; keep compression *restorable* ([Manus](https://manus.im/blog/...); [Anthropic](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)).
 - **Don't scrub failures from the trace.** "Erasing failure removes evidence& the model can't adapt" ([Manus](https://manus.im/blog/...)).
@@ -438,7 +487,7 @@ Metric backbone for all: **task success (test-suite pass), tool-call validity ra
 1. **Live-context cap (headline A/B).** Fixed harness, vary max live-context (3k / 7k / 12k+ chars) via more/less aggressive externalization. *Predicts:* success and tool-call validity fall as live context grows, steeper for Devstral. Validates the framing finding and sets Argo's cap.
 2. **Lexical vs vector retrieval.** grep + repo map **vs** an embedding+vector-store recall tool, same tasks. Measure success, retrieval precision, staleness bugs (calls to non-existent symbols), setup/latency cost. *Hypothesis:* lexical e vector for the leanness cost  justify or refute keeping vectors out.
 3. **Auto-inject digest vs self-recall.** (a) harness auto-injects the ledger every turn vs (b) model must call `recall`. Measure how often the model actually recalls, and downstream drift/success. *Hypothesis:* self-recall underperforms and under-fires on small models.
-4. **Compaction cost/quality.** Current 2×big-model vs (i) Tier-0 clearing only, (ii) Tier-0 + one small-model structured extraction, (iii) recursive roll-up. Measure success, post-compaction continuity (does it repeat solved work / drop open bugs?), and CPU/latency. *Target:* match quality at a fraction of cost, no validate pass.
+4. **Compaction cost/quality.** Current 2ï¿½big-model vs (i) Tier-0 clearing only, (ii) Tier-0 + one small-model structured extraction, (iii) recursive roll-up. Measure success, post-compaction continuity (does it repeat solved work / drop open bugs?), and CPU/latency. *Target:* match quality at a fraction of cost, no validate pass.
 5. **Recitation on/off.** Toggle the end-of-prompt todo recitation on a long (~3050 step) multi-file task. Measure goal-drift incidents and off-plan actions. *Hypothesis:* recitation reduces drift, especially past ~7k context.
 6. **Keep-failures & anti-mimicry.** A/B keeping compressed error traces vs scrubbing them; and uniform vs slightly-varied serialization. Measure repeat-mistake rate and loop incidents.
 7. **Read-only investigation sub-run.** For tasks needing codebase understanding, A/B a fresh-context sub-run returning a 12k-char summary vs inline exploration in the main loop. Measure main-context size, success, and tokens. *Hypothesis:* sub-run keeps main context leaner without hurting success; parallel *editing* subagents (if tested) hurt.
@@ -447,13 +496,13 @@ Metric backbone for all: **task success (test-suite pass), tool-call validity ra
 ---
 
 ## Sources
-- MemGPT: *Towards LLMs as Operating Systems*  https://arxiv.org/abs/2310.08560 · full text https://ar5iv.labs.arxiv.org/html/2310.08560
-- Letta  Memory blocks  https://docs.letta.com/guides/core-concepts/memory/memory-blocks · Local/Ollama models & weak-model warning  https://docs.letta.com/guides/server/providers/ollama · Memory leaderboard  https://leaderboard.letta.com
+- MemGPT: *Towards LLMs as Operating Systems*  https://arxiv.org/abs/2310.08560 ï¿½ full text https://ar5iv.labs.arxiv.org/html/2310.08560
+- Letta  Memory blocks  https://docs.letta.com/guides/core-concepts/memory/memory-blocks ï¿½ Local/Ollama models & weak-model warning  https://docs.letta.com/guides/server/providers/ollama ï¿½ Memory leaderboard  https://leaderboard.letta.com
 - Manus  *Context Engineering for AI Agents: Lessons from Building Manus*  https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus
 - Anthropic  *Effective context engineering for AI agents*  https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
 - Anthropic  *Managing context on the Claude Developer Platform* (memory tool + context editing; +39%/+29%/84%)  https://www.anthropic.com/news/context-management
-- Anthropic  *How we built our multi-agent research system* (90.2%; tokenH80% variance; 15×)  https://www.anthropic.com/engineering/multi-agent-research-system
-- Anthropic docs  Memory tool  https://docs.claude.com/en/docs/agents-and-tools/tool-use/memory-tool · Context editing  https://docs.claude.com/en/docs/build-with-claude/context-editing
+- Anthropic  *How we built our multi-agent research system* (90.2%; tokenH80% variance; 15ï¿½)  https://www.anthropic.com/engineering/multi-agent-research-system
+- Anthropic docs  Memory tool  https://docs.claude.com/en/docs/agents-and-tools/tool-use/memory-tool ï¿½ Context editing  https://docs.claude.com/en/docs/build-with-claude/context-editing
 - Cline  *Why Cline Doesn't Index Your Codebase*  https://cline.ghost.io/why-cline-doesnt-index-your-codebase-and-why-thats-a-good-thing/
 - Aider  Repository map (tree-sitter + graph ranking)  https://aider.chat/docs/repomap.html
 - Cognition (Walden Yan)  *Don't Build Multi-Agents*  https://cognition.ai/blog/dont-build-multi-agents

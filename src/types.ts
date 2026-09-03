@@ -74,7 +74,15 @@ export type AgentEvent =
       current: string | null   // active task title, or null when all tasks are done
     }
   | { type: 'error'; message: string }
-  | { type: 'warning'; message: string }
+  // `level` is the LOOP-RECOVERY LADDER rung (loop.ts's LoopAction.level) when this
+  // warning came from that ladder — L0 steer / L1 compaction / L2 stop-and-reframe.
+  // Previously agent.ts emitted only `action.message` and threw `action.level` away, so
+  // every consumer (the eval's metrics counters, the UI) had to recover the rung by
+  // regex over prose; two counters were silently broken for months for exactly that
+  // reason. Optional because most warnings have no ladder rung at all (stall re-ground,
+  // task-advance, summary ask, near-duplicate streak nudge) — absent means "not a
+  // ladder event", never "L0".
+  | { type: 'warning'; message: string; level?: 'L0' | 'L1' | 'L2' }
   // ── Multi-agent architecture (config.agents) — harness-level narrative events,
   // always emitted UNTAGGED (no __frameId) since they describe the whole task, not
   // one role's turn. Every event a spawned frame produces (thought/tool_call/plan/
@@ -115,6 +123,37 @@ export interface GitCommit {
 export type Role = 'planner' | 'implementer' | 'tester' | 'boss'
 
 export type FrameStatus = 'success' | 'partial' | 'failed' | 'gave_up' | 'killed' | 'restarted'
+
+// PER-FRAME MECHANISM POLICY (2026-09-04). Every harness mechanism that an Agent
+// instance can run is a per-instance boolean (agent.ts: this.tasks/this.memory/
+// this.loop/this.grounding/this.layout), each defaulting to its config.* value —
+// i.e. to whatever the SINGLE-LOOP baseline wants. dispatch.ts's spawnFrame used to
+// set none of them, so every role-scoped frame silently inherited the baseline's
+// mechanism set: a Planner frame ran HARNESS TASK SEQUENCING (config.tasks defaults
+// ON) while holding update_plan, which turned its own model-supplied `verify` command
+// into an unsatisfiable gate on the no-tool-call final answer that IS its task graph.
+// Result: it burned its whole budget and the graph was discarded (measured: all 8
+// large-task Planner frames produced valid 2-5 step graphs; 84 of 85 executed graphs
+// had exactly one step — decomposition never actually ran).
+//
+// The fix is deliberately a POLICY OBJECT, not a few setTasks(false) calls at the
+// spawn site: the defect is "the spawn site states no policy", so the same trap can
+// recur through memory, loop, grounding or layout the moment one of those defaults
+// flips. A role's policy is declared once (frames.ts ROLE_POLICY), applied in one
+// place (dispatch.ts applyFramePolicy), and is exhaustive by type — adding a
+// mechanism without deciding its per-role value is a type error.
+export interface FramePolicy {
+  /** Harness-owned task sequencing (config.tasks): update_plan → ordered ledger, per-task verify/summary gate, recitation. */
+  tasks: boolean
+  /** Harness-owned memory (config.memory): section-selected AGENTS.md + retrieved MEMORY.md entries, and MEMORY.md persistence at compaction. When false the baseline whole-file project context is injected instead, so the frame is never blind. */
+  memory: boolean
+  /** Loop-recovery ladder (config.loopRecovery): mutation-aware repeat blocking, L0 steer → L1 compaction → L2 reframe. */
+  loop: boolean
+  /** Pre-done grounding/self-consistency check on document artifacts (config.grounding). */
+  grounding: boolean
+  /** Pre-done rendered-layout judge on HTML artifacts (config.layout). */
+  layout: boolean
+}
 
 export interface FrameSpawnRequest {
   role: Role

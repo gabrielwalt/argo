@@ -380,18 +380,148 @@ export function dedupeAgainst(existing: string, items: string[]): { fresh: strin
   return { fresh, duplicate }
 }
 
+// ── MEMORY.md WRITE-BOUNDARY FILTER (H15, 2026-09-04) ────────────────────────────
+// What went wrong, precisely: compaction distils its structured state from a RENDERED
+// TRANSCRIPT (compaction.ts's messagesToText emits `Called bash({"command":"ls …"})` for
+// an assistant tool call and `Result: …` for the tool reply); the distillation prompt
+// asks the model to put tool-confirmed items in verifiedFacts and to copy them verbatim;
+// persistToMemory then wrote verifiedFacts straight to the workspace MEMORY.md. That file
+// is re-injected into the system prompt of every later run in the workspace, so the
+// mechanism degraded its own future input — observed twice, near-duplicated, in
+// test-two/MEMORY.md as `- Called bash({"command":"ls /workspace/tests/"}) Result: …`.
+//
+// The filter is deliberately the INVERSE OF A KNOWN RENDERER rather than a general
+// "quality" judgement: every pattern below is anchored to a literal that compaction.ts
+// itself produces, or to a shape (a JSON object, a bare shell command, a truncation
+// ellipsis) that cannot be a durable project fact. Two of the rules are heuristic and
+// stated as such: MIN_ITEM_CHARS/word count for "no durable value", and NEAR_DUP_JACCARD
+// for near-duplicates.
+//
+// LIMIT, stated rather than hidden: this bounds the damage, it does not create durable
+// value. A filter cannot turn transcript-derived text into a fact worth keeping across
+// runs, and the only genuinely good content in the only MEMORY.md that exists was written
+// by a human. The recommendation that the automatic write be replaced by an explicit,
+// narrow model action is recorded in the batch report; that is not a change to make
+// unilaterally, so this batch makes the automatic write safe instead of removing it.
+
+export type MemoryRejectReason =
+  | 'tool-call-transcript'   // contains compaction.ts's `Called <tool>(<json>)` rendering
+  | 'tool-result-transcript' // contains/starts with its `Result: …` rendering
+  | 'json-blob'              // a JSON object literal — tool arguments, not a fact
+  | 'shell-command'          // a bare command line, not a fact about the project
+  | 'truncated'              // ends mid-thought (…) — a clipped transcript fragment
+  | 'transient'              // scoped to one run/iteration, so not durable by definition
+  | 'no-durable-value'       // too short / not a statement
+  | 'too-long'               // not a distilled item
+  | 'near-duplicate'         // ~the same line as one already in the file or this batch
+
+export interface MemoryRejection {
+  item: string
+  reason: MemoryRejectReason
+}
+
+// Heuristic thresholds, kept together and named so they can be tuned in one place.
+const MIN_ITEM_CHARS = 8       // 'first fact' (10) and 'Caching added' (13) must pass
+const MAX_ITEM_CHARS = 400     // a distilled fact; anything longer is transcript or prose dump
+const NEAR_DUP_JACCARD = 0.8   // token-set overlap at/above this counts as the same line
+const NEAR_DUP_MIN_TOKENS = 4  // below this, exact/normalised dedupe is the only guard
+
+// compaction.ts renders a tool call as `Called ${name}(${JSON.stringify(args)…})`. Any
+// tool name matches (the set is open — see types.ts ToolName), which is why this keys on
+// the template's shape, not on a list of names.
+const TOOL_CALL_RENDER = /(^|[\s>*+-])Called\s+[A-Za-z_][A-Za-z0-9_]*\s*\(/
+// …and a tool reply as `Result: ${collapseVerboseOutput(content)}`.
+const TOOL_RESULT_RENDER_LEADING = /^Result\s*:/i
+const TOOL_RESULT_RENDER_INLINE = /\)\s*Result\s*:/i
+const JSON_OBJECT = /\{\s*"[^"\n]+"\s*:/
+const SHELL_COMMAND = /^(ls|cat|cd|cp|mv|rm|mkdir|touch|echo|grep|rg|find|sed|awk|head|tail|chmod|git|npm|npx|node|python3?|pytest|make|curl|wget|docker|tsc)\b/i
+const TRANSIENT = /\b(this run|current run|iteration \d+|just ran|so far this session|at this point in the run)\b/i
+
+// Token set used for the near-duplicate comparison — same normalisation as
+// normalizeItem, then split on non-alphanumerics, dropping 1-2 char noise.
+function itemTokens(s: string): Set<string> {
+  return new Set(normalizeItem(s).split(/[^a-z0-9]+/).filter(t => t.length > 2))
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0
+  let inter = 0
+  for (const t of a) if (b.has(t)) inter++
+  const union = a.size + b.size - inter
+  return union === 0 ? 0 : inter / union
+}
+
+// Why an item may not be written. Pure, order-significant (the most specific,
+// evidence-backed reasons first) and returns null when the item is acceptable.
+export function classifyMemoryItem(item: string): MemoryRejectReason | null {
+  const raw = item.trim()
+  const body = raw.replace(/^[\s>]*[-*+]\s+/, '').trim() // strip a leading bullet marker
+  if (body.length > MAX_ITEM_CHARS) return 'too-long'
+  if (TOOL_CALL_RENDER.test(body)) return 'tool-call-transcript'
+  if (TOOL_RESULT_RENDER_LEADING.test(body) || TOOL_RESULT_RENDER_INLINE.test(body)) return 'tool-result-transcript'
+  if (JSON_OBJECT.test(body)) return 'json-blob'
+  if (SHELL_COMMAND.test(body)) return 'shell-command'
+  if (/[…]$|\.\.\.$/.test(body)) return 'truncated'
+  if (TRANSIENT.test(body)) return 'transient'
+  const normalized = normalizeItem(body)
+  if (normalized.length < MIN_ITEM_CHARS) return 'no-durable-value'
+  // Must read as a statement: at least two words, one of them a real word. A lone path,
+  // filename, number or identifier is a pointer, not a fact worth re-injecting forever.
+  const words = normalized.split(' ').filter(Boolean)
+  if (words.length < 2 || !words.some(w => /^[a-z]{3,}$/.test(w))) return 'no-durable-value'
+  return null
+}
+
+// Splits candidate items into those that may be written and those that may not, given
+// the CURRENT file contents (used for the near-duplicate check — exact/normalised
+// duplicates are still dedupeAgainst's job, which also reports them as `skipped`).
+export function filterDurableItems(items: string[], existing: string): { keep: string[]; rejected: MemoryRejection[] } {
+  const existingTokens = existing
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean)
+    .map(itemTokens)
+    .filter(t => t.size >= NEAR_DUP_MIN_TOKENS)
+  const keep: string[] = []
+  const rejected: MemoryRejection[] = []
+  const keptTokens: Array<Set<string>> = []
+  for (const item of items) {
+    if (item.trim() === '') continue
+    const reason = classifyMemoryItem(item)
+    if (reason) {
+      rejected.push({ item, reason })
+      continue
+    }
+    const tokens = itemTokens(item)
+    if (tokens.size >= NEAR_DUP_MIN_TOKENS) {
+      const dup = [...existingTokens, ...keptTokens].some(t => jaccard(tokens, t) >= NEAR_DUP_JACCARD)
+      if (dup) {
+        rejected.push({ item, reason: 'near-duplicate' })
+        continue
+      }
+      keptTokens.push(tokens)
+    }
+    keep.push(item)
+  }
+  return { keep, rejected }
+}
+
 // Persists durable ledger items to MEMORY.md (Stage 1): read existing (empty string
 // if the file is missing — never an error, most projects start without one), dedupe
 // against it, append ONLY fresh items via formatMemoryAppend, write back. The io
 // hooks are injectable and MUST be used when provided so tests never touch the real
 // filesystem; when absent they default to node:fs/promises. Returns which items were
 // written vs skipped so the caller can drop the written ones from the live window.
+// `rejected` (H15) is items the write boundary refused — transcript renderings, JSON
+// blobs, near-duplicates, content with no durable value. Separate from `skipped`
+// (exact/normalised duplicates, which are a normal, healthy outcome) so a caller can
+// warn about the former without warning about the latter.
 export async function persistToMemory(
   memoryPath: string,
   items: string[],
   io?: { readFile?: (p: string) => Promise<string>; writeFile?: (p: string, c: string) => Promise<void> },
   date?: Date,
-): Promise<{ written: string[]; skipped: string[] }> {
+): Promise<{ written: string[]; skipped: string[]; rejected: MemoryRejection[] }> {
   const readFile = io?.readFile ?? ((p: string) => fsReadFile(p, 'utf-8'))
   const writeFile = io?.writeFile ?? ((p: string, c: string) => fsWriteFile(p, c, 'utf-8'))
 
@@ -402,8 +532,12 @@ export async function persistToMemory(
     existing = '' // missing file → treat as empty, not an error
   }
 
-  const { fresh, duplicate } = dedupeAgainst(existing, items)
-  if (fresh.length === 0) return { written: [], skipped: duplicate }
+  // FILTER FIRST, then dedupe (H15): nothing that fails the durability test can reach
+  // formatMemoryAppend, and the near-duplicate check needs the file's current contents,
+  // which have just been read.
+  const { keep, rejected } = filterDurableItems(items, existing)
+  const { fresh, duplicate } = dedupeAgainst(existing, keep)
+  if (fresh.length === 0) return { written: [], skipped: duplicate, rejected }
 
   const appended = formatMemoryAppend(fresh, date)
   // Separate the new block from prior content with a blank line, without piling up
@@ -411,5 +545,5 @@ export async function persistToMemory(
   const base = existing.replace(/\s+$/, '')
   const next = base === '' ? appended : `${base}\n\n${appended}`
   await writeFile(memoryPath, next)
-  return { written: fresh, skipped: duplicate }
+  return { written: fresh, skipped: duplicate, rejected }
 }

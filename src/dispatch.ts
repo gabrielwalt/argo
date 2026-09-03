@@ -26,7 +26,7 @@ import { Agent } from './agent.js'
 import { config } from './config.js'
 import { SessionLogger } from './logger.js'
 import type { AgentEvent, FrameSpawnRequest, FrameResult, FrameStatus, ModelOptions, Role } from './types.js'
-import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, systemPromptFor, buildAssignment, capSummary, parseTesterVerdict, parseBossVerdict, parseTaskStartVerdict, type TaskStartVerdict } from './frames.js'
+import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, systemPromptFor, buildAssignment, capSummary, parseTesterVerdict, parseBossVerdict, parseTaskStartVerdict, policyFor, TESTER_VERDICT_NUDGE, type TaskStartVerdict } from './frames.js'
 import * as ledger from './ledger.js'
 import { createTaskGraph, readyGroups, allStepsDone, type TaskGraph, type TaskStep } from './tasks.js'
 
@@ -142,6 +142,21 @@ function tagEmit(emit: Emit, frameId: string, role: Role, parentFrameId: string 
   }
 }
 
+// PER-FRAME MECHANISM POLICY (H17, 2026-09-04). The one place a frame's mechanism set is
+// decided, from the one place it is declared (frames.ts's ROLE_POLICY). Exported so it is
+// unit-testable without an Ollama: spawnFrame itself cannot be tested (it writes a ledger
+// entry and runs a real model turn), but "the Planner's frame has task sequencing off and
+// the Implementer's has it on" is exactly this function's contract.
+//
+// Before this existed, spawnFrame configured tools, role prompt, frame id, max iterations
+// and session id, and said NOTHING about tasks/memory/loop/grounding/layout — so every
+// frame silently inherited config.* (tasks ON by default), which is what trapped the
+// Planner. setTasks/setMemory/setLoop had zero production call sites; server.ts:108 set
+// grounding alone.
+export function applyFramePolicy(agent: Agent, role: Role): void {
+  agent.setPolicy(policyFor(role))
+}
+
 async function spawnFrame(req: FrameSpawnRequest, emit: Emit): Promise<SpawnedFrame> {
   checkAborted()
   const frameId = ledger.newId(req.role)
@@ -161,6 +176,7 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit): Promise<SpawnedFr
   agent.setFrameId(frameId)
   agent.setMaxIterations(req.maxIterations ?? ROLE_MAX_ITERATIONS[req.role])
   agent.setSessionId(frameId) // isolates history/compaction-state files per frame
+  applyFramePolicy(agent, req.role) // H17 — never inherit the single-loop baseline's mechanisms
 
   const assignment = await buildAssignment(root(), req)
   activeFrameAgent = agent
@@ -177,10 +193,16 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit): Promise<SpawnedFr
 // Writes a NEW conclusion entry for the same frameId (the ledger is append-only; the
 // latest conclusion for a frameId is authoritative — same convention as episode
 // eviction records).
+// H14 (2026-09-04): the { resume: true } flag is load-bearing. Without it chat() cleared
+// the frame's currentPlan, taskList, loopState, editedPaths, episodes, reconciliation
+// state and iteration counter (agent.ts's per-run reset), so "same Agent instance, same
+// history" was true of the transcript and false of every piece of run state derived from
+// it — a resumed frame restarted at ITER 1 with no plan and no memory of what it had
+// edited. Latent while REDO/replan never fired; live the moment H13 makes REDO reachable.
 async function resumeFrame(frameId: string, agent: Agent, followUp: string): Promise<FrameResult> {
   checkAborted()
   activeFrameAgent = agent
-  const finalAnswer = await agent.chat(followUp)
+  const finalAnswer = await agent.chat(followUp, { resume: true })
   activeFrameAgent = null
   checkAborted()
   const result = deriveFrameResult(frameId, finalAnswer, agent)
@@ -188,18 +210,63 @@ async function resumeFrame(frameId: string, agent: Agent, followUp: string): Pro
   return result
 }
 
-function deriveFrameResult(frameId: string, finalAnswer: string, agent: Agent): FrameResult {
+// H13 (2026-09-04) — THE FRAME BOUNDARY IS WHERE FAILURE WAS BEING DISCARDED.
+// agent.ts turns a cap-hit into the string "Reached maximum iterations (N) without a
+// final answer.", emits a terminal `error` event, and returns that string; this function
+// used to see only "a string came back" and record status:'success'. Measured over the
+// September corpus: 43 frames ended blank at their cap and were recorded success —
+// Planner 9/23 (39%), Boss 26/204, Implementer 6/61, Tester 2/85, single-loop baseline
+// 7/194. Nearly a tenth of all frames reported success having produced nothing, and the
+// same run's ledger conclusion contradicted its own event stream ("10/10 + error" vs
+// "success").
+//
+// The fix is to consult the frame's TERMINAL STATE (Agent.getLastRunOutcome(), set at each
+// of chat()'s exit paths) rather than to pattern-match the returned text or compare
+// iteration counts — the latter is also now wrong by construction, since a resumed frame's
+// counter is cumulative (H14).
+//
+//   'cap'     → 'partial'. Not 'failed': the frame may well have done real work (files
+//               touched are still reported below) — what it did NOT do is conclude, so it
+//               must never read as success. 'partial' is an existing FrameStatus member.
+//   'error'   → 'failed'. The returned string is an error message, not an answer.
+//   'aborted' → 'killed'. Reachable only in narrow races: a stop normally unwinds through
+//               checkAborted()/DispatchAborted before this runs.
+//   'ok'      → the pre-existing text heuristic (gave_up vs success), unchanged.
+//
+// NOTE, deliberately not changed here: the dispatch loop replans on 'failed'/'gave_up'/
+// 'killed' but NOT on 'partial'. So this makes cap-hits visible and stops them being
+// credited; it does not add a new replan trigger. Whether a partial Implementer step
+// should trigger a replan is a separate decision with its own cost (see BATCH2 report).
+// Exported for unit tests: spawnFrame itself needs a ledger and a live model, but the
+// cap-hit → 'partial' mapping is the whole of H13 and must be provable without either.
+export function deriveFrameResult(frameId: string, finalAnswer: string, agent: Agent): FrameResult {
   const editedPaths = agent.getEditedPaths()
+  const outcome = agent.getLastRunOutcome()
   const lower = finalAnswer.toLowerCase()
-  const status: FrameStatus = /\b(giving up|give up|cannot complete|unable to complete)\b/.test(lower)
-    ? 'gave_up'
-    : 'success'
+  const gaveUp = /\b(giving up|give up|cannot complete|unable to complete)\b/.test(lower)
+  const status: FrameStatus = outcome === 'cap'
+    ? 'partial'
+    : outcome === 'error'
+      ? 'failed'
+      : outcome === 'aborted'
+        ? 'killed'
+        : gaveUp
+          ? 'gave_up'
+          : 'success'
+  const issues = outcome === 'ok'
+    ? undefined
+    : [outcome === 'cap'
+        ? `frame hit its iteration cap (${agent.getMaxIterations()}) without producing a final answer`
+        : outcome === 'error'
+          ? 'frame ended with an unexpected error'
+          : 'frame was stopped before it concluded']
   return {
     frameId,
     status,
     summary: capSummary(finalAnswer),
     filesTouched: editedPaths,
     filesWritten: editedPaths,
+    ...(issues ? { issues } : {}),
   }
 }
 
@@ -283,13 +350,16 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
   let finalResult = result
   let verdict = parseTaskStartVerdict(result.summary)
 
-  // Retry once, only when there's genuinely room left (a frame that already hit its cap
-  // has no budget to spend re-asking) and the model didn't already commit to a mode —
-  // if verdict.text is set the marker WAS found, nothing to fix.
-  if (!verdict.text && agent.getIterationCount() < TASK_START_MAX_ITERATIONS) {
+  // Retry once, only when the frame actually concluded on its own (a frame that stalled
+  // at its cap has no budget to spend re-asking) and the model didn't already commit to a
+  // mode — verdict.parsed says the marker WAS found, nothing to fix. hitIterationCap()
+  // replaces the old `getIterationCount() < TASK_START_MAX_ITERATIONS` comparison, which
+  // H14 breaks: the counter is now cumulative across a frame's turns, so a count at or
+  // above the cap no longer implies a stall.
+  if (!verdict.parsed && !agent.hitIterationCap()) {
     const retry = await resumeFrame(result.frameId, agent, TASK_START_MARKER_RETRY_NUDGE)
     const retryVerdict = parseTaskStartVerdict(retry.summary)
-    if (retryVerdict.text) {
+    if (retryVerdict.parsed) {
       verdict = retryVerdict
       finalResult = retry
     }
@@ -299,8 +369,11 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
   // so the dirty-check below must reflect everything the frame actually did, not just
   // its first pass.
   const after = await gitStatusShort(root())
-  const hitCap = agent.getIterationCount() >= TASK_START_MAX_ITERATIONS
-  const base = verdict.text ? verdict : { mode: 'objective' as const, text: userMessage }
+  // Terminal state, not an iteration-count comparison (H13/H14): a frame that stalled at
+  // its cap OR ended in an error mid-attempt is "incomplete" for the routing decision
+  // below, and a resumed frame's cumulative counter can no longer stand in for either.
+  const hitCap = agent.hitIterationCap() || agent.getLastRunOutcome() === 'error'
+  const base = verdict.parsed ? verdict : { mode: 'objective' as const, text: userMessage }
   const dirty = after !== before && after.trim() !== ''
 
   // HARNESS-LEVEL OVERRIDE, not a text convention the model can express: a git-status
@@ -324,7 +397,9 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
       agent,
     }
   }
-  return { ...base, frameId: finalResult.frameId, agent }
+  // Built explicitly rather than by spreading `base` — TaskStartVerdict now carries a
+  // `parsed` flag that RoutedTaskStart has no business holding.
+  return { mode: base.mode, text: base.text, frameId: finalResult.frameId, agent }
 }
 
 interface BossOutcome {
@@ -358,16 +433,27 @@ async function runBoss(
   }
   const { agent, result } = await spawnFrame(req, emit)
   const verdict = parseBossVerdict(result.summary)
-  const hitCap = agent.getIterationCount() >= ROLE_MAX_ITERATIONS.boss
-  if (verdict.action === 'none' && hitCap) {
+  // H13: the same "did this checkpoint actually finish?" question, now answered from the
+  // frame's terminal state instead of an iteration-count comparison (which H14's
+  // cumulative counter invalidates), and extended from 'cap' to any non-clean ending.
+  // The trigger is `!verdict.parsed`, not `action === 'none'`: 'none' is now returned both
+  // for an explicit NONE (a real all-clear, which must be honoured even if the frame then
+  // stalled) and for an unparseable reply.
+  const outcome = agent.getLastRunOutcome()
+  if (!verdict.parsed && outcome !== 'ok') {
+    const why = outcome === 'cap'
+      ? `hit its iteration cap (${ROLE_MAX_ITERATIONS.boss})`
+      : outcome === 'error'
+        ? 'ended with an unexpected error'
+        : 'was stopped'
     return {
       action: 'escalate',
-      message: `Boss ${checkpoint} checkpoint hit its iteration cap (${ROLE_MAX_ITERATIONS.boss}) without ` +
+      message: `Boss ${checkpoint} checkpoint ${why} without ` +
         'producing a parseable verdict — treating as unresolved rather than "nothing wrong," since a stalled ' +
         'checkpoint never actually reviewed anything. Last raw output: ' + capSummary(result.summary),
     }
   }
-  return verdict
+  return { action: verdict.action, message: verdict.message }
 }
 
 // Lynceus verifies a claim (an Implementer step's, or — 2026-09-03 — the Boss's own
@@ -376,7 +462,28 @@ async function runBoss(
 // work: "always at least two distinct frames involved" (docs/subagents-plan.md)
 // means even the Boss's own TRIVIAL self-fix gets a real Tester pass, never just a
 // self-report accepted as-is.
+// H13: a Tester that produced no readable verdict must NOT read as approval. Measured:
+// 85 Tester frames, zero REDOs ever issued, and parseTesterVerdict defaulted every
+// unreadable reply — including the 2 that stalled blank at their cap — to RELEASE, i.e.
+// work accepted with no review at all. The escalation ladder here, in order:
+//   1. round(s) remaining → re-run the verification with a targeted reformat nudge
+//      (TESTER_VERDICT_NUDGE), the same shape as the task-start marker retry: the review
+//      may well have happened and only the verdict line is missing.
+//   2. rounds exhausted → the verified frame's conclusion is REWRITTEN to 'partial' with
+//      an explicit UNVERIFIED note and a fresh ledger conclusion (the ledger is
+//      append-only; the latest conclusion for a frameId wins), plus a harness-level
+//      `warning` event. The Boss's final checkpoint reads that same recent-ledger window,
+//      so an unverified step is visible to it rather than silently released.
+// It deliberately does NOT replan: a Tester failing to format a verdict is not evidence
+// the implementation is wrong, and 'partial' is not in the dispatch loop's replan trigger.
 async function runTesterRounds(frame: SpawnedFrame, combinedPrompt: string, emit: Emit): Promise<SpawnedFrame> {
+  let verdictNudge = ''
+  // At most ONE extra Tester frame is spent on a missing verdict line, deliberately: the
+  // Boss's own measured record is 16/22 markers present, 6/22 unusable, and if the Tester's
+  // rate is similar then retrying every remaining round would triple the verification cost
+  // of ~a quarter of all steps to recover a formatting slip. One targeted retry, then say
+  // "unverified" and move on — leaving the remaining round available for a real REDO cycle.
+  let verdictRetries = 0
   for (let round = 0; round < MAX_TESTER_ROUNDS; round++) {
     const testerReq: FrameSpawnRequest = {
       role: 'tester',
@@ -384,18 +491,54 @@ async function runTesterRounds(frame: SpawnedFrame, combinedPrompt: string, emit
       assignment:
         `Verify this claim.\nOriginal assignment: ${combinedPrompt}\n` +
         `Conclusion (${frame.result.status}): ${frame.result.summary}\n` +
-        `Files touched: ${frame.result.filesTouched.join(', ') || 'none (or made via bash, not tracked)'}`,
+        `Files touched: ${frame.result.filesTouched.join(', ') || 'none (or made via bash, not tracked)'}` +
+        verdictNudge,
     }
-    const { result: testerResult } = await spawnFrame(testerReq, emit)
+    const { agent: testerAgent, result: testerResult } = await spawnFrame(testerReq, emit)
     const verdict = parseTesterVerdict(testerResult.summary)
     if (verdict.action === 'release') break
+    if (verdict.action === 'escalate') {
+      const how = testerAgent.hitIterationCap()
+        ? `stalled at its iteration cap (${ROLE_MAX_ITERATIONS.tester})`
+        : `ended (${testerAgent.getLastRunOutcome()}) with no RELEASE/REDO line`
+      emit({
+        type: 'warning',
+        message: `Tester frame ${testerResult.frameId} ${how} — no verdict to act on. A missing verdict is NOT `
+          + 'a release; the reviewed work is not being accepted on the strength of it.',
+      })
+      if (verdictRetries === 0 && round < MAX_TESTER_ROUNDS - 1) {
+        verdictRetries++
+        verdictNudge = `\n\n${TESTER_VERDICT_NUDGE}`
+        continue
+      }
+      const unverified: FrameResult = {
+        ...frame.result,
+        status: frame.result.status === 'success' ? 'partial' : frame.result.status,
+        summary: capSummary(
+          `${frame.result.summary}\n\nUNVERIFIED: the Tester produced no parseable RELEASE/REDO verdict `
+          + '(including after an explicit request for the verdict line), so this work has NOT been '
+          + 'independently verified.',
+        ),
+        issues: [...(frame.result.issues ?? []), 'tester-verdict-unparseable'],
+      }
+      await ledger.recordConclusion(root(), unverified)
+      frame = { agent: frame.agent, result: unverified }
+      break
+    }
     const resumed = await resumeFrame(frame.result.frameId, frame.agent, verdict.followUp)
     frame = { agent: frame.agent, result: resumed }
+    verdictNudge = ''
   }
   return frame
 }
 
-function parseTaskGraph(objective: string, plannerAnswer: string): TaskGraph {
+// H13: returns null — NOT a one-step graph — when no task graph could be read. The old
+// fail-open default is the single most consequential silent failure measured in this
+// harness: all 8 large-task Planner frames produced valid 2-to-5-step graphs, 84 of 85
+// executed graphs had exactly one step, so the graphs were being parsed away, and "the
+// whole objective goes to one Implementer" looked like a working system. A fallback that
+// is indistinguishable from success is worse than no fallback.
+function parseTaskGraph(objective: string, plannerAnswer: string): TaskGraph | null {
   const m = /```json\s*([\s\S]*?)```/i.exec(plannerAnswer)
   if (m) {
     try {
@@ -414,11 +557,56 @@ function parseTaskGraph(objective: string, plannerAnswer: string): TaskGraph {
         }))
       if (steps.length > 0) return createTaskGraph(objective, steps)
     } catch {
-      // Fall through to the fail-open default below — an unparseable plan must never
-      // block the run, same principle as every other checkpoint in this project.
+      // Fall through to null below. NOT to a synthesised graph: a JSON block that failed
+      // to parse (or parsed to zero usable steps) tells us the Planner's output was not
+      // understood, and pretending it said "one step: the whole objective" destroys the
+      // only signal that anything went wrong.
     }
   }
-  return createTaskGraph(objective, [{ role: 'implementer', prompt: objective, dependsOn: [] }])
+  return null
+}
+
+// Raised when planning cannot produce a graph even after a targeted retry. Unwound by
+// runDispatchLoop, which reports it to the user as a planning failure instead of running
+// an invented single-step plan. The Planner is the one checkpoint whose OUTPUT IS THE PLAN
+// — there is no conservative default available to it, so this is the one place in the
+// pipeline that stops rather than degrades.
+class PlanningFailed extends Error {}
+
+// The Planner's format-retry nudge — the same targeted-recovery shape as task-start's
+// marker retry (the plan may be fine and only the fenced block missing/mangled), not a
+// blind "try again".
+const PLANNER_FORMAT_RETRY_NUDGE =
+  'Your last answer did not contain a readable task graph, so nothing could be dispatched from it. Reply again '
+  + 'with the graph ONLY, as a single fenced ```json block: {"steps": [{"role": "implementer"|"tester", '
+  + '"prompt": "...", "dependsOn": ["s1", ...]}]} — at least one step, no other JSON blocks, nothing after it.'
+
+// Reads a graph out of a Planner frame's final answer, retrying the frame ONCE with a
+// format-only nudge before giving up. Returns the graph and the (possibly updated) frame
+// result; throws PlanningFailed rather than inventing a plan. The retry is a resume of the
+// SAME Planner frame, so it keeps the reasoning it already did (H14).
+async function graphFromPlanner(
+  objective: string,
+  frame: SpawnedFrame,
+  emit: Emit,
+  context: string,
+): Promise<{ graph: TaskGraph; result: FrameResult }> {
+  const first = parseTaskGraph(objective, frame.result.summary)
+  if (first) return { graph: first, result: frame.result }
+  emit({
+    type: 'warning',
+    message: `Planner frame ${frame.result.frameId} (${context}) produced no readable task graph `
+      + `(frame ended: ${frame.agent.getLastRunOutcome()}) — asking once for the JSON block only. `
+      + 'An unreadable plan is NOT a one-step plan.',
+  })
+  const retry = await resumeFrame(frame.result.frameId, frame.agent, PLANNER_FORMAT_RETRY_NUDGE)
+  const second = parseTaskGraph(objective, retry.summary)
+  if (second) return { graph: second, result: retry }
+  throw new PlanningFailed(
+    `Planning failed: the Planner produced no readable task graph for this objective, even after an explicit `
+    + `format retry (${context}; frame ${frame.result.frameId} ended: ${frame.agent.getLastRunOutcome()}). `
+    + `No plan was invented in its place. Objective: ${objective}\nLast raw output:\n${retry.summary}`,
+  )
 }
 
 function emitTaskGraph(emit: Emit, graph: TaskGraph): void {
@@ -478,6 +666,15 @@ export async function runDispatchLoop(
       emit({ type: 'done', content: stopped })
       await logger.flush()
       return stopped
+    }
+    // H13: planning that could not produce a graph is a REPORTED failure, not an
+    // "unexpected error" and emphatically not an invented one-step plan. Same event shape
+    // as the generic branch below (error + no assistant bubble), with the diagnosis as the
+    // returned text so the user/eval sees why nothing ran.
+    if (err instanceof PlanningFailed) {
+      emit({ type: 'error', message: err.message })
+      await logger.flush()
+      return err.message
     }
     const message = `Unexpected error: ${err instanceof Error ? err.message : String(err)}`
     emit({ type: 'error', message })
@@ -561,7 +758,10 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
     doneStepIds.add(graph.steps[0].id)
     commitAgent = verified.agent
   } else {
-    plannerFrame = await spawnFrame(
+    // Held in a local const as well as in plannerFrame: graphFromPlanner may resume the
+    // frame, and the local keeps the non-null Agent reference obvious without depending on
+    // narrowing across the awaits.
+    const planner = await spawnFrame(
       {
         role: 'planner',
         parentFrameId: null,
@@ -569,8 +769,13 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
       },
       emit,
     )
-    commitAgent = plannerFrame.agent
-    graph = parseTaskGraph(objective, plannerFrame.result.summary)
+    plannerFrame = planner
+    commitAgent = planner.agent
+    // H13: no fail-open one-step graph. graphFromPlanner retries the frame once for the
+    // JSON block and otherwise throws PlanningFailed (caught in runDispatchLoop).
+    const planned = await graphFromPlanner(objective, planner, emit, 'initial plan')
+    plannerFrame = { agent: planner.agent, result: planned.result }
+    graph = planned.graph
   }
   await ledger.setPlan(root(), graph)
   emitTaskGraph(emit, graph)
@@ -598,8 +803,21 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
       )
       result = plannerFrame.result
     }
-    commitAgent = plannerFrame.agent
-    graph = parseTaskGraph(objective, result.summary)
+    // Captured before the await for the same reason as the initial-plan branch above.
+    const plannerAgent = plannerFrame.agent
+    commitAgent = plannerAgent
+    // H13: same rule on a replan — one format retry, then PlanningFailed. A replan that
+    // silently collapsed to "one Implementer, the whole objective" was the worst case of
+    // the old fail-open: it discarded both the Boss's diagnosis and the remaining-work
+    // scoping this round exists to produce.
+    const replanned = await graphFromPlanner(
+      objective,
+      { agent: plannerAgent, result },
+      emit,
+      `replan round ${replanRounds}`,
+    )
+    plannerFrame = { agent: plannerAgent, result: replanned.result }
+    graph = replanned.graph
     await ledger.setPlan(root(), graph)
     emitTaskGraph(emit, graph)
     doneStepIds.clear() // fresh step-id space for the new graph — see module doc

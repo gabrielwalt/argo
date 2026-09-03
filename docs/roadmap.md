@@ -5,6 +5,15 @@ loop-recovery ladder, the verification stack, progress trace, conclusion, contex
 management, AGENTS.md/MEMORY.md) plus critiques and current defaults, see
 `docs/harness-instrumentation.md`.
 
+For the **evidence** behind every concept this roadmap acts on — external literature with
+transferability assessed against a 65 k-context local model, Argo's own measured firing counts, a
+*simplest sufficient implementation* per concept, and a concrete validation plan — see
+[`docs/research/`](research/README.md) (added 2026-09-03). It also contains
+[`docs/research/interaction-matrix.md`](research/interaction-matrix.md), which marks every mechanism
+pair as synergistic / neutral / conflicting / redundant. An index mapping every hypothesis ID
+(H01–H26) and every register item (0–8) to its research document is in the 2026-09-03 hypothesis
+register below.
+
 A pragmatic, iterative plan for making Argo a genuinely good **contained coding harness for
 locally-running LLMs** (Qwen, …), while staying true to its mission: local, lean,
 means-not-ends (Ollama/Docker are swappable tools, not goals), observability-first.
@@ -702,6 +711,80 @@ observed agent behaviour — priority follows from what the traces show, not fro
 sounds. Several are already partly built; that is recorded per item with `file:line` evidence, along
 with the evidence for and against the idea mattering, the concrete test that would falsify it, and a
 rough cost.
+
+### 2026-09-03 (later, added by the research consolidation pass) — where the evidence for each item now lives
+
+**Added, not edited.** This register was committed earlier today and is the product of a separate
+analysis pass; nothing above or below has been rewritten or reordered. The table below only adds
+links from each item and each hypothesis ID to the consolidated research body at
+`docs/research/`, which merges this register, the 567-log mechanism verification, the eval
+diagnosis and the external literature into one reference per concept — each with a *simplest
+sufficient implementation*, known traps, and a concrete validation plan.
+
+Start at [`docs/research/README.md`](research/README.md). The single most important new artifact is
+[`docs/research/interaction-matrix.md`](research/interaction-matrix.md), which marks every mechanism
+pair as synergistic / neutral / conflicting / redundant — the class of analysis that would have
+caught the Planner trap before it cost three hypotheses.
+
+| Item in this register | Research document |
+|---|---|
+| Item 0 — per-mechanism firing counters | Landed in Batch 1; see [`07-evaluation-methodology.md`](research/07-evaluation-methodology.md) §3, and the "signals that already exist" section of every other document |
+| **Item 1 — wire the pinned anchor, force eviction** | [`01-context-management.md`](research/01-context-management.md) |
+| Item 2 — multi-turn task sequences | [`04-memory.md`](research/04-memory.md) §4(v), §6 |
+| Item 3 — Implementer context inheritance | [`08-agent-communication.md`](research/08-agent-communication.md) §4(v) · [`02-decomposition-and-planning.md`](research/02-decomposition-and-planning.md) |
+| Item 4 — artifact-by-reference for conclusions | [`08-agent-communication.md`](research/08-agent-communication.md) §4(iii) — **verdict: do nothing; run the falsification test, which is nearly free and retires the item** |
+| Item 5 — rolling stand-up summaries at a ~20-iteration cadence | [`06-iteration-budgets.md`](research/06-iteration-budgets.md) §4(iii) · [`08-agent-communication.md`](research/08-agent-communication.md) §4(ii) |
+| Item 6 — the Boss must verify against artifacts | [`03-supervision-and-verification.md`](research/03-supervision-and-verification.md) §4(ii) · [`08-agent-communication.md`](research/08-agent-communication.md) §4(i) |
+| Item 7 — explicit delegation thresholds | [`06-iteration-budgets.md`](research/06-iteration-budgets.md) §4 "Do nothing about" · [`08-agent-communication.md`](research/08-agent-communication.md) §6 |
+| Item 8 — file-size discipline | [`01-context-management.md`](research/01-context-management.md) §4 "Explicitly do nothing about" — no supporting evidence found in the logs |
+| The iteration-budget directive (~20 chunk, ~200 global) | [`06-iteration-budgets.md`](research/06-iteration-budgets.md) |
+| Deliberately NOT adopted | [`08-agent-communication.md`](research/08-agent-communication.md) §2, §4(iv) |
+| Sequencing constraint | [`07-evaluation-methodology.md`](research/07-evaluation-methodology.md) |
+
+| Hypothesis | Research document |
+|---|---|
+| H01 more iterations help — DISMISSED | [`05`](research/05-drift-and-loop-control.md), [`06`](research/06-iteration-budgets.md) |
+| H02 qwen3.6 only — VALIDATED | [`01`](research/01-context-management.md) §3(d) (it is why the Devstral-era context budget is obsolete) |
+| H03 qwen3.6 self-critique is the best critic — VALIDATED | [`03`](research/03-supervision-and-verification.md) |
+| H04 layout/vision judge — DISMISSED | [`03`](research/03-supervision-and-verification.md) §4(vi) |
+| H05 grounding guard — PARTIAL | [`03`](research/03-supervision-and-verification.md) |
+| H06 config bug explains the gap — DISMISSED | [`07`](research/07-evaluation-methodology.md) |
+| H07 Planner cannot decompose — DISMISSED | [`02`](research/02-decomposition-and-planning.md) §3 |
+| H08–H12 the eval instrument | [`07`](research/07-evaluation-methodology.md) |
+| H13 cap-hit recorded as success | [`06`](research/06-iteration-budgets.md) §4(i), [`03`](research/03-supervision-and-verification.md) §4(i) |
+| H14 `resumeFrame` wipes run state | [`08`](research/08-agent-communication.md) §3, §4(vi) |
+| H15 durable memory poisons its file | [`04`](research/04-memory.md) |
+| H16 `action.level` discarded | [`05`](research/05-drift-and-loop-control.md) §4(iv) |
+| H17 unblock decomposition | [`02`](research/02-decomposition-and-planning.md) §4, §6 |
+| H18 decomposition beats one Implementer | [`02`](research/02-decomposition-and-planning.md) §6 |
+| H19 near-duplicate guard does nothing | [`05`](research/05-drift-and-loop-control.md) §4(i) |
+| H20 L0 keys on exact args | [`05`](research/05-drift-and-loop-control.md) §4(ii) |
+| H21 ~20 as chunk + stand-up cadence | [`06`](research/06-iteration-budgets.md) |
+| H22 ~200 global boundary | [`06`](research/06-iteration-budgets.md) §6 |
+| H23 pinned objective prevents drift | [`01`](research/01-context-management.md), [`05`](research/05-drift-and-loop-control.md) |
+| H24 long-horizon for free | [`01`](research/01-context-management.md) §4(iii) — **note: fix H15's write path first; the write path lives inside the compaction branch, so H24 multiplies it** |
+| H25 cross-turn memory needs multi-turn tasks | [`04`](research/04-memory.md) §4(v) |
+| H26 Implementer frames rebuild context | [`08`](research/08-agent-communication.md) §4(v) |
+
+**Three dated corrections to claims in this register, recorded here rather than edited away:**
+
+1. **The Magentic-One "31 % from the ledger" figure is real but mis-attributed** (cited in
+   `docs/subagents-plan.md` and referenced by Item 5). Verified against
+   [arXiv 2411.04468](https://arxiv.org/abs/2411.04468) §5.3, Fig. 3(a): "without the full ledgers,
+   performance drops by 31%" on GAIA validation with GPT-4o — but that ablation replaces the whole
+   Orchestrator with AutoGen `GroupChat`, "eliminating both ledgers, planning, progress tracking,
+   loop detection, and explicit instructions to other agents." The 31 % is the value of the entire
+   orchestrator, not of the ledger. Do not use it as an argument for a ledger.
+2. **Item 1's "peak context 16 616" figure** (in the Item 1 *Evidence against* paragraph) is correct
+   as written for the 5 003-turn corpus reading — peak is **64 266 of 65 536** with 6 observations at
+   or above the 61 440 threshold. The Item-1 text already carries the corrected number; the older
+   16 616 figure survives in `ASSESSMENT.md` §5.2c and the 2026-09-02 entry above and should be read
+   as superseded there.
+3. **Item 4 (artifact-by-reference) should be resolved by running its own falsification test, not by
+   building it.** Prediction from current data: it will be falsified, because Boss frames run 10–15
+   iterations and their peak context is nowhere near the limit. The *diff* half of the idea is a
+   different matter and has measured harm behind it (`filesWritten` empty in 4 of 9 Implementer
+   conclusions) — see [`08`](research/08-agent-communication.md) §4(i).
 
 ### The framing observation: designed ≠ wired ≠ fires ≠ works
 
