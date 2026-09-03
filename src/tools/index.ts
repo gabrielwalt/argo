@@ -94,11 +94,13 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'read_file',
-      description: 'Read a file. Any absolute path in the container works; use /workspace/path for the project.',
+      description: 'Read a file. Any absolute path in the container works; use /workspace/path for the project. Whole-file output is capped at 8000 chars (head + tail, middle omitted) — for a file longer than that, pass offset/limit to page through it by line instead of guessing from the head and tail alone; the response tells you the total line count and exactly which lines you got.',
       parameters: {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'Absolute path, e.g. /workspace/... or /tmp/...' },
+          offset: { type: 'number', description: 'First line to return, 1-based. Omit to start at line 1. Use this to reach content past the head+tail truncation cap.' },
+          limit: { type: 'number', description: 'Number of lines to return starting at offset. Omit to return through end of file (still capped at 8000 chars).' },
         },
         required: ['path'],
       },
@@ -244,7 +246,7 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
     case 'web_search':
       return webSearch(args.query as string, args.max_results as number | undefined)
     case 'read_file':
-      return readFile(args.path as string)
+      return readFile(args.path as string, args.offset as number | undefined, args.limit as number | undefined)
     case 'write_file':
       return writeFile(args.path as string, args.content as string)
     case 'edit_file':

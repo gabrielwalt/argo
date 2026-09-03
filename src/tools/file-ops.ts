@@ -62,11 +62,81 @@ async function safePath(filePath: string): Promise<string> {
   return path.resolve(filePath)
 }
 
-export async function readFile(filePath: string): Promise<ToolResult> {
+// Counts lines the way an editor or `wc -l` would, not the way a naive
+// content.split('\n') would: "a\nb\n".split('\n') is ['a','b',''] — a
+// trailing newline (the normal end-of-file case) would otherwise inflate
+// the count by one and put the offset/limit marker below one line off from
+// what the model sees when it opens the same file with `sed -n`. The number
+// this produces is exactly what the self-describing marker below reports as
+// "file has N lines", so it has to match what offset/limit actually index.
+function splitLines(content: string): string[] {
+  if (content === '') return []
+  const lines = content.split('\n')
+  if (content.endsWith('\n')) lines.pop()
+  return lines
+}
+
+// offset/limit come in from JSON tool-call arguments — untrusted shape, not
+// just untrusted value (a model can send a string, 0, a negative number, or
+// NaN). Rather than throw on a malformed paging request (which would waste
+// the same turn budget the traced failure ran out of — see file-ops.ts's
+// module comment / the task's measured-defect section), clamp to the
+// smallest sane value and proceed. Returns undefined only when nothing
+// usable was supplied, which readFile treats as "no explicit value here."
+function normalizePositiveInt(n: number | undefined): number | undefined {
+  if (n === undefined || !Number.isFinite(n)) return undefined
+  return Math.max(1, Math.floor(n))
+}
+
+// Paging is opt-in: pass neither offset nor limit and this is byte-for-byte
+// the pre-existing function (same truncateOutput(content, 8000) call, same
+// 500-char head + ~7440-char tail shape). That equivalence is deliberate and
+// load-bearing, not incidental — see the task write-up: a caller that never
+// asks for paging must see exactly what it saw before, so this ships without
+// a flag and without touching bash's or agent.ts's own unrelated callers of
+// truncateOutput (neither is touched by this file at all).
+//
+// With offset and/or limit supplied, this instead returns a specific
+// 1-based line range (offset defaults to 1 if only limit is given; limit
+// defaults to "rest of file" if only offset is given), still capped at 8000
+// chars for the same reason the whole-file path is capped — an unbounded
+// slice just relocates the context-flooding hazard instead of removing it.
+// The result is prefixed with a marker naming the file's total line count
+// and the exact range returned, e.g.
+//   [file has 2790 lines; showing lines 1-120 of 2790; use offset/limit to read another range]
+// This is the fix for the measured failure: a Planner frame that read
+// lib/command.js (2790 lines) via the old head+tail-only truncation had no
+// way to reach handleOptionValue in the invisible middle, no bash (not in
+// ROLE_TOOLS.planner), and by turn 11 no legal read_file retry left either
+// (loop guard blocks duplicate calls) — it burned its whole budget and
+// scored 0/60. The marker's wording is deliberately short, literal, and
+// names the exact parameters ("offset/limit") a small model needs to type
+// to aim its next call, instead of just reporting how much was cut.
+export async function readFile(filePath: string, offset?: number, limit?: number): Promise<ToolResult> {
   try {
     const abs = await safePath(filePath)
     const content = await fs.readFile(abs, 'utf-8')
-    return { output: truncateOutput(content, 8000) }
+    if (offset === undefined && limit === undefined) {
+      return { output: truncateOutput(content, 8000) }
+    }
+    const lines = splitLines(content)
+    const totalLines = lines.length
+    const startLine = normalizePositiveInt(offset) ?? 1  // 1-based
+    const startIdx = startLine - 1
+    if (startIdx >= totalLines) {
+      // A real, readable file with a request past its end is not an error
+      // (the path resolved and the read succeeded) and must not be silently
+      // clamped to the last page either — that would let the model believe
+      // it saw the range it asked for. State the true length instead, so
+      // the very next call can be aimed correctly.
+      return { output: `[file has ${totalLines} lines; offset ${startLine} is past end of file; nothing to show]` }
+    }
+    const count = normalizePositiveInt(limit)
+    const endIdx = count === undefined ? totalLines : Math.min(totalLines, startIdx + count)  // 0-based exclusive == 1-based last line shown
+    const slice = lines.slice(startIdx, endIdx).join('\n')
+    const body = truncateOutput(slice, 8000)
+    const marker = `[file has ${totalLines} lines; showing lines ${startLine}-${endIdx} of ${totalLines}; use offset/limit to read another range]`
+    return { output: `${marker}\n${body}` }
   } catch (err) {
     return { output: '', error: String(err) }
   }
