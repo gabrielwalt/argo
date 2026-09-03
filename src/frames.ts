@@ -44,8 +44,32 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
 // but by accident) routed the whole objective to one large Implementer frame instead
 // of real decomposition. This is exactly the scenario the Planner exists for; 20
 // gives it a real chance to converge instead of reliably timing out on it.
+//
+// Planner raised 20->40 (2026-09-04, unattended driver session, harness c16df84). MEASURED,
+// not guessed: on `commander-count-option` at k=3 with the schema-constrained control plane
+// ON, 2 of the 3 runs ended with the Planner frame logging "Reached maximum iterations (20)
+// without a final answer" — it never concluded, so there was no decision for schema
+// extraction to restate and `graphFromPlanner` threw PlanningFailed with the run dead in
+// about two minutes. The third run concluded and scored 60/60. So on this substrate the
+// dominant Planner failure is NOT unreadable output (the mode schema.ts fixes, which fired
+// and worked once) but simply never finishing: `commander` is 4180 lines with
+// lib/command.js alone at 2790, and reading enough of it to decompose the objective does not
+// fit in 20 turns when each read costs a turn.
+//
+// Two caveats recorded deliberately. (1) This project has already DISMISSED "more iterations
+// help" once — 60->90 made a single-loop Implementer worse, by thrashing. That result does
+// not obviously transfer: a frame killed mid-read while making steady progress is a
+// different failure from a frame drifting with budget to spare, and the evidence here is a
+// cap-hit with no plan rather than a plan that got worse. If 40 merely moves the cap-hit
+// later, the budget is not the constraint and the real lever is how the Planner READS a
+// large repository (docs/research/10-hermes-differential.md: Hermes needs 4-21 calls where
+// Argo needs 69-83) — raise it once, measure, and do not keep raising it.
+// (2) Per Gabriel's design directive, ~20 iterations is meant to be an IDEAL CHUNK SIZE and
+// a stand-up cadence, NOT a hard kill; every entry in this table is currently a hard kill
+// (agent.ts makes the cap-hit string the frame's final answer). The correct fix is a soft
+// cap with a stand-up, and this raise is an interim measurement, not that fix.
 export const ROLE_MAX_ITERATIONS: Record<Role, number> = {
-  planner: 20,
+  planner: 40,
   implementer: 60,
   tester: 20,
   boss: 15,
