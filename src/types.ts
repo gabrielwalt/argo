@@ -19,11 +19,16 @@ export type AgentEvent =
   | { type: 'thought'; content: string }
   | { type: 'tool_call'; tool: ToolName; args: Record<string, unknown> }
   // rejected: true marks a HARNESS-level block (plan/act gate, role restriction, loop
-  // steer) — deliberately still shaped exactly like a real tool_result (see
+  // steer/replay) — deliberately still shaped exactly like a real tool_result (see
   // Agent.rejectToolCall) so the MODEL can't tell the difference and reacts the same
   // way it would to a genuine failure. This field is for CODE (tests, analytics) that
   // needs to tell "the tool actually ran" apart from "the harness declined to run it."
-  | { type: 'tool_result'; tool: ToolName; output: string; error?: string; duration_ms: number; rejected?: boolean }
+  // replayed: true (2026-09, H20 loop-guard redesign) narrows that further for the
+  // ONE rejected case that isn't really a failure at all: the loop ladder's L0 rung
+  // serving back the CACHED result of an identical call already run, labeled as a
+  // repeat, instead of a bare block (see Agent.replayToolCall / loop.ts's
+  // evaluateCall). Always accompanied by rejected: true; never set on its own.
+  | { type: 'tool_result'; tool: ToolName; output: string; error?: string; duration_ms: number; rejected?: boolean; replayed?: boolean }
   | { type: 'message'; role: 'user' | 'assistant'; content: string }
   | { type: 'token_usage'; prompt_tokens: number; generated_tokens: number; num_ctx: number; eval_duration_ms?: number; total_duration_ms?: number }
   | { type: 'done'; content: string }

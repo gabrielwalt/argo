@@ -271,7 +271,13 @@ export class SessionLogger {
           break
 
         case 'tool_result':
-          const status = event.error ? `ERROR · ${event.error}` : `${event.duration_ms}ms`
+          // event.replayed (H20 loop-guard redesign) is the ONE rejected case that
+          // isn't a failure at all — replayToolCall (agent.ts) emits `rejected:
+          // true, error: undefined` for it, which is otherwise indistinguishable
+          // from a real fast (0ms-reporting) execution in this log. Render it
+          // explicitly rather than let a human transcript reader mistake a served
+          // cache for a genuine re-run (/shared/argo-review/REPORT.md defect 4).
+          const status = event.replayed ? 'REPLAYED' : event.error ? `ERROR · ${event.error}` : `${event.duration_ms}ms`
           lines.push(`**📥 Result** \`${status}\``)
           lines.push(``)
           lines.push(`\`\`\``)

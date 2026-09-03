@@ -7,19 +7,94 @@
 // changed, repeating is a loop; if something changed, the repeat is a fresh check
 // and is always allowed. This module only DECIDES what to do about an about-to-run
 // call — the agent (elsewhere) performs the corresponding side effects (skip the
-// call, compact context, force a re-plan). Pure: no fs, no LLM, no Date, no
-// randomness, and no mutation of anything outside the passed-in `state`.
+// call, serve a cached result, compact context, force a re-plan). Pure: no fs, no
+// LLM, no Date, no randomness, and no mutation of anything outside the passed-in
+// `state`.
+//
+// 2026-09 redesign (H19/H20, MECHANISM-VERIFICATION.md §4.1, HYPOTHESIS-LEDGER.md):
+// two changes from the original version of this module.
+//   1. The near-duplicate "same tool, any args" guard (formerly checkSameToolStreak)
+//      is DELETED outright. It fired 180 times across the full log corpus and
+//      changed the model's next action in exactly 0 of them (every sampled firing
+//      was immediately followed by another call to the same tool regardless) — a
+//      mechanism that fires but never helps, not a mechanism that needs tuning.
+//   2. The L0 exact-repeat guard now runs on a NORMALISED key (normalizeCallKey,
+//      below), not the raw JSON.stringify(args) key, and its first hit on a given
+//      key SERVES the cached prior result instead of a bare block. Measured: of 143
+//      exact-repeat blocks with an observable next call, only 6 produced the
+//      intended behaviour change; 46 were evaded by a cosmetically different
+//      re-issue that the raw key cannot see — the two most common forms being
+//      "append `2>&1`" (normalizeCallKey now closes this for the BLOCK decision —
+//      see its rule list below) and "switch `read_file` for `bash cat`". The
+//      latter is deliberately NOT closed and remains a known, still-open gap after
+//      this redesign — see "What this explicitly does NOT collapse" below for why,
+//      and /shared/argo-review/REPORT.md defect 2 for the adversarial review that
+//      flagged it as open rather than implicitly closed by the 46/143 figure above.
+//      Either way, a bare block gives the model nothing to act on besides "try
+//      something else" with no information about WHAT changed (an empty answer,
+//      since the plain answer is "nothing") — which is the other half of this
+//      redesign.
+//
+// 2026-09 FIX ROUND (post-review, /shared/argo-review/REPORT.md +
+// /shared/argo-loopfix/REPORT.md): two more changes, both narrowing when a CACHED
+// RESULT may be replayed — never touching the allow-vs-block decision itself
+// (mutationCount's role there is unchanged by either fix).
+//   3. (FIX 1 / review defect 1) A cached result may only be replayed if no `bash`
+//      call has executed since it was recorded. `isProjectMutation` (agent.ts)
+//      only recognises edit_file/write_file, so a real filesystem change made via
+//      `bash` (sed -i, `>`, `git checkout`, ...) is invisible to mutationCount —
+//      and before this fix, replaying a cached read across that gap told the model
+//      "nothing has changed" about a file that could have just changed underneath
+//      it. See noteBashExecution below.
+//   4. (FIX 2 / review defect 3, cone's call) A cached result may only be replayed
+//      if the CURRENT call's args are the exact ones (up to object key order) that
+//      produced it — normalizeCallKey's bash/path rules are safe for deciding
+//      "this is the same call, blocked" but not for deciding "here is the same
+//      BYTES" (a trailing `2>&1` can change real stdout/stderr interleaving order —
+//      see StoredResult's doc comment below). See canonicalArgsKey below.
 
 export interface LoopConfig {
   // Consecutive no-progress blocks before an L1 compaction is triggered.
   l1BlocksBeforeCompact: number
   // Consecutive no-progress blocks before an L2 stop+reframe (forced re-plan).
   l2BlocksBeforeAbort: number
+  // How many times the FIRST no-progress repeat of a given key gets served the
+  // cached prior result (kind: 'replay') before falling back to the plain textual
+  // L0 steer for further repeats of that same key. See evaluateCall's L0 branch.
+  maxReplaysPerKey: number
 }
 
 export const DEFAULT_LOOP_CONFIG: LoopConfig = {
   l1BlocksBeforeCompact: 3,
   l2BlocksBeforeAbort: 6,
+  maxReplaysPerKey: 1,
+}
+
+// A previously-executed tool's result, cached verbatim so a later exact/normalised
+// repeat can be served it back instead of re-running (or just blocking) the call.
+// Deliberately the minimal shape this module needs — not an import of agent.ts's
+// richer ToolResult, to keep this module dependency-free. This is also the shape
+// handed back on a LoopAction's `replay.cached` field — see StoredResult below for
+// the internal-only extra field kept OUT of this public shape.
+export interface LoopCachedResult {
+  output: string
+  error?: string
+}
+
+// What is actually stored per key: the cached result PLUS a canonical snapshot of
+// the exact args that produced it (FIX 2 / review defect 3). `canonicalArgs` is
+// JSON.stringify'd after ONLY object-key-order normalisation (canonicalize below) —
+// never normalizeCallKey's path/bash rules, which change the actual string values
+// (stripping a trailing `2>&1`, a leading `./`, ...) and are therefore safe for
+// deciding "block this repeat" but not for deciding "these are the same bytes,
+// safe to replay". Concretely: `cat -n X` and `cat -n X 2>&1` normalise to the
+// SAME loopKey (correctly recognised as a repeat, still blocked either way), but
+// they are NOT the same canonicalArgs, so the second is never served the first's
+// cached output — see the file-level FIX 2 note above and the adversarial pair in
+// /shared/argo-review/REPORT.md defect 3 (`2>&1` changes real stdout/stderr
+// interleaving order via tools/bash.ts's stream concatenation, not just spelling).
+interface StoredResult extends LoopCachedResult {
+  canonicalArgs: string
 }
 
 export interface LoopState {
@@ -28,20 +103,32 @@ export interface LoopState {
   // from "same call, but progress happened since".
   lastMutationByKey: Map<string, number>
   // Monotonic count of project mutations (edit/write successes) so far this run.
+  // FIX 1 leaves this untouched: it keeps its exact pre-fix meaning and role in
+  // the allow-vs-block decision (evaluateCall's `seen !== state.mutationCount`
+  // check) — a `bash` call never advances it, same as before this fix round.
   mutationCount: number
   // Consecutive no-progress blocks since the last real progress (noteMutation).
   blocks: number
   // Whether an L1 compaction has already fired for the CURRENT stuck streak —
   // compaction is a one-shot intervention per streak, not repeated every block.
   compactedForStreak: boolean
-  // Coarse near-duplicate guard (2026-09-03, checkSameToolStreak below): the SAME
-  // tool NAME called repeatedly, regardless of args, with no mutation in between —
-  // catches "many different bash commands all re-verifying the same already-true
-  // fact" (observed in eval: self-reverification loops that never repeat an EXACT
-  // call, so evade lastMutationByKey/blocks above entirely, which key on exact args).
-  lastToolName: string | null
-  sameToolStreak: number
-  sameToolWarnedForStreak: boolean
+  // The real result of the most recent EXECUTION of each key (populated by the
+  // caller via recordResult right after a real tool call — this module never runs
+  // a tool itself). Read by evaluateCall to serve a cached replay on the first
+  // no-progress repeat of that key, but ONLY when canonicalArgs still matches
+  // (FIX 2) and no `bash` call has run since (FIX 1 — see noteBashExecution,
+  // which clears this map wholesale). Naturally stays correct across a mutation:
+  // the entry is only ever replaced by a fresh recordResult call, which only
+  // happens when the key was just actually re-executed.
+  lastResultByKey: Map<string, StoredResult>
+  // How many times each key has already been served as a cached replay since it
+  // last actually executed. Cleared for a key the moment it next actually runs
+  // (see evaluateCall's 'allow' branch) so a legitimately repeated action later in
+  // the run gets a fresh replay budget, not the leftover count from earlier. Also
+  // cleared wholesale by noteBashExecution, alongside lastResultByKey — see its
+  // doc comment for why that pairing is kept even though it has no separately
+  // observable effect through evaluateCall today.
+  replaysByKey: Map<string, number>
 }
 
 // Fresh, empty state for the start of a run.
@@ -51,9 +138,8 @@ export function createLoopState(): LoopState {
     mutationCount: 0,
     blocks: 0,
     compactedForStreak: false,
-    lastToolName: null,
-    sameToolStreak: 0,
-    sameToolWarnedForStreak: false,
+    lastResultByKey: new Map(),
+    replaysByKey: new Map(),
   }
 }
 
@@ -63,42 +149,250 @@ export function noteMutation(state: LoopState): void {
   state.mutationCount++
   state.blocks = 0
   state.compactedForStreak = false
-  state.sameToolStreak = 0
-  state.sameToolWarnedForStreak = false
 }
 
-// Coarse near-duplicate guard, deliberately SEPARATE from evaluateCall above: that
-// ladder only ever fires on an EXACT repeat (same tool + same args) and BLOCKS the
-// call once it does. This one is looser (same tool, ANY args) and never blocks —
-// near-duplicate calls, unlike exact ones, sometimes genuinely differ (gemini-cli's
-// own loop-detection design treats these as a distinct case for exactly this
-// reason: fuzzy matching, not a hard skip). Call this AFTER evaluateCall allows the
-// call through; it only ever adds a nudge, never prevents execution. Fires once per
-// streak (mirrors compactedForStreak) so it doesn't renag on every single call past
-// the threshold. A call to a DIFFERENT tool resets the streak.
-export const SAME_TOOL_WARN_THRESHOLD = 3
+// FIX 1 (/shared/argo-loopfix/REPORT.md, /shared/argo-review/REPORT.md defect 1).
+// Call right after a `bash` call actually executed — success OR error, since a
+// command can mutate the filesystem before later failing (`sed -i ...; false`) and
+// its effect either way is unknowable without a shell parser. `isProjectMutation`
+// (agent.ts) only ever recognises edit_file/write_file, so a real change made via
+// `sed -i`, `>`, `mv`, `git apply`, `git checkout`, etc. never advances
+// mutationCount — before this fix, that gap let a later cached-replay confidently
+// tell the model "nothing has changed" about a file that just changed underneath
+// it via bash, which is strictly worse than the pre-redesign bare block (it
+// fabricates specific stale content instead of fabricating nothing).
+//
+// The fix is deliberately NOT "try to recognise a mutation-looking bash command" —
+// that is exactly the "clever fuzzy matcher" this module elsewhere declines to
+// build (see normalizeCallKey's rejections below), and a false negative there
+// (missing a real mutation) would recreate the exact bug this is fixing. Instead,
+// every cached result is invalidated wholesale on ANY bash call, not just one
+// attributed to the same file: a bash call's blast radius is unknowable, so the
+// conservative, provably-safe choice is to distrust every cache rather than guess
+// which one (if any) bash might have touched.
+//
+// This does NOT touch mutationCount, lastMutationByKey, blocks, or
+// compactedForStreak — invalidating a CACHE is not progress, and the allow-vs-
+// block decision (evaluateCall's `seen !== state.mutationCount` check) is exactly
+// as blind to bash mutations after this fix as it was before it (a real, separate,
+// documented gap — see /shared/argo-loopguard/REPORT.md's own Q2 — left for a
+// follow-up that can see inside `bash`, not patched over here by proxy). The one
+// visible cost is an occasional missed replay for a key that bash never actually
+// touched, which falls back to the plain L0 steer instead — the safe direction per
+// this module's own principle that a false collapse is worse than a missed one.
+export function noteBashExecution(state: LoopState): void {
+  state.lastResultByKey.clear()
+  // replaysByKey clears too. This has no OBSERVABLE effect through evaluateCall on
+  // its own today — the L0 replay branch already requires `cached` to be truthy,
+  // so a stale positive count against a now-absent cache entry could never be read
+  // — but keeping the invariant "a key's replay budget never outlives the cached
+  // result it was consuming budget against" true unconditionally (not just true by
+  // the accident of one guard clause) means this function's contract stays legible
+  // without also reading evaluateCall's internals, and stays correct if that guard
+  // ever changes shape.
+  state.replaysByKey.clear()
+}
 
-export function checkSameToolStreak(state: LoopState, toolName: string, threshold = SAME_TOOL_WARN_THRESHOLD): string | null {
-  if (state.lastToolName === toolName) {
-    state.sameToolStreak++
-  } else {
-    state.lastToolName = toolName
-    state.sameToolStreak = 1
-    state.sameToolWarnedForStreak = false
+// Call right after a tool call actually executed (whether it errored or not) with
+// the key evaluateCall was given for that call and the exact args it ran with, so
+// a later no-progress repeat of the SAME key with the SAME args (FIX 2 — see
+// StoredResult's doc comment) can be served this exact result back (see
+// evaluateCall's L0 'replay' branch). Never called for a call the ladder itself
+// blocked — those never reach the tool.
+export function recordResult(
+  state: LoopState,
+  key: string,
+  args: Record<string, unknown>,
+  result: LoopCachedResult,
+): void {
+  state.lastResultByKey.set(key, { ...result, canonicalArgs: canonicalArgsKey(args) })
+}
+
+// ── L0 key normalisation (H20) ──────────────────────────────────────────────
+//
+// evaluateCall's `key` is normally repetitionKey(name, args) from agent.ts — the
+// literal JSON.stringify of the arguments. normalizeCallKey below computes a
+// SEPARATE, coarser key that the ARGO_LOOP ladder uses instead (the baseline
+// REPEAT_THRESHOLD path in agent.ts keeps using the raw key unchanged, so
+// behaviour with the ladder OFF is untouched by any of this).
+//
+// Every rule here is chosen because it can be shown NOT to change what the call
+// actually does — never because it merely looks similar. The governing principle:
+// a MISSED evasion just costs another iteration (the existing failure mode,
+// unchanged); a FALSE collapse tells the model a materially different call is
+// "the same one you already ran", which can hide real information from it. When a
+// candidate rule cannot be shown safe, it is left out — see the explicit
+// rejections below the code (`| head`, cross-tool equivalence, interior path
+// spellings, generic whitespace collapse, and — post-review — a trailing slash)
+// for cases considered and declined.
+//
+// IMPORTANT: this key normalisation governs the BLOCK/no-progress decision only.
+// It does NOT govern whether a cached result may be REPLAYED — that additionally
+// requires canonicalArgs to match exactly (FIX 2, see StoredResult above) and no
+// intervening `bash` call (FIX 1, see noteBashExecution above). A rule can be
+// perfectly safe for "these two calls are the same ask" while still being unsafe
+// for "these two calls would return the same bytes" — the `2>&1` rule below is
+// exactly that case, which is why it stays here (blocking is still correct) but is
+// NOT trusted for replay.
+//
+// What this DOES collapse:
+//   - Object key order in the args object (`{a,b}` vs `{b,a}` serialize the same).
+//   - A leading `./` or a doubled internal `/` in a `path` argument
+//     (read_file/write_file/edit_file/view_image) — unambiguous POSIX-equivalent
+//     spellings of the same path with no symlink/`..` resolution attempted.
+//   - For `bash`'s `command` string only, and only at the very END of the string
+//     (see the "why only the end" note on normalizeBashCommand): leading/trailing
+//     whitespace; a trailing chain of `2>&1` / `1>&2` / `>/dev/null` / `1>/dev/null`
+//     / `2>/dev/null` / `&>/dev/null` (streams that are merged or discarded, never
+//     written to a real file); quotes around a trailing plain path/word token with
+//     no whitespace or shell metacharacters in it; a leading `./` on that same
+//     trailing token.
+//
+// What this explicitly does NOT collapse (by design, not oversight):
+//   - A trailing `/` on a `path` argument (`x/` vs `x`). Considered safe in the
+//     original version of this rule and REMOVED after adversarial review
+//     (/shared/argo-review/REPORT.md's normalisation table): if `x` is a plain
+//     file, `read_file('x/')` can fail with an ENOTDIR-class error where
+//     `read_file('x')` succeeds — collapsing the two hides a real success/failure
+//     boundary, not a spelling difference, which is exactly the false-collapse
+//     this module's own principle says is worse than a miss. `./x` and doubled
+//     internal `/` stay collapsed; only the trailing case was unsafe.
+//   - `bash cat X` vs `read_file X` — literally the model's own most common evasion
+//     (MECHANISM-VERIFICATION.md §4.1) but collapsing across TOOLS asserts the two
+//     tools are equivalent for every purpose (error text, size limits, permissions
+//     differ), which is not a "small, well-argued rule" — it is exactly the
+//     "clever fuzzy matcher" the mandate says to avoid. Left as a KNOWN, STILL-OPEN
+//     GAP (not implicitly closed by this redesign's other numbers — see
+//     /shared/argo-review/REPORT.md defect 2) — the cached-replay mechanism
+//     (below) helps here too, once, if the model happens to re-hit the SAME tool a
+//     second time, but not on the cross-tool switch itself.
+//   - `> real/path`, `>> real/path`, `| tee real/path` — anything that can write a
+//     real file is never touched, even though a model switching TO one of these as
+//     its evasion is common (an observed real example switched `| head -80` to
+//     `| tee /tmp/…`) — that is a genuine behaviour change, not a cosmetic one.
+//   - A trailing `| head` (with or without a count) added or removed. Considered
+//     and rejected: unlike a redirection, `head` changes how much of the SAME
+//     output the model can see, and whether adding/removing it is "cosmetic"
+//     depends on the direction — a model that saw truncated output and now wants
+//     the rest is asking a genuinely different question, and collapsing that would
+//     be exactly the false-collapse the mandate warns is worse than a miss.
+//   - Any whitespace or quoting INSIDE the middle of a bash command (only the
+//     trailing token and the string's own ends are touched — see
+//     normalizeBashCommand's header comment for why the middle is left alone).
+//   - Any argument other than `command` (bash) and `path` (file tools) — e.g.
+//     `edit_file`'s `old_string`/`new_string`, or a materially different
+//     `timeout_ms`/`cwd` on a repeated bash call, are compared verbatim.
+//   - `..` path segments, resolving symlinks, or case-folding — none of that can be
+//     done correctly without touching the filesystem, which this pure module must
+//     not do.
+
+// Recursively sorts object keys so `{a:1,b:2}` and `{b:2,a:1}` serialize
+// identically. Array element ORDER is never touched — unlike object keys, position
+// in an array can carry meaning, so only object key order (which by definition
+// carries none in JSON) is normalised. Reused for BOTH normalizeCallKey (the block
+// decision) and canonicalArgsKey (the replay-eligibility decision, FIX 2) because
+// reordering an object's keys never changes any argument VALUE — unlike every
+// other normalizeArgsForKey rule below, it is safe for both purposes at once.
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize)
+  if (value !== null && typeof value === 'object') {
+    const src = value as Record<string, unknown>
+    const out: Record<string, unknown> = {}
+    for (const k of Object.keys(src).sort()) out[k] = canonicalize(src[k])
+    return out
   }
-  if (state.sameToolStreak >= threshold && !state.sameToolWarnedForStreak) {
-    state.sameToolWarnedForStreak = true
-    return (
-      `You have now called \`${toolName}\` ${state.sameToolStreak} times in a row (different arguments each time, ` +
-      'but the same kind of action, with nothing changed in between). If you already have what you need, commit ' +
-      'to your verdict or answer now — otherwise take a genuinely different kind of action.'
-    )
+  return value
+}
+
+// FIX 2's replay-eligibility snapshot: canonicalize (key order only — see its doc
+// comment) then stringify, WITHOUT any of normalizeArgsForKey's path/bash rules.
+// Two calls whose normalizeCallKey matches can still have different
+// canonicalArgsKey values (e.g. the `2>&1` pair) — that difference is exactly what
+// FIX 2 uses to refuse a replay while still allowing the block/escalation decision
+// to treat them as the same repeat.
+function canonicalArgsKey(args: Record<string, unknown>): string {
+  return JSON.stringify(canonicalize(args))
+}
+
+// './x' and 'x' name the same file; collapsing '..' or symlinks would require
+// actually resolving the filesystem, which this rule deliberately does not attempt
+// (a wrong resolution would itself be a false collapse). A trailing '/' is
+// deliberately NOT collapsed here — see "What this explicitly does NOT collapse"
+// above (FIX 3 / review's normalisation table: an ENOTDIR-class failure can turn
+// on that exact spelling difference).
+function normalizePathArg(p: string): string {
+  return p.replace(/^\.\//, '').replace(/\/{2,}/g, '/')
+}
+
+const PATH_ARG_KEYS = new Set(['path'])
+
+// Rules 2-4 below intentionally touch only the STRING'S OWN ENDS (leading/trailing
+// whitespace, and suffix chains of specific tokens), never an interior substring.
+// This module has no shell parser and never will, so it relies on a structural
+// fact instead: in any syntactically valid shell command, quotes are balanced, so
+// a quote that is still "open" at the very end of the string cannot exist (an
+// actually-open quote would make the command incomplete, which is not something a
+// model would knowingly submit as a finished call). That means anything matched by
+// an END-anchored pattern, after removal of an already end-anchored match to its
+// right, is provably outside any quoted region — "provably outside quotes by
+// construction" is the bar for every rule here, not "probably fine in practice".
+function normalizeBashCommand(cmd: string): string {
+  let s = cmd.trim()
+
+  // Rule 1 — a trailing chain of stream redirections that MERGE or DISCARD an
+  // already-produced stream, never write a real file: 2>&1, 1>&2, >/dev/null,
+  // 1>/dev/null, 2>/dev/null, &>/dev/null. This is the exact evasion measured in
+  // MECHANISM-VERIFICATION.md §4.1: `cat -n X` -> `cat -n X 2>&1`. Looped because
+  // more than one can stack (`>/dev/null 2>&1`); re-trimmed after each removal.
+  // Safe for the BLOCK decision (two commands differing only by this chain really
+  // are "no progress" either way); NOT trusted for REPLAY (FIX 2 — see the
+  // `2>&1`-changes-interleaving-order case in canonicalArgsKey's doc comment and
+  // /shared/argo-review/REPORT.md defect 3).
+  const redir = /\s*(?:2>&1|1>&2|&>\s*\/dev\/null|[12]?>\s*\/dev\/null)\s*$/
+  while (redir.test(s)) s = s.replace(redir, '').trimEnd()
+
+  // Rule 2 — quotes around the trailing token, ONLY when the quoted content has no
+  // whitespace and no shell metacharacter (so the quoting could not have been
+  // doing any real work — no word-splitting or globbing to prevent). `cat file.txt`
+  // and `cat "file.txt"` behave identically; `cat "*.txt"` and `cat *.txt` do NOT
+  // (glob expansion differs), and '*' is excluded from the allowed charset so that
+  // case is left untouched.
+  s = s.replace(/(^|\s)(['"])([A-Za-z0-9_.\/=-]+)\2$/, '$1$3')
+
+  // Rule 3 — a leading './' on the trailing token only, now that it is unquoted.
+  // '../x' is a different, real path segment and is not touched: the regex
+  // requires the token to start with exactly one '.' then '/', and `(^|\s)`
+  // anchors that to the START of the token, so '..' cannot satisfy it (the
+  // character immediately before the matched '.' would have to be whitespace or
+  // start-of-string, but in '../x' it is another '.').
+  s = s.replace(/(^|\s)\.\/([A-Za-z0-9_.\/-]+)$/, '$1$2')
+
+  return s
+}
+
+function normalizeArgsForKey(name: string, args: Record<string, unknown>): Record<string, unknown> {
+  const canon = canonicalize(args) as Record<string, unknown>
+  for (const k of Object.keys(canon)) {
+    if (PATH_ARG_KEYS.has(k) && typeof canon[k] === 'string') canon[k] = normalizePathArg(canon[k] as string)
   }
-  return null
+  if (name === 'bash' && typeof canon.command === 'string') canon.command = normalizeBashCommand(canon.command)
+  return canon
+}
+
+// The ARGO_LOOP ladder's own repeat key — NOT used by the baseline REPEAT_THRESHOLD
+// path in agent.ts (which keeps repetitionKey's raw JSON.stringify unchanged), so
+// this can only ever affect behaviour when the ladder is on.
+export function normalizeCallKey(name: string, args: Record<string, unknown>): string {
+  return `${name}:${JSON.stringify(normalizeArgsForKey(name, args))}`
 }
 
 export type LoopAction =
   | { kind: 'allow' }
+  // First no-progress repeat(s) of a key, up to cfg.maxReplaysPerKey: the cached
+  // result of the call that already ran is served back, labeled as a repeat,
+  // instead of a bare block. `cached` is exactly what recordResult last stored for
+  // this key (output/error only — canonicalArgs is internal, see StoredResult).
+  | { kind: 'replay'; level: 'L0'; message: string; cached: LoopCachedResult }
   | { kind: 'steer'; level: 'L0'; message: string }
   | { kind: 'compact'; level: 'L1'; message: string }
   | { kind: 'replan'; level: 'L2'; message: string }
@@ -114,23 +408,36 @@ export interface LoopContext {
 }
 
 // Decide what to do about an about-to-run tool call identified by `key` (=
-// repetitionKey(name, args) in agent.ts). Mutates `state`: records
-// lastMutationByKey on allow, and advances/resets blocks + compactedForStreak
-// on a no-progress repeat.
+// normalizeCallKey(name, args) when the ladder is on — see agent.ts) with the
+// exact `args` it is about to run with (needed only for FIX 2's replay-eligibility
+// check below; the allow-vs-block decision itself is still keyed on `key` alone,
+// exactly as before). Mutates `state`: records lastMutationByKey + clears any
+// replay budget on allow, and advances/resets blocks + compactedForStreak on a
+// no-progress repeat.
 export function evaluateCall(
   state: LoopState,
   key: string,
+  args: Record<string, unknown>,
   ctx: LoopContext,
   cfg: LoopConfig = DEFAULT_LOOP_CONFIG,
 ): LoopAction {
   const seen = state.lastMutationByKey.get(key)
   if (seen === undefined || seen !== state.mutationCount) {
-    // New key, or a mutation happened since this key last ran — not a stall.
+    // New key, or a mutation happened since this key last ran — not a stall. A
+    // fresh execution is about to happen (the caller calls recordResult right
+    // after it), so this key's replay budget resets too.
     state.lastMutationByKey.set(key, state.mutationCount)
+    state.replaysByKey.delete(key)
     return { kind: 'allow' }
   }
 
-  // Same call, nothing has changed since — a no-progress repeat.
+  // Same call, nothing has changed since — a no-progress repeat. This decision is
+  // driven by mutationCount alone, exactly as before FIX 1/2 — a `bash` call that
+  // may have mutated the target file still does not make this an 'allow' (that gap
+  // is real, documented, and deliberately not patched by proxy here — see
+  // noteBashExecution's doc comment). What FIX 1/2 change is only what happens
+  // BELOW, inside this same no-progress branch: whether the block is a REPLAY or
+  // the plain steer.
   state.blocks++
 
   if (state.blocks >= cfg.l2BlocksBeforeAbort) {
@@ -140,11 +447,51 @@ export function evaluateCall(
     state.compactedForStreak = true
     return { kind: 'compact', level: 'L1', message: l1SteerMessage(ctx) }
   }
+
+  // L0: serve the cached result, labeled as a repeat, while budget for this key
+  // remains AND that cache is still trustworthy — cheaper AND more informative
+  // than a bare block when it is (see the file header for why). A cache is
+  // trustworthy only when BOTH hold: (FIX 2) the current call's args are exactly
+  // what produced it (canonicalArgsKey match — a normalised-equal-but-raw-different
+  // repeat, e.g. the `2>&1` pair, still counts as a block above but is not replayed
+  // here); (FIX 1) no `bash` call ran since it was recorded (noteBashExecution
+  // clears lastResultByKey wholesale on any bash execution, so `cached` is simply
+  // absent here if one did). Once budget is exhausted, or a cache exists but fails
+  // either check, further no-progress repeats of the SAME key fall back to the
+  // plain textual steer; the global `blocks` counter above still drives the run to
+  // L1/L2 on the same schedule regardless of which L0 form fired.
+  const cached = state.lastResultByKey.get(key)
+  const replays = state.replaysByKey.get(key) ?? 0
+  const sameArgs = cached !== undefined && cached.canonicalArgs === canonicalArgsKey(args)
+  if (cached && sameArgs && replays < cfg.maxReplaysPerKey) {
+    state.replaysByKey.set(key, replays + 1)
+    // `cached` mirrors exactly what recordResult stored — and NOTHING MORE. Building it
+    // as `{ output, error: cached.error }` would materialise an explicit `error: undefined`
+    // key on a result that never had one, which then rides out into the emitted
+    // tool_result event and makes a successful replay structurally different from the
+    // successful real call it reproduces. The replay's whole promise is that it is the
+    // earlier result verbatim, so the payload has to be shaped like it too.
+    const payload: LoopCachedResult = cached.error === undefined ? { output: cached.output } : { output: cached.output, error: cached.error }
+    return { kind: 'replay', level: 'L0', message: l0ReplayMessage(ctx), cached: payload }
+  }
   return { kind: 'steer', level: 'L0', message: l0SteerMessage(ctx) }
 }
 
-// L0 — gentle first steer: name the exact repeat, demand a different concrete
-// action or a final answer if the task is actually done.
+// L0, replay form — the FIRST no-progress repeat(s) of a key (see cfg.maxReplaysPerKey):
+// tells the model plainly that the result it is about to see again is old, not new.
+export function l0ReplayMessage(ctx: LoopContext): string {
+  return (
+    `You just issued the EXACT same \`${ctx.toolName}\` call that already ran, with nothing changed since — ` +
+    'the result below is reproduced verbatim from that earlier run, not a fresh observation. Nothing has ' +
+    `changed, so running it again will not tell you anything new: take a DIFFERENT concrete action, or give ` +
+    `your final answer if the task is already done.\n\n${ctx.recite}`
+  )
+}
+
+// L0, plain steer form — used once a key's replay budget (cfg.maxReplaysPerKey) is
+// exhausted, or the cached result is no longer trustworthy enough to serve (FIX
+// 1/FIX 2 above): names the exact repeat, demand a different concrete action or a
+// final answer if the task is actually done.
 export function l0SteerMessage(ctx: LoopContext): string {
   return (
     `You just issued the EXACT same \`${ctx.toolName}\` call that already ran, with nothing changed since. ` +

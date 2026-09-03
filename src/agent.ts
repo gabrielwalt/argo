@@ -42,7 +42,7 @@ import {
   renderRecallPointer,
   persistToMemory,
 } from './memory.js'
-import { createLoopState, noteMutation, evaluateCall, checkSameToolStreak, type LoopState } from './loop.js'
+import { createLoopState, noteMutation, noteBashExecution, evaluateCall, normalizeCallKey, recordResult, type LoopState } from './loop.js'
 import { classifyTool, inferDependencies, evict, type EpisodeMeta } from './eviction.js'
 import { recordEpisode, markEpisodeEvicted, newId as newLedgerId } from './ledger.js'
 
@@ -699,6 +699,23 @@ export class Agent {
     emitAndLog({ type: 'tool_call', tool: name, args })
     emitAndLog({ type: 'tool_result', tool: name, output: '', error: reason, duration_ms: 0, rejected: true })
     this.pushCtx({ role: 'tool', content: `Error: ${reason}` })
+  }
+
+  // LOOP-RECOVERY LADDER, L0 cached-replay form (ARGO_LOOP; H20). Unlike
+  // rejectToolCall above — which deliberately frames a block as an ERROR so the
+  // model can't tell a harness rejection from a real failure — a replay is telling
+  // the model something true and useful: this exact call already ran, nothing has
+  // changed, and here again is exactly what it returned. Still marked rejected
+  // (the tool did not actually run a second time — see AgentEvent's doc comment)
+  // plus replayed (this specific reason for not running it), and still gets the
+  // same tool_call/tool_result event PAIR every other outcome here gets, so
+  // analytics can tell "really executed" / "harness blocked" / "harness replayed"
+  // apart without guessing from message text.
+  private replayToolCall(name: ToolName, args: Record<string, unknown>, cached: { output: string; error?: string }, label: string, emitAndLog: (e: AgentEvent) => void): void {
+    emitAndLog({ type: 'tool_call', tool: name, args })
+    emitAndLog({ type: 'tool_result', tool: name, output: cached.output, error: cached.error, duration_ms: 0, rejected: true, replayed: true })
+    const body = cached.error ? `Error: ${cached.error}\n${cached.output}` : cached.output
+    this.pushCtx({ role: 'tool', content: `${label}\n\n[Previous result, reproduced verbatim — nothing has changed]\n${body}` })
   }
 
   // Lets the user force compaction between turns (server.ts's POST /compact-now,
@@ -1803,12 +1820,28 @@ export class Agent {
           // identical call has already produced the same result that many times.
           const key = repetitionKey(name, args)
           let priorRepeats = 0
+          // Only set when this.loop is on — the normalised key the ladder actually
+          // keys on (see loop.ts's normalizeCallKey doc comment for exactly what it
+          // collapses). Recorded here so recordResult below (after real execution)
+          // can cache the result under the SAME key evaluateCall will look up next
+          // time. The baseline `key` above is untouched and still drives
+          // recentCalls/REPEAT_THRESHOLD when this.loop is off.
+          let loopKey: string | undefined
           if (this.loop) {
-            // Mutation-aware ladder (ARGO_LOOP): blocks the 2nd identical call when
-            // nothing changed since it last ran; escalates L0 steer -> L1 compaction
-            // -> L2 forced re-plan. Replaces the count-based REPEAT_THRESHOLD steer.
+            // Mutation-aware ladder (ARGO_LOOP; H19/H20 redesign): blocks the 2nd
+            // NORMALISED-identical call when nothing changed since it last ran, and
+            // serves the CACHED result of the earlier call back (labeled as a
+            // repeat) rather than a bare block, for as long as that key's replay
+            // budget lasts — see loop.ts's evaluateCall/l0ReplayMessage. Escalates
+            // L0 -> L1 compaction -> L2 forced re-plan exactly as before; only the
+            // key (normalised, not raw) and the L0 payload (replay, not just a
+            // steer) changed. Replaces the count-based REPEAT_THRESHOLD steer.
+            loopKey = normalizeCallKey(name, args)
             const recite = this.buildLoopRecite()
-            const action = evaluateCall(this.loopState, key, { toolName: name, recite, hasTasks: this.tasks && recite.length > 0 })
+            // args passed through so evaluateCall can enforce FIX 2 (raw-args match
+            // before a replay — /shared/argo-loopfix/REPORT.md): the block/escalation
+            // decision below is still keyed on loopKey alone, exactly as before.
+            const action = evaluateCall(this.loopState, loopKey, args, { toolName: name, recite, hasTasks: this.tasks && recite.length > 0 })
             if (action.kind !== 'allow') {
               if (action.kind === 'compact' || action.kind === 'replan') this.loopSteerEscalated = true
               if (action.kind === 'compact') {
@@ -1828,21 +1861,21 @@ export class Agent {
               // loop counters, the UI) to recover it by regex over the message wording —
               // the defect class that left two counters silently broken for months.
               emitAndLog({ type: 'warning', message: action.message, level: action.level })
-              this.rejectToolCall(name, args, `SKIPPED — identical to a call already run with nothing new since. ${action.message}`, emitAndLog)
+              if (action.kind === 'replay') {
+                this.replayToolCall(name, args, action.cached, action.message, emitAndLog)
+              } else {
+                this.rejectToolCall(name, args, `SKIPPED — identical to a call already run with nothing new since. ${action.message}`, emitAndLog)
+              }
               continue
             }
-            // Coarse near-duplicate guard (loop.ts checkSameToolStreak) — the SAME
-            // tool called repeatedly with DIFFERENT args each time (so the exact-match
-            // ladder above never sees a repeat) evades it entirely; observed in eval
-            // as a real self-reverification pattern (many different bash commands all
-            // re-checking the same already-true fact). Never blocks — this call still
-            // executes below — just nudges toward concluding once the streak is long
-            // enough, via the same context-injection path as every other warning here.
-            const fuzzyWarning = checkSameToolStreak(this.loopState, name)
-            if (fuzzyWarning) {
-              emitAndLog({ type: 'warning', message: fuzzyWarning })
-              this.pushCtx({ role: 'tool', content: fuzzyWarning })
-            }
+            // NOTE: the former near-duplicate guard (checkSameToolStreak — same tool,
+            // any args, no mutation in between) lived here. Deleted (2026-09, H19):
+            // 180 firings across the full log corpus, 0 with any observed effect —
+            // every sampled firing was followed by another call to the same tool
+            // regardless of the nudge. A mechanism that reliably fires and never once
+            // changes what happens next is not a mechanism worth keeping around
+            // "just in case"; see MECHANISM-VERIFICATION.md §4 (Near-duplicate tool
+            // guard) for the firing census this is based on.
           } else {
             priorRepeats = this.recentCalls.filter(k => k === key).length
             if (priorRepeats >= REPEAT_THRESHOLD) {
@@ -1864,6 +1897,25 @@ export class Agent {
           const start = Date.now()
           const result = await executeTool(name, args)
           const duration_ms = Date.now() - start
+
+          // FIX 1 (/shared/argo-loopfix/REPORT.md, /shared/argo-review/REPORT.md
+          // defect 1): a `bash` call just ran — its effect on the filesystem is
+          // unknowable without a shell parser (isProjectMutation below only ever
+          // sees edit_file/write_file), so every cached replay is invalidated
+          // wholesale rather than risk later telling the model "nothing has
+          // changed" about a file bash may have just changed. Deliberately NOT
+          // gated on result.error — a command can mutate before failing (`sed -i
+          // ...; false`). Must run BEFORE recordResult below, so if THIS call is
+          // the one being cached, its own fresh entry survives the invalidation.
+          if (this.loop && name === 'bash') noteBashExecution(this.loopState)
+
+          // Cache this real result under the loop ladder's normalised key, so a
+          // later no-progress repeat of THIS call (see evaluateCall/loopKey above)
+          // can be served it back instead of a bare block. Only when this.loop is
+          // on — loopKey is undefined otherwise, and this is a no-op either way if
+          // no repeat ever follows. `args` recorded alongside so a later repeat can
+          // be checked for a byte-exact match before replay (FIX 2, above).
+          if (this.loop && loopKey !== undefined) recordResult(this.loopState, loopKey, args, { output: result.output, error: result.error })
 
           emitAndLog({
             type: 'tool_result',

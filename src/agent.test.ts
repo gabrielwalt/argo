@@ -790,3 +790,298 @@ test('loop OFF (baseline): the identical call runs up to REPEAT_THRESHOLD before
     await cleanupSession(sessionId, 'argo-loop-off-case')
   }
 })
+
+// ── LOOP-RECOVERY LADDER, H19/H20 redesign — cached replay + normalised key. The
+// pure mechanics of both (evaluateCall's 'replay' branch, normalizeCallKey's
+// collapse/refuse rules) are unit-tested exhaustively in loop.test.ts; these two
+// tests are the AGENT-level integration proof that the wiring actually reaches
+// them: the tool_result event served for a blocked repeat really does carry the
+// EARLIER call's real output (not just a message), and a cosmetically-varied
+// repeat (not just a byte-identical one) is recognised as the same call. No live
+// model, no docker/sandbox container — read_file on a nonexistent absolute path is
+// a deterministic, side-effect-free error both times, same trick the repetition-
+// guard tests at the top of this file already rely on.
+
+test('loop ON: a blocked repeat is served the EARLIER call\'s actual result, not just a message', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-loop-replay-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, readCall, finalAnswer]))
+  agent.setSessionId(sessionId)
+  agent.setLoop(true)
+  try {
+    await agent.chat('argo loop replay case')
+
+    const reads = events.filter((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'read_file')
+    assert.equal(reads.length, 2)                 // one tool_result per attempt, real or replayed
+    const [first, second] = reads
+    assert.equal(first.rejected, undefined)       // the 1st call actually ran
+    assert.equal(second.rejected, true)           // the 2nd was blocked...
+    assert.equal(second.replayed, true)           // ...specifically as a cached REPLAY, not a plain steer
+    // The replay carries the SAME error text the real call produced — reproduced,
+    // not regenerated or replaced with a generic "blocked" message.
+    assert.equal(second.error, first.error)
+    assert.equal(second.output, first.output)
+  } finally {
+    await cleanupSession(sessionId, 'argo-loop-replay-case')
+  }
+})
+
+// Leading './' is still a collapsed spelling after FIX 3 (only the TRAILING-slash rule
+// was removed — see the dedicated FIX 3 test below). This is the agent-level proof of the
+// post-FIX-2 contract, which deliberately SPLITS what used to be one outcome: a
+// cosmetically-varied repeat is still RECOGNISED (so it is blocked and never executes a
+// second time — the H20 evasion fix), but it is NOT answered from the cache. The review
+// showed why: two calls can normalise to one key and still produce different real bytes
+// (a trailing `2>&1` makes the shell interleave one fd, where bash.ts otherwise
+// concatenates two separated buffers), so replaying the first call's output under the
+// second call's spelling would answer a question that was not asked. Replay therefore
+// requires byte-identical raw arguments; normalisation governs blocking only.
+const NORMALIZE_PATH_A = 'nonexistent-argo-normalize-test'
+const NORMALIZE_PATH_B = './nonexistent-argo-normalize-test'  // leading './' — a cosmetically different spelling of the SAME relative path (note A is relative too: './X' and '/X' are genuinely different files, so that pairing never collapsed and never should)
+const readCallNormA: ScriptedResponse = {
+  message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: NORMALIZE_PATH_A } } }] },
+}
+const readCallNormB: ScriptedResponse = {
+  message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: NORMALIZE_PATH_B } } }] },
+}
+
+test('loop ON: a cosmetically-varied repeat (leading "./") is recognised as the SAME call and BLOCKED, but never served from cache (H20 + FIX 2)', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-loop-normalize-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCallNormA, readCallNormB, finalAnswer]))
+  agent.setSessionId(sessionId)
+  agent.setLoop(true)
+  try {
+    const answer = await agent.chat('argo loop normalization case')
+
+    // Only the FIRST spelling actually ran: the normalised key recognised the second as
+    // a repeat and blocked it. The OLD raw-JSON key would have missed this entirely and
+    // let the 2nd call execute for real (see the loop-OFF baseline test below).
+    assert.equal(readResults(events).length, 1)
+
+    // ...and it was NOT replayed, because the raw args differ. This is the FIX 2
+    // boundary: recognised for blocking, ineligible for a cached answer.
+    const replay = events.find((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'read_file' && e.replayed === true)
+    assert.equal(replay, undefined, 'a normalised-equal but raw-different repeat must not be answered from cache')
+
+    // It still produced a rejected tool_result — the plain L0 steer, not silence.
+    const rejected = events.find((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'read_file' && e.rejected === true)
+    assert.ok(rejected, 'expected the blocked repeat to surface as a rejected tool_result carrying the L0 steer')
+
+    assert.equal(answer, 'Final answer.')
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-loop-normalization-case')
+  }
+})
+
+test('loop OFF (baseline): the same leading-"./" repeat is NOT recognised (unaffected by the ladder) — proves the ON case above is the ladder\'s doing', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-loop-normalize-off-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCallNormA, readCallNormB, finalAnswer]))
+  agent.setSessionId(sessionId)
+  agent.setLoop(false)
+  try {
+    const answer = await agent.chat('argo loop normalization baseline case')
+
+    // Baseline keys on the raw args (repetitionKey) — a leading './' makes it a
+    // DIFFERENT key, so both calls run for real, under REPEAT_THRESHOLD.
+    assert.equal(readResults(events).length, 2)
+    assert.equal(answer, 'Final answer.')
+  } finally {
+    await cleanupSession(sessionId, 'argo-loop-normalization-off-case')
+  }
+})
+
+// FIX 3 (/shared/argo-review/REPORT.md's normalisation table): the trailing-slash
+// rule was REMOVED from normalizeCallKey — read_file('x/') can fail with an
+// ENOTDIR-class error where read_file('x') succeeds, so collapsing them would hide
+// a real success/failure boundary rather than a spelling difference. This is the
+// agent-level proof that a trailing-slash repeat now runs TWICE for real under the
+// ladder (same as the leading-'./' case would have BEFORE this fix removed just the
+// trailing-slash rule) — loop.test.ts pins the underlying normalizeCallKey behavior
+// directly; this pins the wiring.
+test('loop ON: a trailing-slash repeat is NO LONGER collapsed (FIX 3) — both calls run for real, not replayed', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-loop-trailing-slash-${Date.now()}`
+  const trailingSlashPath = NORMALIZE_PATH_A + '/'
+  const readCallTrailingSlash: ScriptedResponse = {
+    message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: trailingSlashPath } } }] },
+  }
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCallNormA, readCallTrailingSlash, finalAnswer]))
+  agent.setSessionId(sessionId)
+  agent.setLoop(true)
+  try {
+    const answer = await agent.chat('argo loop trailing slash case')
+
+    // Both calls actually ran — a trailing slash is a DIFFERENT normalizeCallKey
+    // after FIX 3, so the 2nd is a brand-new key (not a no-progress repeat of the
+    // 1st) and is allowed, not blocked/replayed.
+    assert.equal(readResults(events).length, 2)
+    assert.equal(events.some(e => e.type === 'tool_result' && e.tool === 'read_file' && e.replayed === true), false)
+
+    assert.equal(answer, 'Final answer.')
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    await cleanupSession(sessionId, 'argo-loop-trailing-slash-case')
+  }
+})
+
+test('loop ON: a project mutation between two identical calls resets the ladder — the later call runs fresh, not replayed', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-loop-mutation-${Date.now()}`
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'argo-loop-mutation-'))
+  const prevWorkspacePath = config.workspacePath
+  config.workspacePath = dir
+  const writeCall: ScriptedResponse = {
+    message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'write_file', arguments: { path: '/workspace/loop-mutation-out.txt', content: 'hello' } } }] },
+  }
+  // read (runs), read (no mutation yet -> replayed), update_plan (required before
+  // the mutation below), write (a REAL mutation), read again (must run fresh).
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
+    readCall, readCall, planCall, writeCall, readCall, finalAnswer,
+  ]))
+  agent.setSessionId(sessionId)
+  agent.setLoop(true)
+  try {
+    const answer = await agent.chat('argo loop mutation case')
+
+    // The 1st and 3rd (post-mutation) read_file calls both actually ran; only the
+    // 2nd — issued before anything changed — was replayed.
+    assert.equal(readResults(events).length, 2)
+    const readToolResults = events.filter((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'read_file')
+    assert.equal(readToolResults.length, 3)
+    assert.deepEqual(readToolResults.map(r => r.replayed ?? false), [false, true, false])
+
+    // The write actually landed (config.workspacePath pointed at a real temp dir).
+    const writeResult = events.find((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'write_file')
+    assert.ok(writeResult && !writeResult.rejected && !writeResult.error)
+    assert.equal(await fs.readFile(path.join(dir, 'loop-mutation-out.txt'), 'utf-8'), 'hello')
+
+    assert.equal(answer, 'Final answer.')
+    assert.equal(events.some(e => e.type === 'error'), false)
+  } finally {
+    config.workspacePath = prevWorkspacePath
+    await fs.rm(dir, { recursive: true, force: true })
+    await cleanupSession(sessionId, 'argo-loop-mutation-case')
+  }
+})
+
+// ── FIX 1 (/shared/argo-loopfix/REPORT.md, /shared/argo-review/REPORT.md defect
+// 1): a `bash` call is invisible to isProjectMutation (agent.ts:210-213 only ever
+// recognises edit_file/write_file under /workspace), so before this fix a cached
+// read served across an intervening bash call could confidently tell the model
+// "nothing has changed" about a file bash may have just changed. The fix
+// invalidates every cached result on any bash call (loop.ts's noteBashExecution) —
+// this is the agent-level proof the wiring actually calls it after a REAL bash tool
+// execution, not just the pure loop.test.ts unit test of noteBashExecution itself.
+// The bash command itself ('true') is content-free by design: the fix does not
+// (and, per the mandate, must not) inspect what the command does — only THAT one
+// ran — so this deliberately does not depend on any real mutation actually
+// happening, on docker being available, or on any workspace file existing.
+
+const bashCall: ScriptedResponse = {
+  message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'bash', arguments: { command: 'true' } } }] },
+}
+
+test('loop ON: an intervening bash call invalidates the cached replay (FIX 1) — the next repeat gets the plain steer, not stale content', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-loop-bash-invalidate-${Date.now()}`
+  // read (runs, cached), read (would normally be replayed — see the replay test
+  // above), bash (not a tracked mutation — mutationCount stays put — but the
+  // cached read result is invalidated wholesale), read (must NOT be replayed).
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
+    readCall, readCall, bashCall, readCall, finalAnswer,
+  ]))
+  agent.setSessionId(sessionId)
+  agent.setLoop(true)
+  try {
+    const answer = await agent.chat('argo loop bash invalidate case')
+
+    const reads = events.filter((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'read_file')
+    assert.equal(reads.length, 3)
+    assert.equal(reads[0].rejected, undefined)          // 1st: ran for real
+    assert.equal(reads[1].rejected, true)                // 2nd: blocked...
+    assert.equal(reads[1].replayed, true)                // ...and specifically replayed (no bash yet)
+    assert.equal(reads[2].rejected, true)                // 3rd: still a no-progress repeat by
+    // mutationCount (a real, separate, documented gap this fix does NOT close —
+    // see loop.ts's noteBashExecution doc comment) — but crucially NOT a replay:
+    assert.equal(reads[2].replayed ?? false, false)
+    assert.match(reads[2].error ?? '', /STOP repeating it/)       // the plain L0 steer fired instead
+    assert.doesNotMatch(reads[2].error ?? '', /reproduced verbatim/) // never claims "nothing has changed"
+
+    // The bash call itself was never blocked by the ladder (a brand-new key) — it
+    // actually ran, which is the precondition for noteBashExecution firing at all.
+    assert.ok(events.some(e => e.type === 'tool_result' && e.tool === 'bash'), 'expected the bash call to actually execute')
+
+    assert.equal(answer, 'Final answer.')
+  } finally {
+    await cleanupSession(sessionId, 'argo-loop-bash-invalidate-case')
+  }
+})
+
+// ── FIX 4 (/shared/argo-review/REPORT.md defect 4): logger.ts's tool_result case
+// derived status from event.error alone, so a replay (rejected: true, replayed:
+// true, error: undefined) rendered identically to a real fast execution in the
+// human-readable markdown transcript. Exercised end to end here (not in
+// logger.test.ts, which this scoop does not own) via a real Agent run whose
+// SessionLogger.flush() writes the .md file this asserts against.
+
+test('loop ON: a replay is rendered as REPLAYED in the human-readable markdown log (FIX 4)', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-loop-replay-logger-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, readCall, finalAnswer]))
+  agent.setSessionId(sessionId)
+  agent.setLoop(true)
+  try {
+    await agent.chat('argo loop replay logger case')
+
+    assert.ok(
+      events.some(e => e.type === 'tool_result' && e.replayed === true),
+      'expected a replayed tool_result (same setup as the replay test above)',
+    )
+
+    const files = await fs.readdir(LOGS_DIR)
+    const mdFile = files.find(f => f.endsWith('.md') && f.includes('argo-loop-replay-logger-case'))
+    assert.ok(mdFile, 'expected a markdown log file for this run')
+    const md = await fs.readFile(path.join(LOGS_DIR, mdFile as string), 'utf-8')
+    assert.match(md, /REPLAYED/)
+  } finally {
+    await cleanupSession(sessionId, 'argo-loop-replay-logger-case')
+  }
+})
+
+// ── Pinning what /shared/argo-review/REPORT.md's test-gaps section calls
+// "correct by inspection" but previously unpinned: a replayed tool call must not
+// create a second CWL ledger episode. The `continue` in the ladder's block/replay
+// branch (agent.ts, right after replayToolCall/rejectToolCall) fires BEFORE the
+// episode-recording block (config.agents, guarded by the same `continue`) — episode
+// count staying at 1 after 2 attempts (1 real + 1 replayed) is the pin. editedPaths
+// lives in that exact same guarded block, so this doubles as that pin too — its
+// own dedup (`!includes`) makes it unable to distinguish "never ran" from "ran
+// twice, deduped" on its own, which is why episodes (never deduped) is the decisive
+// assertion here.
+
+test('loop ON + agents ON: a replayed tool call does not create a second ledger episode', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-loop-replay-episodes-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, readCall, finalAnswer]))
+  agent.setSessionId(sessionId)
+  agent.setLoop(true)
+  const agentsBefore = config.agents
+  config.agents = true
+  try {
+    await agent.chat('argo loop replay episode case')
+
+    const reads = events.filter((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'read_file')
+    assert.equal(reads.length, 2)
+    assert.equal(reads[1].replayed, true)
+
+    // Only the FIRST (real) read became a CWL episode — the replayed 2nd attempt
+    // never reaches the episode-recording block.
+    assert.equal(agent.getRunState().episodes, 1)
+  } finally {
+    config.agents = agentsBefore
+    await cleanupSession(sessionId, 'argo-loop-replay-episode-case')
+  }
+})
