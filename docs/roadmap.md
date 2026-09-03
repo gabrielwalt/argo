@@ -655,3 +655,39 @@ particular task isn't there yet.
 discriminating range; author the remaining proposed tiers (ambiguous multi-file refactor, drift-trap
 long-horizon task, trivial-batch and tight-debug-loop Argo-stressors) — none built yet, this pass
 only proved the scoring mechanism and shipped one (still-too-easy) task through it end to end.
+
+## 2026-09-03 — Expanding upward: a decomposition-shaped task, grounded and piloted
+
+**Research.** Aider Polyglot's own design principle (tasks requiring larger patches, more context,
+more realistic engineering work than SWE-bench-style single-function fixes) confirms the "expand
+upward" direction. More specifically useful: "When Parallelism Pays Off: Cohesion-Aware Task
+Partitioning for Multi-Agent Coding" (arXiv:2606.00953) — decomposition earns its cost specifically
+on LOOSELY-COUPLED subtasks. Every bigproj task built so far (`bigproj-deps`, `bigproj-effort`,
+`bigproj-duedate-bug`) is the opposite: one cohesive algorithm, naturally owned end to end by a
+single Implementer regardless of how hard the algorithm itself is — which is very likely *why* the
+Planner has never converged on a real graph (Finding 7): it's never been given a task actually
+shaped for decomposition, only harder versions of tasks that don't need it.
+
+**Built: `bigproj-observability`** — three genuinely independent features in one request (a CSV
+export module with zero dependency on TaskService; `getAuditLog()`; an optional `onEvent` hook),
+each independently verifiable, purpose-built as the first real fair test of Finding 7's question.
+Self-verified before seeding across 3 split test files (`test/export.test.js`,
+`test/audit-log.test.js`, `test/event-hook.test.js` — split specifically so an unimplemented
+`export.js` fails as ONE missing-module error rather than collapsing 3 real assertions into it,
+a calibration bug caught and fixed before seeding, not after): a correct reference implementation
+passes all 45 project tests; the seeded baseline (an unimplemented `export.js` stub, unmodified
+`service.js`) passes 38/45 (84%) — well clear of both ceiling and floor.
+
+**Piloted on Hermes**: 100/100, 71s, clean single pass.
+
+**A real methodological catch on the Argo side, caught before it corrupted the result**: the first
+Argo attempt returned `agents: false` on `/status` — `~/.config/argo/env`'s `ARGO_AGENTS` had been
+left at `0` from the earlier pre-multi-agent baseline comparative work (Phase 6) and never reverted.
+That run (single-loop, not multi-agent) still scored 88/100 before hitting the eval's own 900s
+timeout — correctness alone (parsed from the test summary) was at full marks, meaning the plain
+baseline nearly finished this task unaided too; noted as a real, if incidental, data point, but not
+conflated with a multi-agent test. Fixed `ARGO_AGENTS=1` and did a full detach/reattach (confirmed
+`agents: true` via `/status`) before re-running — the correct, multi-agent result is the one that
+counts for Finding 7's question and is recorded separately once that run completes. General lesson
+recorded in `MEMORY.md`: **always check `/status`'s `agents` field before trusting an eval run
+against a workspace that outlived an earlier `ARGO_AGENTS` toggle.**

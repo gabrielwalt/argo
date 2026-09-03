@@ -94,8 +94,11 @@ export function shScore(cmd, cwd) {
 // not a new heuristic.
 export function testFileTampered(ws, testFile) {
   if (!testFile) return false;
-  try { return sh('git diff --name-only', wsPath(ws)).split('\n').some(f => f.trim() === testFile); }
-  catch { return false; }
+  const files = Array.isArray(testFile) ? testFile : [testFile];
+  try {
+    const changed = new Set(sh('git diff --name-only', wsPath(ws)).split('\n').map(f => f.trim()));
+    return files.some(f => changed.has(f));
+  } catch { return false; }
 }
 
 // Combines the pieces into one 0-100 score. This is a GRADIENT alongside the existing
@@ -165,6 +168,22 @@ export const TASKS = [
     testFile: 'test/duedate-sort.test.js',
     setup: () => `cp "${path.join(FIXTURES, 'bigproj-duedate-sort.test.js')}" test/duedate-sort.test.js`,
     prompt: 'The tasklab test suite has a failing spec at test/duedate-sort.test.js: when sorting by dueDate, tasks with a null dueDate must appear LAST in both ascending and descending order, but in descending order they currently jump to the front. Read the failing test and src/query.js, find the root cause of how the sort direction is applied to the null sentinel, and fix it so nulls stay last in both directions without breaking the existing sort tests. Make the full suite pass with node --test.',
+    check: 'npm test' },
+  // Low-cohesion decomposition probe (docs/roadmap.md, 2026-09-03 "expand upward"
+  // entry) — grounded in "When Parallelism Pays Off: Cohesion-Aware Task
+  // Partitioning for Multi-Agent Coding" (arXiv:2606.00953): decomposition should
+  // help most on LOOSELY-COUPLED subtasks, which every prior bigproj task
+  // deliberately was NOT (each is one cohesive algorithm — dependency graph,
+  // effort threading, a sort-direction fix). This is three genuinely independent
+  // features in one request (an audit log, a CSV export module, and an optional
+  // event hook), each verifiable and scoreable on its own, purpose-built to give
+  // the Planner a real, fair shot at a task graph that actually helps — rather
+  // than another single-concern task a lone Implementer frame naturally owns
+  // end to end regardless of how hard the concern itself is.
+  { id: 'bigproj-observability', ws: 'bigproj',
+    testFile: ['test/export.test.js', 'test/audit-log.test.js', 'test/event-hook.test.js'],
+    setup: () => `cp "${path.join(FIXTURES, 'bigproj-export.test.js')}" test/export.test.js && cp "${path.join(FIXTURES, 'bigproj-audit-log.test.js')}" test/audit-log.test.js && cp "${path.join(FIXTURES, 'bigproj-event-hook.test.js')}" test/event-hook.test.js`,
+    prompt: 'Add three independent pieces to the tasklab project: (1) in src/export.js, implement exportTasksToCsv(tasks) — currently unimplemented — returning a CSV string with header "id,title,status,priority", one row per task, quoting any field containing a comma. (2) On TaskService (src/service.js) add getAuditLog(), returning every successful create/update/transition/remove as { action, taskId, ts } in order (a failed/rejected operation must NOT appear). (3) Let TaskService\'s factory accept an optional onEvent(name, payload) callback, invoked after every successful create/update/transition/remove with payload { taskId } — a service built without it must keep working normally. Three new failing tests are seeded at test/export.test.js, test/audit-log.test.js, and test/event-hook.test.js — read them first, then make the full suite pass with node --test.',
     check: 'npm test' },
 
   // ─────────────────────────────────────────────────────────────────────────
