@@ -1318,3 +1318,20 @@ force long-horizon behaviour for testing â€” the two must not be run in the same
 being recorded as separate conditions. H15 (durable memory writing garbage) must be fixed before
 either, since the memory write path sits inside the compaction branch and more compaction means
 more sludge into a file re-injected every iteration.
+
+## Priority research: the Hermes differential
+
+Why does the runaway-frame failure occur in Argo and not in Hermes? Anchor comparison on
+`bigproj-observability`: **Hermes 11 model calls / 237 196 input tokens / passed 100. Argo 75 calls /
+930 342 tokens / failed**, one frame taking 61% of calls. Across the September tasks Hermes used
+4-21 calls where Argo used 69-83. That is a different way of working, not a tuning gap.
+
+We can settle it from evidence rather than reason about it: **Hermes stores its full message history
+and its system prompts in `~/.hermes/state.db`**, so the two trajectories can be diffed directly.
+Leading hypothesis to test first  the `lsp/` directory suggests Hermes navigates code via a language
+server, jumping to symbols instead of reading whole files, which would explain the call gap directly
+and matches `docs/research/09-small-model-scaffolding.md` §2. Argo hands the model whole files;
+`lib/command.js` alone is 2 790 lines.
+
+Full method, candidate explanations and deliverable: `/shared/argo-program/RESUME.md` §5 item 4.
+Output lands at `docs/research/10-hermes-differential.md`.
