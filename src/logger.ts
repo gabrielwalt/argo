@@ -368,6 +368,36 @@ export class SessionLogger {
           break
         }
 
+        // ── Multi-agent architecture (config.agents) — harness-level narrative
+        // events, always untagged (see types.ts's FrameTag doc).
+        case 'objective':
+          lines.push(`**🎯 Objective** \`${time}\` — ${event.text}`)
+          lines.push(``)
+          break
+
+        case 'task_graph': {
+          lines.push(`**📋 Task graph · revision ${event.revision}** \`${time}\``)
+          lines.push(``)
+          for (const s of event.steps) {
+            const deps = s.dependsOn.length ? ` (after ${s.dependsOn.join(', ')})` : ''
+            lines.push(`> - [${s.role}] ${s.prompt}${deps}`)
+          }
+          lines.push(``)
+          break
+        }
+
+        case 'boss_verdict':
+          lines.push(`**⚖️ Jason (Boss) · ${event.action}** \`${time}\`${event.targetFrameId ? ` — target ${event.targetFrameId}` : ''}`)
+          lines.push(``)
+          lines.push(`> ${event.message.replace(/\n/g, '\n> ')}`)
+          lines.push(``)
+          break
+
+        case 'replan':
+          lines.push(`**🔄 Replanning** \`${time}\` — ${event.reason}`)
+          lines.push(``)
+          break
+
         default: {
           // Compile-time guard: a new AgentEvent variant without a case above
           // fails the build here instead of silently vanishing from the .md

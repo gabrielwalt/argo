@@ -4,7 +4,59 @@ import { readFile, writeFile, editFile } from './file-ops.js'
 import { fetchUrl } from './fetch-url.js'
 import { browserFetch } from './browser-fetch.js'
 import { viewImage } from './view-image.js'
+import * as ledger from '../ledger.js'
+import { config } from '../config.js'
 import type { ToolName, ToolResult } from '../types.js'
+
+// MULTI-AGENT LEDGER TOOL (config.agents / ARGO_AGENTS). Query-only from a model's
+// perspective — the harness-automatic writers (recordDelegation, recordConclusion, ...)
+// are called directly from dispatch.ts/frames.ts, never through this tool, so they can
+// never be forgotten. Root is config.workspacePath, NOT a literal '/workspace' — that
+// literal only exists on the filesystem in-container; standalone dev mode runs this
+// process directly on the host (see dispatch.ts's root() for the full rationale). Never
+// throws — errors go in the `error` field, matching every other tool in this module.
+async function runLedgerTool(args: Record<string, unknown>): Promise<ToolResult> {
+  const root = config.workspacePath || '/workspace'
+  const action = typeof args.action === 'string' ? args.action : ''
+  try {
+    switch (action) {
+      case 'get_goal': {
+        const obj = await ledger.getObjective(root)
+        return { output: obj ?? '(no objective set yet)' }
+      }
+      case 'get_plan': {
+        const plan = await ledger.getPlan(root)
+        return { output: plan ? JSON.stringify(plan) : '(no plan recorded yet)' }
+      }
+      case 'get_recent': {
+        const n = typeof args.n === 'number' ? args.n : 10
+        const scope = args.scope === 'frame' || args.scope === 'task' ? args.scope : undefined
+        return { output: JSON.stringify(await ledger.getRecent(root, n, scope)) }
+      }
+      case 'get_conclusion': {
+        const frameId = typeof args.frame_id === 'string' ? args.frame_id : ''
+        if (!frameId) return { output: '', error: 'get_conclusion requires frame_id' }
+        const c = await ledger.getConclusion(root, frameId)
+        return { output: c ? JSON.stringify(c) : '(no conclusion recorded for that frame)' }
+      }
+      case 'get_frame_trail': {
+        const frameId = typeof args.frame_id === 'string' ? args.frame_id : ''
+        if (!frameId) return { output: '', error: 'get_frame_trail requires frame_id' }
+        return { output: JSON.stringify(await ledger.getFrameTrail(root, frameId)) }
+      }
+      case 'expand': {
+        const episodeId = typeof args.episode_id === 'string' ? args.episode_id : ''
+        if (!episodeId) return { output: '', error: 'expand requires episode_id' }
+        const content = await ledger.expand(root, episodeId)
+        return { output: content ?? '(no content recorded for that episode, or it was never evicted)' }
+      }
+      default:
+        return { output: '', error: `Unknown ledger action: ${action}. Valid: get_goal, get_plan, get_recent, get_conclusion, get_frame_trail, expand.` }
+    }
+  } catch (err) {
+    return { output: '', error: String(err) }
+  }
+}
 
 export const toolDefinitions = [
   {
@@ -159,6 +211,28 @@ export const toolDefinitions = [
       },
     },
   },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'ledger',
+      description: 'Query the multi-agent ledger — the persistent record under /workspace/.argo/ of every delegation, conclusion, standup, and injection across this task. Use it to look up prior work instead of assuming, e.g. what a dependency actually found/touched, or to recover content that was evicted from your own context.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['get_goal', 'get_plan', 'get_recent', 'get_conclusion', 'get_frame_trail', 'expand'],
+            description: 'get_goal: the immutable objective. get_plan: the current mutable execution plan. get_recent: sliding window over the ledger (needs n). get_conclusion/get_frame_trail: a specific frame\'s result or full story (needs frame_id). expand: recover a specific evicted episode\'s original content (needs episode_id).',
+          },
+          frame_id: { type: 'string', description: 'Required for get_conclusion and get_frame_trail.' },
+          episode_id: { type: 'string', description: 'Required for expand.' },
+          n: { type: 'number', description: 'Required for get_recent — how many recent entries to return.' },
+          scope: { type: 'string', enum: ['frame', 'task'], description: 'Optional filter for get_recent, restricting standup entries to one granularity.' },
+        },
+        required: ['action'],
+      },
+    },
+  },
 ]
 
 export async function executeTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
@@ -184,6 +258,8 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
     case 'update_plan':
       // Handled in the agent loop (needs agent state); never dispatched here.
       return { output: '', error: 'update_plan is handled by the agent loop' }
+    case 'ledger':
+      return runLedgerTool(args)
     default:
       return { output: '', error: `Unknown tool: ${name}` }
   }

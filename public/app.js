@@ -359,6 +359,10 @@ function startTraceBlock(model) {
   traceStartTime = Date.now()
   latestIteration = null
   clearActivityQueue()
+  // Multi-agent architecture (config.agents): each top-level run starts with a clean
+  // slate of role cards — frameIds are unique per run, but nothing should ever look
+  // up a PRIOR run's card by accident.
+  roleCards.clear()
 
   const block = document.createElement('div')
   block.className = 'trace-block running'
@@ -524,11 +528,39 @@ function finishReplay() {
 }
 
 function handleEvent(event) {
+  // Multi-agent architecture (config.agents): a tagged event belongs to one frame's
+  // turn, not the top-level run — route it into that frame's role card instead of
+  // the switch below. Also nudges the status bar to name the active role, the
+  // "boss-level" glance the multi-agent UI is built around.
+  if (event.__frameId) {
+    handleFrameEvent(event)
+    if (event.type === 'start') {
+      const meta = ROLE_META[event.__role] || { name: event.__role, title: event.__role }
+      setStatus('busy', `Running · ${meta.name} (${meta.title})`)
+    }
+    return
+  }
   switch (event.type) {
     case 'start':
       currentRunModel = event.model
       startTraceBlock(event.model)
       setStatus('busy', `Running · ${event.model}`)
+      break
+
+    case 'objective':
+      renderObjective(event)
+      break
+
+    case 'task_graph':
+      renderTaskGraph(event)
+      break
+
+    case 'boss_verdict':
+      renderBossVerdict(event)
+      break
+
+    case 'replan':
+      renderReplan(event)
       break
 
     case 'iteration':
@@ -692,9 +724,29 @@ function handleEvent(event) {
 // to have added them optimistically. ollama_request / compact_progress /
 // token_usage are live-only telemetry with nothing to draw into the trace.
 function handleEventForSession(event) {
+  if (event.__frameId) {
+    handleFrameEvent(event)
+    return
+  }
   switch (event.type) {
     case 'start':
       startTraceBlock(event.model)
+      break
+
+    case 'objective':
+      renderObjective(event)
+      break
+
+    case 'task_graph':
+      renderTaskGraph(event)
+      break
+
+    case 'boss_verdict':
+      renderBossVerdict(event)
+      break
+
+    case 'replan':
+      renderReplan(event)
       break
 
     case 'iteration':
@@ -1109,8 +1161,13 @@ sendBtn.addEventListener('mouseleave', () => {
   sendStop.classList.add('hidden')
 })
 
-function addTraceItem(className, label, body, collapsible) {
-  if (!currentTraceBlock) return null
+// `container` defaults to the top-level trace block's own item list, but a role
+// card (see below) passes its OWN nested items list so the same rendering logic
+// (label/body/expand-on-long-text) works identically whether an event belongs to
+// the top-level run or to one specific agent's turn inside it.
+function addTraceItem(className, label, body, collapsible, container) {
+  const target = container || (currentTraceBlock && currentTraceBlock.items)
+  if (!target) return null
   const el = document.createElement('div')
   el.className = `trace-item ${className}`
 
@@ -1145,9 +1202,233 @@ function addTraceItem(className, label, body, collapsible) {
     el.appendChild(bodyEl)
   }
 
-  currentTraceBlock.items.appendChild(el)
+  target.appendChild(el)
   maybeAutoScroll()
   return el
+}
+
+// ── Multi-agent architecture (config.agents) — nested role cards ─────────────────
+// Every event a spawned frame produces (thought/tool_call/plan/done/...) arrives
+// tagged with __frameId/__role/__parentFrameId (see types.ts's FrameTag); an
+// untagged event is the top-level dispatch narrative, rendered exactly like the
+// single-loop baseline (unchanged code path below). A tagged event instead nests
+// inside a small collapsible "role card" for that one frame's turn — one flat,
+// chronological sequence inside the SAME top-level trace block, since dispatch
+// is strictly sequential (docs/subagents-plan.md's hard no-parallelism rule), so
+// execution order alone already shows which agent ran after which.
+//
+// Display names are a presentation-only layer over the plain functional role —
+// see frames.ts's ROLE_NAME for the same mapping, chosen for an actual functional
+// match rather than flavor alone.
+const ROLE_META = {
+  boss:        { name: 'Jason',   title: 'Boss',        icon: '⚖️' },
+  planner:     { name: 'Tiphys',  title: 'Planner',     icon: '🧭' },
+  implementer: { name: 'Argus',   title: 'Implementer', icon: '🔨' },
+  tester:      { name: 'Lynceus', title: 'Tester',      icon: '👁️' },
+}
+
+// frameId -> { el, arrow, items, outcome, hasItems }. Cleared per top-level run
+// (startTraceBlock) — see there for why stale entries can't leak across runs.
+const roleCards = new Map()
+
+// Gets the card for an already-known frameId (a RESUMED frame — the Planner
+// replanning, or a Tester's REDO waking the same Implementer back up — reuses its
+// existing card rather than creating a confusing duplicate), or creates a fresh one.
+function getOrCreateRoleCard(frameId, role, assignment) {
+  const existing = roleCards.get(frameId)
+  if (existing) {
+    existing.el.classList.add('active')
+    return existing
+  }
+  const meta = ROLE_META[role] || { name: role, title: role, icon: '🤖' }
+
+  const card = document.createElement('div')
+  card.className = 'role-card active'
+
+  const toggle = document.createElement('div')
+  toggle.className = 'role-card-toggle'
+
+  const arrow = document.createElement('span')
+  arrow.className = 'role-card-arrow'
+  // No expand affordance until this frame actually accumulates a nested item —
+  // a one-shot answer with nothing else to show gets no arrow at all.
+
+  const titleWrap = document.createElement('div')
+  titleWrap.className = 'role-card-title-wrap'
+  const title = document.createElement('span')
+  title.className = 'role-card-title'
+  title.textContent = `${meta.icon} ${meta.name} · ${meta.title}`
+  const subtitle = document.createElement('span')
+  subtitle.className = 'role-card-subtitle'
+  subtitle.textContent = summarize(assignment, 120)
+  titleWrap.append(title, subtitle)
+
+  const outcome = document.createElement('span')
+  outcome.className = 'role-card-outcome'
+
+  toggle.append(arrow, titleWrap, outcome)
+  toggle.addEventListener('click', () => {
+    if (!card.classList.contains('expandable')) return
+    card.classList.toggle('open')
+    arrow.textContent = card.classList.contains('open') ? '▼' : '▶'
+  })
+
+  const items = document.createElement('div')
+  items.className = 'role-card-items'
+
+  card.append(toggle, items)
+  if (!currentTraceBlock) startTraceBlock(currentRunModel)
+  currentTraceBlock.items.appendChild(card)
+  maybeAutoScroll()
+
+  const record = { el: card, arrow, items, outcome, hasItems: false }
+  roleCards.set(frameId, record)
+  return record
+}
+
+function addRoleCardItem(frameId, className, label, body, collapsible) {
+  const card = roleCards.get(frameId)
+  if (!card) return
+  if (!card.hasItems) {
+    card.hasItems = true
+    card.el.classList.add('expandable')
+    card.arrow.textContent = '▶'
+  }
+  addTraceItem(className, label, body, collapsible, card.items)
+}
+
+// Closes out a frame's card with its one-line outcome — a SYNTHESIS (short status +
+// summary), never the raw text again: the raw final answer already appeared as this
+// same frame's last nested item (its own 'thought'/'message'), so repeating it here
+// would just duplicate what expanding the card already shows.
+function closeRoleCard(frameId, outcomeText) {
+  const card = roleCards.get(frameId)
+  if (!card) return
+  card.outcome.textContent = outcomeText
+  card.el.classList.remove('active')
+}
+
+// Routes ONE tagged event into its frame's role card. Shared by the live and replay
+// paths (handleEvent/handleEventForSession) since none of this has live-only side
+// effects beyond the top-level status-bar hint, which the caller applies separately.
+function handleFrameEvent(event) {
+  const frameId = event.__frameId
+  const role = event.__role
+  switch (event.type) {
+    case 'start':
+      getOrCreateRoleCard(frameId, role, event.query)
+      break
+    case 'thought':
+      addRoleCardItem(frameId, 'thought', '💭 Thought', event.content, true)
+      break
+    case 'tool_call':
+      addRoleCardItem(frameId, 'tool-call', `🔧 ${event.tool}`, JSON.stringify(event.args, null, 2), true)
+      break
+    case 'tool_result': {
+      const isError = !!event.error
+      const label = `📥 Result${event.error ? ' · ERROR' : ''} · ${event.duration_ms}ms`
+      const body = event.error ? `${event.error}\n${event.output}` : event.output
+      addRoleCardItem(frameId, isError ? 'tool-result error' : 'tool-result', label, body, true)
+      break
+    }
+    case 'warning':
+      addRoleCardItem(frameId, 'warning', '⚠ Warning', event.message, false)
+      break
+    case 'compact_start':
+      addRoleCardItem(frameId, 'compact', '📦 Compacting context', `${event.messageCount} messages, ${Math.round(event.contextUsagePct * 100)}% context`, false)
+      break
+    case 'compact':
+      addRoleCardItem(frameId, 'compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
+      break
+    case 'plan':
+      addRoleCardItem(frameId, 'plan-inline', `📋 Plan (rev ${event.revision})`, `Objective: ${event.objective}\n${(event.steps || []).join('\n')}`, true)
+      break
+    case 'git_commit':
+      addRoleCardItem(frameId, 'git', '🔀 Committed', `${event.hash} — ${event.message}`, false)
+      break
+    case 'message':
+      // Swallowed deliberately — this frame's final answer is already captured as
+      // its 'done' outcome below; rendering it again here would duplicate it.
+      break
+    case 'done':
+      closeRoleCard(frameId, summarize(event.content, 140))
+      break
+    case 'error':
+      addRoleCardItem(frameId, 'error-item', '⚠ Error', event.message, false)
+      closeRoleCard(frameId, '⚠ error')
+      break
+    // iteration / token_usage / ollama_request / compact_progress: live-only
+    // telemetry with nothing worth a per-frame UI element.
+  }
+}
+
+// The harness-level narrative events (config.agents) — always untagged, describing
+// the whole task rather than one frame's turn. Objective and task-graph reuse the
+// existing plan-card pattern (message-level card, splits the trace above/below);
+// boss_verdict/replan render as small always-visible dividers INSIDE the trace block
+// — they're cross-cutting relationship markers ("Jason redirected this attempt"),
+// not one role's own detail, so they don't belong nested inside any single card.
+
+function renderObjective(event) {
+  const el = document.createElement('div')
+  el.className = 'message objective'
+  el.innerHTML = `<div class="objective-title">🎯 Objective</div><div class="objective-text">${escHtml(event.text)}</div>`
+  messagesEl.appendChild(el)
+  maybeAutoScroll()
+}
+
+function renderTaskGraph(event) {
+  const model = currentRunModel
+  const resume = !!currentTraceBlock
+  if (currentTraceBlock && currentTraceBlock.items.childElementCount === 0) {
+    currentTraceBlock.el.remove()
+    currentTraceBlock = null
+  } else {
+    finalizeTraceBlock()
+  }
+
+  const el = document.createElement('div')
+  el.className = 'message plan md'
+  const title = event.revision > 1 ? `📋 Task graph · revised (v${event.revision})` : '📋 Task graph'
+  const steps = (event.steps || []).map(s => {
+    const meta = ROLE_META[s.role] || { icon: '🤖', title: s.role }
+    const deps = s.dependsOn && s.dependsOn.length
+      ? ` <span class="plan-step-deps">(after ${escHtml(s.dependsOn.join(', '))})</span>`
+      : ''
+    return `<li>${meta.icon} <span class="plan-step-role">${escHtml(meta.title)}</span> — ${escHtml(s.prompt)}${deps}</li>`
+  }).join('')
+  el.innerHTML = `<div class="plan-title">${escHtml(title)}</div>` + (steps ? `<ol class="plan-steps">${steps}</ol>` : '')
+  messagesEl.appendChild(el)
+
+  if (resume) startTraceBlock(model)
+  maybeAutoScroll()
+}
+
+const BOSS_VERDICT_META = {
+  inject:   { icon: '💬', label: 'Jason injects a correction' },
+  restart:  { icon: '🔁', label: 'Jason restarts this attempt' },
+  escalate: { icon: '⛔', label: 'Jason escalates back to Tiphys' },
+}
+
+function renderBossVerdict(event) {
+  if (!currentTraceBlock) return
+  const meta = BOSS_VERDICT_META[event.action] || { icon: '⚖️', label: `Jason: ${event.action}` }
+  const el = document.createElement('div')
+  el.className = `role-divider role-divider-${event.action}`
+  el.title = event.message
+  el.innerHTML = `<span class="role-divider-icon">${meta.icon}</span><span class="role-divider-label">${escHtml(meta.label)}</span>`
+  currentTraceBlock.items.appendChild(el)
+  maybeAutoScroll()
+}
+
+function renderReplan(event) {
+  if (!currentTraceBlock) return
+  const el = document.createElement('div')
+  el.className = 'trace-separator replan-separator'
+  el.title = event.reason
+  el.innerHTML = `<span class="trace-separator-line"></span><span class="trace-separator-label">🔄 Replanning</span><span class="trace-separator-line"></span>`
+  currentTraceBlock.items.appendChild(el)
+  maybeAutoScroll()
 }
 
 function renderMarkdown(content) {
@@ -2485,6 +2766,12 @@ async function boot() {
   const status = await fetch(`${API_BASE}/status`).then(r => r.json()).catch(() => ({}))
   showEnvBanner(status.env)
   if (!window.__WS__ && !status.workspacePath) { showNoWorkspaceScreen(); finishReplay(); return }
+
+  // Multi-agent architecture (config.agents): the grounding toggle isn't wired to
+  // dispatch.ts's frames yet — hide it rather than show a control that would
+  // silently do nothing, same principle as everywhere else in this UI.
+  const groundingSetting = document.querySelector('.setting-grounding')
+  if (groundingSetting) groundingSetting.classList.toggle('hidden', !!status.agents)
 
   // Draw an empty donut immediately (visible before the first token_usage), and
   // capture the auto-compaction threshold for the donut's tick.

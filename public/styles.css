@@ -712,6 +712,18 @@ main {
 }
 .plan-steps { margin: 4px 0 0; padding-left: 20px; }
 .plan-steps li { margin: 2px 0; }
+.plan-step-role { font-weight: 600; color: var(--gold); }
+.plan-step-deps { color: var(--muted); font-size: .9em; }
+
+/* Multi-agent architecture (config.agents) — the immutable objective, pinned once,
+   never repeated: same visual weight as a plan card but its own accent so it's not
+   mistaken for a (mutable) task graph. */
+.message.objective {
+  border-left: 3px solid var(--purple);
+  background: rgba(139, 92, 246, .06);
+  white-space: normal;
+}
+.objective-title { font-weight: 600; color: var(--purple); margin-bottom: 4px; }
 
 .message.user {
   background: linear-gradient(135deg, rgba(91, 103, 245, 0.18), rgba(91, 103, 245, 0.08));
@@ -1013,6 +1025,60 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .trace-item.compact            { color: var(--accent); }
 .trace-item.error-item         { color: #fca5a5; background: rgba(239,68,68,.08); }
 .trace-item.warning            { color: var(--yellow); background: rgba(234,179,8,.06); }
+
+/* Multi-agent architecture (config.agents) — one role's turn, nested inside the
+   top-level trace block. Mirrors .trace-block's own visual language at a smaller
+   scale rather than inventing a new one. No .expandable class = no arrow, no
+   pointer cursor = nothing to see beyond the header (see addRoleCardItem/app.js). */
+.role-card {
+  background: rgba(255,255,255,.02);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  animation: trace-in .12s ease-out;
+}
+.role-card-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  user-select: none;
+}
+.role-card.expandable .role-card-toggle { cursor: pointer; }
+.role-card.expandable .role-card-toggle:hover { background: rgba(255,255,255,.03); }
+.role-card-arrow { color: var(--muted); font-size: 9px; flex-shrink: 0; width: 8px; }
+.role-card-title-wrap { display: flex; flex-direction: column; min-width: 0; overflow: hidden; gap: 1px; flex: 1; }
+.role-card-title { color: var(--gold); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.role-card.active .role-card-title { color: var(--yellow); }
+.role-card-subtitle { font-size: 10px; color: var(--muted); opacity: .75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.role-card-outcome { margin-left: auto; font-size: 10px; color: var(--muted); opacity: .8; text-align: right; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0; }
+.role-card-items {
+  display: none;
+  flex-direction: column;
+  padding: 0 8px 6px 20px;
+  gap: 3px;
+}
+.role-card.open .role-card-items { display: flex; }
+
+/* A Boss (Jason) verdict or a replan — a cross-cutting relationship marker, not
+   any one frame's own detail, so it sits directly in the trace flow rather than
+   nested inside a role card. Always visible, never collapsed — this IS the
+   "how the agents work together" narrative the multi-agent UI exists to surface. */
+.role-divider {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  margin: 2px 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  border-radius: 5px;
+  background: rgba(201, 162, 39, .06);
+  color: var(--gold);
+}
+.role-divider-escalate { background: rgba(239,68,68,.08); color: #fca5a5; }
+.role-divider-restart  { background: rgba(234,179,8,.08); color: var(--yellow); }
 
 .trace-label { font-weight: 700; margin-bottom: 3px; display: flex; align-items: center; gap: 6px; }
 .trace-duration { margin-left: auto; font-weight: 400; opacity: .6; font-size: 10px; }

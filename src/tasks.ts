@@ -9,6 +9,8 @@
 // it is side-effect-free at import and trivially unit-testable. The LLM-driven parts
 // (deciding WHEN to re-plan, WHAT the steps are) live in agent.ts.
 
+import type { Role } from './types.js'
+
 export type TaskStatus = 'pending' | 'active' | 'done'
 
 export interface Task {
@@ -272,4 +274,81 @@ export function renderTaskSummaries(list: TaskList): string {
   return list.tasks
     .map(t => `${t.id}. ${t.title} [${t.status}]\n    ${t.summary || '(no summary recorded)'}`)
     .join('\n')
+}
+
+// ── TASK GRAPH (docs/subagents-plan.md, config.agents / ARGO_AGENTS) ──────────────
+// The Planner's output in the multi-agent architecture: a DAG of steps, each naming
+// which role executes it, its own prompt, and dependencies on other steps in this
+// same graph. Deliberately a SEPARATE type from TaskList/StepInput above (the
+// single-loop baseline's plan shape) rather than an extension of it — the two plans
+// serve different loops and mixing their fields would make the baseline's
+// createTaskList/reconcile ambiguous about which fields apply. Pure: no LLM, no fs,
+// no Date — same discipline as the rest of this module.
+
+export interface TaskStep {
+  id: string // stable within the graph, e.g. "s1" — dependsOn references these, not frameIds
+  role: Role
+  prompt: string
+  dependsOn: string[]
+  // Steps sharing a frameGroup run in ONE frame, fed as sequential assignments,
+  // instead of each getting its own frame + Tester pass — the unified mechanism for
+  // both "too cheap to warrant its own frame" and "touches the same files/logic as
+  // another step, must not be isolated" (see docs/subagents-plan.md).
+  frameGroup?: string
+  // Tiphys (the Planner) marks a step trivial when it's small/unambiguous enough
+  // that Lynceus's (the Tester's) separate verification pass wouldn't earn its
+  // extra iterations — Jason's own periodic/final checks remain the safety net
+  // either way. Default false (unchanged behavior) when omitted.
+  skipTest?: boolean
+}
+
+export interface TaskGraph {
+  objective: string
+  steps: TaskStep[]
+  revision: number
+}
+
+// Builds a fresh graph (revision 1), assigning stable ids by position.
+export function createTaskGraph(objective: string, steps: Array<Omit<TaskStep, 'id'>>): TaskGraph {
+  return {
+    objective: objective.trim(),
+    steps: steps.map((s, i) => ({ id: `s${i + 1}`, ...s })),
+    revision: 1,
+  }
+}
+
+// Steps whose dependsOn are ALL satisfied and that aren't already done or in flight,
+// grouped by frameGroup (a step with no frameGroup is its own singleton group, keyed
+// by its own id) — what the dispatch loop dequeues next.
+export function readyGroups(
+  graph: TaskGraph,
+  doneStepIds: ReadonlySet<string>,
+  inFlightStepIds: ReadonlySet<string>,
+): Map<string, TaskStep[]> {
+  const groups = new Map<string, TaskStep[]>()
+  for (const step of graph.steps) {
+    if (doneStepIds.has(step.id) || inFlightStepIds.has(step.id)) continue
+    if (!step.dependsOn.every(d => doneStepIds.has(d))) continue
+    const key = step.frameGroup ?? step.id
+    const arr = groups.get(key) ?? []
+    arr.push(step)
+    groups.set(key, arr)
+  }
+  return groups
+}
+
+export function allStepsDone(graph: TaskGraph, doneStepIds: ReadonlySet<string>): boolean {
+  return graph.steps.every(s => doneStepIds.has(s.id))
+}
+
+// Renders the task graph as a compact recited block — the TaskGraph analogue of
+// renderTaskLedger above, used by eviction.ts's pinned-anchor renderer.
+export function renderTaskGraph(graph: TaskGraph): string {
+  if (graph.steps.length === 0) return ''
+  const lines = graph.steps.map(s => {
+    const deps = s.dependsOn.length ? ` (after ${s.dependsOn.join(', ')})` : ''
+    const group = s.frameGroup ? ` [group: ${s.frameGroup}]` : ''
+    return `${s.id}. [${s.role}] ${s.prompt}${deps}${group}`
+  })
+  return `[PLAN — task graph, revision ${graph.revision}]\n${lines.join('\n')}`
 }

@@ -177,8 +177,12 @@ const readCall: ScriptedResponse = {
 }
 const finalAnswer: ScriptedResponse = { message: { role: 'assistant', content: 'Final answer.' } }
 
+// Excludes rejected (harness-blocked) calls — Agent.rejectToolCall deliberately
+// emits a tool_result shaped just like a real one (so the MODEL can't tell the
+// difference), marked `rejected: true` for exactly this purpose: telling "the tool
+// actually ran" apart from "the harness declined to run it" in code like this.
 function readResults(events: AgentEvent[]): AgentEvent[] {
-  return events.filter(e => e.type === 'tool_result' && e.tool === 'read_file')
+  return events.filter(e => e.type === 'tool_result' && e.tool === 'read_file' && !e.rejected)
 }
 function warningsMatching(events: AgentEvent[], re: RegExp): Array<Extract<AgentEvent, { type: 'warning' }>> {
   return events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning' && re.test(e.message))
@@ -370,7 +374,7 @@ test('plan/act gate: a project mutation is blocked until a plan is recorded, the
     assert.equal(events.some(e => e.type === 'plan'), true)             // update_plan recorded a plan
     // Exactly one edit_file actually executed — the post-plan one; the pre-plan
     // attempt was blocked before reaching the tool.
-    assert.equal(events.filter(e => e.type === 'tool_result' && e.tool === 'edit_file').length, 1)
+    assert.equal(events.filter(e => e.type === 'tool_result' && e.tool === 'edit_file' && !e.rejected).length, 1)
     assert.equal(answer, 'Final answer.')
     assert.equal(events.some(e => e.type === 'error'), false)
   } finally {
@@ -728,10 +732,19 @@ test('loop ON: repeated identical non-mutating call is blocked and escalates L0 
     // The identical call actually ran exactly once — every later repeat (no mutation
     // since it last ran) was blocked before reaching the tool, not executed.
     assert.equal(readResults(events).length, 1)
-    assert.equal(events.filter(e => e.type === 'tool_call' && e.tool === 'read_file').length, 1)
+    // Every attempt — real or rejected — still gets a tool_call event (task #30's
+    // unified rejection surfacing: a block looks exactly like a real attempt up to
+    // the tool_result, which is where `rejected` distinguishes them).
+    assert.equal(events.filter(e => e.type === 'tool_call' && e.tool === 'read_file').length, 7)
 
-    // One warning steer per blocked repeat (6 of the 7 identical calls).
-    const warnings = warningsMatching(events, /./)
+    // One warning steer per blocked repeat (6 of the 7 identical calls) — scoped to
+    // the loop LADDER's own three message shapes specifically (not `/./`, which
+    // would also catch the separate, unrelated stall/progress-check mechanism: with
+    // this project's dev MAX_ITERATIONS=20, its now-proportional checkpoints
+    // (agent.ts, 2026-09-03) land inside this test's own 8-iteration run and add a
+    // real, expected "PROGRESS CHECK" warning that has nothing to do with the ladder
+    // under test here).
+    const warnings = warningsMatching(events, /EXACT same|context was just compacted|repeatedly looped/)
     assert.equal(warnings.length, 6)
     // Escalation genuinely reached all three levels (message text is level-specific —
     // see l0SteerMessage/l1SteerMessage/l2ReframeMessage in loop.ts).
@@ -766,7 +779,10 @@ test('loop OFF (baseline): the identical call runs up to REPEAT_THRESHOLD before
     // ladder allows above.
     assert.equal(readResults(events).length, REPEAT_THRESHOLD)
     assert.ok(readResults(events).length > 1, 'baseline allows more than one execution, unlike the ON ladder')
-    assert.equal(events.filter(e => e.type === 'tool_call' && e.tool === 'read_file').length, REPEAT_THRESHOLD)
+    // Every attempt — real or rejected — still gets a tool_call event (task #30's
+    // unified rejection surfacing), so this is the full 7 attempts, not just the 3
+    // that actually executed.
+    assert.equal(events.filter(e => e.type === 'tool_call' && e.tool === 'read_file').length, 7)
 
     assert.equal(answer, 'Final answer.')
     assert.equal(events.some(e => e.type === 'error'), false)

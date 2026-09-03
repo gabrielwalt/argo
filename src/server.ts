@@ -13,6 +13,7 @@ import { listLogs, readLog, readLogEvents, listSessions, deleteAllLogs, deleteSe
 import type { AgentEvent, ModelOptions } from './types.js'
 import { checkEnvironment, logEnvironment, type EnvCheck } from './health.js'
 import { installAuth } from './auth.js'
+import { runDispatchLoop, abortDispatch } from './dispatch.js'
 
 const execAsync = promisify(exec)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -45,12 +46,16 @@ if (!config.workerMode) {
   app.use(express.static(path.join(__dirname, '..', 'public')))
 }
 
-const agent = new Agent((event: AgentEvent, seq?: number) => {
-  // Forward the per-run seq alongside the event so the browser can dedupe
-  // replayed (persisted) events against this live SSE stream at the reconnect
-  // boundary — the JSONL replay (readLogEvents) carries the same __seq.
+// Forward the per-run seq alongside the event so the browser can dedupe replayed
+// (persisted) events against this live SSE stream at the reconnect boundary — the
+// JSONL replay (readLogEvents) carries the same __seq. Named (not inline) so
+// dispatch.ts's runDispatchLoop can share the exact same emit path for every
+// role-scoped Agent instance it spawns (config.agents) — one SSE stream either way.
+function emitEvent(event: AgentEvent, seq?: number) {
   bus.emit('agent', typeof seq === 'number' ? { ...event, __seq: seq } : event)
-})
+}
+
+const agent = new Agent(emitEvent)
 
 const SESSION_ID_FILE = path.join(LOGS_DIR, 'current-session.txt')
 
@@ -110,7 +115,18 @@ app.post('/chat', async (req, res) => {
   res.json({ ok: true })
 
   try {
-    await agent.chat(message)
+    // MULTI-AGENT ARCHITECTURE (config.agents / ARGO_AGENTS, docs/subagents-plan.md):
+    // the dispatch loop drives Planner/Implementer/Tester/Boss as scoped Agent
+    // instances of its own, sharing this same emit path — `agent` (the baseline
+    // single-loop instance above) is bypassed entirely while this flag is on, so its
+    // /history, /context, /reset etc. reflect the baseline path only. Per-request
+    // overrides (model/options/maxIterations/...) above still apply to `agent` even
+    // when unused here, matching every other flag's existing pattern in this route.
+    if (config.agents) {
+      await runDispatchLoop(message, emitEvent, { model, options, sessionId: currentSessionId })
+    } else {
+      await agent.chat(message)
+    }
   } finally {
     isBusy = false
   }
@@ -127,6 +143,11 @@ app.get('/context', (req, res) => {
 
 app.post('/stop', (_req, res) => {
   agent.abort()
+  // MULTI-AGENT ARCHITECTURE (config.agents): agent.abort() alone only reaches the
+  // shared baseline instance above — every frame a dispatch run spawns is a separate
+  // Agent, so it needs its own stop path (see dispatch.ts's abortDispatch). Harmless to
+  // call unconditionally: a no-op when no dispatch run is in flight.
+  abortDispatch()
   res.json({ ok: true })
 })
 
@@ -338,6 +359,10 @@ app.get('/status', (req, res) => {
     memory: config.memory,
     loop: config.loopRecovery,
     autoCommit: config.autoCommit,
+    // MULTI-AGENT ARCHITECTURE (docs/subagents-plan.md). Lets the settings panel hide
+    // controls that don't apply to the dispatch path (e.g. grounding isn't wired to
+    // dispatch.ts's frames) instead of showing a toggle that would silently do nothing.
+    agents: config.agents,
   })
 })
 
@@ -442,7 +467,9 @@ interface FileEntry {
   size?: number
 }
 
-const SKIP = new Set(['node_modules', '.git'])
+// .argo (config.agents) is harness bookkeeping — the multi-agent ledger and scratch
+// work, not a project deliverable — same treatment as .git.
+const SKIP = new Set(['node_modules', '.git', '.argo'])
 // Only excluded at the true filesystem root — virtual/pseudo filesystems with
 // no meaningful content to browse (huge or synthetic on every read).
 const ROOT_SKIP = new Set(['proc', 'sys', 'dev', 'run'])

@@ -34,6 +34,14 @@ export interface LoopState {
   // Whether an L1 compaction has already fired for the CURRENT stuck streak —
   // compaction is a one-shot intervention per streak, not repeated every block.
   compactedForStreak: boolean
+  // Coarse near-duplicate guard (2026-09-03, checkSameToolStreak below): the SAME
+  // tool NAME called repeatedly, regardless of args, with no mutation in between —
+  // catches "many different bash commands all re-verifying the same already-true
+  // fact" (observed in eval: self-reverification loops that never repeat an EXACT
+  // call, so evade lastMutationByKey/blocks above entirely, which key on exact args).
+  lastToolName: string | null
+  sameToolStreak: number
+  sameToolWarnedForStreak: boolean
 }
 
 // Fresh, empty state for the start of a run.
@@ -43,6 +51,9 @@ export function createLoopState(): LoopState {
     mutationCount: 0,
     blocks: 0,
     compactedForStreak: false,
+    lastToolName: null,
+    sameToolStreak: 0,
+    sameToolWarnedForStreak: false,
   }
 }
 
@@ -52,6 +63,38 @@ export function noteMutation(state: LoopState): void {
   state.mutationCount++
   state.blocks = 0
   state.compactedForStreak = false
+  state.sameToolStreak = 0
+  state.sameToolWarnedForStreak = false
+}
+
+// Coarse near-duplicate guard, deliberately SEPARATE from evaluateCall above: that
+// ladder only ever fires on an EXACT repeat (same tool + same args) and BLOCKS the
+// call once it does. This one is looser (same tool, ANY args) and never blocks —
+// near-duplicate calls, unlike exact ones, sometimes genuinely differ (gemini-cli's
+// own loop-detection design treats these as a distinct case for exactly this
+// reason: fuzzy matching, not a hard skip). Call this AFTER evaluateCall allows the
+// call through; it only ever adds a nudge, never prevents execution. Fires once per
+// streak (mirrors compactedForStreak) so it doesn't renag on every single call past
+// the threshold. A call to a DIFFERENT tool resets the streak.
+export const SAME_TOOL_WARN_THRESHOLD = 3
+
+export function checkSameToolStreak(state: LoopState, toolName: string, threshold = SAME_TOOL_WARN_THRESHOLD): string | null {
+  if (state.lastToolName === toolName) {
+    state.sameToolStreak++
+  } else {
+    state.lastToolName = toolName
+    state.sameToolStreak = 1
+    state.sameToolWarnedForStreak = false
+  }
+  if (state.sameToolStreak >= threshold && !state.sameToolWarnedForStreak) {
+    state.sameToolWarnedForStreak = true
+    return (
+      `You have now called \`${toolName}\` ${state.sameToolStreak} times in a row (different arguments each time, ` +
+      'but the same kind of action, with nothing changed in between). If you already have what you need, commit ' +
+      'to your verdict or answer now — otherwise take a genuinely different kind of action.'
+    )
+  }
+  return null
 }
 
 export type LoopAction =

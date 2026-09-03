@@ -42,7 +42,9 @@ import {
   renderRecallPointer,
   persistToMemory,
 } from './memory.js'
-import { createLoopState, noteMutation, evaluateCall, type LoopState } from './loop.js'
+import { createLoopState, noteMutation, evaluateCall, checkSameToolStreak, type LoopState } from './loop.js'
+import { classifyTool, inferDependencies, evict, type EpisodeMeta } from './eviction.js'
+import { recordEpisode, markEpisodeEvicted, newId as newLedgerId } from './ledger.js'
 
 // SYSTEM PROMPT — authoring guidance (for maintainers, not the model):
 // Use this for HIGH-LEVEL steering of *how to work*, awareness of the tools the
@@ -383,6 +385,36 @@ export class Agent {
   //   actionTrace     — short recent-action trace (compact labels), oldest→newest.
   private criticModel = config.criticModel
   private editedPaths: string[] = []
+  // How many iterations THIS run actually consumed (1-based, updated every iteration
+  // regardless of which exit path chat() ultimately takes) — what dispatch.ts reads to
+  // decide whether a just-concluded frame was large enough to warrant an immediate
+  // standup, on top of the aggregate action-episode counter (docs/subagents-plan.md).
+  private lastIterationCount = 0
+  // this.loopState.mutationCount recorded at the last 20/35/45 stall/progress
+  // checkpoint (see chat()) — lets that checkpoint tell "genuinely stuck" apart from
+  // "still landing real edits, just needed more than 20 iterations for a bigger task,"
+  // which used to fire the same alarmed PROGRESS CHECK/STALL message either way (a
+  // real false alarm observed on the aider-transpose eval task: steady edits, no
+  // drift, still got nagged at iteration 20).
+  private mutationCountAtLastStallCheck = 0
+  // Trouble signals for THIS run, read by dispatch.ts (multi-agent) to decide whether
+  // a just-concluded frame earns an IMMEDIATE Boss standup on top of the aggregate
+  // action-episode counter (docs/subagents-plan.md, 2026-09-03 redesign) — a frame
+  // that hit L1/L2 loop-recovery or needed an Ollama retry showed real friction even
+  // if it eventually converged, which the aggregate counter alone wouldn't surface
+  // for a short, single-frame task.
+  private loopSteerEscalated = false // true once evaluateCall ever returns compact(L1) or replan(L2)
+  private ollamaRetryCount = 0
+  // MULTI-AGENT ARCHITECTURE (config.agents / ARGO_AGENTS, docs/subagents-plan.md). A
+  // call frame is one scoped Agent instance: allowedTools restricts which tools are
+  // offered to Ollama AND accepted by the tool-dispatch loop (null = unrestricted,
+  // the baseline behavior); frameId correlates this instance's episodes/tool calls to
+  // a ledger frame (null when not running as part of a dispatch — the baseline never
+  // sets it, so episode recording to the ledger is a no-op then). episodes is the CWL
+  // episode graph (see eviction.ts) for THIS instance's own history, reset per run.
+  private allowedTools: ToolName[] | null = null
+  private frameId: string | null = null
+  private episodes: EpisodeMeta[] = []
   // Bounded excerpts of pages fetched this run (url + truncated content), so the
   // grounding guard can verify document specifics against what was ACTUALLY fetched
   // (the full fetch results survive in this.history, but this keeps a compact,
@@ -491,6 +523,39 @@ export class Agent {
     this.autoCommitEnabled = on
   }
 
+  // MULTI-AGENT ARCHITECTURE (config.agents). null restores unrestricted (baseline)
+  // tool access — see frames.ts's ROLE_TOOLS for the per-role sets dispatch.ts passes.
+  setAllowedTools(tools: ToolName[] | null) {
+    this.allowedTools = tools
+  }
+
+  setFrameId(id: string | null) {
+    this.frameId = id
+  }
+
+  // MULTI-AGENT ARCHITECTURE (config.agents): appended after the baseline SYSTEM_PROMPT
+  // (whose tool-usage/filesystem conventions still apply to every role) — this is what
+  // gives a role-scoped frame its distinct job description (frames.ts's
+  // ROLE_SYSTEM_SUFFIX). Empty string (the default) leaves the baseline byte-identical.
+  private roleInstructions = ''
+  setRoleInstructions(text: string) {
+    this.roleInstructions = text
+  }
+
+  // What dispatch.ts reads to build a FrameResult's filesTouched/filesWritten —
+  // diff-derived from actual edit_file/write_file calls, not self-reported.
+  getEditedPaths(): string[] {
+    return this.editedPaths
+  }
+
+  getIterationCount(): number {
+    return this.lastIterationCount
+  }
+
+  hadTrouble(): boolean {
+    return this.loopSteerEscalated || this.ollamaRetryCount > 0
+  }
+
   getMaxIterations(): number {
     return this.maxIterations
   }
@@ -513,6 +578,22 @@ export class Agent {
   private pushCtx(m: Message): void {
     this.history.push(m)
     this.historyTs.set(m, Date.now())
+  }
+
+  // UNIFIED REJECTION SURFACING. Every harness-level block (the plan/act gate, a
+  // role-restricted tool outside this frame's allowed set, a loop-steered repeat)
+  // used to look completely different from a real tool failure — just a floating
+  // 'warning' + a bare tool-role message, with no 'tool_call'/'tool_result' pair at
+  // all. A real, observed failure mode: the model reads that as *nothing happened*
+  // rather than *my action was rejected*, and proceeds as if a blocked edit had
+  // actually landed (only discovering the truth several turns later when a test
+  // still fails). Fix: make a rejection emit the EXACT same tool_call + tool_result
+  // shape a genuine tool error does — indistinguishable in kind, so the model's
+  // already-trained "my last call failed" recognition fires the same way either way.
+  private rejectToolCall(name: ToolName, args: Record<string, unknown>, reason: string, emitAndLog: (e: AgentEvent) => void): void {
+    emitAndLog({ type: 'tool_call', tool: name, args })
+    emitAndLog({ type: 'tool_result', tool: name, output: '', error: reason, duration_ms: 0, rejected: true })
+    this.pushCtx({ role: 'tool', content: `Error: ${reason}` })
   }
 
   // Lets the user force compaction between turns (server.ts's POST /compact-now,
@@ -555,6 +636,40 @@ export class Agent {
     emitAndLog: (e: AgentEvent) => void,
     manual = false,
   ): Promise<{ newRunStart: number; compacted: boolean }> {
+    // MULTI-AGENT ARCHITECTURE (config.agents): replaces LLM-summarization compaction
+    // with CWL-style deterministic episode eviction (docs/subagents-plan.md, "Context
+    // management") — no LLM call, and unlike compaction it never restructures
+    // this.history's indices, so currentRunStart stays valid unchanged. compaction.ts's
+    // structured-summary path is kept only as the pre-existing (baseline) behavior when
+    // this flag is off.
+    if (config.agents) {
+      const msgsBefore = this.history.length
+      const { messages, evictedEpisodeIds } = evict(this.history, this.episodes)
+      if (evictedEpisodeIds.length === 0) return { newRunStart: currentRunStart, compacted: false }
+      this.history = messages
+      this.lastCompactedAt = Date.now()
+      if (this.frameId) {
+        for (const id of evictedEpisodeIds) {
+          try {
+            await markEpisodeEvicted(config.workspacePath || '/workspace', id)
+          } catch (err) {
+            emitAndLog({ type: 'warning', message: `Marking episode evicted failed (${err instanceof Error ? err.message : String(err)}) — continuing` })
+          }
+        }
+      }
+      emitAndLog({
+        type: 'compact',
+        summary: `deterministic eviction: stubbed ${evictedEpisodeIds.length} episode(s) (recoverable via ledger expand)`,
+        messagesBefore: msgsBefore,
+        messagesAfter: this.history.length,
+        contextUsagePct,
+        rangeDescription: `evicted ${evictedEpisodeIds.length} episode(s), oldest-action-first`,
+        validated: false,
+        manual,
+      })
+      return { newRunStart: currentRunStart, compacted: true }
+    }
+
     const msgsBefore = this.history.length
     const split = splitForCompaction(this.history, currentRunStart)
 
@@ -732,11 +847,17 @@ export class Agent {
         messages.push({ role: 'tool', content: `RELEVANT PROJECT INSTRUCTIONS (from AGENTS.md, for the current task):\n${asel.text}` })
       }
     }
+    // MULTI-AGENT ARCHITECTURE (config.agents): a role-scoped frame only offers Ollama
+    // the tools in this.allowedTools (frames.ts's ROLE_TOOLS); null (baseline, and
+    // every existing caller) offers the full set unchanged.
+    const offeredTools = this.allowedTools
+      ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
+      : toolDefinitions
     return withTimeout(this.ollama.chat({
       model: this.model,
       messages,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      tools: toolDefinitions as any[],
+      tools: offeredTools as any[],
       stream: false,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       options: this.options as any,
@@ -760,6 +881,7 @@ export class Agent {
     try {
       return await this.chatCall(systemPrompt)
     } catch (err) {
+      this.ollamaRetryCount++
       emitAndLog({ type: 'warning', message: `Ollama request failed (${err instanceof Error ? err.message : String(err)}) — retrying once` })
       await new Promise(resolve => setTimeout(resolve, this.chatRetryDelayMs))
       if (this.aborted) return null
@@ -1096,6 +1218,9 @@ export class Agent {
     // Loop-steering state, scoped to this run only (see REPEAT_WINDOW above).
     this.recentCalls = []
     this.loopState = createLoopState()
+    this.mutationCountAtLastStallCheck = 0
+    this.loopSteerEscalated = false
+    this.ollamaRetryCount = 0
     this.currentPlan = null
     // HARNESS TASK LEDGER + MEMORY per-run state (only used when this.tasks/this.memory
     // are on; resetting them unconditionally is a harmless local write for the baseline).
@@ -1112,6 +1237,7 @@ export class Agent {
     this.fetchedSources = []
     this.lastCommandOutput = ''
     this.actionTrace = []
+    this.episodes = []
     let loopSteers = 0
     // No-progress detector: tool calls since the last actual change to the project.
     // A planned run that keeps inspecting without ever editing is stuck (the novel-arg
@@ -1132,7 +1258,22 @@ export class Agent {
     const projectContext = this.memory
       ? await this.buildProjectMemoryContext(userMessage)
       : await loadProjectContext()
-    const systemPrompt = projectContext ? `${SYSTEM_PROMPT}\n\n${projectContext}` : SYSTEM_PROMPT
+    const baseSystemPrompt = this.roleInstructions ? `${SYSTEM_PROMPT}\n\n${this.roleInstructions}` : SYSTEM_PROMPT
+    const systemPrompt = projectContext ? `${baseSystemPrompt}\n\n${projectContext}` : baseSystemPrompt
+
+    // Stall/progress-check iteration numbers for THIS run, scaled to THIS run's own
+    // budget (2026-09-03: multi-agent roles run short, fixed budgets — Boss/Planner
+    // 15, Tester 20, a Boss task-start checkpoint as low as 6 — and the original
+    // fixed 20/35/45 checkpoints below simply never fired for them, since they hit
+    // their own hard maxIterations ceiling first and got ZERO mid-run steering. Each
+    // checkpoint is min(the original fixed value, a fraction of this run's own
+    // maxIterations) — for any budget >=~60 (Implementer's, and the baseline's own
+    // typical config) this reduces to exactly the original fixed values (unchanged,
+    // still "a first guess tuned against the eval"); for a short-budget role it
+    // scales down proportionally instead of never firing at all.
+    const stallCheckpoints = [0.4, 0.65, 0.85].map((frac, idx) =>
+      Math.min([20, 35, 45][idx], Math.max(1, Math.round(frac * this.maxIterations))),
+    )
 
     try {
       for (let i = 0; i < this.maxIterations; i++) {
@@ -1144,29 +1285,59 @@ export class Agent {
           return msg
         }
         emitAndLog({ type: 'iteration', current: i + 1, max: this.maxIterations })
+        this.lastIterationCount = i + 1
 
         // Stall re-ground (Magentic-One style). On a long run that is drifting, the
         // loop-steer guard can't help — its churn has novel args — and the reground
         // done-gate only fires at "done", never mid-run. So at fixed iteration counts
-        // (well above normal convergence — observed passing tasks ≤13 iters) inject a
-        // non-terminating re-ground toward the objective, then force a re-plan at the
-        // top. Each fires once (iterNum is strictly increasing). Thresholds are a first
-        // guess to be tuned against the eval.
+        // (well above normal convergence — observed passing tasks ≤13 iters), scaled
+        // to THIS run's own budget (stallCheckpoints, above), inject a non-terminating
+        // re-ground toward the objective, then force a re-plan at the top. Each fires
+        // once (iterNum is strictly increasing).
         const iterNum = i + 1
-        if (iterNum === 20 || iterNum === 35 || iterNum === 45) {
-          const activePlan = this.currentPlan as { objective: string } | null
-          const objective = activePlan?.objective || userMessage
-          const stall = iterNum === 45
-            ? `STALL: ${iterNum} iterations without finishing — your approach is not converging. Call update_plan now with a revised plan that lists ONLY the remaining work as concrete steps, then carry it out. Do not repeat what has not worked.`
-            : `PROGRESS CHECK: ${iterNum} iterations in and not finished. Objective: "${objective}". State which steps are DONE and which REMAIN, then make the single most important remaining change now — if you have been searching or re-reading without editing, stop and implement the next concrete step; if the approach is wrong, call update_plan to revise.`
-          emitAndLog({ type: 'warning', message: stall })
-          this.pushCtx({ role: 'tool', content: stall })
-          // ON-STALL critic checkpoint: reuse the existing stall/progress trigger
-          // (no parallel plumbing). The critic reviews the recent trace + latest
-          // test output and returns a CONCRETE corrective, injected as a steer.
-          if (config.critic) {
-            const stallPlan = this.currentPlan as { steps: string[] } | null
-            await this.runCriticCheckpoint('on-stall', objective, stallPlan?.steps ?? [], emitAndLog)
+        if (stallCheckpoints.includes(iterNum)) {
+          // Real edits landing since the LAST checkpoint (not since run start — a
+          // stretch of pure investigation right after an earlier burst of edits
+          // should still be able to trip the alarm) mean this is a bigger task making
+          // genuine progress, not a stuck loop — skip the alarmed message entirely
+          // rather than nagging a model that is already doing the right thing.
+          const mutationsSinceLastCheck = this.loopState.mutationCount - this.mutationCountAtLastStallCheck
+          this.mutationCountAtLastStallCheck = this.loopState.mutationCount
+          if (mutationsSinceLastCheck === 0) {
+            const activePlan = this.currentPlan as { objective: string } | null
+            const objective = activePlan?.objective || userMessage
+            // Boss/Tester (multi-agent roles) don't have update_plan in their
+            // restricted tool set — telling them to call it would be nonsensical.
+            // `allowedTools` is null for the baseline's own unrestricted loop, which
+            // always has update_plan, so the richer wording is the right default.
+            // Requiring write_file TOO (not just update_plan's presence) is deliberate:
+            // Tiphys (the Planner role) has update_plan in ITS tool set as well, but
+            // its own job is to emit a JSON task graph as its final TEXT ANSWER, not
+            // to call update_plan — that tool is the baseline/Implementer's own
+            // internal task-ledger mechanism, unrelated to the multi-agent TaskGraph.
+            // Telling a stalled Planner to "call update_plan" was a real observed
+            // failure: it just made the Planner MORE confused about what action to
+            // take, not less, while it burned its whole budget without ever emitting
+            // the JSON block dispatch.ts actually needs.
+            const hasUpdatePlan = this.allowedTools === null ||
+              (this.allowedTools.includes('update_plan') && this.allowedTools.includes('write_file'))
+            const isLastCheckpoint = iterNum === stallCheckpoints[stallCheckpoints.length - 1]
+            const stall = isLastCheckpoint
+              ? (hasUpdatePlan
+                ? `STALL: ${iterNum} iterations without finishing — your approach is not converging. Call update_plan now with a revised plan that lists ONLY the remaining work as concrete steps, then carry it out. Do not repeat what has not worked.`
+                : `STALL: ${iterNum} iterations without finishing — your approach is not converging. Conclude NOW with your best verdict/answer given what you have found so far, or take one genuinely different action — do not repeat what has not worked.`)
+              : (hasUpdatePlan
+                ? `PROGRESS CHECK: ${iterNum} iterations in and not finished. Objective: "${objective}". State which steps are DONE and which REMAIN, then make the single most important remaining change now — if you have been searching or re-reading without editing, stop and implement the next concrete step; if the approach is wrong, call update_plan to revise.`
+                : `PROGRESS CHECK: ${iterNum} iterations in and not finished. Objective: "${objective}". State what you have confirmed so far, then either conclude with your verdict/answer or take the single most important remaining action — do not keep re-checking the same thing.`)
+            emitAndLog({ type: 'warning', message: stall })
+            this.pushCtx({ role: 'tool', content: stall })
+            // ON-STALL critic checkpoint: reuse the existing stall/progress trigger
+            // (no parallel plumbing). The critic reviews the recent trace + latest
+            // test output and returns a CONCRETE corrective, injected as a steer.
+            if (config.critic) {
+              const stallPlan = this.currentPlan as { steps: string[] } | null
+              await this.runCriticCheckpoint('on-stall', objective, stallPlan?.steps ?? [], emitAndLog)
+            }
           }
         }
 
@@ -1441,6 +1612,14 @@ export class Agent {
             }
             continue
           }
+          // MULTI-AGENT ARCHITECTURE (config.agents): a role-scoped frame rejects any
+          // tool outside its ROLE_TOOLS set — enforced here too (not just in the tools
+          // offered to Ollama above), since a model can still emit a call for a tool it
+          // wasn't offered. Not counted as a repeat; the call simply never runs.
+          if (this.allowedTools && !this.allowedTools.includes(name)) {
+            this.rejectToolCall(name, args, `tool "${name}" is not available in this role — it was NOT called.`, emitAndLog)
+            continue
+          }
           // Plan/act gate: investigation (reads/greps) flows freely, but a project
           // mutation is BLOCKED until a plan is recorded — separating plan from act
           // as a state with different rules. Gated by "about to change the project"
@@ -1449,9 +1628,8 @@ export class Agent {
           // its place and it isn't counted as a repeat, so the retried call runs
           // normally once the plan exists.
           if (!this.currentPlan && isProjectMutation(name, args)) {
-            const gate = `Before changing the project (\`${name}\` on ${typeof args.path === 'string' ? args.path : 'a file'}) you must record a plan. Read the relevant files if you haven't, then call update_plan with one concrete, verifiable objective and the steps to reach it — then make this change. Recording a plan does not end your turn.`
-            emitAndLog({ type: 'warning', message: gate })
-            this.pushCtx({ role: 'tool', content: gate })
+            const gate = `REJECTED — this ${name} call was NOT applied, nothing changed on disk. You must record a plan first. Read the relevant files if you haven't, then call update_plan with one concrete, verifiable objective and the steps to reach it — THEN retry this exact change. Recording a plan does not end your turn.`
+            this.rejectToolCall(name, args, gate, emitAndLog)
             continue
           }
           // Loop steering (see REPEAT_* above): recentCalls holds calls actually
@@ -1466,6 +1644,7 @@ export class Agent {
             const recite = this.buildLoopRecite()
             const action = evaluateCall(this.loopState, key, { toolName: name, recite, hasTasks: this.tasks && recite.length > 0 })
             if (action.kind !== 'allow') {
+              if (action.kind === 'compact' || action.kind === 'replan') this.loopSteerEscalated = true
               if (action.kind === 'compact') {
                 try {
                   this.phase = 'compacting'
@@ -1478,8 +1657,20 @@ export class Agent {
                 }
               }
               emitAndLog({ type: 'warning', message: action.message })
-              this.pushCtx({ role: 'tool', content: action.message })
+              this.rejectToolCall(name, args, `SKIPPED — identical to a call already run with nothing new since. ${action.message}`, emitAndLog)
               continue
+            }
+            // Coarse near-duplicate guard (loop.ts checkSameToolStreak) — the SAME
+            // tool called repeatedly with DIFFERENT args each time (so the exact-match
+            // ladder above never sees a repeat) evades it entirely; observed in eval
+            // as a real self-reverification pattern (many different bash commands all
+            // re-checking the same already-true fact). Never blocks — this call still
+            // executes below — just nudges toward concluding once the streak is long
+            // enough, via the same context-injection path as every other warning here.
+            const fuzzyWarning = checkSameToolStreak(this.loopState, name)
+            if (fuzzyWarning) {
+              emitAndLog({ type: 'warning', message: fuzzyWarning })
+              this.pushCtx({ role: 'tool', content: fuzzyWarning })
             }
           } else {
             priorRepeats = this.recentCalls.filter(k => k === key).length
@@ -1492,7 +1683,7 @@ export class Agent {
               loopSteers++
               const steer = loopSteerMessage(name, priorRepeats, loopSteers, (this.currentPlan as { objective: string } | null)?.objective ?? '')
               emitAndLog({ type: 'warning', message: steer })
-              this.pushCtx({ role: 'tool', content: steer })
+              this.rejectToolCall(name, args, `SKIPPED — identical to a call already run with nothing new since. ${steer}`, emitAndLog)
               continue
             }
           }
@@ -1523,7 +1714,37 @@ export class Agent {
           // loop already runs: file edits (incl. failed attempts, so intent-to-
           // tamper with a test/spec file is visible), the latest command output,
           // and a short action trace.
-          if (config.critic || this.grounding || this.memory || this.layout) {
+          // MULTI-AGENT ARCHITECTURE (config.agents): every tool call becomes a CWL
+          // episode (exploratory | action), linked to its inferred dependencies, and —
+          // when this instance is running as part of a dispatch (this.frameId set) —
+          // written to the ledger losslessly (the full result survives there even once
+          // evicted from the live window; see eviction.ts / ledger.ts). update_plan and
+          // ledger itself are harness/bookkeeping calls, not typed episodes. (update_plan
+          // is already excluded by control flow — that branch always `continue`s above.)
+          if (config.agents && name !== 'ledger') {
+            const kind = classifyTool(name)
+            const episodeId = newLedgerId('ep')
+            const deps = inferDependencies(this.episodes, kind)
+            const messageIndex = this.history.length - 1 // the tool-result message just pushed
+            this.episodes.push({ episodeId, kind, tool: name, messageIndex, dependsOn: deps })
+            if (this.frameId) {
+              const fullContent = result.error ? `Error: ${result.error}\n${result.output}` : result.output
+              try {
+                await recordEpisode(config.workspacePath || '/workspace', {
+                  frameId: this.frameId,
+                  episodeId,
+                  episodeKind: kind,
+                  tool: name,
+                  argsSummary: JSON.stringify(args).slice(0, 300),
+                  dependsOn: deps,
+                  fullContent,
+                })
+              } catch (err) {
+                emitAndLog({ type: 'warning', message: `Episode record failed (${err instanceof Error ? err.message : String(err)}) — continuing` })
+              }
+            }
+          }
+          if (config.critic || this.grounding || this.memory || this.layout || config.agents) {
             if (name === 'edit_file' || name === 'write_file') {
               const p = typeof args.path === 'string' ? args.path : ''
               if (p && !this.editedPaths.includes(p)) this.editedPaths.push(p)
@@ -1691,7 +1912,11 @@ export class Agent {
     return result
   }
 
-  private async autoCommit(emitAndLog: (e: AgentEvent) => void): Promise<void> {
+  // Public so dispatch.ts (config.agents) can call it once at the end of a whole
+  // dispatch run, using any convenient already-constructed frame's Agent instance —
+  // the logic itself is instance-agnostic (just git + this.ollama for the commit
+  // message), unlike the baseline loop's per-run call, which stays private.
+  async autoCommit(emitAndLog: (e: AgentEvent) => void): Promise<void> {
     try {
       // Initialise git if workspace isn't tracked yet (idempotent on existing repos)
       await this.tracedBash('git rev-parse --git-dir 2>/dev/null || git init -q', emitAndLog)

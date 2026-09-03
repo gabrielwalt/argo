@@ -103,4 +103,12 @@ export const config = {
   // Local vision model used by the view_image tool to read/judge images (screenshots,
   // diagrams, rendered layouts). See src/tools/view-image.ts.
   visionModel:      process.env.ARGO_VISION_MODEL ?? 'qwen2.5vl:7b',
+  // MULTI-AGENT ARCHITECTURE (docs/subagents-plan.md). OFF by default (env ARGO_AGENTS=1
+  // to enable) — the existing single-loop path stays the default until this is proven.
+  // When on: the dispatch loop (src/dispatch.ts) drives Planner/Implementer/Tester/Boss
+  // as scoped Agent instances, the ledger (src/ledger.ts) records every delegation/
+  // conclusion/standup/injection/episode under /workspace/.argo/, and context management
+  // switches from LLM-summarization compaction to deterministic episode eviction
+  // (src/eviction.ts). No two LLM calls ever run concurrently, for any role.
+  agents:           ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_AGENTS ?? '').trim().toLowerCase()),
 }

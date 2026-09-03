@@ -1,0 +1,709 @@
+// THE ORCHESTRATOR (docs/subagents-plan.md, config.agents / ARGO_AGENTS). Harness code,
+// not an LLM — a strictly sequential dispatch loop over the ledger. Every role (Planner,
+// Implementer, Tester, Boss) is one scoped `Agent` instance (agent.ts) reused as the
+// call-frame execution primitive; this module owns spawning them, translating the
+// Planner's task graph into frame dependencies, and applying the Boss's verdicts.
+//
+// HARD RULE: no two LLM calls ever run concurrently, for any reason — every `await`
+// below fully resolves before the next one starts. One GPU, one resident model.
+//
+// v1 SIMPLIFICATIONS, noted explicitly (see docs/subagents-plan.md for the full design
+// this is a first pass at):
+//  - A frame's FrameResult is derived from its natural final answer + diffed files,
+//    not a dedicated `conclude` tool call.
+//  - Tester/Boss verdicts are parsed from a text convention at the end of their final
+//    answer (RELEASE/REDO, NONE/INJECT/RESTART/ESCALATE) — see frames.ts.
+//  - The pinned anchor (objective+plan) is folded into each frame's initial assignment
+//    rather than threaded into per-turn recitation.
+//  - Replanning starts a fresh step-id space for the new graph (the Planner ITSELF
+//    stays a persistent, resumed Agent instance and is told what already succeeded, so
+//    completed real-world work is never blindly redone — but step-tracking bookkeeping
+//    resets on a replan rather than being merged positionally).
+
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { Agent } from './agent.js'
+import { config } from './config.js'
+import { SessionLogger } from './logger.js'
+import type { AgentEvent, FrameSpawnRequest, FrameResult, FrameStatus, ModelOptions, Role } from './types.js'
+import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, systemPromptFor, buildAssignment, capSummary, parseTesterVerdict, parseBossVerdict, parseTaskStartVerdict, type TaskStartVerdict } from './frames.js'
+import * as ledger from './ledger.js'
+import { createTaskGraph, readyGroups, allStepsDone, type TaskGraph, type TaskStep } from './tasks.js'
+
+// The workspace root — config.workspacePath (NOT a literal '/workspace') because
+// standalone dev mode runs this Node process directly on the HOST while `bash`
+// reaches the project through a separate docker-exec'd container; only in-container
+// worker mode has a real '/workspace' directory on ITS OWN filesystem. Read fresh
+// each call, never cached, since standalone mode's runtime "mount a folder" flow
+// mutates config.workspacePath directly (see server.ts's POST /api/workspace).
+function root(): string {
+  return config.workspacePath || '/workspace'
+}
+
+const execFileAsync = promisify(execFile)
+// Fails open to '' ("nothing changed") on any error — not a git repo, git unavailable,
+// etc. — same fail-open convention as every other checkpoint here; this is a detection
+// heuristic, not a correctness-critical path.
+async function gitStatusShort(cwd: string): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync('git', ['status', '--short'], { cwd })
+    return stdout
+  } catch {
+    return ''
+  }
+}
+
+// Total changed lines (added + removed) in the working tree right now — used to size a
+// TRIVIAL self-attempt's actual blast radius. The Boss only has `bash`, not edit_file:
+// its ONLY way to "fix" a file is a full heredoc rewrite, which is an inherently blunt,
+// all-or-nothing instrument (unlike edit_file's precise, scoped replacement). Observed
+// in eval: a Boss judged a 6-method feature TRIVIAL, rewrote the entire target file
+// from scratch via `cat > file << EOF` to "fix" it, hallucinated large parts of the
+// surrounding code it never needed to touch, and broke an unrelated constructor
+// signature other files depended on — a real, damaging failure a mere `dirty` check
+// (any change at all) can't distinguish from a genuinely tiny, safe edit.
+async function gitDiffLineCount(cwd: string): Promise<number> {
+  try {
+    const { stdout } = await execFileAsync('git', ['diff', '--shortstat'], { cwd })
+    const m = /(\d+) insertion.*?(\d+) deletion|(\d+) insertion|(\d+) deletion/.exec(stdout)
+    if (!m) return 0
+    const nums = m.slice(1).filter(Boolean).map(Number)
+    return nums.reduce((a, b) => a + b, 0)
+  } catch {
+    return 0
+  }
+}
+// Above this many changed lines, a self-attempt no longer counts as evidence of a
+// genuinely TRIVIAL (1-2 iteration) fix, regardless of whether the Boss claims it
+// finished — generous enough for a real one-or-two-line change plus its imports/
+// braces, nowhere near enough for a full-file rewrite.
+const TRIVIAL_DIFF_LINE_LIMIT = 15
+const ACTION_EPISODES_PER_STANDUP = 10
+// A frame that alone burns more iterations than this earns an immediate post-hoc
+// standup regardless of the aggregate action-episode pacing (docs/subagents-plan.md,
+// "large-frame standup trigger") — roughly the same order of magnitude as the
+// baseline loop's own stall/progress-check thresholds (agent.ts, iterNum 20/35/45),
+// since that's the point past which a SINGLE frame's own run starts to risk the same
+// drift a standup exists to catch.
+const LARGE_FRAME_ITERATIONS = 25
+const MAX_TESTER_ROUNDS = 3
+const MAX_REPLAN_ROUNDS = 5
+const MAX_FINAL_VERIFY_ROUNDS = 3
+
+// Model/options for the CURRENT dispatch run, set once at the top of runDispatchLoop
+// and read by every spawnFrame call below. Module-level state is safe here only
+// because server.ts's `isBusy` guard already prevents a second /chat request from
+// starting a new runDispatchLoop while one is in flight — the same invariant that
+// makes "no two LLM calls ever run concurrently" hold in the first place.
+let currentModel: string | undefined
+let currentOptions: ModelOptions | undefined
+
+// Matches Agent's own constructor param exactly (agent.ts), so a tagged emit can be
+// handed straight to `new Agent(...)` — the optional `seq` is what the SSE/JSONL replay
+// dedup logic (server.ts, app.js) keys on.
+type Emit = (e: AgentEvent, seq?: number) => void
+
+// STOP BUTTON (server.ts's POST /stop). The baseline Agent's own .abort() only affects
+// the ONE shared instance server.ts constructs at module scope — every frame here is a
+// SEPARATE Agent instance, so that call alone does nothing for a dispatch run. Track
+// whichever frame is currently mid-chat() and abort THAT one too; the dispatch loop
+// itself also checks stopRequested between frames (a frame stopping mid-chat only ends
+// that one frame's turn, not the whole run) and unwinds via DispatchAborted, mirroring
+// the baseline loop's own "Stopped." return convention exactly.
+let stopRequested = false
+let activeFrameAgent: Agent | null = null
+
+export function abortDispatch(): void {
+  stopRequested = true
+  activeFrameAgent?.abort()
+}
+
+class DispatchAborted extends Error {}
+
+function checkAborted(): void {
+  if (stopRequested) throw new DispatchAborted()
+}
+
+interface SpawnedFrame {
+  agent: Agent
+  result: FrameResult
+}
+
+// Tags EVERY event this frame's Agent instance ever emits (thought/tool_call/
+// tool_result/plan/done/...) with which role produced it and where it sits in the
+// delegation tree — see types.ts's FrameTag. Bound once at construction, so a later
+// resumeFrame() call on the same Agent instance automatically stays tagged too; no
+// re-wrapping needed. An UNTAGGED event (the objective/task_graph/boss_verdict/replan
+// narrative events below, emitted via the raw `emit` param) is the harness's own
+// top-level narrative, not any one frame's turn.
+function tagEmit(emit: Emit, frameId: string, role: Role, parentFrameId: string | null) {
+  return (event: AgentEvent, seq?: number) => {
+    emit({ ...event, __frameId: frameId, __role: role, __parentFrameId: parentFrameId } as unknown as AgentEvent, seq)
+  }
+}
+
+async function spawnFrame(req: FrameSpawnRequest, emit: Emit): Promise<SpawnedFrame> {
+  checkAborted()
+  const frameId = ledger.newId(req.role)
+  await ledger.recordDelegation(root(), {
+    frameId,
+    parentFrameId: req.parentFrameId,
+    from: 'harness',
+    to: req.role,
+    prompt: req.assignment,
+    contextGiven: req.dependsOn,
+  })
+
+  const agent = new Agent(tagEmit(emit, frameId, req.role, req.parentFrameId), currentModel)
+  if (currentOptions) agent.setOptions(currentOptions)
+  agent.setAllowedTools(ROLE_TOOLS[req.role])
+  agent.setRoleInstructions(systemPromptFor(req.role))
+  agent.setFrameId(frameId)
+  agent.setMaxIterations(req.maxIterations ?? ROLE_MAX_ITERATIONS[req.role])
+  agent.setSessionId(frameId) // isolates history/compaction-state files per frame
+
+  const assignment = await buildAssignment(root(), req)
+  activeFrameAgent = agent
+  const finalAnswer = await agent.chat(assignment)
+  activeFrameAgent = null
+  checkAborted()
+  const result = deriveFrameResult(frameId, finalAnswer, agent)
+  await ledger.recordConclusion(root(), result)
+  return { agent, result }
+}
+
+// Resumes an EXISTING frame (same Agent instance, same history) with a follow-up
+// message — used for the Planner's replanning rounds and the Tester's "redo" verdict.
+// Writes a NEW conclusion entry for the same frameId (the ledger is append-only; the
+// latest conclusion for a frameId is authoritative — same convention as episode
+// eviction records).
+async function resumeFrame(frameId: string, agent: Agent, followUp: string): Promise<FrameResult> {
+  checkAborted()
+  activeFrameAgent = agent
+  const finalAnswer = await agent.chat(followUp)
+  activeFrameAgent = null
+  checkAborted()
+  const result = deriveFrameResult(frameId, finalAnswer, agent)
+  await ledger.recordConclusion(root(), result)
+  return result
+}
+
+function deriveFrameResult(frameId: string, finalAnswer: string, agent: Agent): FrameResult {
+  const editedPaths = agent.getEditedPaths()
+  const lower = finalAnswer.toLowerCase()
+  const status: FrameStatus = /\b(giving up|give up|cannot complete|unable to complete)\b/.test(lower)
+    ? 'gave_up'
+    : 'success'
+  return {
+    frameId,
+    status,
+    summary: capSummary(finalAnswer),
+    filesTouched: editedPaths,
+    filesWritten: editedPaths,
+  }
+}
+
+// dispatch.ts's own harness-level override on top of the Boss's text verdict — see
+// the 'preempted'/'preempted-incomplete' cases in runBossTaskStart below.
+interface RoutedTaskStart {
+  mode: TaskStartVerdict['mode'] | 'preempted' | 'preempted-incomplete'
+  text: string
+  frameId: string
+  agent: Agent
+}
+
+// Deliberately tiny — this is the STRUCTURAL enforcement of "the Boss shouldn't do
+// actual work unless it's really 1-2 iterations, else it should delegate" (2026-09-03
+// redesign, Magentic-One-grounded: an orchestrator that can act itself needs a real
+// bound on how much, not just an instruction not to). Enough room to read a couple of
+// files and classify; nowhere near enough to run a real implement-then-reverify cycle
+// (observed at 8-15+ iterations in eval failures) to completion. Set to 10, not lower —
+// Agent.setMaxIterations clamps any smaller request UP to 10 regardless (its own
+// documented floor), so anything below 10 here would silently lie about the real
+// budget and make the `hitCap` comparison below fire too early, misreading a clean
+// finish with room to spare as an exhausted, incomplete attempt.
+const TASK_START_MAX_ITERATIONS = 10
+
+// Boss, checkpoint task-start: a FOUR-way router (docs/subagents-plan.md, "skippable
+// phases" + the 2026-09-03 redesign). Never re-fires within one dispatch — the
+// objective is set exactly once per task by construction (setObjective's own
+// immutability guard is the backstop if this were ever called twice).
+async function runBossTaskStart(userMessage: string, emit: Emit): Promise<RoutedTaskStart> {
+  const req: FrameSpawnRequest = {
+    role: 'boss',
+    parentFrameId: null,
+    maxIterations: TASK_START_MAX_ITERATIONS,
+    assignment:
+      `CHECKPOINT: task-start\nThe user asked: "${userMessage}"\n` +
+      'Ground this if it references project specifics, current facts, or anything you cannot already verify — ' +
+      'check real files or the web where it matters, rather than answering from assumption. ' +
+      `You have a hard budget of ${TASK_START_MAX_ITERATIONS} iterations for this checkpoint — plenty for reading ` +
+      'and classifying, not enough for a real implementation effort, by design. Read only enough to classify, not ' +
+      'enough to fully understand the codebase — the moment you notice real complexity (an unfamiliar multi-file ' +
+      'area, several functions/modules involved, a design decision to make), STOP reading and classify OBJECTIVE ' +
+      'immediately; Tiphys (the Planner) has a longer budget specifically to do that deeper reading, so spending ' +
+      'your own short budget on it first only shrinks the room you have left to classify at all. If you do attempt ' +
+      'a fix yourself (TRIVIAL below), verify it ONCE — one clean test/check run confirming it — and then CONCLUDE ' +
+      'immediately with your answer line. Do not re-run the same check again "to be sure": repeated re-verification ' +
+      'of a fix you already confirmed wastes the very budget that makes this checkpoint safe, and a fresh Tester ' +
+      'independently re-checks your work right after anyway, so your own one-time confirmation is enough. ' +
+      'Classify the request into exactly ONE of four modes and end your answer with exactly one line in that ' +
+      'mode\'s format:\n' +
+      '- ANSWER: <complete final answer> — you already know the full answer (a question, a lookup, something you ' +
+      'just verified) and no project change is needed at all. No further frame ever spawns.\n' +
+      '- TRIVIAL: <what you did, or will do> — genuinely 1-2 iterations of work (a one-character typo, a single ' +
+      'obvious constant, a one-line change you can name without reading anything else first). You MAY fix it ' +
+      'yourself right now, within your small budget above, before answering — a fresh Tester will independently ' +
+      'verify whatever you did before this returns to the user, so you are never the only check on your own work. ' +
+      'If you are not confident it is genuinely this small, do NOT attempt it — classify SIMPLE instead and let ' +
+      'the Implementer do it.\n' +
+      '- SIMPLE: <concrete, verifiable objective> — a single well-scoped change, even if it takes real effort to ' +
+      'diagnose or isn\'t trivial to write (a bug in one file, a fix to one function) — but still ONE piece of ' +
+      'work. Do NOT attempt this yourself, no matter how tempting. This delegates straight to one Implementer, ' +
+      'independently verified by a Tester — no Planner ceremony.\n' +
+      '- OBJECTIVE: <concrete, verifiable objective> — you anticipate this needs MULTIPLE distinct pieces of work ' +
+      '(several files, several unrelated concerns, or genuine ambiguity about the approach) — the only case that ' +
+      'goes to the Planner for real decomposition. Never "NONE" or "no objective" here, regardless of how simple ' +
+      'the request is or whether it involves this project at all.',
+  }
+  const before = await gitStatusShort(root())
+  const { agent, result } = await spawnFrame(req, emit)
+  const after = await gitStatusShort(root())
+  const hitCap = agent.getIterationCount() >= TASK_START_MAX_ITERATIONS
+  const verdict = parseTaskStartVerdict(result.summary)
+  const base = verdict.text ? verdict : { mode: 'objective' as const, text: userMessage }
+  const dirty = after !== before && after.trim() !== ''
+
+  // HARNESS-LEVEL OVERRIDE, not a text convention the model can express: a git-status
+  // diff is unambiguous and needs no model cooperation, unlike trusting whatever the
+  // Boss's own wording claims. Three distinct outcomes once we know the workspace
+  // changed: the attempt looks complete and SMALL (didn't exhaust its tiny budget, and
+  // the diff is genuinely tiny) — verify it independently and move on; it ran out of
+  // budget mid-attempt, OR it claims completion but the diff is suspiciously large for
+  // something classified TRIVIAL (a real observed failure: a full heredoc file rewrite
+  // that hallucinated most of the file and broke an unrelated constructor signature) —
+  // either way, don't gamble on it, hand it to a real Implementer with the attempt as
+  // context and an explicit instruction to critically review (and revert, if it isn't
+  // actually minimal/correct) rather than build on top of a hasty rewrite.
+  if (dirty) {
+    const changedLines = await gitDiffLineCount(root())
+    const suspiciouslyLarge = changedLines > TRIVIAL_DIFF_LINE_LIMIT
+    return {
+      mode: (hitCap || suspiciouslyLarge) ? 'preempted-incomplete' : 'preempted',
+      text: base.text,
+      frameId: result.frameId,
+      agent,
+    }
+  }
+  return { ...base, frameId: result.frameId, agent }
+}
+
+interface BossOutcome {
+  action: 'none' | 'inject' | 'restart' | 'escalate'
+  message: string
+}
+
+async function runBoss(
+  checkpoint: 'standup' | 'final',
+  contextText: string,
+  emit: Emit,
+): Promise<BossOutcome> {
+  const req: FrameSpawnRequest = {
+    role: 'boss',
+    parentFrameId: null,
+    assignment: `CHECKPOINT: ${checkpoint}\n${contextText}`,
+  }
+  const { result } = await spawnFrame(req, emit)
+  return parseBossVerdict(result.summary)
+}
+
+// Lynceus verifies a claim (an Implementer step's, or — 2026-09-03 — the Boss's own
+// task-start attempt) and can send it back for a targeted redo. Factored out so the
+// SAME independent-verification path applies uniformly regardless of who did the
+// work: "always at least two distinct frames involved" (docs/subagents-plan.md)
+// means even the Boss's own TRIVIAL self-fix gets a real Tester pass, never just a
+// self-report accepted as-is.
+async function runTesterRounds(frame: SpawnedFrame, combinedPrompt: string, emit: Emit): Promise<SpawnedFrame> {
+  for (let round = 0; round < MAX_TESTER_ROUNDS; round++) {
+    const testerReq: FrameSpawnRequest = {
+      role: 'tester',
+      parentFrameId: frame.result.frameId,
+      assignment:
+        `Verify this claim.\nOriginal assignment: ${combinedPrompt}\n` +
+        `Conclusion (${frame.result.status}): ${frame.result.summary}\n` +
+        `Files touched: ${frame.result.filesTouched.join(', ') || 'none (or made via bash, not tracked)'}`,
+    }
+    const { result: testerResult } = await spawnFrame(testerReq, emit)
+    const verdict = parseTesterVerdict(testerResult.summary)
+    if (verdict.action === 'release') break
+    const resumed = await resumeFrame(frame.result.frameId, frame.agent, verdict.followUp)
+    frame = { agent: frame.agent, result: resumed }
+  }
+  return frame
+}
+
+function parseTaskGraph(objective: string, plannerAnswer: string): TaskGraph {
+  const m = /```json\s*([\s\S]*?)```/i.exec(plannerAnswer)
+  if (m) {
+    try {
+      const parsed = JSON.parse(m[1]) as {
+        steps?: Array<{ role?: string; prompt?: string; dependsOn?: string[]; frameGroup?: string; skipTest?: boolean }>
+      }
+      const steps = (parsed.steps ?? [])
+        .filter((s): s is { role: string; prompt: string; dependsOn?: string[]; frameGroup?: string; skipTest?: boolean } =>
+          typeof s.prompt === 'string' && (s.role === 'implementer' || s.role === 'tester'))
+        .map(s => ({
+          role: s.role as Role,
+          prompt: s.prompt,
+          dependsOn: Array.isArray(s.dependsOn) ? s.dependsOn.filter((d): d is string => typeof d === 'string') : [],
+          ...(s.frameGroup ? { frameGroup: s.frameGroup } : {}),
+          ...(s.skipTest === true ? { skipTest: true } : {}),
+        }))
+      if (steps.length > 0) return createTaskGraph(objective, steps)
+    } catch {
+      // Fall through to the fail-open default below — an unparseable plan must never
+      // block the run, same principle as every other checkpoint in this project.
+    }
+  }
+  return createTaskGraph(objective, [{ role: 'implementer', prompt: objective, dependsOn: [] }])
+}
+
+function emitTaskGraph(emit: Emit, graph: TaskGraph): void {
+  emit({ type: 'task_graph', objective: graph.objective, steps: graph.steps, revision: graph.revision })
+}
+
+const PLANNER_FORMAT_INSTRUCTION =
+  'End your answer with a JSON code block fenced in ```json ... ``` shaped exactly as: ' +
+  '{"steps": [{"role": "implementer"|"tester", "prompt": "...", "dependsOn": ["s1", ...], "frameGroup": "optional", ' +
+  '"skipTest": false}]}. Reference earlier steps in dependsOn by their 1-based position (s1, s2, ...).'
+
+export async function runDispatchLoop(
+  userMessage: string,
+  rawEmit: Emit,
+  overrides?: { model?: string; options?: ModelOptions; sessionId?: string },
+): Promise<string> {
+  currentModel = overrides?.model
+  currentOptions = overrides?.options
+  stopRequested = false
+  activeFrameAgent = null
+  const model = currentModel ?? config.model
+
+  // The dispatch run's own top-level narrative (start/objective/task_graph/
+  // boss_verdict/replan/message/done) gets a REAL persisted log — a SessionLogger
+  // exactly like agent.ts's baseline chat() creates, under the SAME sessionId
+  // server.ts already tracks for the UI's session dropdown/history (passed in via
+  // overrides.sessionId). Without this, the ONLY record of "what did the harness
+  // decide" was the live SSE stream — gone the moment the run ended, and every
+  // individual FRAME (each its own real Agent.chat() call) already gets its own
+  // separate JSONL+MD, so "every session is logged" was silently false for the
+  // one file that would show the overall shape of the run. Only UNTAGGED events
+  // (no __frameId) are logged HERE — a tagged event already has its own home in
+  // its frame's own log; logging it again here would just duplicate it.
+  const logger = new SessionLogger(userMessage, model, currentOptions ?? {}, overrides?.sessionId)
+  const emit: Emit = (event, seq) => {
+    if ('__frameId' in event) { rawEmit(event, seq); return }
+    logger.log(event)
+    rawEmit(event, logger.getSeq())
+  }
+
+  // Top-level lifecycle events, UNTAGGED (no frame owns them) — mirrors agent.ts's own
+  // chat() exactly (start ... message/done), so the existing status bar, trace block,
+  // notifications, and git/file refresh in app.js work unmodified for the WHOLE
+  // dispatch run; every tagged per-frame event nests inside this same trace block.
+  emit({ type: 'start', model, query: userMessage, options: currentOptions ?? {} })
+  try {
+    const finalAnswer = await runDispatchLoopBody(userMessage, emit)
+    emit({ type: 'message', role: 'assistant', content: finalAnswer })
+    emit({ type: 'done', content: finalAnswer })
+    await logger.flush()
+    return finalAnswer
+  } catch (err) {
+    if (err instanceof DispatchAborted) {
+      // No 'message' event on a user-requested stop — mirrors agent.ts's own
+      // stop path exactly (done only, no assistant chat bubble for "Stopped.").
+      const stopped = 'Stopped.'
+      emit({ type: 'done', content: stopped })
+      await logger.flush()
+      return stopped
+    }
+    const message = `Unexpected error: ${err instanceof Error ? err.message : String(err)}`
+    emit({ type: 'error', message })
+    await logger.flush()
+    return message
+  }
+}
+
+async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<string> {
+  await ledger.ensureGitignored(root())
+
+  const taskStart = await runBossTaskStart(userMessage, emit)
+
+  // ANSWER: Jason already knows, verified it himself — no Planner/Implementer/Tester
+  // frame ever spawns. The whole point of this mode is zero further iteration.
+  if (taskStart.mode === 'answer') {
+    await ledger.setObjective(root(), taskStart.text)
+    emit({ type: 'objective', text: taskStart.text })
+    return taskStart.text
+  }
+
+  const objective = taskStart.text
+  await ledger.setObjective(root(), objective)
+  emit({ type: 'objective', text: objective })
+
+  // plannerFrame stays null until/unless something actually goes wrong (replan()
+  // below spawns one lazily at that point) for every mode except 'objective' — the
+  // whole point of TRIVIAL/SIMPLE/preempted is skipping Tiphys's ceremony for work
+  // that isn't anticipated to need MULTIPLE distinct pieces.
+  let plannerFrame: SpawnedFrame | null = null
+  // Whichever frame's Agent instance most recently did real work — reused purely as
+  // the vehicle for the end-of-run autoCommit (it only needs git + a model, not a
+  // specific role), so a run that never spawns a Planner still has one.
+  let commitAgent: Agent | null = null
+  let graph: TaskGraph
+
+  const doneStepIds = new Set<string>()
+  const stepFrameId = new Map<string, string>()
+
+  if (taskStart.mode === 'trivial' || taskStart.mode === 'simple') {
+    // Both delegate to exactly one Implementer, always followed by a Tester pass
+    // (no skipTest here — "at least two independent frames" is the floor, not
+    // something a task-start classification alone should be able to waive; only
+    // Tiphys's own per-step OBJECTIVE-graph decisions use skipTest, see tasks.ts).
+    graph = createTaskGraph(objective, [{ role: 'implementer', prompt: objective, dependsOn: [] }])
+  } else if (taskStart.mode === 'preempted-incomplete') {
+    // The Boss attempted a TRIVIAL fix itself but either ran out of its small
+    // task-start budget mid-attempt, or produced a suspiciously large diff for
+    // something it judged trivial (see runBossTaskStart's TRIVIAL_DIFF_LINE_LIMIT —
+    // the Boss's only editing tool is bash, so its "fix" may be a full heredoc file
+    // rewrite, an inherently blunt instrument prone to hallucinating large parts of
+    // a file it never needed to touch). Hand it to a REAL Implementer with an
+    // explicit instruction to CRITICALLY review — not just build on top of — what
+    // was done. Goes through the normal Implementer+Tester path below like any
+    // other single-step task.
+    graph = createTaskGraph(objective, [{
+      role: 'implementer',
+      prompt: `${objective}\n\nA PREVIOUS ATTEMPT (by the task-start classifier, under a small iteration budget, ` +
+        'with only bash available — no precise file-editing tool) got partway through, or produced a change too ' +
+        `large to trust unreviewed. What it attempted: ${taskStart.text}\n` +
+        'First, examine the CURRENT diff against the actual objective above: if it looks like a careful, correct, ' +
+        'minimal change, finish whatever is left. If it looks like an unwarranted full-file rewrite, unrelated ' +
+        'code hallucinated in, or a broken API other files depend on, REVERT it (e.g. `git checkout -- <file>`) ' +
+        'and implement the objective cleanly yourself instead of building on top of a hasty rewrite.',
+      dependsOn: [],
+    }])
+  } else if (taskStart.mode === 'preempted') {
+    // The Boss already made (and, within its own small budget, apparently
+    // completed) the change during task-start — detected via a workspace diff, see
+    // runBossTaskStart. No Implementer frame spawns, but this still gets a genuine,
+    // independent Tester pass before being marked done — never just Jason grading
+    // his own work as the only check (the whole point of keeping >=2 frames
+    // involved even on the fastest path).
+    graph = createTaskGraph(objective, [{ role: 'implementer', prompt: objective, dependsOn: [] }])
+    const preemptedFrame: SpawnedFrame = {
+      agent: taskStart.agent,
+      result: { frameId: taskStart.frameId, status: 'success', summary: taskStart.text, filesTouched: [], filesWritten: [] },
+    }
+    const verified = await runTesterRounds(preemptedFrame, objective, emit)
+    stepFrameId.set(graph.steps[0].id, verified.result.frameId)
+    doneStepIds.add(graph.steps[0].id)
+    commitAgent = verified.agent
+  } else {
+    plannerFrame = await spawnFrame(
+      {
+        role: 'planner',
+        parentFrameId: null,
+        assignment: `Objective: ${objective}\nProduce a task graph for this objective. ${PLANNER_FORMAT_INSTRUCTION}`,
+      },
+      emit,
+    )
+    commitAgent = plannerFrame.agent
+    graph = parseTaskGraph(objective, plannerFrame.result.summary)
+  }
+  await ledger.setPlan(root(), graph)
+  emitTaskGraph(emit, graph)
+
+  let standupWatermark = Date.now()
+  let replanRounds = 0
+
+  async function replan(reason: string): Promise<void> {
+    replanRounds++
+    emit({ type: 'replan', reason })
+    const followUp =
+      `REPLANNING ROUND.\n${reason}\nProduce a revised task graph for the objective's REMAINING work only ` +
+      `(do not redo what already succeeded). ${PLANNER_FORMAT_INSTRUCTION}`
+    let result: FrameResult
+    if (plannerFrame) {
+      result = await resumeFrame(plannerFrame.result.frameId, plannerFrame.agent, followUp)
+      plannerFrame = { agent: plannerFrame.agent, result }
+    } else {
+      // A TRIVIAL start never spawned a Planner — this is the first time one is
+      // actually needed, so spawn it fresh rather than resuming a frame that never
+      // existed.
+      plannerFrame = await spawnFrame(
+        { role: 'planner', parentFrameId: null, assignment: `Objective: ${objective}\n${followUp}` },
+        emit,
+      )
+      result = plannerFrame.result
+    }
+    commitAgent = plannerFrame.agent
+    graph = parseTaskGraph(objective, result.summary)
+    await ledger.setPlan(root(), graph)
+    emitTaskGraph(emit, graph)
+    doneStepIds.clear() // fresh step-id space for the new graph — see module doc
+  }
+
+  // Runs a Boss standup over the same recent-ledger window either trigger reads, and
+  // applies whichever verdict comes back (docs/subagents-plan.md). Always resets
+  // standupWatermark — a large-frame-triggered standup covers the same recent activity
+  // an aggregate-triggered one would have, so the aggregate counter should not ALSO
+  // fire again immediately after. Returns the frame to keep tracking (the original,
+  // unless 'restart' replaced it with a fresh one).
+  async function runStandup(
+    trigger: 'large-frame' | 'trouble' | 'aggregate',
+    frame: SpawnedFrame,
+    role: Role,
+    combinedPrompt: string,
+    depFrameIds: string[],
+    steps: TaskStep[],
+  ): Promise<SpawnedFrame> {
+    standupWatermark = Date.now()
+    const recent = await ledger.getRecent(root(), 20)
+    const triggerDetail = trigger === 'large-frame'
+      ? ` (frame ran ${frame.agent.getIterationCount()} iterations)`
+      : trigger === 'trouble'
+        ? ' (frame hit loop-recovery escalation or needed an Ollama retry — converged, but with real friction)'
+        : ''
+    const outcome = await runBoss(
+      'standup',
+      `Objective: ${objective}\nTrigger: ${trigger}${triggerDetail}\n` +
+        `Recent ledger activity (most recent last):\n${JSON.stringify(recent).slice(0, 4000)}`,
+      emit,
+    )
+    if (outcome.action === 'inject') {
+      emit({ type: 'boss_verdict', action: 'inject', message: outcome.message, targetFrameId: frame.result.frameId })
+      await ledger.recordInjection(root(), { targetFrameId: frame.result.frameId, message: outcome.message, reason: 'boss-standup', injectedBy: 'boss' })
+      return frame
+    }
+    if (outcome.action === 'restart') {
+      emit({ type: 'boss_verdict', action: 'restart', message: outcome.message, targetFrameId: frame.result.frameId })
+      await ledger.recordInjection(root(), { targetFrameId: frame.result.frameId, message: outcome.message, reason: 'boss-restart', injectedBy: 'boss' })
+      const retryReq: FrameSpawnRequest = {
+        role,
+        parentFrameId: plannerFrame?.result.frameId ?? null,
+        assignment: `${combinedPrompt}\n\nA PREVIOUS ATTEMPT at this task got stuck. What it did and where: ${frame.result.summary}\nTry a different approach.`,
+        dependsOn: depFrameIds,
+      }
+      const retry = await spawnFrame(retryReq, emit)
+      commitAgent = retry.agent
+      for (const s of steps) stepFrameId.set(s.id, retry.result.frameId)
+      return retry
+    }
+    if (outcome.action === 'escalate') {
+      emit({ type: 'boss_verdict', action: 'escalate', message: outcome.message, targetFrameId: null })
+      await replan(`Boss escalation during standup: ${outcome.message}`)
+    }
+    return frame
+  }
+
+  while (!allStepsDone(graph, doneStepIds)) {
+    if (replanRounds > MAX_REPLAN_ROUNDS) {
+      return `Could not complete the objective after ${MAX_REPLAN_ROUNDS} replanning rounds. Objective: ${objective}. Last plan:\n${plannerFrame?.result.summary ?? '(none)'}`
+    }
+
+    const groups = readyGroups(graph, doneStepIds, new Set())
+    if (groups.size === 0) {
+      await replan('No steps are currently ready to run — the dependency graph may be malformed or contradictory.')
+      continue
+    }
+
+    for (const steps of groups.values()) {
+      const role = steps[0].role
+      const depFrameIds = [...new Set(steps.flatMap(s => s.dependsOn))]
+        .map(id => stepFrameId.get(id))
+        .filter((x): x is string => !!x)
+      const combinedPrompt = steps.map(s => s.prompt).join('\n\n---\n\n')
+
+      let frame = await spawnFrame(
+        { role, parentFrameId: plannerFrame?.result.frameId ?? null, assignment: combinedPrompt, dependsOn: depFrameIds },
+        emit,
+      )
+      commitAgent = frame.agent
+
+      // skipTest is now ONLY a per-step decision Tiphys makes for a Planner-produced
+      // OBJECTIVE graph (tasks.ts) — task-start's own trivial/simple/preempted paths
+      // never set it, since "at least two independent frames" is a floor those paths
+      // don't get to waive on their own.
+      if (role === 'implementer' && !steps[0].skipTest) {
+        frame = await runTesterRounds(frame, combinedPrompt, emit)
+      }
+
+      for (const s of steps) {
+        stepFrameId.set(s.id, frame.result.frameId)
+        doneStepIds.add(s.id)
+      }
+
+      if (frame.result.status === 'failed' || frame.result.status === 'gave_up' || frame.result.status === 'killed') {
+        await replan(`Step(s) [${steps.map(s => s.id).join(', ')}] ended with status "${frame.result.status}": ${frame.result.summary}`)
+        break // the group's steps are re-planned from scratch; stop iterating this stale `groups` map
+      }
+
+      // Three independent standup triggers, any one fires a Boss review of the SAME
+      // recent ledger window (docs/subagents-plan.md, 2026-09-03 redesign): a frame
+      // that alone burned past LARGE_FRAME_ITERATIONS, or one that showed real
+      // friction even though it converged (hit L1/L2 loop-recovery, or needed an
+      // Ollama retry — hadTrouble()), is checked IMMEDIATELY (post-hoc — frames run
+      // to completion under the no-concurrency rule, so "immediate" means "the
+      // moment it concludes," not mid-frame) rather than waiting for the aggregate
+      // counter — a raw action-episode count alone can't tell "healthy, paced work"
+      // apart from "converged, but only after real thrashing." The aggregate
+      // ACTION_EPISODES_PER_STANDUP counter remains the fallback for many small,
+      // individually-unremarkable frames that never trip either signal.
+      const justRanLong = frame.agent.getIterationCount() > LARGE_FRAME_ITERATIONS
+      const hadTrouble = frame.agent.hadTrouble()
+      const actionsSince = (justRanLong || hadTrouble) ? 0 : await ledger.countActionEpisodesSince(root(), standupWatermark)
+      if (justRanLong || hadTrouble || actionsSince >= ACTION_EPISODES_PER_STANDUP) {
+        const trigger = justRanLong ? 'large-frame' : hadTrouble ? 'trouble' : 'aggregate'
+        frame = await runStandup(trigger, frame, role, combinedPrompt, depFrameIds, steps)
+      }
+    }
+  }
+
+  // Boss, checkpoint final: independently verify the objective was actually met before
+  // returning to the user; on dissatisfaction, resume the Planner rather than failing.
+  for (let round = 0; round < MAX_FINAL_VERIFY_ROUNDS; round++) {
+    const recent = await ledger.getRecent(root(), 30)
+    const outcome = await runBoss(
+      'final',
+      `Objective: ${objective}\nAll planned steps report done. Recent ledger:\n${JSON.stringify(recent).slice(0, 4000)}`,
+      emit,
+    )
+    if (outcome.action !== 'escalate') break
+    emit({ type: 'boss_verdict', action: 'escalate', message: outcome.message, targetFrameId: null })
+    await replan(`Boss final verification found gaps: ${outcome.message}`)
+    while (!allStepsDone(graph, doneStepIds)) {
+      const groups = readyGroups(graph, doneStepIds, new Set())
+      if (groups.size === 0) break
+      for (const steps of groups.values()) {
+        const role = steps[0].role
+        const combinedPrompt = steps.map(s => s.prompt).join('\n\n---\n\n')
+        const frame = await spawnFrame({ role, parentFrameId: plannerFrame?.result.frameId ?? null, assignment: combinedPrompt }, emit)
+        commitAgent = frame.agent
+        for (const s of steps) { stepFrameId.set(s.id, frame.result.frameId); doneStepIds.add(s.id) }
+      }
+    }
+  }
+
+  const lastConclusions = [...stepFrameId.values()]
+  const summaries = await Promise.all(lastConclusions.map(id => ledger.getConclusion(root(), id)))
+  const doneSummary = summaries.filter((c): c is NonNullable<typeof c> => !!c).map(c => `- ${c.summary}`).join('\n')
+
+  // Mirrors the baseline loop's own end-of-run auto-commit (agent.ts), opt-in via the
+  // same config.autoCommit flag. Reuses whichever frame's Agent instance most recently
+  // did real work purely as a vehicle — autoCommit() only needs git + a model to write
+  // the message, it doesn't care which role's instance runs it. commitAgent is only
+  // null here if NO frame ever spawned, which can't happen once we're past the
+  // 'answer' early-return above.
+  if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
+
+  return `Objective: ${objective}\n\n${doneSummary || plannerFrame?.result.summary || 'Done.'}`
+}
