@@ -7,8 +7,12 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "test": "tsx --test src/*.test.ts src/tools/*.test.ts",
-    "eval": "node scripts/eval.mjs",
-    "eval:e2e": "node scripts/eval-e2e.mjs"
+    "eval": "node scripts/eval/probe.mjs",
+    "eval:e2e": "node scripts/eval/e2e.mjs",
+    "eval:hermes": "node scripts/eval/hermes.mjs",
+    "eval:judge": "node scripts/eval/quality-judge.mjs",
+    "eval:supervisor": "node scripts/eval/supervisor/run.mjs",
+    "eval:trend": "node scripts/eval/trend.mjs"
   },
   "dependencies": {
     "cors": "^2.8.5",

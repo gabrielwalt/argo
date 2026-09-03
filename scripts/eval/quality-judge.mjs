@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Quality judge for eval-e2e.mjs runs (docs/overnight-log.md, Phase 5). Deterministic
+ * Quality judge for e2e.mjs runs (docs/overnight-log.md, Phase 5). Deterministic
  * pass/fail (the eval's own `check`) answers "did it work" — this answers "was it done
  * well": did the run stay on-goal, waste frames/iterations, show drift or hallucination,
  * and did the multi-agent orchestration (which frames ran, in what order, any standups/
@@ -13,10 +13,10 @@
  * than inventing a new judging mechanism — that is the only critic setup this project
  * has ever confirmed reliable (docs/eval-log.md, 2026-07-27 SUPERVISOR entries).
  *
- * Usage: node scripts/eval-quality-judge.mjs <taskId> [<taskId> ...]
- *        node scripts/eval-quality-judge.mjs --all
- * Reads:  ~/.local/share/argo/eval-ledgers/<taskId>.jsonl (saved by eval-e2e.mjs)
- *         ~/.local/share/argo/eval-diffs/<taskId>.diff    (saved by eval-e2e.mjs)
+ * Usage: node scripts/eval/quality-judge.mjs <taskId> [<taskId> ...]
+ *        node scripts/eval/quality-judge.mjs --all
+ * Reads:  ~/.local/share/argo/eval-runs/ledgers/<taskId>.jsonl (saved by e2e.mjs)
+ *         ~/.local/share/argo/eval-runs/diffs/<taskId>.diff    (saved by e2e.mjs)
  * Env:    OLLAMA_HOST (default http://localhost:11434), JUDGE_MODEL (default qwen3.6:latest)
  */
 import { readFileSync, readdirSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -24,9 +24,10 @@ import path from 'node:path';
 import os from 'node:os';
 import { Ollama } from 'ollama';
 
-const LEDGER_DIR = process.env.EVAL_LEDGER_DIR || path.join(os.homedir(), '.local/share/argo/eval-ledgers');
-const DIFF_DIR = process.env.EVAL_DIFF_DIR || path.join(os.homedir(), '.local/share/argo/eval-diffs');
-const OUT_DIR = process.env.EVAL_JUDGE_DIR || path.join(os.homedir(), '.local/share/argo/eval-judgments');
+const RUNS_DIR = process.env.EVAL_RUNS_DIR || path.join(os.homedir(), '.local/share/argo/eval-runs');
+const LEDGER_DIR = process.env.EVAL_LEDGER_DIR || path.join(RUNS_DIR, 'ledgers');
+const DIFF_DIR = process.env.EVAL_DIFF_DIR || path.join(RUNS_DIR, 'diffs');
+const OUT_DIR = process.env.EVAL_JUDGE_DIR || path.join(RUNS_DIR, 'judgments');
 const MODEL = process.env.JUDGE_MODEL || 'qwen3.6:latest';
 const ollama = new Ollama({ host: process.env.OLLAMA_HOST || 'http://localhost:11434' });
 
@@ -116,7 +117,7 @@ const taskIds = args[0] === '--all'
   : args;
 
 if (taskIds.length === 0) {
-  console.error('Usage: node scripts/eval-quality-judge.mjs <taskId> [<taskId> ...] | --all');
+  console.error('Usage:  node scripts/eval/quality-judge.mjs <taskId> [<taskId> ...] | --all');
   process.exit(1);
 }
 

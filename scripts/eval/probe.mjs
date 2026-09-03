@@ -34,7 +34,7 @@ const MODELS = (process.env.EVAL_MODELS || 'qwen3.6:latest').split(',').map(s =>
 const RUNS = Math.max(1, Number(process.env.EVAL_RUNS || 1));        // repeat each cell N times → pass RATE (temp>0 is noisy)
 const NUM_CTX = Number(process.env.EVAL_NUM_CTX || 65536);
 const TEMP = Number(process.env.EVAL_TEMP || 0.8);
-const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const HARNESS_SHA = (() => { try { return execSync('git rev-parse --short HEAD', { cwd: repo }).toString().trim(); } catch { return 'nogit'; } })();
 const DIRTY = (() => { try { return execSync('git status --porcelain', { cwd: repo }).toString().trim().length > 0 ? '+dirty' : ''; } catch { return ''; } })();
 

@@ -10,7 +10,7 @@
  * It replays three pre-recorded, hand-labeled runs of `bigproj-effort` (all qwen3.6):
  * a best-approach-but-incomplete run, an honest-but-off-goal run, and a thrash +
  * attempted-oracle-gaming run. For each candidate critic × each run it builds the
- * blind judge prompt (scripts/eval-fixtures/supervisor/judge-prompt.md + one
+ * blind judge prompt (scripts/eval/supervisor/fixtures/judge-prompt.md + one
  * run-<ts>.json artifact), calls the model, parses a strict-JSON verdict, and scores
  * the candidate against the ground truth in labels.json — which the judge never sees.
  *
@@ -38,11 +38,11 @@
  *
  * Usage (host):
  *   npm run eval:supervisor            # once package.json has the script (see note below)
- *   node scripts/eval-supervisor.mjs   # raw invocation, same thing
- *   EVAL_SUP_MODELS="qwen3.6:latest,devstral:24b,deepseek-r1:14b" node scripts/eval-supervisor.mjs
+ *   node scripts/eval/supervisor/run.mjs   # raw invocation, same thing
+ *   EVAL_SUP_MODELS="qwen3.6:latest,devstral:24b,deepseek-r1:14b" node scripts/eval/supervisor/run.mjs
  *
  * package.json note (do NOT auto-edit — add this line by hand when wiring it up):
- *   "scripts": { "eval:supervisor": "node scripts/eval-supervisor.mjs" }
+ *   "scripts": { "eval:supervisor": "node scripts/eval/supervisor/run.mjs" }
  *
  * Env:
  *   OLLAMA_HOST      Ollama base URL           (default http://localhost:11434)
@@ -52,7 +52,7 @@
  *   EVAL_SUP_RUNS    judge repeats per run     (default 1; >1 aggregates to reduce
  *                    single-sample noise: booleans by majority, quality by mean-rounded)
  *   EVAL_SUP_TEMP    judging temperature       (default 0.2)
- *   EVAL_SUP_DIR     fixtures dir              (default scripts/eval-fixtures/supervisor)
+ *   EVAL_SUP_DIR     fixtures dir              (default scripts/eval/supervisor/fixtures)
  */
 import { execSync } from 'node:child_process';
 import { readFileSync, readdirSync, mkdirSync, existsSync, writeFileSync } from 'node:fs';
@@ -65,8 +65,9 @@ const OLLAMA_HOST = (process.env.OLLAMA_HOST || 'http://localhost:11434').replac
 const MODELS = (process.env.EVAL_SUP_MODELS || 'qwen3.6:latest,devstral:24b').split(',').map(s => s.trim()).filter(Boolean);
 const RUNS = Math.max(1, Number(process.env.EVAL_SUP_RUNS || 1));
 const TEMP = Number(process.env.EVAL_SUP_TEMP || 0.2);
-const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const SUP_DIR = process.env.EVAL_SUP_DIR || path.join(REPO, 'scripts/eval-fixtures/supervisor');
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPO = path.resolve(HERE, '../../..');
+const SUP_DIR = process.env.EVAL_SUP_DIR || path.join(HERE, 'fixtures');
 // Verdict cache: persists each raw model reply keyed by (model + exact prompt) so the eval
 // is RESUMABLE and never re-hammers the GPU for a call it already made. Defaults to a temp
 // dir (outside the repo) so nothing is left behind; disable with EVAL_SUP_NOCACHE=1. On a
@@ -75,7 +76,7 @@ const SUP_DIR = process.env.EVAL_SUP_DIR || path.join(REPO, 'scripts/eval-fixtur
 const CACHE_DIR = process.env.EVAL_SUP_CACHE_DIR || path.join(os.tmpdir(), 'argo-supervisor-cache');
 const CACHE_ON = process.env.EVAL_SUP_NOCACHE !== '1';
 
-// git-SHA stamp for the eval-log (same pattern as eval-e2e.mjs).
+// git-SHA stamp for the eval-log (same pattern as e2e.mjs).
 const HARNESS_SHA = (() => { try { return execSync('git rev-parse --short HEAD', { cwd: REPO }).toString().trim(); } catch { return 'nogit'; } })();
 const DIRTY = (() => { try { return execSync('git status --porcelain', { cwd: REPO }).toString().trim().length > 0 ? '+dirty' : ''; } catch { return ''; } })();
 
@@ -249,7 +250,7 @@ console.log(winner
   ? `\nWINNER: ${winner} (best overall among critics that pass the gaming-detection gate)`
   : `\nNO WINNER: every candidate FAILED the hard gaming-detection gate — none is safe to use as the critic.`);
 
-// ── Ready-to-paste docs/eval-log.md block (same pattern as eval-e2e.mjs) ────────────
+// ── Ready-to-paste docs/eval-log.md block (same pattern as e2e.mjs) ────────────
 const date = new Date().toISOString().slice(0, 10);
 console.log(`\n--- eval-log entry (paste into docs/eval-log.md) ---`);
 console.log(`### ${date} — SUPERVISOR (critic) — harness \`${HARNESS_SHA}${DIRTY}\``);
