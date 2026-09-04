@@ -70,6 +70,38 @@ interface LogEntryJson {
   event: AgentEvent
 }
 
+// Collapses whitespace (including embedded newlines) to single spaces and trims, so two
+// pieces of content that differ only in formatting still compare equal — a thought and a
+// final answer built from the same model turn can carry different trailing whitespace or
+// paragraph breaks despite being the same text.
+function normalizeForCompare(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+// A single-line, length-bounded rendering of `text` for a markdown TABLE CELL — never the
+// full body, which belongs under its own heading further down and is what made the header
+// table unreadable (a ~450-word prompt printed before any real activity). Two things a
+// table cell cannot survive: an embedded newline (breaks the row) and an unescaped `|`
+// (breaks the column count) — both are handled here, not left to the caller.
+function excerptForTable(text: string, maxLen = 110): string {
+  const oneLine = normalizeForCompare(text)
+  const truncated = oneLine.length > maxLen ? `${oneLine.slice(0, maxLen).trimEnd()}…` : oneLine
+  return truncated.replace(/\|/g, '\\|')
+}
+
+// True when `thoughtText` is the SAME content as `finalText`, or the leading part of it —
+// the shape a model's last thought takes when it reasons its way to an answer and then
+// repeats that exact reasoning as the final answer verbatim. Deliberately one-directional:
+// a final answer that is a prefix of a LONGER thought is NOT this pattern (the thought then
+// carries information the final answer dropped, so it must stay). An empty thought never
+// counts as a match — every string "starts with" the empty string, which would otherwise
+// suppress a thought whenever the final answer happened to be empty too.
+function isThoughtDuplicateOfFinal(thoughtText: string, finalText: string): boolean {
+  const t = normalizeForCompare(thoughtText)
+  if (!t) return false
+  return normalizeForCompare(finalText).startsWith(t)
+}
+
 export class SessionLogger {
   private entries: LogEntry[] = []
   private startTs = Date.now()
@@ -200,7 +232,11 @@ export class SessionLogger {
       opts.num_ctx != null ? `ctx=${opts.num_ctx}` : null,
     ].filter(Boolean).join(' ') || 'defaults'
 
-    lines.push(`| **Query** | ${this.meta.query} |`)
+    // Short excerpt only — the full query is rendered once, in full, under `## 💬 User`
+    // below (the `message`/role:'user' event carries the identical string). Printing it
+    // twice put a several-hundred-word prompt in front of every real trace line; the table
+    // is for scanning, the heading below is where the reader actually reads it.
+    lines.push(`| **Query** | ${excerptForTable(this.meta.query)} |`)
     lines.push(`| **Model** | ${this.meta.model} |`)
     lines.push(`| **Options** | \`${optsStr}\` |`)
     lines.push(`| **Started** | ${this.meta.startedAt} |`)
@@ -212,9 +248,24 @@ export class SessionLogger {
     lines.push(``)
 
     let currentIter = 0
+    // Set only by the 'thought' case below, for exactly the thought that was the
+    // IMMEDIATELY PRECEDING entry — read here, before it can be cleared, so the
+    // 'message' case can tell "the model's last thought WAS its final answer" apart from
+    // "a thought happened earlier in the run" (which must never be touched: only the
+    // trailing duplicate is redundant, every earlier thought is genuinely distinct
+    // reasoning). Cleared for every event type except 'thought' itself, so a tool call or
+    // any other event between a thought and a later message correctly breaks the link.
+    let pendingThought: { start: number; text: string } | null = null
+    // Set whenever the '## ✅ Final Answer' heading is rendered, so the terminal 'done'
+    // event (below) can tell whether its own content is that same text arriving a third
+    // time, or the ONLY place the run's outcome text appears (an aborted run emits 'done'
+    // with no preceding 'message' at all — see that case for why this must stay null then).
+    let lastAssistantContent: string | null = null
 
     for (const { ts, event } of this.entries) {
       const time = ts.slice(11, 23)
+      const priorThought = pendingThought
+      if (event.type !== 'thought') pendingThought = null
 
       switch (event.type) {
         case 'start':
@@ -229,10 +280,23 @@ export class SessionLogger {
             lines.push(event.content)
             lines.push(``)
           } else {
+            // If the entry immediately before this one was a thought that IS this same
+            // final answer (verbatim, or the leading part of it — see
+            // isThoughtDuplicateOfFinal), drop that thought block rather than rendering
+            // the same text twice in a row: '## ✅ Final Answer' is the artifact a reader
+            // is looking for, and a thought that only restated the answer carries nothing
+            // a reasoning trace needs beyond what the heading below already shows. Any
+            // OTHER thought — one from an earlier iteration, or one that reasoned toward
+            // but did not simply repeat the answer — is untouched; only the trailing,
+            // provably-identical case is removed.
+            if (priorThought && isThoughtDuplicateOfFinal(priorThought.text, event.content)) {
+              lines.length = priorThought.start
+            }
             lines.push(`## ✅ Final Answer`)
             lines.push(``)
             lines.push(event.content)
             lines.push(``)
+            lastAssistantContent = event.content
           }
           break
 
@@ -255,6 +319,7 @@ export class SessionLogger {
         }
 
         case 'thought':
+          pendingThought = { start: lines.length, text: event.content }
           lines.push(`**💭 Thought** \`${time}\``)
           lines.push(``)
           lines.push(`> ${event.content.replace(/\n/g, '\n> ')}`)
@@ -294,9 +359,17 @@ export class SessionLogger {
 
         case 'done':
           // An aborted run emits only 'done' (see agent.ts's abort branch) — no
-          // 'message' event precedes it — so this is sometimes the only place
-          // the outcome appears at all, not just a duplicate of 'message'.
-          lines.push(`*Run finished* — ${event.content}`)
+          // 'message' event precedes it — so lastAssistantContent is null in that case
+          // and this is sometimes the only place the outcome appears at all, not just a
+          // duplicate of 'message'; the content must survive there. Everywhere else
+          // 'done' carries the SAME text '## ✅ Final Answer' just rendered, so only the
+          // marker (plus how long the whole run took) is worth keeping — the text itself
+          // would be a third copy of something the reader already read twice.
+          if (lastAssistantContent != null && normalizeForCompare(event.content) === normalizeForCompare(lastAssistantContent)) {
+            lines.push(`*Run finished* · ${dur}s`)
+          } else {
+            lines.push(`*Run finished* — ${event.content}`)
+          }
           lines.push(``)
           break
 
