@@ -678,6 +678,8 @@ function handleEvent(event) {
         const next = promptQueue.shift()
         renderQueue()
         startRun(next.text)
+      } else {
+        confirmRunEnded()
       }
       break
     }
@@ -753,6 +755,7 @@ function handleEvent(event) {
       setStatus('error', 'Error')
       finalizeTraceBlock()
       setBusy(false)
+      confirmRunEnded()
       break
   }
 }
@@ -971,6 +974,31 @@ function setBusy(val) {
 }
 
 let stopRequested = false
+
+// Defensive safety net for the top-level 'done'/'error' SSE events themselves —
+// mirrors stopAgent's own poll below. setBusy(false) in handleEvent is optimistic:
+// it trusts the SSE event just received. server.ts sets its own isBusy=false in a
+// finally block AFTER dispatch.ts's 'done'/'error' emission and its logger.flush()
+// — a normally-brief window where a concurrent /status call still reports
+// busy:true. Give that flush a couple of seconds head start, then confirm the
+// server actually agrees the run is over. If /status still says busy after that,
+// this isn't the harmless race — something is genuinely stuck server-side (or the
+// SSE event that just fired was itself stale/misrouted) — and the UI should say so
+// instead of quietly sitting on "Ready" while the server disagrees.
+async function confirmRunEnded() {
+  await new Promise(resolve => setTimeout(resolve, 2500))
+  if (busy) return  // a new run already started (e.g. queue auto-advance) — nothing to confirm
+  let status
+  try {
+    status = await fetch(`${API_BASE}/status`).then(r => r.json())
+  } catch {
+    return  // network hiccup — not worth flagging as a server-side problem
+  }
+  if (status.busy === true) {
+    setBusy(true)
+    setStatus('error', 'Server still reports busy after the run ended — reload if this persists')
+  }
+}
 
 async function stopAgent() {
   // Abort only takes effect once the current model/tool call finishes, which can

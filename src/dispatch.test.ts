@@ -927,3 +927,34 @@ test('buildImplementerCapFollowUp: never mentions the generic "concluded with" f
   const text = buildImplementerCapFollowUp('Some task', 'Some status')
   assert.equal(text.includes('concluded with'), false)
 })
+
+// ── UI-CLEAN-END regression guard (2026-09) ─────────────────────────────────
+//
+// The browser only ever leaves its busy/sailing state on an UNTAGGED (no
+// __frameId) 'done' or 'error' event — app.js's handleEvent() early-returns any
+// event carrying __frameId straight to the per-frame role-card path, which never
+// touches setBusy/setStatus. runDispatchLoop's own try/catch (its 'start' emit
+// through every return path) is the ONLY place in this file allowed to emit an
+// untagged 'done' or 'error' — every per-frame lifecycle event goes through
+// spawnFrame/resumeFrame's emit wrapper (frames.ts), which always tags with
+// __frameId before it reaches here. If a future edit ever emits a bare
+// { type: 'done' } / { type: 'error' } from inside the Planner/Implementer/Tester
+// pipeline (runObjectiveViaPlanner, runTesterValidation, etc.) instead of just
+// `return`-ing a string up to runDispatchLoop, the UI would see it as the WHOLE
+// run finishing while frames are still in flight — this is the failure mode this
+// test exists to catch before it ships again.
+test('UI-CLEAN-END: only runDispatchLoop itself emits an untagged done/error event', async () => {
+  const source = await fs.readFile(new URL('./dispatch.ts', import.meta.url), 'utf-8')
+  // Isolate everything OUTSIDE runDispatchLoop's own body (start...end of function)
+  // so its own three legitimate emit sites don't trip this check.
+  const fnStart = source.indexOf('export async function runDispatchLoop(')
+  assert.ok(fnStart >= 0, 'runDispatchLoop must exist')
+  const fnEnd = source.indexOf('\nexport ', fnStart + 1)
+  const before = source.slice(0, fnStart)
+  const after = fnEnd >= 0 ? source.slice(fnEnd) : ''
+  const outsideBody = before + after
+  const bareEmit = /emit\(\{\s*type:\s*'(done|error)'/g
+  assert.equal(bareEmit.test(outsideBody), false,
+    'found an untagged done/error emit outside runDispatchLoop — every other function must ' +
+    'return its result string and let runDispatchLoop emit done/error, never emit them itself')
+})

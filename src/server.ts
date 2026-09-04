@@ -150,6 +150,12 @@ app.post('/chat', async (req, res) => {
       await agent.chat(message)
     }
   } finally {
+    // Set BEFORE any async cleanup (logger flush already happened inside
+    // runDispatchLoop/chat before they returned). The `done` SSE event was
+    // emitted before this point; if isBusy stays true any longer, a client
+    // reconnecting (es.onopen → /status) sees busy:true AFTER the done event
+    // already cleared the UI, and re-sets it to busy with nothing left to
+    // clear it — the "refresh fixes it" race the owner reported.
     isBusy = false
   }
 })
