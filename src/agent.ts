@@ -150,10 +150,16 @@ function extractToolCallsFromContent(content: string): Array<{ name: string; arg
 }
 
 // Wraps a promise with a hard timeout; rejects if the promise doesn't resolve in time.
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+// The optional onTimeout callback fires exactly once, right before the timeout rejects —
+// used by chatCall to abort the underlying fetch (see its own comment) since Promise.race
+// merely stops WAITING on the losing promise, it never cancels it.
+function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout?: () => void): Promise<T> {
   let timer: NodeJS.Timeout
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`Ollama did not respond within ${ms / 1000}s`)), ms)
+    timer = setTimeout(() => {
+      if (onTimeout) onTimeout()
+      reject(new Error(`Ollama did not respond within ${ms / 1000}s`))
+    }, ms)
   })
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer!))
 }
@@ -1235,6 +1241,13 @@ export class Agent {
     const offeredTools = this.allowedTools
       ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
       : toolDefinitions
+    // TIMEOUT ABORT: on timeout, call this.ollama.abort() to cancel any ongoing
+    // streaming requests. For non-streaming requests (our case), the Ollama JS client
+    // does NOT support per-call abort — the underlying fetch stays open. The timeout
+    // rejection from withTimeout still fires, and chatWithRetry's soft recovery
+    // (returning { timeoutError } instead of throwing) handles the case where both
+    // the original call and the retry time out — the iteration loop injects an error
+    // message and continues rather than killing the run.
     return withTimeout(this.ollama.chat({
       model: this.model,
       messages,
@@ -1243,7 +1256,7 @@ export class Agent {
       stream: false,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       options: this.options as any,
-    }), config.chatTimeoutMs)
+    }), config.chatTimeoutMs, () => { try { this.ollama.abort() } catch { /* best effort */ } })
   }
 
   // The main per-iteration chat call with ONE automatic retry. This is safe to
@@ -1259,15 +1272,32 @@ export class Agent {
   // aborted during the retry wait, so the caller stops instead of retrying into
   // a run the user already asked to stop. Return type inferred as
   // Promise<ChatResponse | null>.
+  // Returns null on user abort. Returns an object with `{ timeoutError: string }` when
+  // both the original call and the retry timed out — the iteration loop injects this as
+  // context for the agent and continues rather than killing the run. Non-timeout errors
+  // (e.g. malformed response, connection refused) are still rethrown to the outer catch.
   private async chatWithRetry(systemPrompt: string, emitAndLog: (e: AgentEvent) => void) {
+    const isTimeout = (e: unknown) => e instanceof Error && e.message.includes('did not respond within')
     try {
       return await this.chatCall(systemPrompt)
     } catch (err) {
       this.ollamaRetryCount++
-      emitAndLog({ type: 'warning', message: `Ollama request failed (${err instanceof Error ? err.message : String(err)}) — retrying once` })
+      const msg = err instanceof Error ? err.message : String(err)
+      emitAndLog({ type: 'warning', message: `Ollama request failed (${msg}) — retrying once` })
       await new Promise(resolve => setTimeout(resolve, this.chatRetryDelayMs))
       if (this.aborted) return null
-      return await this.chatCall(systemPrompt)
+      try {
+        return await this.chatCall(systemPrompt)
+      } catch (retryErr) {
+        // Only soft-recover on timeouts — other errors (malformed response, etc.) are
+        // still fatal and rethrown to chat()'s outer catch as before.
+        if (isTimeout(retryErr)) {
+          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
+          emitAndLog({ type: 'warning', message: `Ollama retry also timed out (${retryMsg}) — injecting error and continuing` })
+          return { timeoutError: `The model did not respond (${retryMsg}). Your previous request was lost. Continue from where you left off — re-issue your last tool call or take a different approach.` }
+        }
+        throw retryErr
+      }
     }
   }
 
@@ -1652,6 +1682,7 @@ export class Agent {
     // Reset to 0 on any turn that DOES produce a tool call, so the count always
     // means "since the last real action," not "since the run started."
     let consecutiveThinkingTurns = 0
+    let consecutiveTimeouts = 0
     // How this turn ends is decided by whichever exit path below runs; assume the good
     // case so a normal final answer needs no bookkeeping, and overwrite on the cap /
     // error / abort paths. Reset for a resumed turn too: it describes the LAST turn.
@@ -1916,6 +1947,25 @@ export class Agent {
           this.phase = 'idle'
           return stopped
         }
+        // Timeout recovery: both the original call and the retry failed (e.g. Ollama
+        // MLX engine hung). Instead of killing the run, inject the error as context
+        // and continue the iteration loop — the agent sees the error and can adapt.
+        if ('timeoutError' in response) {
+          consecutiveTimeouts++
+          if (consecutiveTimeouts >= 3) {
+            // Three consecutive timeouts — the model is genuinely unresponsive.
+            const capMsg = `Stopped after ${consecutiveTimeouts} consecutive timeouts.`
+            this.lastRunOutcome = 'error'
+            emitAndLog({ type: 'error', message: capMsg })
+            emitAndLog({ type: 'done', content: capMsg })
+            this.phase = 'idle'
+            return capMsg
+          }
+          emitAndLog({ type: 'warning', message: response.timeoutError })
+          this.pushCtx({ role: 'tool', content: `Error: ${response.timeoutError}` })
+          continue iterations
+        }
+        consecutiveTimeouts = 0 // reset on any successful response
 
         const numCtx = this.options.num_ctx ?? 65536
         if (response.prompt_eval_count != null) {
@@ -2000,7 +2050,8 @@ export class Agent {
         this.pushCtx(msg)
 
         const callsToRun = nativeCalls.length > 0
-          ? nativeCalls.map(tc => ({ name: tc.function.name as ToolName, args: tc.function.arguments as Record<string, unknown> }))
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ? nativeCalls.map((tc: any) => ({ name: tc.function.name as ToolName, args: tc.function.arguments as Record<string, unknown> }))
           : fallbackCalls.map(fc => ({ name: fc.name as ToolName, args: fc.arguments }))
 
         for (const { name, args } of callsToRun) {

@@ -215,7 +215,7 @@ let pendingEvents = []          // live SSE events received while replaying
 let liveRunMaxSeq = 0           // high-water dedup mark for live vs. replayed events (current run)
 
 // ── Model options ────────────────────────────────────────────────
-const DEFAULTS = { temperature: 0.8, top_p: 0.9, top_k: 40, num_ctx: 65536 }
+const DEFAULTS = { temperature: 0.6, top_p: 0.95, top_k: 20, num_ctx: 65536 }
 const modelOpts = { ...DEFAULTS }
 const MAX_ITERATIONS_DEFAULT = 1000
 let maxIterations = MAX_ITERATIONS_DEFAULT
