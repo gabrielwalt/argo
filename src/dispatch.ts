@@ -82,6 +82,23 @@ function root(): string {
 // frames.ts), not this count; raise that first before raising this.
 const MAX_PLANNER_ROUNDS = 50
 
+// Safety cap for repeated Implementer cap-hits on the SAME objective (this task,
+// "iteration limits and progress nudges"): each cap-hit gets the Planner one chance to
+// reframe the task narrower (buildImplementerCapFollowUp, below) rather than failing the
+// run outright, but a Planner that keeps handing back tasks the Implementer can't finish
+// even after reframing means the loop isn't converging — 2 lets it try twice more before
+// the OBJECTIVE loop gives up and reports the failure to the user instead of burning the
+// full MAX_PLANNER_ROUNDS budget on a task that is never going to land.
+const MAX_IMPLEMENTER_CAP_RETRIES = 2
+
+// Safety cap for Tester FAIL→fix-and-retest cycles on ONE task (this task, "Testers are
+// back, harness-driven"). Per the brief: "Cap at 2 fix attempts per task before
+// escalating to the Planner." Each attempt spawns a NEW Implementer with the Tester's
+// own self-contained fix assignment, then re-runs the Tester — after this many attempts
+// still fail validation, runTesterValidation gives up on the task and the caller
+// (runObjectiveViaPlanner / the SIMPLE fast path) escalates instead of looping forever.
+const MAX_TESTER_FIX_ATTEMPTS = 2
+
 // Model/options for the CURRENT dispatch run, set once at the top of runDispatchLoop
 // and read by every spawnFrame call below. Module-level state is safe here only
 // because server.ts's `isBusy` guard already prevents a second /chat request from
@@ -259,6 +276,7 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
   if (currentOptions) agent.setOptions(currentOptions)
   agent.setAllowedTools(toolOverride ?? ROLE_TOOLS[req.role])
   agent.setRoleInstructions(systemPromptFor(req.role))
+  agent.setRole(req.role) // agent.ts's role-specific progress-check thresholds/messages
   agent.setFrameId(frameId)
   agent.setMaxIterations(req.maxIterations ?? ROLE_MAX_ITERATIONS[req.role])
   agent.setSessionId(frameId) // isolates history/compaction-state files per frame
@@ -647,6 +665,127 @@ export function buildNextTaskPrompt(completedMessage: string | null): string {
   )
 }
 
+// IMPLEMENTER CAP-HIT FOLLOW-UP (this task, "iteration limits and progress nudges").
+// Used INSTEAD OF buildNextTaskPrompt above for the one Planner resume immediately
+// following an Implementer frame that hit its own hard iteration cap
+// (agent.hitIterationCap(), see runDispatchLoopBody's OBJECTIVE loop) — the generic
+// "previous sub-agent concluded with..." wording doesn't distinguish a real conclusion
+// from a raw "Reached maximum iterations" cap-hit string, and feeding the Planner the
+// SAME framing for both risks it reading a cap-hit as ordinary completed work. This is
+// explicit instead: the assignment was too broad for one implementation pass, and the
+// Planner is asked to reframe it narrower (or decide the objective is already met)
+// rather than simply handed the same failed assignment again. Text is VERBATIM per
+// this task's brief; pure and exported so it is directly testable without spawning a
+// real frame.
+export function buildImplementerCapFollowUp(assignment: string, lastStatus: string): string {
+  return (
+    'The previous implementation sub-agent was unable to complete its task within the iteration budget.\n' +
+    `It was working on: ${assignment}\n` +
+    `Its last status: ${lastStatus}\n\n` +
+    'This task was too broad or complex for a single implementation pass. Please reframe it as a more ' +
+    'specific, narrower task and provide a revised assignment, or determine that a different approach ' +
+    'is needed. Call conclude with the revised assignment, or conclude that the objective is complete ' +
+    'if the work done so far is sufficient.'
+  )
+}
+
+// ── SUCCESS/FAIL — every Implementer's own verdict (this task, "Testers are back,
+// harness-driven, not Planner-driven"). Appended to every Implementer's assignment
+// (buildImplementerAssignment for TRIVIAL/SIMPLE; the Planner's own per-task text for
+// OBJECTIVE) so the HARNESS — not the Planner — can decide whether to spawn a Tester
+// (SUCCESS) or route the failure straight back to the Planner (FAIL) without needing
+// the Planner to parse or restate that decision. Text is VERBATIM per this task's
+// brief; kept separate from the "raw" assignment text (buildImplementerAssignment/
+// the Planner's own text is never itself mutated) so callers still have the plain
+// task description available for the Tester's "{implementer prompt}" field, which
+// should describe the TASK, not this harness bookkeeping suffix.
+export function appendImplementerResultFormat(assignment: string): string {
+  return `${assignment}\n\nWhen you are done, call \`conclude\` with your result in one of these formats:\n`
+    + '- `SUCCESS: {description of what you implemented and how you verified it}`\n'
+    + '- `FAIL: {description of what you tried, what failed, and why}`'
+}
+
+export interface ImplementerResult {
+  succeeded: boolean
+  message: string
+}
+
+// Parses an Implementer's `conclude` text against the SUCCESS:/FAIL: convention
+// appendImplementerResultFormat asks for. FAIL is checked first so a message that
+// happens to mention "success" inside an otherwise-failing explanation is never
+// misread. Per the brief: neither prefix present → treat as SUCCESS ("the model
+// didn't follow the format but did conclude") — this is the one place in this
+// pipeline that DELIBERATELY fails open, because the Tester exists precisely to
+// catch a wrongly-claimed success; unlike the Tester's own parse below, there is a
+// second real check downstream, so failing open here does not skip verification
+// entirely the way it would for the Tester.
+export function parseImplementerResult(text: string): ImplementerResult {
+  const trimmed = text.trim()
+  const fail = /^FAIL\s*:\s*([\s\S]+)/i.exec(trimmed)
+  if (fail) return { succeeded: false, message: fail[1].trim() }
+  const success = /^SUCCESS\s*:\s*([\s\S]+)/i.exec(trimmed)
+  if (success) return { succeeded: true, message: success[1].trim() }
+  return { succeeded: true, message: trimmed }
+}
+
+// ── THE TESTER — harness-spawned, not Planner-driven (this task). Prompt text is
+// VERBATIM per this task's brief; `{implementer prompt}` is the TASK the Implementer
+// was given (the raw assignment, WITHOUT appendImplementerResultFormat's bookkeeping
+// suffix — the Tester needs to know what was asked for, not how the Implementer was
+// told to format its own sign-off), and `{implementer's conclude message}` is exactly
+// what the Implementer's own `conclude` call returned (its FULL text, including its
+// own SUCCESS:/FAIL: prefix — the Tester should see precisely what was claimed).
+export function buildTesterAssignment(implementerAssignment: string, implementerConclusion: string): string {
+  return (
+    'Your task is to critically validate the implementation of the following assignment:\n\n' +
+    `<argo-implementation-assignment>\n${implementerAssignment}\n</argo-implementation-assignment>\n\n` +
+    'The implementation sub-agent concluded with:\n\n' +
+    `<argo-implemented>\n${implementerConclusion}\n</argo-implemented>\n\n` +
+    'Do not assume the implementation is correct. Actively look for ways it may be incomplete, incorrect, ' +
+    'fragile, inconsistent with the surrounding codebase, or technically compliant while still failing the ' +
+    'underlying objective.\n\n' +
+    'Inspect the implementation and relevant project files, and test or verify it as appropriate. Think beyond ' +
+    'the obvious happy path: consider edge cases, regressions, integration points, hidden assumptions, ' +
+    'unintended side effects, error handling, compatibility, and anything the implementer may have overlooked. ' +
+    'Be deliberately critical and investigate suspicious details rather than accepting the implementer\'s ' +
+    'conclusion at face value.\n\n' +
+    'Also account for any relevant instructions, conventions, constraints, or prior decisions in `AGENTS.md` ' +
+    'and `MEMORY.md`.\n\n' +
+    'Your task is complete once you call `conclude` with exactly one of these outcomes:\n\n' +
+    '- `SUCCESS` — if the implementation satisfies the assignment and you found no material issue that still ' +
+    'needs fixing.\n' +
+    '- `FAIL: {self-contained fix assignment}` — if anything material is wrong, incomplete, unverified, or ' +
+    'requires further implementation. The text after `FAIL:` must be a clear, self-contained prompt for the ' +
+    'implementation agent explaining what failed, what must be fixed, what should remain unchanged, and how ' +
+    'the fix should be validated.\n\n' +
+    'Do not modify the project yourself. Your role is to inspect, test, challenge, and report.\n\n' +
+    'You have a hard budget of 20 iterations to call `conclude`.'
+  )
+}
+
+export interface TesterResult {
+  passed: boolean
+  fixAssignment?: string // only meaningful when passed === false
+}
+
+// Parses a Tester's `conclude` text against the SUCCESS/FAIL: convention
+// buildTesterAssignment asks for. Deliberately the OPPOSITE fail-open direction from
+// parseImplementerResult above: an unparseable Tester reply (neither marker) is NOT
+// treated as passed — this project's own history (frames.ts's parseTesterVerdict,
+// the now-superseded RELEASE/REDO convention) already measured the real cost of that
+// exact default once: "an unparseable TESTER reply became RELEASE, i.e. work accepted
+// with no review." The Tester is the ONE check standing between a claimed SUCCESS and
+// the Planner/user; a markerless or capped-out reply reads as "still failing" here,
+// using whatever text the Tester DID produce as the best available fix assignment —
+// worse than a real fix prompt, but never silently treated as approval.
+export function parseTesterResult(text: string): TesterResult {
+  const trimmed = text.trim()
+  if (/^SUCCESS\b/i.test(trimmed)) return { passed: true }
+  const fail = /^FAIL\s*:\s*([\s\S]+)/i.exec(trimmed)
+  if (fail) return { passed: false, fixAssignment: fail[1].trim() }
+  return { passed: false, fixAssignment: trimmed }
+}
+
 // Detects a Planner `conclude` answer that means "no further work needed" rather
 // than a real Implementer assignment — the harness's only signal to stop the
 // OBJECTIVE loop and treat the objective as complete.
@@ -708,6 +847,30 @@ export function isPlannerDone(concludeText: string): boolean {
   if (PLANNER_DONE_PHRASES.some(re => re.test(text))) return true
   if (text.length < PLANNER_DONE_SHORT_CHARS && !IMPLEMENTATION_VERB.test(text)) return true
   return false
+}
+
+// GIVE-UP (this task, "the Planner can give up"). A SEPARATE signal from isPlannerDone
+// above — "the objective is met" and "I cannot complete this" are opposite outcomes and
+// must never be conflated. Checked BEFORE isPlannerDone at every call site (the explicit
+// failure signal takes priority — a give-up phrased ambiguously enough to also brush
+// against a "done" phrase must still read as a failure, never quietly as success). Per
+// the brief: `GIVE_UP:` as an explicit prefix, OR a reasonable natural-language
+// heuristic ("give up" / "cannot complete") for a model that concludes without the
+// prefix — same "try natural language first" reasoning as isPlannerDone's own phrase
+// list above, and the same reason this is a heuristic rather than a rigid required
+// marker.
+const PLANNER_GIVE_UP_PHRASES: RegExp[] = [
+  /^\s*GIVE_UP\s*:/i,
+  /\bgive(?:s|n)? up\b/i,
+  /\bcannot complete\b/i,
+  /\bcan\u2019t complete\b/i,
+  /\bunable to complete (?:the|this) objective\b/i,
+]
+
+export function isPlannerGiveUp(concludeText: string): boolean {
+  const text = concludeText.trim()
+  if (!text) return false
+  return PLANNER_GIVE_UP_PHRASES.some(re => re.test(text))
 }
 
 export async function runDispatchLoop(
@@ -802,6 +965,275 @@ function plannerCapFailure(stage: string, frameId: string, rawOutput: string): P
   )
 }
 
+// THE FULL ITERATIVE PLANNER PIPELINE (this rewrite — see the module header for the
+// overall design). Spawns a FRESH Planner frame with the INITIAL planning prompt
+// (buildInitialPlannerPrompt — an ordered list of concrete sub-tasks, delivered as its
+// `conclude` answer), then resumes that same Planner frame round by round to produce
+// exactly one self-contained Implementer assignment at a time, informed by the previous
+// Implementer's own conclusion, until the Planner reports the objective complete. There
+// is no separate "replan" step and no Tester round: the Planner IS the loop, and the
+// Implementer is trusted to test its own work when instructed to.
+//
+// TWO CALLERS (this task, "SIMPLE cap-hit escalation"): the OBJECTIVE task-start mode
+// (its original, sole caller) and — new — the SIMPLE mode's ESCALATION path, when its
+// one Implementer hits its own hard iteration cap. A SIMPLE task the Boss judged as
+// "3-20 iterations" that instead ran the full 80 without concluding was measurably
+// bigger than that judgment — rather than reporting a raw cap-hit string as failure,
+// it gets the SAME decomposition machinery an OBJECTIVE task gets, starting completely
+// fresh (a NEW Planner frame, the INITIAL prompt, not a resume of anything): the failed
+// Implementer's own edits are still sitting in the workspace (git, not this function's
+// business — whichever frame eventually calls autoCommit() below picks up ALL
+// uncommitted changes, not just its own), and the Planner is expected to ground itself
+// in that current project state (read_file/bash, same as any Planner) and plan forward
+// from it rather than being told about the failure explicitly — the brief for this
+// escalation calls for exactly the plain initial prompt, no special-cased wording.
+// One EXTRA Implementer spawn made while validating a task (a Tester FAIL→fix
+// round) — returned by runTesterValidation below so the CALLER (runObjectiveViaPlanner
+// / the SIMPLE fast path) can fold it into its own completedTasks/cap-hit bookkeeping,
+// which differs by caller (OBJECTIVE has a Planner to feed a cap-hit follow-up back
+// to and a shared retry budget across the whole objective; SIMPLE has none of that and
+// just escalates) — kept as data here rather than a decision made inside this helper.
+interface TesterFixAttempt {
+  assignment: string
+  conclusion: string
+  capped: boolean
+}
+
+interface TesterValidationResult {
+  passed: boolean
+  // The validated Implementer conclusion when passed; the Tester's own explanation
+  // (or, if a fix-attempt Implementer capped, that Implementer's own cap-hit message)
+  // when not passed.
+  message: string
+  lastAgent: Agent // for autoCommit — whichever frame most recently ran
+  fixAttempts: TesterFixAttempt[]
+}
+
+// THE TESTER VALIDATION CYCLE (this task, "Testers are back, harness-driven, not
+// Planner-driven"). Spawns a Tester to validate an Implementer's SUCCESS conclusion;
+// if the Tester finds a problem, spawns a NEW Implementer with the Tester's own
+// self-contained fix assignment and re-tests — up to MAX_TESTER_FIX_ATTEMPTS times —
+// before giving up on this one task. Shared by BOTH the OBJECTIVE loop
+// (parentFrameId = the Planner's frameId) and the SIMPLE fast path (parentFrameId =
+// null) per the brief's "same SUCCESS/FAIL parsing" for both paths.
+async function runTesterValidation(
+  parentFrameId: string | null,
+  assignment: string,
+  conclusion: string,
+  emit: Emit,
+): Promise<TesterValidationResult> {
+  let currentAssignment = assignment
+  let currentConclusion = conclusion
+  let lastAgent!: Agent
+  const fixAttempts: TesterFixAttempt[] = []
+
+  for (let attempt = 0; attempt <= MAX_TESTER_FIX_ATTEMPTS; attempt++) {
+    const testerFrame = await spawnFrame(
+      { role: 'tester', parentFrameId, assignment: buildTesterAssignment(currentAssignment, currentConclusion) },
+      emit,
+    )
+    lastAgent = testerFrame.agent
+
+    if (testerFrame.agent.hitIterationCap()) {
+      // The Tester itself never concluded — its own cap-hit string is not a real
+      // verdict to extract a fix assignment from. Read as "still failing" rather
+      // than risk spawning a fix-Implementer with garbage as its assignment.
+      return { passed: false, message: testerFrame.result.summary, lastAgent, fixAttempts }
+    }
+
+    const testerResult = parseTesterResult(testerFrame.result.summary)
+    if (testerResult.passed) {
+      return { passed: true, message: currentConclusion, lastAgent, fixAttempts }
+    }
+    if (attempt === MAX_TESTER_FIX_ATTEMPTS) {
+      // Out of fix attempts — still failing, escalate.
+      return { passed: false, message: testerFrame.result.summary, lastAgent, fixAttempts }
+    }
+
+    const fixAssignment = testerResult.fixAssignment ?? testerFrame.result.summary
+    const fixFrame = await spawnFrame(
+      { role: 'implementer', parentFrameId, assignment: appendImplementerResultFormat(fixAssignment) },
+      emit,
+      undefined,
+      fixAssignment,
+    )
+    lastAgent = fixFrame.agent
+    const capped = fixFrame.agent.hitIterationCap()
+    fixAttempts.push({ assignment: fixAssignment, conclusion: fixFrame.result.summary, capped })
+    if (capped) {
+      return { passed: false, message: fixFrame.result.summary, lastAgent, fixAttempts }
+    }
+
+    currentAssignment = fixAssignment
+    currentConclusion = fixFrame.result.summary
+    // Loop again — re-test the fix. Deliberately NOT parsing the fix-Implementer's
+    // own SUCCESS/FAIL here: the Tester is the one gate that decides whether a fix
+    // actually landed, not the Implementer's own self-report (that's the entire
+    // point of a Tester existing).
+  }
+
+  // Unreachable — the loop above always returns — but TypeScript needs a value here.
+  return { passed: false, message: currentConclusion, lastAgent, fixAttempts }
+}
+
+async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<string> {
+  // Whichever frame's Agent instance most recently did real work — reused purely as
+  // the vehicle for the end-of-run autoCommit (it only needs git + a model, not a
+  // specific role). Deliberately NOT seeded from a caller's own prior frame (e.g. a
+  // SIMPLE mode's now-capped Implementer): autoCommit operates on the whole git
+  // working tree (git status/add -A), not per-agent-instance state, so any earlier
+  // uncommitted work is still picked up by whichever frame spawned by THIS function
+  // ends up calling autoCommit — no need to thread the caller's agent through.
+  let commitAgent: Agent | null = null
+
+  const plannerFrame = await spawnFrame(
+    { role: 'planner', parentFrameId: null, assignment: buildInitialPlannerPrompt(objective) },
+    emit,
+  )
+  commitAgent = plannerFrame.agent
+  if (plannerFrame.agent.hitIterationCap()) {
+    throw plannerCapFailure('producing the overall plan', plannerFrame.result.frameId, plannerFrame.result.summary)
+  }
+
+  const plannerAgent = plannerFrame.agent
+  const plannerFrameId = plannerFrame.result.frameId
+  // What the Planner is resumed with on the NEXT round — normally buildNextTaskPrompt's
+  // generic "previous sub-agent concluded with..." wording, but overridden to
+  // buildImplementerCapFollowUp when the Implementer that just ran hit its own hard
+  // iteration cap (see the branch below). Starts as the first detail call (no
+  // Implementer has run yet).
+  let plannerFollowUp: string = buildNextTaskPrompt(null)
+  const completedTasks: Array<{ prompt: string; conclusion: string }> = []
+  let done = false
+  // Counts Implementer cap-hits across THIS objective's whole OBJECTIVE loop — see
+  // MAX_IMPLEMENTER_CAP_RETRIES above. Shared across BOTH the initial per-task
+  // Implementer and any Tester fix-attempt Implementers (runTesterValidation) — any
+  // Implementer hitting its own hard cap is the same signal regardless of which
+  // round of the task it happened on.
+  let implementerCapHits = 0
+
+  for (let round = 0; round < MAX_PLANNER_ROUNDS; round++) {
+    // Each detail call gets its OWN fresh iteration budget (40, with progress checks
+    // at 20/30) rather than the accumulating count resumeFrame's underlying
+    // chat(..., { resume: true }) uses by default — the Planner's CONTEXT carries
+    // over (same Agent instance, same history), but its iteration budget must not.
+    // Scoped to just this one call site, not resumeFrame itself: the Boss task-start
+    // marker-retry resume (this file, runBossTaskStart) and any future Tester REDO
+    // resume still want the default accumulating behavior.
+    plannerAgent.resetIterations()
+    const detailResult = await resumeFrame(plannerFrameId, plannerAgent, plannerFollowUp)
+    if (plannerAgent.hitIterationCap()) {
+      throw plannerCapFailure('detailing the next task', plannerFrameId, detailResult.summary)
+    }
+
+    // GIVE-UP (this task) is checked BEFORE "done" — an explicit failure signal must
+    // never be misread as quiet success. Ends the run immediately with a failure
+    // message that includes the Planner's own explanation, per the brief.
+    if (isPlannerGiveUp(detailResult.summary)) {
+      if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
+      return `Objective: ${objective}\n\nThe Planner gave up: ${detailResult.summary}\n\n`
+        + completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
+    }
+
+    if (isPlannerDone(detailResult.summary)) {
+      done = true
+      break
+    }
+
+    const nextAssignment = detailResult.summary
+    // What's actually given to the Implementer — the Planner's task text PLUS the
+    // SUCCESS:/FAIL: sign-off convention (this task, "Testers are back"). nextAssignment
+    // itself stays the plain task text, used for completedTasks/buildImplementerCapFollowUp
+    // and as the Tester's own "{implementer prompt}" field.
+    const implementerAssignment = appendImplementerResultFormat(nextAssignment)
+
+    // Implementer FAIL is NOT retried here — the failing task's own conclusion simply
+    // becomes what the Planner sees on its next detail call (via plannerFollowUp
+    // below), and the Planner decides what to do about it, exactly like the
+    // pre-existing "no harness-level retry" discipline this module has followed since
+    // H13. The ONE exception (iteration-cap): an Implementer that hits its own hard
+    // iteration cap (agent.hitIterationCap()) gets resumed to the Planner with an
+    // explicit "this task was too broad, reframe it narrower" message instead of the
+    // generic wording, up to MAX_IMPLEMENTER_CAP_RETRIES times before this loop gives
+    // up and reports the failure to the user rather than a raw cap-hit string or an
+    // indefinite retry loop.
+    const implFrame = await spawnFrame(
+      { role: 'implementer', parentFrameId: plannerFrameId, assignment: implementerAssignment },
+      emit,
+      undefined,
+      nextAssignment,
+    )
+    commitAgent = implFrame.agent
+    completedTasks.push({ prompt: nextAssignment, conclusion: implFrame.result.summary })
+
+    if (implFrame.agent.hitIterationCap()) {
+      implementerCapHits++
+      if (implementerCapHits > MAX_IMPLEMENTER_CAP_RETRIES) {
+        if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
+        return `Objective: ${objective}\n\nAn implementation sub-agent hit its iteration cap `
+          + `${implementerCapHits} times on this objective, even after being asked to reframe the task `
+          + 'narrower each time. Reporting this instead of continuing to loop.\n\n'
+          + completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
+      }
+      plannerFollowUp = buildImplementerCapFollowUp(nextAssignment, implFrame.result.summary)
+      continue
+    }
+
+    // NEW (this task): the Implementer's own SUCCESS/FAIL verdict decides whether the
+    // harness spawns a Tester at all — a FAIL skips the Tester entirely and goes
+    // straight back to the Planner with the failure details, per the brief.
+    const implResult = parseImplementerResult(implFrame.result.summary)
+    if (!implResult.succeeded) {
+      plannerFollowUp = buildNextTaskPrompt(implFrame.result.summary)
+      continue
+    }
+
+    // SUCCESS → the harness spawns a Tester to validate, with up to
+    // MAX_TESTER_FIX_ATTEMPTS fix-and-retest rounds if it finds a problem.
+    const cycle = await runTesterValidation(plannerFrameId, nextAssignment, implFrame.result.summary, emit)
+    commitAgent = cycle.lastAgent
+    for (const fa of cycle.fixAttempts) completedTasks.push({ prompt: fa.assignment, conclusion: fa.conclusion })
+
+    const cappedFix = cycle.fixAttempts.find(fa => fa.capped)
+    if (cappedFix) {
+      implementerCapHits++
+      if (implementerCapHits > MAX_IMPLEMENTER_CAP_RETRIES) {
+        if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
+        return `Objective: ${objective}\n\nAn implementation sub-agent hit its iteration cap `
+          + `${implementerCapHits} times on this objective, even after being asked to reframe the task `
+          + 'narrower each time. Reporting this instead of continuing to loop.\n\n'
+          + completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
+      }
+      plannerFollowUp = buildImplementerCapFollowUp(cappedFix.assignment, cappedFix.conclusion)
+      continue
+    }
+
+    plannerFollowUp = cycle.passed
+      ? buildNextTaskPrompt(cycle.message)
+      : buildNextTaskPrompt(
+          `Tester could not validate this task after ${MAX_TESTER_FIX_ATTEMPTS} fix attempt(s). ${cycle.message}`,
+        )
+  }
+
+  if (!done) {
+    if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
+    return `Could not complete the objective within ${MAX_PLANNER_ROUNDS} planner rounds. Objective: ${objective}\n\n`
+      + completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
+  }
+
+  const doneSummary = completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
+
+  // Mirrors the baseline loop's own end-of-run auto-commit (agent.ts), opt-in via the
+  // same config.autoCommit flag. Reuses whichever frame's Agent instance most recently
+  // did real work purely as a vehicle — autoCommit() only needs git + a model to write
+  // the message, it doesn't care which role's instance runs it. commitAgent is only
+  // null here if NO frame ever spawned, which can't happen once past the Planner spawn
+  // above.
+  if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
+
+  return `Objective: ${objective}\n\n${doneSummary || 'No implementation tasks were required.'}`
+}
+
 async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<string> {
   await ledger.ensureGitignored(root())
 
@@ -819,95 +1251,78 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
   await ledger.setObjective(root(), objective)
   emit({ type: 'objective', text: objective })
 
-  // Whichever frame's Agent instance most recently did real work — reused purely as
-  // the vehicle for the end-of-run autoCommit (it only needs git + a model, not a
-  // specific role), so a run that never spawns a Planner still has one.
-  let commitAgent: Agent | null = null
-
-  // TRIVIAL/SIMPLE skip the Planner entirely and — this rewrite — skip the Tester
-  // entirely too: a single well-scoped Implementer, instructed to test its own work
-  // if the assignment calls for it (see this module's header). SIMPLE is no longer
-  // distinguished from TRIVIAL in HOW it is dispatched, only in what the Boss's own
-  // classification text says the objective involves.
-  if (taskStart.mode === 'trivial' || taskStart.mode === 'simple') {
+  // TRIVIAL: skips the Planner AND the Tester entirely — a single well-scoped
+  // Implementer, instructed to test its own work if the assignment calls for it (see
+  // this module's header). Deliberately untouched by this task's Tester/escalation
+  // machinery: a TRIVIAL classification means the Boss judged this 1-3 iterations, so
+  // hitting the 80-iteration hard cap on it is a genuine failure to report as-is, not
+  // something to escalate — whatever the Implementer concluded IS the final answer.
+  // It still gets appendImplementerResultFormat's SUCCESS:/FAIL: instructions (every
+  // Implementer's assignment does, per this task's brief), but that verdict is never
+  // parsed here — it's just echoed back verbatim as part of the raw conclusion, same
+  // as any other text the model might have concluded with before this task existed.
+  if (taskStart.mode === 'trivial') {
     const frame = await spawnFrame(
-      { role: 'implementer', parentFrameId: null, assignment: buildImplementerAssignment(objective) },
+      { role: 'implementer', parentFrameId: null, assignment: appendImplementerResultFormat(buildImplementerAssignment(objective)) },
       emit,
       undefined,
       objective,
     )
-    commitAgent = frame.agent
-    if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
+    if (config.autoCommit) await frame.agent.autoCommit(emit)
     return `Objective: ${objective}\n\n${frame.result.summary}`
   }
 
-  // OBJECTIVE: the Planner drives an ITERATIVE loop (this rewrite — see the module
-  // header for the full design). One initial call produces the overall plan (an
-  // ordered list of sub-tasks, delivered as its `conclude` answer); each subsequent
-  // call resumes the SAME Planner frame to produce exactly one self-contained
-  // Implementer assignment, informed by the previous Implementer's own conclusion.
-  // There is no separate "replan" step and no Tester round: the Planner IS the
-  // loop, and the Implementer is trusted to test its own work when instructed to.
-  const plannerFrame = await spawnFrame(
-    { role: 'planner', parentFrameId: null, assignment: buildInitialPlannerPrompt(objective) },
-    emit,
-  )
-  commitAgent = plannerFrame.agent
-  if (plannerFrame.agent.hitIterationCap()) {
-    throw plannerCapFailure('producing the overall plan', plannerFrame.result.frameId, plannerFrame.result.summary)
-  }
-
-  const plannerAgent = plannerFrame.agent
-  const plannerFrameId = plannerFrame.result.frameId
-  let completedMessage: string | null = null
-  const completedTasks: Array<{ prompt: string; conclusion: string }> = []
-  let done = false
-
-  for (let round = 0; round < MAX_PLANNER_ROUNDS; round++) {
-    const detailResult = await resumeFrame(plannerFrameId, plannerAgent, buildNextTaskPrompt(completedMessage))
-    if (plannerAgent.hitIterationCap()) {
-      throw plannerCapFailure('detailing the next task', plannerFrameId, detailResult.summary)
-    }
-
-    if (isPlannerDone(detailResult.summary)) {
-      done = true
-      break
-    }
-
-    const nextAssignment = detailResult.summary
-
-    // Implementer failure/partial/gave-up is NOT retried here — the failing task's
-    // own conclusion simply becomes what the Planner sees on its next detail call
-    // (via completedMessage below), and the Planner decides what to do about it,
-    // exactly like the pre-existing "no harness-level retry" discipline this
-    // module has followed since H13.
-    const implFrame = await spawnFrame(
-      { role: 'implementer', parentFrameId: plannerFrameId, assignment: nextAssignment },
+  // SIMPLE: tries ONE well-scoped Implementer first, exactly like TRIVIAL — no Planner
+  // ceremony up front. Per the brief: "Implementer → Tester → done (same SUCCESS/FAIL
+  // parsing). If Implementer hits cap → escalate to OBJECTIVE path."
+  if (taskStart.mode === 'simple') {
+    const implementerAssignment = buildImplementerAssignment(objective)
+    const frame = await spawnFrame(
+      { role: 'implementer', parentFrameId: null, assignment: appendImplementerResultFormat(implementerAssignment) },
       emit,
       undefined,
-      nextAssignment,
+      objective,
     )
-    commitAgent = implFrame.agent
+    // The task was measurably bigger than the Boss's "3-20 iterations" judgment —
+    // escalate to the full OBJECTIVE pipeline (runObjectiveViaPlanner, the SAME
+    // iterative Planner+Implementer+Tester loop an OBJECTIVE task gets) rather than
+    // reporting a raw "Reached maximum iterations" string as failure.
+    if (frame.agent.getLastRunOutcome() === 'cap') {
+      return await runObjectiveViaPlanner(objective, emit)
+    }
 
-    completedTasks.push({ prompt: nextAssignment, conclusion: implFrame.result.summary })
-    completedMessage = implFrame.result.summary
+    const implResult = parseImplementerResult(frame.result.summary)
+    if (!implResult.succeeded) {
+      // FAIL, and SIMPLE has no Planner conversation to route the failure back to —
+      // the Implementer's own explanation of what it tried and why it failed IS the
+      // final answer, same as this branch's pre-Tester behavior for any failure text.
+      if (config.autoCommit) await frame.agent.autoCommit(emit)
+      return `Objective: ${objective}\n\n${frame.result.summary}`
+    }
+
+    // SUCCESS → the harness spawns a Tester, with up to MAX_TESTER_FIX_ATTEMPTS
+    // fix-and-retest rounds if it finds a problem — "same SUCCESS/FAIL parsing" as
+    // the OBJECTIVE path, via the SAME shared runTesterValidation helper.
+    const cycle = await runTesterValidation(null, implementerAssignment, frame.result.summary, emit)
+
+    // Either a fix-attempt Implementer hit its own hard cap, or the Tester still
+    // found a problem after using up its fix attempts. SIMPLE has no ongoing Planner
+    // conversation to escalate a failure INTO (unlike OBJECTIVE, where this becomes
+    // the Planner's next detail-call context) — so, mirroring the cap-hit escalation
+    // immediately above, hand the WHOLE objective to the full iterative pipeline
+    // instead of reporting an unresolved failure as the final answer. Deliberately no
+    // autoCommit call here first: runObjectiveViaPlanner does its own, and whatever
+    // is already dirty in the workspace is picked up there regardless of which frame
+    // last touched it (see that function's own commitAgent comment).
+    if (cycle.fixAttempts.some(fa => fa.capped) || !cycle.passed) {
+      return await runObjectiveViaPlanner(objective, emit)
+    }
+
+    if (config.autoCommit) await cycle.lastAgent.autoCommit(emit)
+    return `Objective: ${objective}\n\n${cycle.message}`
   }
 
-  if (!done) {
-    if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
-    return `Could not complete the objective within ${MAX_PLANNER_ROUNDS} planner rounds. Objective: ${objective}\n\n`
-      + completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
-  }
-
-  const doneSummary = completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
-
-  // Mirrors the baseline loop's own end-of-run auto-commit (agent.ts), opt-in via the
-  // same config.autoCommit flag. Reuses whichever frame's Agent instance most recently
-  // did real work purely as a vehicle — autoCommit() only needs git + a model to write
-  // the message, it doesn't care which role's instance runs it. commitAgent is only
-  // null here if NO frame ever spawned, which can't happen once we're past the
-  // 'answer' early-return above.
-  if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
-
-  return `Objective: ${objective}\n\n${doneSummary || 'No implementation tasks were required.'}`
+  // OBJECTIVE: the Planner drives the full iterative loop from the start
+  // (docs/subagents-plan.md) — see runObjectiveViaPlanner above for the design.
+  return await runObjectiveViaPlanner(objective, emit)
 }

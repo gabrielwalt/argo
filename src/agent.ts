@@ -7,7 +7,8 @@ import { toolDefinitions, executeTool } from './tools/index.js'
 import { bash, NO_OUTPUT } from './tools/bash.js'
 import { truncateOutput } from './tools/truncate.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
-import type { AgentEvent, ToolName, ModelOptions, FramePolicy } from './types.js'
+import type { AgentEvent, ToolName, ModelOptions, FramePolicy, Role } from './types.js'
+import { PROGRESS_CHECK_ITERATIONS, PROGRESS_CHECK_MESSAGES } from './frames.js'
 import { runCritic, isTestOrSpecPath, type Critique, type CriticCheckpoint } from './critic.js'
 import { runGroundingCritic, isDocPath, findNumericConflicts } from './grounding.js'
 import { checkLayout, selectLayoutArtifact, type LayoutVerdict } from './layout.js'
@@ -539,6 +540,14 @@ export class Agent {
   // episode graph (see eviction.ts) for THIS instance's own history, reset per run.
   private allowedTools: ToolName[] | null = null
   private frameId: string | null = null
+  // Which ROLE (Planner/Implementer/Tester/Boss) this frame is, set by dispatch.ts's
+  // spawnFrame alongside setAllowedTools/setMaxIterations/etc (frames.ts's ROLE_TOOLS/
+  // ROLE_MAX_ITERATIONS are the same per-role tables this mirrors). null for the
+  // unrestricted baseline, which never sets it. The ONLY thing this drives is which
+  // progress-check thresholds/messages chat() uses (frames.ts's PROGRESS_CHECK_ITERATIONS/
+  // PROGRESS_CHECK_MESSAGES) — every other role-shaped decision in this file already goes
+  // through allowedTools/roleInstructions/the FramePolicy switches, which stay as they are.
+  private roleTag: Role | null = null
   private episodes: EpisodeMeta[] = []
   // Bounded excerpts of pages fetched this run (url + truncated content), so the
   // grounding guard can verify document specifics against what was ACTUALLY fetched
@@ -624,6 +633,21 @@ export class Agent {
     this.maxIterations = Math.min(1000, Math.max(10, Math.trunc(n)))
   }
 
+  // Lets a caller give a RESUMED turn (chat(msg, { resume: true })) a fresh iteration
+  // budget instead of the default accumulating one (dispatch.ts's Planner loop —
+  // resumeFrame keeps the frame's history/plan/etc, but each detail call must get its
+  // own 40-iteration budget and its own 20/30 progress checks, not an offset-by-
+  // whatever-the-previous-call-used budget). Deliberately NOT the default for every
+  // resume: other resume call sites (e.g. the Boss task-start marker-retry resume;
+  // a future Tester REDO) rely on the EXISTING accumulating behavior (iterationBase =
+  // lastIterationCount, set in chat()'s resume branch) to report a frame's total
+  // effort across its whole life — this only zeroes the ONE piece of state
+  // (lastIterationCount) that decision reads, and only when a caller explicitly asks
+  // for it, immediately before the next chat(..., { resume: true }) call.
+  resetIterations() {
+    this.lastIterationCount = 0
+  }
+
   setGrounding(on: boolean) {
     this.grounding = on
   }
@@ -677,6 +701,12 @@ export class Agent {
 
   setFrameId(id: string | null) {
     this.frameId = id
+  }
+
+  // See the roleTag field doc above — dispatch.ts's spawnFrame calls this once, at the
+  // same spawn site as setAllowedTools/setRoleInstructions/setMaxIterations.
+  setRole(role: Role | null) {
+    this.roleTag = role
   }
 
   // MULTI-AGENT ARCHITECTURE (config.agents, dispatch.ts). Seeds a plan for a frame
@@ -1731,9 +1761,22 @@ export class Agent {
     // this checkpoint only (via the assignment marker) so every other role's
     // 0.4/0.65/0.85 scaling is untouched.
     const isBossTaskStartCheckpoint = userMessage.startsWith('CHECKPOINT: task-start')
-    const stallCheckpoints = [isBossTaskStartCheckpoint ? 1 : 0.4, 0.65, 0.85].map((frac, idx) =>
-      this.iterationBase + Math.min([20, 35, 45][idx], Math.max(1, Math.round(frac * this.maxIterations))),
-    )
+    // PER-ROLE FIXED PROGRESS CHECKS (frames.ts's PROGRESS_CHECK_ITERATIONS/
+    // PROGRESS_CHECK_MESSAGES, this task). When this frame's role has an entry there
+    // (currently Planner and Implementer only), its checkpoints are these EXACT
+    // per-call iteration numbers with EXACT message text, replacing the generic
+    // fraction-of-maxIterations mechanism below for this frame only — the numbers
+    // the brief specifies for those two roles (Planner: 20 of 40; Implementer:
+    // 50/60/70 of 80) don't fall out of the generic 0.4/0.65/0.85 scaling. null for every other role
+    // (Tester, Boss, the unrestricted baseline), which keeps the generic mechanism
+    // exactly as it was.
+    const roleProgressIterations = this.roleTag ? PROGRESS_CHECK_ITERATIONS[this.roleTag] : undefined
+    const roleProgressMessages = this.roleTag ? PROGRESS_CHECK_MESSAGES[this.roleTag] : undefined
+    const stallCheckpoints = roleProgressIterations
+      ? roleProgressIterations.map(n => this.iterationBase + n)
+      : [isBossTaskStartCheckpoint ? 1 : 0.4, 0.65, 0.85].map((frac, idx) =>
+          this.iterationBase + Math.min([20, 35, 45][idx], Math.max(1, Math.round(frac * this.maxIterations))),
+        )
     // A resumed turn gets its own full iteration allowance; what carries over is the
     // COUNT (for reporting and for dispatch.ts's large-frame standup trigger), not the
     // remaining budget — a targeted REDO/replan follow-up that inherited 2 leftover
@@ -1773,7 +1816,20 @@ export class Agent {
         // the "N iterations without finishing" wording both refer to the frame's own
         // total effort rather than resetting on every resume.
         const iterNum = iterCurrent
-        if (stallCheckpoints.includes(iterNum)) {
+        if (roleProgressMessages) {
+          // FIXED PER-ROLE PROGRESS CHECK (Planner/Implementer, see stallCheckpoints
+          // above) — fires unconditionally at each listed iteration, regardless of
+          // whether real edits have landed since the last one: these are countdown
+          // nudges toward a hard cap, not a stall detector, so "the model is making
+          // genuine progress" is not a reason to skip one. index-aligned with
+          // roleProgressIterations, which is how stallCheckpoints was built.
+          const idx = stallCheckpoints.indexOf(iterNum)
+          if (idx !== -1) {
+            const stall = roleProgressMessages[idx]
+            emitAndLog({ type: 'warning', message: stall })
+            this.pushCtx({ role: 'tool', content: stall })
+          }
+        } else if (stallCheckpoints.includes(iterNum)) {
           // Real edits landing since the LAST checkpoint (not since run start — a
           // stretch of pure investigation right after an earlier burst of edits
           // should still be able to trip the alarm) mean this is a bigger task making

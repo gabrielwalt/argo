@@ -9,7 +9,14 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { ROLE_TOOLS, TASK_START_TOOLS, systemPromptFor } from './frames.js'
+import {
+  ROLE_TOOLS,
+  TASK_START_TOOLS,
+  systemPromptFor,
+  ROLE_MAX_ITERATIONS,
+  PROGRESS_CHECK_ITERATIONS,
+  PROGRESS_CHECK_MESSAGES,
+} from './frames.js'
 
 test('TASK_START_TOOLS has bash for investigation but no direct write tools', () => {
   // bash is included so the Boss can grep, cat, ls, run tests to understand
@@ -162,4 +169,72 @@ test('TASK_START_TOOLS (the read-only classification checkpoint) also holds conc
   // Without it the checkpoint could investigate forever but never actually
   // classify — a turn with no tool calls no longer ends anything either.
   assert.equal(TASK_START_TOOLS.includes('conclude'), true)
+})
+
+// ── ITERATION LIMITS AND PROGRESS NUDGES (this task) ────────────────────────────────
+// ROLE_MAX_ITERATIONS.planner stays 40 (already matched the brief); implementer is
+// raised 60->80 to leave real room after the new 50/60/70 escalation below. Boss/
+// Tester are untouched — the Boss's own soft-10/hard-20 classification budget lives
+// in dispatch.ts (TASK_START_MAX_ITERATIONS/TASK_START_HARD_CAP), not here.
+
+test('ROLE_MAX_ITERATIONS: planner=40 (unchanged), implementer=80 (raised this task), tester/boss untouched', () => {
+  assert.equal(ROLE_MAX_ITERATIONS.planner, 40)
+  assert.equal(ROLE_MAX_ITERATIONS.implementer, 80)
+  assert.equal(ROLE_MAX_ITERATIONS.tester, 20)
+  assert.equal(ROLE_MAX_ITERATIONS.boss, 15)
+})
+
+test('PROGRESS_CHECK_ITERATIONS: planner escalates at 20/30, strictly below its 40-iteration cap', () => {
+  assert.deepEqual(PROGRESS_CHECK_ITERATIONS.planner, [20, 30])
+  for (const n of PROGRESS_CHECK_ITERATIONS.planner!) {
+    assert.ok(n < ROLE_MAX_ITERATIONS.planner, `${n} must be below the hard cap ${ROLE_MAX_ITERATIONS.planner}`)
+  }
+})
+
+test('PROGRESS_CHECK_ITERATIONS: implementer escalates at 50/60/70, strictly below its 80-iteration cap', () => {
+  assert.deepEqual(PROGRESS_CHECK_ITERATIONS.implementer, [50, 60, 70])
+  for (const n of PROGRESS_CHECK_ITERATIONS.implementer!) {
+    assert.ok(n < ROLE_MAX_ITERATIONS.implementer, `${n} must be below the hard cap ${ROLE_MAX_ITERATIONS.implementer}`)
+  }
+})
+
+test('PROGRESS_CHECK_ITERATIONS: no entry for tester or boss — they keep the generic fraction-based mechanism', () => {
+  assert.equal(PROGRESS_CHECK_ITERATIONS.tester, undefined)
+  assert.equal(PROGRESS_CHECK_ITERATIONS.boss, undefined)
+})
+
+test('PROGRESS_CHECK_MESSAGES is index-aligned with PROGRESS_CHECK_ITERATIONS for both roles', () => {
+  assert.equal(PROGRESS_CHECK_MESSAGES.planner!.length, PROGRESS_CHECK_ITERATIONS.planner!.length)
+  assert.equal(PROGRESS_CHECK_MESSAGES.implementer!.length, PROGRESS_CHECK_ITERATIONS.implementer!.length)
+})
+
+test('PROGRESS_CHECK_MESSAGES: planner messages match the brief\'s exact wording and escalate in tone (gentle, then firmer)', () => {
+  const [gentle, firmer] = PROGRESS_CHECK_MESSAGES.planner!
+  assert.equal(
+    gentle,
+    'PROGRESS CHECK: 20 iterations in. Wrap up your analysis and call conclude with your result.',
+  )
+  assert.equal(
+    firmer,
+    'PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.',
+  )
+})
+
+test('PROGRESS_CHECK_MESSAGES: implementer messages match the brief\'s exact wording and escalate in tone', () => {
+  const [soft, firmer, strongest] = PROGRESS_CHECK_MESSAGES.implementer!
+  assert.equal(
+    soft,
+    'PROGRESS CHECK: 50 iterations in and not finished. Start wrapping up your work. Call conclude with a ' +
+      'summary of what you accomplished, what didn\'t work, and what\'s left to do.',
+  )
+  assert.equal(
+    firmer,
+    'PROGRESS CHECK: 60 iterations in. You must wrap up now. Call conclude with what you accomplished and ' +
+      'what remains.',
+  )
+  assert.equal(
+    strongest,
+    'PROGRESS CHECK: 70 iterations. Finish immediately. Call conclude with your final status — what was ' +
+      'done, what failed, and what\'s left.',
+  )
 })

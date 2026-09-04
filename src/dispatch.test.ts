@@ -28,12 +28,13 @@ import {
   buildImplementerAssignment,
   buildInitialPlannerPrompt,
   buildNextTaskPrompt,
+  buildImplementerCapFollowUp,
   isPlannerDone,
   TASK_START_MAX_ITERATIONS,
   TASK_START_HARD_CAP,
   TASK_START_CAP_FAILURE_MESSAGE,
 } from './dispatch.js'
-import { parseTaskStartVerdict } from './frames.js'
+import { parseTaskStartVerdict, ROLE_TOOLS, ROLE_MAX_ITERATIONS } from './frames.js'
 
 // ── buildTaskStartAssignment — the exact prompt text ────────────────────────
 
@@ -719,4 +720,210 @@ test('conclude drives the task ledger exactly like a no-tool-call turn used to: 
   } finally {
     await cleanupSeedPlanSession(sessionId)
   }
+})
+
+// ── ITERATION LIMITS AND PROGRESS NUDGES (this task) ────────────────────────────────
+// frames.ts's ROLE_MAX_ITERATIONS/PROGRESS_CHECK_ITERATIONS/PROGRESS_CHECK_MESSAGES half;
+// agent.ts consumes them once Agent.setRole() has been called (dispatch.ts's spawnFrame
+// calls it alongside setAllowedTools/setMaxIterations — see agent.ts's roleTag field).
+// Scripted-Ollama-client style, same seam as the seedPlan tests above: a "thinking" reply
+// (no tool calls) never ends the run and never trips the identical-tool-call loop guard
+// (that guard only watches EXECUTED tool calls), so scriptedOllama's "repeat the last
+// response forever" behaviour is exactly what's needed to drive the loop all the way to
+// its iteration cap with no other mechanism (task ledger, grounding, loop-recovery)
+// getting in the way — none of tasks/memory/grounding/layout are turned on here.
+
+test('ROLE_MAX_ITERATIONS: planner stays 40, implementer raised to 80 (this task)', () => {
+  assert.equal(ROLE_MAX_ITERATIONS.planner, 40)
+  assert.equal(ROLE_MAX_ITERATIONS.implementer, 80)
+})
+
+const thinkingTurn: ScriptedResponse = { message: { role: 'assistant', content: 'Still working on it.' } }
+
+test('Planner role: escalating PROGRESS CHECK nudges fire at 20 and 30 before the iteration cap at 40', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-role-progress-planner-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([thinkingTurn]))
+  agent.setSessionId(sessionId)
+  agent.setAllowedTools(ROLE_TOOLS.planner)
+  agent.setRole('planner')
+  agent.setMaxIterations(ROLE_MAX_ITERATIONS.planner)
+  try {
+    const answer = await agent.chat('argo role-progress planner case')
+    const warnings = events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning')
+      .map(e => e.message)
+    assert.ok(
+      warnings.includes('PROGRESS CHECK: 20 iterations in. Wrap up your analysis and call conclude with your result.'),
+    )
+    assert.ok(
+      warnings.includes('PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.'),
+    )
+    // The role-specific checkpoint REPLACES the generic mechanism for this frame —
+    // none of the generic fraction-based STALL/PROGRESS wording should appear.
+    assert.equal(warnings.some(w => w.startsWith('STALL:')), false)
+    assert.equal(agent.getLastRunOutcome(), 'cap')
+    assert.ok(answer.startsWith('Reached maximum iterations'))
+  } finally {
+    await cleanupSeedPlanSession(sessionId)
+  }
+})
+
+// ── Agent.resetIterations() — the Planner's per-resume iteration budget reset ───────
+// (owner clarification, this task). The Planner's CONTEXT carries over on resumeFrame
+// (same Agent, same history), but the iteration BUDGET must restart at 0 for each
+// detail call, unlike resumeFrame's default accumulating behavior (H14, agent.ts) that
+// other resume call sites (the Boss task-start marker-retry resume; a future Tester
+// REDO) still rely on. resetIterations() is a small, targeted method — it zeroes
+// exactly the one field (lastIterationCount) that chat()'s resume branch reads to set
+// iterationBase, and only when a caller explicitly asks for it right before the next
+// chat(..., { resume: true }) call.
+//
+// Script: 5 thinking turns + one conclude call, THEN thinkingTurn forever (scriptedOllama
+// repeats the LAST array element once its own internal call counter runs past the
+// array's length) — so the FIRST chat() call concludes after exactly 6 real iterations,
+// and any further chat() call on the same Agent just keeps thinking forever, which is
+// what's needed to observe where the iteration counter/checkpoints land on the SECOND
+// (resumed) call.
+function plannerTwoCallScript(): ScriptedResponse[] {
+  return [thinkingTurn, thinkingTurn, thinkingTurn, thinkingTurn, thinkingTurn, concludeCall('First round result.'), thinkingTurn]
+}
+
+test('resetIterations(): WITHOUT it, a resumed call inherits the previous call\'s count — reported iteration numbers keep climbing (H14 default, unchanged for other resume sites)', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-reset-iterations-off-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama(plannerTwoCallScript()))
+  agent.setSessionId(sessionId)
+  agent.setAllowedTools(ROLE_TOOLS.planner)
+  agent.setRole('planner')
+  agent.setMaxIterations(ROLE_MAX_ITERATIONS.planner)
+  try {
+    const firstAnswer = await agent.chat('argo planner initial round')
+    assert.equal(firstAnswer, 'First round result.')
+    assert.equal(agent.getIterationCount(), 6)
+    // Deliberately NO resetIterations() call here — this is the pre-existing
+    // accumulating behavior every OTHER resume site still depends on.
+    await agent.chat('argo planner next round', { resume: true })
+    const iterationEvents = events.filter((e): e is Extract<AgentEvent, { type: 'iteration' }> => e.type === 'iteration')
+    // The resumed call's FIRST reported iteration continues from the prior count (6),
+    // not from 1 — and its reported max is inflated by the same offset (6 + 40 = 46),
+    // not the frame's own 40-iteration budget.
+    const secondCallIterations = iterationEvents.slice(6) // the first 6 belong to the first call
+    assert.equal(secondCallIterations[0].current, 7)
+    assert.equal(secondCallIterations[0].max, 46)
+  } finally {
+    await cleanupSeedPlanSession(sessionId)
+  }
+})
+
+test('resetIterations(): called before a resumed Planner detail call, the reported iteration numbers restart at 1 and the checkpoints/cap land at the frame\'s own fresh 20/30/40', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-reset-iterations-on-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama(plannerTwoCallScript()))
+  agent.setSessionId(sessionId)
+  agent.setAllowedTools(ROLE_TOOLS.planner)
+  agent.setRole('planner')
+  agent.setMaxIterations(ROLE_MAX_ITERATIONS.planner)
+  try {
+    const firstAnswer = await agent.chat('argo planner initial round')
+    assert.equal(firstAnswer, 'First round result.')
+    assert.equal(agent.getIterationCount(), 6)
+    // dispatch.ts's Planner loop calls this immediately before every resumeFrame —
+    // exactly what's under test here.
+    agent.resetIterations()
+    const answer = await agent.chat('argo planner next round', { resume: true })
+    const iterationEvents = events.filter((e): e is Extract<AgentEvent, { type: 'iteration' }> => e.type === 'iteration')
+    const secondCallIterations = iterationEvents.slice(6)
+    // Fresh budget: the resumed call's FIRST iteration reports 1, not 7 — and its max
+    // is the frame's own 40, not 46.
+    assert.equal(secondCallIterations[0].current, 1)
+    assert.equal(secondCallIterations[0].max, 40)
+    const warnings = events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning')
+      .map(e => e.message)
+    // The 20/30 progress checks fire at THIS call's own 20th/30th iteration, not
+    // offset by the 6 iterations the first call already used.
+    assert.ok(
+      warnings.includes('PROGRESS CHECK: 20 iterations in. Wrap up your analysis and call conclude with your result.'),
+    )
+    assert.ok(
+      warnings.includes('PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.'),
+    )
+    // The hard cap hits after exactly 40 MORE iterations, not 34 (40 - 6).
+    assert.equal(agent.getLastRunOutcome(), 'cap')
+    assert.ok(answer.startsWith('Reached maximum iterations (40)'))
+    assert.equal(secondCallIterations.length, 40)
+  } finally {
+    await cleanupSeedPlanSession(sessionId)
+  }
+})
+
+test('Implementer role: escalating PROGRESS CHECK nudges fire at 50, 60 and 70 before the iteration cap at 80', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-role-progress-implementer-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([thinkingTurn]))
+  agent.setSessionId(sessionId)
+  agent.setAllowedTools(ROLE_TOOLS.implementer)
+  agent.setRole('implementer')
+  agent.setMaxIterations(ROLE_MAX_ITERATIONS.implementer)
+  try {
+    await agent.chat('argo role-progress implementer case')
+    const warnings = events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning')
+      .map(e => e.message)
+    assert.ok(warnings.includes(
+      'PROGRESS CHECK: 50 iterations in and not finished. Start wrapping up your work. Call conclude with a ' +
+        'summary of what you accomplished, what didn\'t work, and what\'s left to do.',
+    ))
+    assert.ok(warnings.includes(
+      'PROGRESS CHECK: 60 iterations in. You must wrap up now. Call conclude with what you accomplished and ' +
+        'what remains.',
+    ))
+    assert.ok(warnings.includes(
+      'PROGRESS CHECK: 70 iterations. Finish immediately. Call conclude with your final status — what was ' +
+        'done, what failed, and what\'s left.',
+    ))
+    assert.equal(warnings.some(w => w.startsWith('STALL:')), false)
+    assert.equal(agent.getLastRunOutcome(), 'cap')
+  } finally {
+    await cleanupSeedPlanSession(sessionId)
+  }
+})
+
+test('Tester/Boss roles keep the pre-existing generic fraction-based checkpoints untouched (no entry in PROGRESS_CHECK_ITERATIONS)', async () => {
+  // Regression guard for the "every other role's 0.4/0.65/0.85 scaling is untouched"
+  // claim in agent.ts's stallCheckpoints comment — a Tester frame at its own 20-
+  // iteration cap should still see the GENERIC wording, not a role-specific one
+  // (there is none defined for 'tester').
+  const events: AgentEvent[] = []
+  const sessionId = `test-role-progress-tester-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([thinkingTurn]))
+  agent.setSessionId(sessionId)
+  agent.setAllowedTools(ROLE_TOOLS.tester)
+  agent.setRole('tester')
+  agent.setMaxIterations(ROLE_MAX_ITERATIONS.tester)
+  try {
+    await agent.chat('argo role-progress tester case')
+    const warnings = events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning')
+      .map(e => e.message)
+    assert.ok(warnings.some(w => w.startsWith('STALL:') || w.startsWith('PROGRESS CHECK:')))
+    assert.equal(warnings.some(w => w.includes('Wrap up your analysis')), false, 'the Planner-specific wording must not leak into a Tester frame')
+  } finally {
+    await cleanupSeedPlanSession(sessionId)
+  }
+})
+
+// ── buildImplementerCapFollowUp — the message that resumes the Planner instead of
+// failing the run when an Implementer frame hits its hard iteration cap ─────────────
+
+test('buildImplementerCapFollowUp: includes the assignment and last status, and asks for a narrower reframed task', () => {
+  const text = buildImplementerCapFollowUp('Refactor the entire billing module.', 'Reached maximum iterations (80) without a final answer.')
+  assert.ok(text.includes('unable to complete its task within the iteration budget'))
+  assert.ok(text.includes('It was working on: Refactor the entire billing module.'))
+  assert.ok(text.includes('Its last status: Reached maximum iterations (80) without a final answer.'))
+  assert.ok(text.includes('too broad or complex for a single implementation pass'))
+  assert.ok(text.includes('Call conclude with the revised assignment'))
+  assert.ok(text.includes('conclude that the objective is complete'))
+})
+
+test('buildImplementerCapFollowUp: never mentions the generic "concluded with" framing buildNextTaskPrompt uses — this is a distinct message, not a variant', () => {
+  const text = buildImplementerCapFollowUp('Some task', 'Some status')
+  assert.equal(text.includes('concluded with'), false)
 })

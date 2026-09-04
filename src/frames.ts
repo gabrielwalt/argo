@@ -21,14 +21,26 @@ import { getConclusion } from './ledger.js'
 // specific, it is how any frame ends its turn now (agent.ts's chat() loop: a turn
 // with no tool calls is a thinking turn, only calling `conclude` finishes). The
 // Planner's plan (both its initial overall plan and each per-task assignment,
-// read straight through as free text — see dispatch.ts's isPlannerDone; there is
-// no TASK:/TEST:/DONE line convention any more), the Boss's checkpoint markers,
-// and (for the still-defined-but-unspawned Tester role — see dispatch.ts's module
-// header) a RELEASE/REDO verdict are all delivered as `conclude`'s `answer`
+// read straight through as free text — see dispatch.ts's isPlannerDone/
+// isPlannerGiveUp; there is no TASK:/TEST:/DONE line convention any more), the
+// Boss's checkpoint markers, and the Tester's SUCCESS/FAIL verdict (dispatch.ts's
+// parseTesterResult — see below) are all delivered as `conclude`'s `answer`
 // argument instead of a bare no-tool-call final message — dispatch.ts/frames.ts's
-// parsing functions (parseTesterVerdict, parseBossVerdict, parseTaskStartVerdict)
-// are unaffected: they only ever read the STRING chat() returns, and that string
-// is still exactly the model's own text either way.
+// parsing functions are unaffected: they only ever read the STRING chat() returns,
+// and that string is still exactly the model's own text either way.
+//
+// TESTER IS BACK, HARNESS-DRIVEN (this task, superseding the "iterative planner"
+// rewrite's removal of it below). The harness (dispatch.ts's runObjectiveViaPlanner/
+// runTesterValidation) spawns a Tester automatically after every Implementer
+// concludes SUCCESS — the Planner never decides this and never sees a Tester frame
+// directly, only the eventual validated (or still-failing) result folded back into
+// its next detail call. The Tester's OWN conclude convention is now SUCCESS/FAIL:
+// (dispatch.ts's buildTesterAssignment/parseTesterResult), NOT the RELEASE/REDO
+// convention parseTesterVerdict below still implements — that function is now
+// doubly superseded (previously dead because nothing spawned a Tester at all; now
+// dead because the live Tester uses a different convention) and kept ONLY because
+// batch2.test.ts (off this task's write list) still exercises it directly. See
+// dispatch.ts's own module-level comments for the live design.
 export const ROLE_TOOLS: Record<Role, ToolName[]> = {
   // Deliberately NO update_plan (removed 2026-09-04). The Planner's deliverable is
   // its own FRAME'S FINAL ANSWER on each call (delivered via `conclude`'s `answer`
@@ -49,7 +61,12 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
   // pure log noise. The harness owns the plan; the Implementer's job is to execute
   // it, not define or refine it (see agent.ts's canUpdatePlan/buildSystemPrompt).
   implementer: ['read_file', 'write_file', 'edit_file', 'bash', 'fetch_url', 'web_search', 'browser_fetch', 'ledger', 'conclude'],
-  // Deliberately no write_file/edit_file — Tester directs fixes, never makes them.
+  // Deliberately no write_file/edit_file — Tester directs fixes (its FAIL: text
+  // becomes a NEW Implementer's assignment, dispatch.ts's parseTesterResult/
+  // runTesterValidation), never makes them itself. `bash` is kept for running the
+  // project's own tests/checks (see the Boss's own read-only bash rationale above —
+  // same reasoning: no bash would leave the Tester unable to actually verify
+  // anything beyond reading code).
   tester: ['read_file', 'bash', 'ledger', 'conclude'],
   // Deliberately no write_file/edit_file — the Boss verifies, it never fixes.
   boss: ['read_file', 'bash', 'web_search', 'fetch_url', 'ledger', 'conclude'],
@@ -119,11 +136,65 @@ export const TASK_START_TOOLS: ToolName[] = ['read_file', 'bash', 'web_search', 
 // a stand-up cadence, NOT a hard kill; every entry in this table is currently a hard kill
 // (agent.ts makes the cap-hit string the frame's final answer). The correct fix is a soft
 // cap with a stand-up, and this raise is an interim measurement, not that fix.
+// Implementer raised 60->80 (this task, "iteration limits and progress nudges"). The
+// escalating PROGRESS_CHECK_ITERATIONS/PROGRESS_CHECK_MESSAGES table below now gives the
+// Implementer THREE nudges before its hard cap (50/60/70), so 80 keeps a real 10-iteration
+// margin after the strongest ("Finish immediately") nudge instead of the cap landing right
+// on top of it — a model that genuinely needs a couple more turns to call `conclude` after
+// being told to wrap up should get them, same spirit as the Planner's own "not a hard kill,
+// an ideal chunk size" note below.
 export const ROLE_MAX_ITERATIONS: Record<Role, number> = {
   planner: 40,
-  implementer: 60,
+  implementer: 80,
   tester: 20,
   boss: 15,
+}
+
+// PER-ROLE PROGRESS-CHECK ESCALATION (this task). Distinct from the generic fraction-of-
+// maxIterations stall/progress mechanism already in agent.ts (the `stallCheckpoints` local
+// in chat(), scaled 0.4/0.65/0.85 of a run's own budget) — that mechanism stays exactly as
+// it is for every role NOT listed here (Tester, Boss, the unrestricted baseline). Planner and
+// Implementer instead get FIXED, ABSOLUTE per-call iteration thresholds with role-specific
+// wording, because the brief's numbers (Planner: two escalating nudges at 20/30 of a 40 cap;
+// Implementer: three escalating nudges at 50/60/70 of an 80 cap) don't fall out of the generic
+// fractions — 20/40 = 0.5 and 30/40 = 0.75 (not 0.4/0.65/0.85), and both roles need one more
+// rung than the generic table has. agent.ts reads these keyed by the frame's role (Agent.
+// setRole, called by dispatch.ts's spawnFrame alongside setAllowedTools/setMaxIterations/etc.)
+// and, when a role has an entry here, replaces the generic mechanism for that one frame's
+// checkpoints with these exact iteration numbers and exact message text — unconditionally (no
+// "skip if the model already edited something since the last check" allowance the generic
+// mechanism applies for Tester/Boss): these are fixed checkpoints on a countdown to a hard
+// cap, not a stall detector, so they fire every time regardless of how much real progress is
+// happening. Iteration numbers here are per-CALL (i.e. per resumeFrame/chat() turn on the
+// frame's Agent instance), matching the brief exactly ("PER CALL, not across the whole
+// session") — this falls out for free from how agent.ts's iteration loop already works: the
+// `for (let i = 0; i < this.maxIterations; i++)` loop always starts i at 0 on every chat()
+// call regardless of a resumed frame's cumulative `iterationBase` (that offset only shifts
+// REPORTED iteration numbers and this table's own thresholds together, so the comparison
+// still lands on the same LOCAL iteration count every call — see agent.ts's stallCheckpoints
+// computation).
+export const PROGRESS_CHECK_ITERATIONS: Partial<Record<Role, number[]>> = {
+  planner: [20, 30],
+  implementer: [50, 60, 70],
+}
+
+// Message text is VERBATIM per this task's brief — index-aligned with
+// PROGRESS_CHECK_ITERATIONS[role] (message[i] fires at iteration[i]). Planner's own
+// two rungs mirror the Implementer's escalating tone (gentle reminder, then firmer)
+// at half the iteration count, since its hard cap (40) is half the Implementer's (80).
+export const PROGRESS_CHECK_MESSAGES: Partial<Record<Role, string[]>> = {
+  planner: [
+    'PROGRESS CHECK: 20 iterations in. Wrap up your analysis and call conclude with your result.',
+    'PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.',
+  ],
+  implementer: [
+    'PROGRESS CHECK: 50 iterations in and not finished. Start wrapping up your work. Call conclude with a ' +
+      'summary of what you accomplished, what didn\'t work, and what\'s left to do.',
+    'PROGRESS CHECK: 60 iterations in. You must wrap up now. Call conclude with what you accomplished and ' +
+      'what remains.',
+    'PROGRESS CHECK: 70 iterations. Finish immediately. Call conclude with your final status — what was ' +
+      'done, what failed, and what\'s left.',
+  ],
 }
 
 // PER-ROLE MECHANISM POLICY (2026-09-04). See types.ts's FramePolicy for why this is a
