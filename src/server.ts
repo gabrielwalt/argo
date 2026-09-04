@@ -14,6 +14,7 @@ import type { AgentEvent, ModelOptions } from './types.js'
 import { checkEnvironment, logEnvironment, type EnvCheck } from './health.js'
 import { installAuth } from './auth.js'
 import { runDispatchLoop, abortDispatch } from './dispatch.js'
+import { ensureWorkspaceId, workspaceHasContent, parseSessionPointer, formatSessionPointer, decideSessionResume, type SessionResumeReason } from './workspace-identity.js'
 
 const execAsync = promisify(exec)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -66,6 +67,26 @@ function makeSessionId(): string {
 let currentSessionId = makeSessionId()
 let isBusy = false
 let envStatus: EnvCheck | null = null
+
+// Content identity of the mounted workspace (see workspace-identity.ts) — set once by
+// startServer(). Null in standalone dev mode before a workspace is mounted, or if the
+// workspace is unwritable (ensureWorkspaceId fails open rather than blocking startup).
+let currentWorkspaceId: string | null = null
+
+// Set once by startServer()'s resume-vs-fresh decision, surfaced on GET /status as
+// `startupSession` so a future UI change can say "started a fresh session — the
+// previous one belonged to a different workspace" instead of silently showing nothing.
+// /reset and /resume/:sessionId are explicit user actions, not a silent auto-decision,
+// so they don't update this — only the startup-time choice needs to be visible.
+let startupSessionInfo: { resumed: boolean; reason: SessionResumeReason; previousSessionId?: string } | null = null
+
+// Every write site that used to persist a bare session id now persists it together
+// with the workspace content id it was written under, so a later restart can tell
+// whether the recorded session still belongs to this folder (decideSessionResume in
+// workspace-identity.ts). Fire-and-forget, matching the previous bare-write sites.
+function writeSessionPointer(sessionId: string): Promise<void> {
+  return fs.writeFile(SESSION_ID_FILE, formatSessionPointer({ sessionId, workspaceId: currentWorkspaceId }), 'utf-8').catch(() => {})
+}
 
 // SSE — streams all agent events to connected browsers
 app.get('/events', (req, res) => {
@@ -170,7 +191,7 @@ app.post('/reset', (req, res) => {
   agent.reset()
   currentSessionId = makeSessionId()
   agent.setSessionId(currentSessionId)
-  fs.writeFile(SESSION_ID_FILE, currentSessionId, 'utf-8').catch(() => {})
+  writeSessionPointer(currentSessionId)
   registerSession(currentSessionId).catch(() => {})
   res.json({ ok: true })
 })
@@ -346,6 +367,12 @@ app.get('/status', (req, res) => {
     sessionId: currentSessionId,
     workspacePath: config.workspacePath || null,
     env: envStatus,
+    // Set once at startup by the resume-vs-fresh decision (workspace-identity.ts) —
+    // null in standalone dev mode before a workspace is mounted. A future UI change
+    // reads this to show e.g. "started a fresh session: this folder's previous
+    // session belonged to different content" instead of silently discarding the old
+    // objective from view with no explanation.
+    startupSession: startupSessionInfo,
     // Effective compaction trigger is near-full: fires when only compactReserveTokens of
     // headroom remain (agent.ts), NOT at the old 2/3 fraction. Report the effective
     // fraction (from the default num_ctx) so the donut's threshold tick is correct; the
@@ -415,7 +442,7 @@ app.delete('/logs', async (req, res) => {
   agent.reset()
   currentSessionId = makeSessionId()
   agent.setSessionId(currentSessionId)
-  fs.writeFile(SESSION_ID_FILE, currentSessionId, 'utf-8').catch(() => {})
+  writeSessionPointer(currentSessionId)
   res.json({ ok: true })
 })
 
@@ -427,7 +454,7 @@ app.post('/resume/:sessionId', async (req, res) => {
   // Switch session
   currentSessionId = req.params.sessionId
   agent.setSessionId(currentSessionId)
-  fs.writeFile(SESSION_ID_FILE, currentSessionId, 'utf-8').catch(() => {})
+  writeSessionPointer(currentSessionId)
   // Load per-session history file if it exists (full fidelity with tool calls),
   // otherwise reconstruct from log events (user+assistant messages only)
   await agent.loadPersistedHistory()
@@ -548,11 +575,55 @@ app.get('/file', async (req, res) => {
 export async function startServer() {
   // Initialize session ID before loading history so historyFile points to the right file
   await fs.mkdir(path.dirname(SESSION_ID_FILE), { recursive: true })
+
+  // Content identity of the mounted workspace (workspace-identity.ts). Null in
+  // standalone dev mode before a folder is mounted (config.workspacePath === ''), or
+  // if the workspace turns out to be unwritable — ensureWorkspaceId fails open rather
+  // than blocking startup over a bookkeeping file.
+  currentWorkspaceId = config.workspacePath ? await ensureWorkspaceId(config.workspacePath) : null
+
+  let rawPointer = ''
   try {
-    currentSessionId = (await fs.readFile(SESSION_ID_FILE, 'utf-8')).trim()
+    rawPointer = await fs.readFile(SESSION_ID_FILE, 'utf-8')
   } catch {
-    await fs.writeFile(SESSION_ID_FILE, currentSessionId, 'utf-8').catch(() => {})
+    // No pointer file yet — parseSessionPointer('') returns null below, handled the
+    // same as any other "nothing recorded to resume" case.
   }
+  const pointer = parseSessionPointer(rawPointer)
+
+  if (!config.workspacePath) {
+    // No workspace mounted yet at all (standalone dev mode before POST
+    // /api/workspace) — there is no content to check identity against, so carry
+    // over whatever pointer exists exactly as before this change.
+    if (pointer) {
+      currentSessionId = pointer.sessionId
+    } else {
+      await writeSessionPointer(currentSessionId)
+    }
+  } else {
+    // THE FIX: resume the persisted session only if it's provably this workspace's
+    // — see decideSessionResume's own comment for the full reasoning, in particular
+    // why a legacy pointer (no recorded workspace id, the state of every session
+    // written before this change) falls back to a content check rather than an
+    // unconditional resume OR an unconditional reset.
+    const hasContent = await workspaceHasContent(config.workspacePath)
+    const decision = decideSessionResume(pointer, currentWorkspaceId, hasContent)
+    const previousSessionId = pointer?.sessionId
+    if (decision.resume && pointer) {
+      currentSessionId = pointer.sessionId
+      console.log(`[session] Resuming session ${currentSessionId} (${decision.reason})`)
+    } else {
+      currentSessionId = makeSessionId()
+      // Visible-on-purpose: a silent reset here would be the same class of defect as
+      // the silent resume this fix removes. Nothing is deleted — the previous
+      // session's run logs/history stay on disk, reachable via listSessions()/
+      // POST /resume/:sessionId — only the "current" pointer moves.
+      console.log(`[session] Starting fresh session ${currentSessionId} — ${decision.reason}${previousSessionId ? ` (previous session ${previousSessionId} left on disk, still reachable via past sessions)` : ''}`)
+    }
+    startupSessionInfo = { resumed: decision.resume, reason: decision.reason, ...(previousSessionId ? { previousSessionId } : {}) }
+    await writeSessionPointer(currentSessionId)
+  }
+
   agent.setSessionId(currentSessionId)
   await Promise.all([
     agent.loadPersistedHistory(),
