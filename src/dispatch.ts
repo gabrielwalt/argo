@@ -451,38 +451,41 @@ export function buildTaskStartGraph(objective: string, mode: 'trivial' | 'simple
 export function buildTaskStartAssignment(userMessage: string, verbatimRequestOn: boolean): string {
   return (
     'CHECKPOINT: task-start\n' +
-    `The user asked:\n<argo-user-prompt>\n${userMessage}\n</argo-user-prompt>\n\n` +
-    // VERBATIM REQUEST THREADING (config.verbatimRequest): this checkpoint's whole
-    // reason for existing was to compress the request into one mode line for
-    // everything downstream — under that pressure, two traced eval failures came from
-    // the compression silently dropping a seeded-test-file pointer and a "do NOT
-    // modify existing tests" clause (docs/research/10-hermes-differential.md, finding
-    // 1). With the flag on, this checkpoint is no longer that request's only surviving
-    // record (spawnFrame attaches the raw message to every downstream frame's
-    // assignment too — see frames.ts), so telling the model that changes what its
-    // mode line should optimize for: a concise digest rather than a defensive
-    // transcription attempt. Flag-gated so the OFF path's prompt text is byte-
-    // identical to before this existed.
+    'Your task is to classify the following user request into exactly one of the four modes below:\n' +
+    `<argo-user-prompt>\n${userMessage}\n</argo-user-prompt>\n\n` +
+    // VERBATIM REQUEST THREADING (config.verbatimRequest): when on, the raw user
+    // message is also attached to every downstream frame's assignment (see
+    // buildAssignment / renderVerbatimRequestBlock in frames.ts), so this checkpoint
+    // is no longer the request's only surviving record and the mode line can be a
+    // concise digest rather than a defensive transcription. Flag-gated so the OFF
+    // path's prompt text is byte-identical to before this existed.
     (verbatimRequestOn
       ? 'Note: the user\'s request above is ALSO threaded verbatim to every downstream frame (Planner, ' +
         'Implementer, Tester) alongside whatever you write below — this checkpoint is no longer the only place ' +
         'it survives, so your mode line can be a concise digest rather than an exhaustive transcription; the ' +
         'original is preserved separately for anyone who needs the exact wording.\n\n'
       : '') +
-    'Ground this if it references project specifics, current facts, or anything you cannot already verify — ' +
-    'check real files or the web where it matters, rather than answering from assumption.\n\n' +
-    'The project is READ-ONLY: you are only classifying this request, so nothing can be modified. Classify it ' +
-    'into exactly ONE of four modes and end your answer with exactly one line in that mode\'s format:\n' +
-    '- ANSWER: <complete final answer> — you already know it for certain, or one quick lookup settles it, and ' +
-    'nothing in the project needs to change.\n' +
-    '- TRIVIAL: <concrete, verifiable objective> — 1-3 iterations, and you are SURE it needs neither testing ' +
-    'nor numerous iterations (a one-character typo, a single obvious constant). Goes to an Implementer.\n' +
-    '- SIMPLE: <concrete, verifiable objective> — a well-scoped change taking 3-20 iterations to diagnose or ' +
-    'implement (a bug in one file, one function to fix). Goes to an Implementer and a Tester.\n' +
-    '- OBJECTIVE: <concrete, verifiable objective> — more than 20 iterations, or it needs deeper upfront ' +
-    'analysis (several distinct pieces of work, or genuine ambiguity about the approach). Goes to a Planner ' +
-    'to be broken down. Never "NONE" or "no objective" here, regardless of how simple the request is or ' +
-    'whether it involves this project at all.'
+    'Return exactly one of these formats:\n' +
+    '- `ANSWER:\\n{complete final answer}` — Use only if you already know the answer with certainty and no ' +
+    'project changes are required.\n' +
+    '- `TRIVIAL:\\n{concrete, verifiable objective}` — Use only for the most trivial changes when you are ' +
+    'certain no testing is needed, such as a one-character typo or a single obvious constant change. Do not ' +
+    'implement it yourself; instead, formulate a clear objective for the Implementer agent, which has write ' +
+    'access. Such tasks typically take 1\u20133 iterations.\n' +
+    '- `SIMPLE:\\n{concrete, verifiable objective}` — Use for a well-scoped change that will typically take ' +
+    '3\u201320 iterations to diagnose and implement, such as a bug confined to one file or a single function ' +
+    'to fix. The objective will be handled by an Implementer and a Tester agent.\n' +
+    '- `OBJECTIVE:\\n{concrete, verifiable objective}` — Use if you expect the task to take more than 20 ' +
+    'iterations, require deeper upfront analysis, involve several distinct pieces of work, or contain genuine ' +
+    'ambiguity about the approach. The objective will be given to a Planner agent to break down into an ' +
+    'actionable plan.\n\n' +
+    'Do not implement anything. The project is READ-ONLY; your only task is to classify the request, and ' +
+    'nothing may be modified.\n' +
+    'Ground your answer or objective whenever it depends on project-specific details, current facts, or ' +
+    'anything you cannot know with certainty. Inspect the relevant files or use the web when necessary rather ' +
+    'than relying on assumptions.\n' +
+    `You have a hard budget of ${TASK_START_MAX_ITERATIONS} iterations to classify the task and return ` +
+    'exactly the required format.'
   )
 }
 

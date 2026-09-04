@@ -32,39 +32,23 @@ test('buildTaskStartAssignment: wraps the user message in <argo-user-prompt> tag
 test('buildTaskStartAssignment: states the project is read-only', () => {
   const text = buildTaskStartAssignment('fix the bug', false)
   assert.ok(/READ-ONLY/.test(text))
-  assert.ok(/nothing can be modified/.test(text))
+  assert.ok(/nothing may be modified/.test(text))
 })
 
-test('buildTaskStartAssignment: all four mode markers are present with a stated iteration range each', () => {
+test('buildTaskStartAssignment: all four mode markers are present', () => {
   const text = buildTaskStartAssignment('fix the bug', false)
-  // ANSWER deliberately has NO iteration figure — the Boss may still iterate (a
-  // lookup) before answering; the distinguishing fact is that no further agent
-  // spawns, not that answering costs zero turns. Owner correction, 2026-09-05.
-  assert.ok(/ANSWER:.*nothing in the project needs to change\.\n/.test(text))
-  assert.equal(text.includes('Budget: 0 iterations'), false)
-  // TRIVIAL: "neither testing nor numerous iterations" — it DOES iterate briefly,
-  // just not many times and not with a separate verification pass. Owner correction.
-  assert.ok(/TRIVIAL:.*1-3 iterations.*neither testing nor numerous iterations/.test(text))
-  assert.equal(/neither testing nor iteration\b/.test(text), false, 'the uncorrected wording must not linger')
-  assert.ok(/SIMPLE:.*3-20 iterations/.test(text))
-  assert.ok(/OBJECTIVE:.*more than 20 iterations/.test(text))
-})
-
-test('buildTaskStartAssignment: keeps the "never NONE / no objective" constraint on the OBJECTIVE mode', () => {
-  const text = buildTaskStartAssignment('fix the bug', false)
-  assert.ok(/Never "NONE" or "no objective"/.test(text))
-})
-
-test('buildTaskStartAssignment: classification modes are present without excessive guidance', () => {
-  const text = buildTaskStartAssignment('fix the bug', false)
-  // The four modes and their format lines must be present
   assert.ok(text.includes('ANSWER:'))
   assert.ok(text.includes('TRIVIAL:'))
   assert.ok(text.includes('SIMPLE:'))
   assert.ok(text.includes('OBJECTIVE:'))
-  // The old "STOP reading" and "hard budget" lines must NOT be present
-  assert.equal(text.includes('STOP reading'), false)
-  assert.equal(text.includes('hard budget'), false)
+  // Iteration ranges stated for the three non-answer modes
+  assert.ok(/1.3 iterations/.test(text))
+  assert.ok(/3.20 iterations/.test(text))
+  assert.ok(/more than 20/.test(text))
+  // TRIVIAL explicitly says not to implement
+  assert.ok(/Do not implement it yourself/.test(text))
+  // Grounding instruction present
+  assert.ok(/Ground your answer/.test(text))
 })
 
 test('buildTaskStartAssignment: no verbatim-request note when the flag is off', () => {
