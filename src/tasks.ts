@@ -280,10 +280,13 @@ export function renderTaskSummaries(list: TaskList): string {
 // task-graph design AND the interim "flatten it to a task list" pass). The Planner no
 // longer produces ANY harness-owned plan object at all — TaskStep, createTaskGraph,
 // readyGroups/nextStep, allStepsDone are gone entirely. dispatch.ts now calls the
-// Planner iteratively: one initial call for a rough plan (plain text, never parsed
-// into a structure), then repeated resumeFrame calls that each detail exactly one
-// Implementer task via a simple TASK:/TEST:/DONE text convention
-// (dispatch.ts's parseNextTask). See dispatch.ts's module header for the full flow.
+// Planner iteratively via `conclude`: one initial call for an overall plan (plain
+// text, never parsed into a structure), then repeated resumeFrame calls that each
+// produce exactly one self-contained Implementer assignment as their own `conclude`
+// answer — used verbatim, with no TASK:/TEST:/DONE line convention (that convention,
+// and dispatch.ts's parseNextTask that read it, were themselves removed in a later
+// rewrite that also dropped the Tester entirely from this pipeline). See dispatch.ts's
+// module header for the full current flow.
 //
 // TaskGraph itself (below) is NOT fully deleted — kept to the minimal shape two
 // off-limits files still need to type-check against: ledger.ts's PinnedState.plan
@@ -293,9 +296,17 @@ export function renderTaskSummaries(list: TaskList): string {
 // run — this type+function pair is inert legacy weight, not active machinery. Safe
 // to delete outright once ledger.ts/eviction.ts are migrated off the graph concept;
 // flagged for the cone in the report rather than done here.
+//
+// `skipTest` (2026-XX rewrite): removed from `steps` — grepped every reference
+// project-wide (src/**, docs/**) and the only ones left were this type's own
+// declaration and two docs mentions already describing it as removed decomposition
+// machinery. Nothing in the codebase ever read `.skipTest` off a TaskGraph step (the
+// Tester itself is no longer spawned at all — see dispatch.ts's module header), so
+// carrying the field forward here would be dead weight with no reader, which this
+// project's own governing principle rules out.
 export interface TaskGraph {
   objective: string
-  steps: Array<{ id: string; role: Role; prompt: string; skipTest?: boolean }>
+  steps: Array<{ id: string; role: Role; prompt: string }>
   revision: number
 }
 

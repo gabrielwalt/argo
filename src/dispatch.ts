@@ -1,58 +1,65 @@
 // THE ORCHESTRATOR (docs/subagents-plan.md, config.agents / ARGO_AGENTS). Harness code,
 // not an LLM — a strictly sequential dispatch loop over the ledger. Every role (Planner,
-// Implementer, Tester, Boss) is one scoped `Agent` instance (agent.ts) reused as the
-// call-frame execution primitive; this module owns spawning them and driving the
-// ITERATIVE PLANNER flow (2026-09 — supersedes both the original task-graph design and
-// the interim "flatten it to a task list" pass): the Planner is called ONCE for a rough
-// overall plan (plain text), then RESUMED repeatedly to detail exactly one Implementer
-// task at a time, informed by everything completed so far, until it says DONE. There is
-// no harness-owned plan OBJECT any more — no graph, no list, no step ids — the Planner's
-// own plain-text answers ARE the plan, start to finish.
+// Implementer, Boss) is one scoped `Agent` instance (agent.ts) reused as the call-frame
+// execution primitive; this module owns spawning them and driving the ITERATIVE PLANNER
+// flow.
 //
 // HARD RULE: no two LLM calls ever run concurrently, for any reason — every `await`
 // below fully resolves before the next one starts. One GPU, one resident model.
 //
-// v1 SIMPLIFICATIONS, noted explicitly (see docs/subagents-plan.md for the full design
-// this is a first pass at):
-//  - A frame's FrameResult is derived from its natural final answer + diffed files,
-//    not a dedicated `conclude` tool call.
-//  - The Tester's verdict is parsed from a text convention at the end of its final
-//    answer (RELEASE/REDO — see frames.ts). The Boss's own NONE/INJECT/RESTART/
-//    ESCALATE standup/final-verification convention is still defined in frames.ts but
-//    has no live call site here any more (see "REMOVED" below) — task-start's separate
-//    ANSWER/TRIVIAL/SIMPLE/OBJECTIVE convention is the only one this module still acts
-//    on for the Boss.
-//  - There is no separate "replan" step: adaptation is just what happens naturally on
-//    the Planner's next detail call, which always sees the full completed-work record
-//    (including any failures) and can act on it however it judges best.
+// TESTER REMOVED (2026-09, this rewrite). The owner's own words: "let's forget about
+// the testing agent, and not rely on it anymore, assuming the implementing agent will
+// test what it does if we instruct it to do so." There is no Tester spawn anywhere in
+// this module any more — not just for the OBJECTIVE/Planner path (the original ask)
+// but for SIMPLE too, which used to run one Implementer + one Tester. SIMPLE is now
+// identical in shape to TRIVIAL: one Implementer, instructed (via the Boss's own
+// classification text) to test its own work when that is called for. `runTesterRounds`,
+// `buildTesterAssignment`'s dispatch-side callers, `buildTesterPromptFromImpl`, and
+// `MAX_TESTER_ROUNDS` are gone from this file. frames.ts's `ROLE_TOOLS.tester`/
+// `ROLE_MAX_ITERATIONS.tester`/`ROLE_POLICY.tester`/`ROLE_SYSTEM_SUFFIX.tester` and its
+// `parseTesterVerdict`/`TESTER_VERDICT_NUDGE` stay defined there — Role (types.ts, off
+// limits) still enumerates `'tester'` so those Record<Role,...> tables need an entry
+// regardless, and batch2.test.ts (also off this task's write list) still exercises
+// parseTesterVerdict directly — but nothing in this module ever spawns one.
 //
-// REMOVED (2026-09, "iterative planner"): the Boss standup/final-verification
-// checkpoints — periodic health checks over a task-graph execution loop that no
-// longer exists — were removed along with the loop they reviewed. This was NOT
-// explicitly requested by name, but the new flow's own spec never calls them, and
-// leaving a large block of guaranteed-dead code (runBoss/runStandup and their
-// trigger constants) sitting here would contradict this project's own "every line
-// must earn its place" governing principle. Flagged prominently in the report for
-// the owner to veto if unwanted. parseBossVerdict/BossVerdict/extractBossVerdict
-// remain defined and tested in frames.ts/schema.ts (pure, harmless to keep) should a
-// future checkpoint want them back.
+// PLANNER DISPATCH, REWRITTEN (this task). The Planner is called ONCE for an overall
+// plan (`buildInitialPlannerPrompt`, plain text, `conclude`d — no harness-owned plan
+// object, no graph, no list, no step ids), then RESUMED repeatedly
+// (`buildNextTaskPrompt`) to detail exactly one self-contained Implementer assignment
+// at a time, each call informed by the previous Implementer's own conclusion. There is
+// no `TASK:`/`TEST:` line convention any more: every frame (Planner included) now ends
+// its turn by calling the `conclude` tool (frames.ts's ROLE_TOOLS, every role), and the
+// Planner's `conclude` answer is used AS the next Implementer's assignment verbatim —
+// unless it reads as "no further work needed", detected by `isPlannerDone` below (a
+// natural-language heuristic, deliberately not a rigid marker — see that function's
+// own comment for why and what was considered instead). `parseNextTask`,
+// `NEXT_TASK_RETRY_NUDGE`, and `detailNextTask`'s format-retry machinery are gone
+// along with the marker convention they existed to parse: a `conclude` answer is
+// always usable text, there is nothing to reformat.
+//
+// v1 SIMPLIFICATIONS, still true and noted explicitly:
+//  - A frame's FrameResult is derived from its `conclude` answer + diffed files.
+//  - There is no separate "replan" step: adaptation is just what happens naturally on
+//    the Planner's next detail call, which always sees the prior Implementer's own
+//    conclusion (including any failure) and can act on it however it judges best.
+//
+// REMOVED PREVIOUSLY (2026-09, "iterative planner"): the Boss standup/final-
+// verification checkpoints — periodic health checks over a task-graph execution loop
+// that no longer exists. Still true; not revisited by this task.
 
 import { Agent } from './agent.js'
 import { config } from './config.js'
 import { SessionLogger } from './logger.js'
 import type { AgentEvent, FrameSpawnRequest, FrameResult, FrameStatus, ModelOptions, Role, ToolName } from './types.js'
-import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, systemPromptFor, buildAssignment, capSummary, parseTesterVerdict, parseTaskStartVerdict, policyFor, TESTER_VERDICT_NUDGE, TASK_START_TOOLS, type TaskStartVerdict } from './frames.js'
+import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, systemPromptFor, buildAssignment, capSummary, parseTaskStartVerdict, policyFor, TASK_START_TOOLS, type TaskStartVerdict } from './frames.js'
 import * as ledger from './ledger.js'
 // SCHEMA-CONSTRAINED CONTROL PLANE (config.schemaControlPlane, docs/research/
 // 09-small-model-scaffolding.md §1/§7; see src/schema.ts for the full design rationale).
-// A single restatement call, tried after the cheap regex parse fails. NEVER used to
-// invent a decision: both extractX functions here return null on any doubt, and every
-// call site below falls through to the SAME hard-stop / conservative default the
-// flag-off path already uses on that null. (extractTaskGraph was removed alongside
-// schema.ts's whole task-graph extraction subsystem — see that module's header; there
-// is no schema-constrained recovery path for the Planner's new TASK:/TEST:/DONE
-// detail replies, only the plain regex parse + one format-retry nudge below.)
-import { extractTaskStart, extractTesterVerdict } from './schema.js'
+// Still used for the task-start checkpoint's ANSWER/TRIVIAL/SIMPLE/OBJECTIVE marker
+// recovery below. There is no schema-constrained recovery path for the Planner's
+// `conclude` answers any more — that answer is always usable free text (there is no
+// marker line to fail to produce), so nothing here calls extractTesterVerdict any more.
+import { extractTaskStart } from './schema.js'
 
 // The workspace root — config.workspacePath (NOT a literal '/workspace') because
 // standalone dev mode runs this Node process directly on the HOST while `bash`
@@ -64,17 +71,16 @@ function root(): string {
   return config.workspacePath || '/workspace'
 }
 
-const MAX_TESTER_ROUNDS = 3
-
-// Safety valve for the iterative Planner loop (2026-09) — bounds how many
-// TASK:/TEST:/DONE detail calls one dispatch run will make before giving up, the
-// same role MAX_REPLAN_ROUNDS used to play for the old graph-replan design. 30 is
-// generous headroom above the 2-5 steps a typical objective decomposes into
-// (docs/subagents-plan.md) while still bounding a Planner that never says DONE —
-// if this is ever hit in practice, the real lever is almost certainly the Planner's
-// own per-call iteration budget (ROLE_MAX_ITERATIONS.planner, frames.ts), not this
-// count; raise that first before raising this.
-const MAX_PLANNER_TASKS = 30
+// Safety valve for the iterative Planner loop — bounds how many Implementer-then-
+// resume-Planner rounds one dispatch run will make before giving up. Raised 30->50
+// per this task's brief: the loop body per round is now cheaper (one Implementer
+// spawn + one Planner resume, no Tester rounds), so the same wall-clock budget buys
+// more rounds; 50 is still comfortably above the 2-5 steps a typical objective
+// decomposes into (docs/subagents-plan.md) while bounding a Planner that never
+// says it's done. If this is ever hit in practice, the real lever is almost
+// certainly the Planner's own per-call iteration budget (ROLE_MAX_ITERATIONS.planner,
+// frames.ts), not this count; raise that first before raising this.
+const MAX_PLANNER_ROUNDS = 50
 
 // Model/options for the CURRENT dispatch run, set once at the top of runDispatchLoop
 // and read by every spawnFrame call below. Module-level state is safe here only
@@ -198,9 +204,9 @@ export interface SpawnedFrame {
 // tool_result/plan/done/...) with which role produced it and where it sits in the
 // delegation tree — see types.ts's FrameTag. Bound once at construction, so a later
 // resumeFrame() call on the same Agent instance automatically stays tagged too; no
-// re-wrapping needed. An UNTAGGED event (the objective/boss_verdict/replan narrative
-// events below, emitted via the raw `emit` param) is the harness's own top-level
-// narrative, not any one frame's turn.
+// re-wrapping needed. An UNTAGGED event (the objective/done narrative events below,
+// emitted via the raw `emit` param) is the harness's own top-level narrative, not any
+// one frame's turn.
 //
 // Also the one hook point for the live registry's lastTokenUsage cache (read-only
 // observability only — this does not change what's emitted or sent to Ollama, it
@@ -220,12 +226,6 @@ function tagEmit(emit: Emit, frameId: string, role: Role, parentFrameId: string 
 // unit-testable without an Ollama: spawnFrame itself cannot be tested (it writes a ledger
 // entry and runs a real model turn), but "the Planner's frame has task sequencing off and
 // the Implementer's has it on" is exactly this function's contract.
-//
-// Before this existed, spawnFrame configured tools, role prompt, frame id, max iterations
-// and session id, and said NOTHING about tasks/memory/loop/grounding/layout — so every
-// frame silently inherited config.* (tasks ON by default), which is what trapped the
-// Planner. setTasks/setMemory/setLoop had zero production call sites; server.ts:108 set
-// grounding alone.
 export function applyFramePolicy(agent: Agent, role: Role): void {
   agent.setPolicy(policyFor(role))
 }
@@ -241,9 +241,8 @@ export function applyFramePolicy(agent: Agent, role: Role): void {
 // Implementer that already has a concrete objective before its first turn — see
 // Agent.seedPlan's own comment for the full reasoning. Every Implementer spawn site
 // below passes its own task prompt here (the TRIVIAL/SIMPLE objective, or the
-// Planner's own per-task detail prompt); every other role omits it (Tester/Boss
-// never hold write_file/edit_file, so the gate can never trip for them; the Planner
-// never writes either).
+// Planner's own per-task detail prompt); every other role omits it (the Planner
+// never writes at all, so the gate can never trip for it).
 async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: ToolName[], seedObjective?: string): Promise<SpawnedFrame> {
   checkAborted()
   const frameId = ledger.newId(req.role)
@@ -283,31 +282,21 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
 }
 
 // Resumes an EXISTING frame (same Agent instance, same history) with a follow-up
-// message — used for the Planner's per-task detail calls and the Tester's "redo"
-// verdict. Writes a NEW conclusion entry for the same frameId (the ledger is
-// append-only; the latest conclusion for a frameId is authoritative — same
-// convention as episode eviction records).
+// message — used for the Planner's per-task detail calls. Writes a NEW conclusion
+// entry for the same frameId (the ledger is append-only; the latest conclusion for a
+// frameId is authoritative — same convention as episode eviction records).
 // H14 (2026-09-04): the { resume: true } flag is load-bearing. Without it chat() cleared
 // the frame's currentPlan, taskList, loopState, editedPaths, episodes, reconciliation
 // state and iteration counter (agent.ts's per-run reset), so "same Agent instance, same
 // history" was true of the transcript and false of every piece of run state derived from
 // it — a resumed frame restarted at ITER 1 with no plan and no memory of what it had
-// edited. Latent while REDO never fired; live the moment H13 makes REDO reachable.
+// edited.
 // LIVE REGISTRY + resumeFrame: no registry update needed here beyond activeFrameId.
 // The frameId's entry already exists (spawnFrame put it there, and it is never
 // deleted until the NEXT run's clear()), and it holds this exact same Agent
-// instance by construction ("Resumes an EXISTING frame (same Agent instance...)"
-// above) — so `live` (computed from map membership) and the entry's role/
-// parentFrameId/startedAt all stay correct with no changes on this path. What DOES
-// need updating is which frame counts as "currently executing" for GET /frames'
-// `active` field, exactly like activeFrameAgent just below.
-//
-// The H14 bug noted above (chat() wipes currentPlan/taskList/loopState/
-// editedPaths/episodes/reconciliation-state/iteration-counter on resume) does NOT
-// affect what GET /context or GET /frames report: both read only
-// agent.getContext(), which reads this.history and this.compactionState — neither
-// is in that list, so message counts/content stay accurate across a resume
-// regardless of that separate, not-fixed-here bug.
+// instance by construction — so `live` (computed from map membership) and the
+// entry's role/parentFrameId/startedAt all stay correct with no changes on this
+// path.
 async function resumeFrame(frameId: string, agent: Agent, followUp: string): Promise<FrameResult> {
   checkAborted()
   activeFrameAgent = agent
@@ -326,15 +315,13 @@ async function resumeFrame(frameId: string, agent: Agent, followUp: string): Pro
 // final answer.", emits a terminal `error` event, and returns that string; this function
 // used to see only "a string came back" and record status:'success'. Measured over the
 // September corpus: 43 frames ended blank at their cap and were recorded success —
-// Planner 9/23 (39%), Boss 26/204, Implementer 6/61, Tester 2/85, single-loop baseline
-// 7/194. Nearly a tenth of all frames reported success having produced nothing, and the
-// same run's ledger conclusion contradicted its own event stream ("10/10 + error" vs
+// nearly a tenth of all frames reported success having produced nothing, and the same
+// run's ledger conclusion contradicted its own event stream ("10/10 + error" vs
 // "success").
 //
 // The fix is to consult the frame's TERMINAL STATE (Agent.getLastRunOutcome(), set at each
 // of chat()'s exit paths) rather than to pattern-match the returned text or compare
-// iteration counts — the latter is also now wrong by construction, since a resumed frame's
-// counter is cumulative (H14).
+// iteration counts.
 //
 //   'cap'     → 'partial'. Not 'failed': the frame may well have done real work (files
 //               touched are still reported below) — what it did NOT do is conclude, so it
@@ -463,13 +450,11 @@ export const TASK_START_CAP_FAILURE_MESSAGE =
 // a real frame; the cone reviewing this change can also just call it to see exactly
 // what reaches the model.
 //
-// 2026-09-05: rewritten to make classification's read-only-ness explicit in the
-// prompt itself (matching the tool-set change, TASK_START_TOOLS in frames.ts) and
-// roughly halved in length — every mode now states its own iteration-budget as a
-// uniform field (0 / 1-3 / 3-20 / 20+) instead of burying it in prose, and the "you
-// MAY fix it yourself" / "verify it once" guidance is gone: there is no longer a
-// fix-it-yourself path to guide. The <argo-user-prompt> tagging and per-mode budgets
-// are deliberate and must survive any future edit of this prompt.
+// LOCKED — do not modify. This is the Boss prompt referenced by the task brief as
+// off-limits; the SIMPLE mode's description below is unchanged text, even though
+// SIMPLE no longer spawns a Tester (see this module's header) — "handled by an
+// Implementer and a Tester agent" is now inaccurate to the actual pipeline, but this
+// exact function body is explicitly out of scope for this rewrite.
 export function buildTaskStartAssignment(userMessage: string, verbatimRequestOn: boolean): string {
   return (
     'CHECKPOINT: task-start\n' +
@@ -531,8 +516,8 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
   // above the cap no longer implies a stall.
   if (!verdict.parsed && !agent.hitIterationCap()) {
     if (config.schemaControlPlane) {
-      // Replaces the resumeFrame retry entirely (see the module-header comment on the
-      // import above): a single bounded, schema-constrained restatement of the SAME
+      // Replaces the resumeFrame retry entirely (see the import comment at the
+      // top of this file): a single bounded, schema-constrained restatement of the SAME
       // final answer, no extra frame turn, no tools, think:false. The ledger conclusion
       // is deliberately left untouched — nothing about the frame's own run changes,
       // only how the harness reads what it already said.
@@ -572,136 +557,33 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
   return { mode: base.mode, text: base.text }
 }
 
-// the Tester verifies a claim (an Implementer task's, or — 2026-09-03 — the Boss's own
-// task-start attempt) and can send it back for a targeted redo. Factored out so the
-// SAME independent-verification path applies uniformly regardless of who did the
-// work: "always at least two distinct frames involved" (docs/subagents-plan.md)
-// means even the Boss's own TRIVIAL self-fix gets a real Tester pass, never just a
-// self-report accepted as-is.
-// H13: a Tester that produced no readable verdict must NOT read as approval. Measured:
-// 85 Tester frames, zero REDOs ever issued, and parseTesterVerdict defaulted every
-// unreadable reply — including the 2 that stalled blank at their cap — to RELEASE, i.e.
-// work accepted with no review at all. The escalation ladder here, in order:
-//   1. round(s) remaining → re-run the verification with a targeted reformat nudge
-//      (TESTER_VERDICT_NUDGE), the same shape as the task-start marker retry: the review
-//      may well have happened and only the verdict line is missing.
-//   2. rounds exhausted → the verified frame's conclusion is REWRITTEN to 'partial' with
-//      an explicit UNVERIFIED note and a fresh ledger conclusion (the ledger is
-//      append-only; the latest conclusion for a frameId wins), plus a harness-level
-//      `warning` event.
-// It deliberately does NOT retry the Implementer itself on a missing verdict: a Tester
-// failing to format a verdict is not evidence the implementation is wrong.
+// Raised when the Planner cannot produce a usable answer even after a targeted retry
+// of its INITIAL plan call, or when the Planner hits its own iteration cap on ANY
+// call (initial plan or a per-task detail resume) without concluding at all. Unwound
+// by runDispatchLoop, which reports it to the user as a planning failure instead of
+// inventing a task. The Planner is the one checkpoint whose OUTPUT IS THE PLAN —
+// there is no conservative default available to it, so this is the one place in the
+// pipeline that stops rather than degrades.
 //
-// `implPrompt` is the harness-authored (2026-09, "iterative planner") verification
-// context — see buildTesterPromptFromImpl below — built by the HARNESS from the
-// Implementer's own prompt plus its conclusion, never by the Planner: the Planner's
-// job is to decide WHETHER a task needs testing (its TEST: yes/no answer), not to
-// draft the Tester's own assignment text.
-async function runTesterRounds(frame: SpawnedFrame, implPrompt: string, emit: Emit): Promise<SpawnedFrame> {
-  let verdictNudge = ''
-  // At most ONE extra Tester frame is spent on a missing verdict line, deliberately: the
-  // Boss's own measured record is 16/22 markers present, 6/22 unusable, and if the Tester's
-  // rate is similar then retrying every remaining round would triple the verification cost
-  // of ~a quarter of all tasks to recover a formatting slip. One targeted retry, then say
-  // "unverified" and move on — leaving the remaining round available for a real REDO cycle.
-  let verdictRetries = 0
-  for (let round = 0; round < MAX_TESTER_ROUNDS; round++) {
-    const testerReq: FrameSpawnRequest = {
-      role: 'tester',
-      parentFrameId: frame.result.frameId,
-      assignment: buildTesterPromptFromImpl(implPrompt, frame.result.summary) + verdictNudge,
-    }
-    const { agent: testerAgent, result: testerResult } = await spawnFrame(testerReq, emit)
-    const verdict = parseTesterVerdict(testerResult.summary)
-    if (verdict.action === 'release') break
-    if (verdict.action === 'escalate') {
-      const how = testerAgent.hitIterationCap()
-        ? `stalled at its iteration cap (${ROLE_MAX_ITERATIONS.tester})`
-        : `ended (${testerAgent.getLastRunOutcome()}) with no RELEASE/REDO line`
-      emit({
-        type: 'warning',
-        message: `Tester frame ${testerResult.frameId} ${how} — no verdict to act on. A missing verdict is NOT `
-          + 'a release; the reviewed work is not being accepted on the strength of it.',
-      })
-      // Builds the SAME "unverified" terminal FrameResult either path below falls to —
-      // factored out only to avoid writing it twice, not a behavior change.
-      const buildUnverified = (): FrameResult => ({
-        ...frame.result,
-        status: frame.result.status === 'success' ? 'partial' : frame.result.status,
-        summary: capSummary(
-          `${frame.result.summary}\n\nUNVERIFIED: the Tester produced no parseable RELEASE/REDO verdict `
-          + '(including after an explicit request for the verdict line), so this work has NOT been '
-          + 'independently verified.',
-        ),
-        issues: [...(frame.result.issues ?? []), 'tester-verdict-unparseable'],
-      })
-      if (config.schemaControlPlane) {
-        // Replaces the TESTER_VERDICT_NUDGE resume entirely (see the import comment at the
-        // top of this file): one bounded, schema-constrained restatement of the SAME final
-        // answer, attempted only when the frame actually concluded (a capped Tester's
-        // final answer is agent.ts's own cap-hit notice, nothing to restate — resuming it
-        // would just re-hit the same cap, H14). On failure, go straight to the SAME
-        // "unverified" terminal state the flag-off path reaches once ITS OWN retry budget
-        // is spent (never straight to release) — a further free-text nudge is not expected
-        // to succeed where a schema-constrained one already failed.
-        const extracted = testerAgent.getLastRunOutcome() === 'ok'
-          ? await extractTesterVerdict(effectiveModel(), testerResult.summary)
-          : null
-        if (extracted) {
-          emit({
-            type: 'warning',
-            message: `schema-extraction recovered a Tester verdict for frame ${testerResult.frameId} `
-              + `(verdict: ${extracted.verdict}) after the RELEASE/REDO line was missing.`,
-          })
-          if (extracted.verdict === 'release') break
-          const resumed = await resumeFrame(frame.result.frameId, frame.agent, extracted.reason ?? TESTER_VERDICT_NUDGE)
-          frame = { agent: frame.agent, result: resumed }
-          continue
-        }
-        const unverified = buildUnverified()
-        await ledger.recordConclusion(root(), unverified)
-        frame = { agent: frame.agent, result: unverified }
-        break
-      }
-      if (verdictRetries === 0 && round < MAX_TESTER_ROUNDS - 1) {
-        verdictRetries++
-        verdictNudge = `\n\n${TESTER_VERDICT_NUDGE}`
-        continue
-      }
-      const unverified = buildUnverified()
-      await ledger.recordConclusion(root(), unverified)
-      frame = { agent: frame.agent, result: unverified }
-      break
-    }
-    const resumed = await resumeFrame(frame.result.frameId, frame.agent, verdict.followUp)
-    frame = { agent: frame.agent, result: resumed }
-    verdictNudge = ''
-  }
-  return frame
-}
-
-// Raised when the Planner cannot produce a readable answer even after a targeted
-// retry — either its INITIAL plan call (which cannot fail this way; there is no
-// required format for the rough plan, so anything it says is accepted) or, in
-// practice, a per-task DETAIL call that never produces a readable TASK:/DONE line
-// (see detailNextTask below). Unwound by runDispatchLoop, which reports it to the
-// user as a planning failure instead of inventing a task. The Planner is the one
-// checkpoint whose OUTPUT IS THE PLAN — there is no conservative default available
-// to it, so this is the one place in the pipeline that stops rather than degrades.
+// NOTE (this rewrite): under the `conclude`-based design there is no rigid TASK:/
+// TEST:/DONE line to fail to produce — the Planner's `conclude` answer is always
+// usable free text, read straight through isPlannerDone below. So the only way a
+// detail call now reaches PlanningFailed is a genuine cap-hit (agent.hitIterationCap()),
+// never an "unparseable reply" — the previous format-retry-then-fail path
+// (detailNextTask/parseNextTask/NEXT_TASK_RETRY_NUDGE) is gone along with the
+// convention it existed to parse.
 export class PlanningFailed extends Error {}
 
-// Implementer/Tester assignments, wrapped the same way as the Boss task-start
-// checkpoint's `<argo-user-prompt>` tags (buildTaskStartAssignment, above) — one
-// prompt shape across every role instead of each spawn site below handing over a
-// bare, untagged string. Pure and exported so the exact text is directly testable
-// without spawning a real frame.
+// Implementer assignments, wrapped the same way as the Boss task-start checkpoint's
+// `<argo-user-prompt>` tags (buildTaskStartAssignment, above) — one prompt shape
+// across roles instead of each spawn site below handing over a bare, untagged
+// string. Pure and exported so the exact text is directly testable without spawning
+// a real frame.
 //
-// NOTE (2026-09, "iterative planner"): buildImplementerAssignment is used ONLY for
-// the TRIVIAL/SIMPLE task-start fast paths below, which hand the Boss's own
-// classified objective straight to one Implementer. The OBJECTIVE path's
-// per-task Implementer prompt is the Planner's OWN TASK: text, unwrapped — see
-// buildNextTaskPrompt's format instruction ("a concrete, self-contained prompt for
-// the Implementer agent") and runDispatchLoopBody below.
+// Used for the TRIVIAL/SIMPLE task-start fast paths below, which hand the Boss's own
+// classified objective straight to one Implementer. The OBJECTIVE path's per-task
+// Implementer assignment is the Planner's OWN `conclude` answer, unwrapped — see
+// buildNextTaskPrompt and runDispatchLoopBody below.
 export function buildImplementerAssignment(objective: string): string {
   return (
     'Your task is to implement the following objective:\n' +
@@ -709,149 +591,123 @@ export function buildImplementerAssignment(objective: string): string {
   )
 }
 
-// Same tag, opposite framing: the Tester is told what to VERIFY, never what to
-// implement, matching ROLE_SYSTEM_SUFFIX.tester ("You verify another agent's
-// claimed work — you never fix anything yourself").
-export function buildTesterAssignment(claim: string): string {
-  return (
-    'Your task is to verify the following claimed work:\n' +
-    `<argo-objective>\n${claim}\n</argo-objective>`
-  )
-}
-
-// The Tester's assignment for an iterative-Planner task (2026-09) — built by the
-// HARNESS, never the Planner: the Planner only decides WHETHER a task needs testing
-// (its TEST: yes/no answer), never drafts the Tester's own prompt. Reuses
-// buildTesterAssignment's existing <argo-objective> wrapping convention so this is
-// one more instance of the same tagging shape every role's assignment already uses,
-// not a new one.
-export function buildTesterPromptFromImpl(implPrompt: string, implConclusion: string): string {
-  return buildTesterAssignment(`The Implementer was asked to: ${implPrompt}\nIt reported: ${implConclusion}`)
-}
-
-// The Planner's FIRST call: a rough overall plan in plain text, not a formal
-// structure — no JSON, no step list, nothing this harness parses. The Planner is
-// resumed repeatedly afterward (buildNextTaskPrompt below) to turn this into
-// concrete, one-at-a-time Implementer tasks. `<argo-objective>` tags mirror the same
-// unmistakable-boundary convention as the task-start checkpoint's
-// `<argo-user-prompt>` tags (buildTaskStartAssignment, above) — pure and exported so
+// The Planner's FIRST call — VERBATIM, per this task's brief; every word of this
+// string reaches the model exactly as written here. No structural markup beyond the
+// `<argo-objective>` tag (which mirrors the same unmistakable-boundary convention as
+// the task-start checkpoint's `<argo-user-prompt>` tag, buildTaskStartAssignment
+// above) — the Planner's deliverable is its own `conclude` answer (an ordered list
+// of sub-tasks in plain text), not a harness-parsed structure. Pure and exported so
 // this exact text is directly testable without spawning a real frame.
 export function buildInitialPlannerPrompt(objective: string): string {
   return (
+    'Your task is to create an implementation plan for the following user-requested objective:\n' +
     `<argo-objective>\n${objective}\n</argo-objective>\n\n` +
-    'The project is READ-ONLY for you. Create a rough overall plan for addressing this objective. Describe ' +
-    'the pieces of work you see, in what order they should be done, and any considerations. This is a ' +
-    'high-level plan — you will be asked to detail each task one at a time afterward.'
+    'Your task is complete once you call `conclude` with an ordered list of concrete, actionable sub-tasks that can be assigned to implementation sub-agents. The plan should make dependencies and sequencing clear, and each sub-task should have a sufficiently specific and verifiable objective.\n\n' +
+    'Do not implement anything. The project is READ-ONLY: your role is to plan and orchestrate the implementation, and nothing may be modified. Inspect the relevant project files as needed to understand the codebase and ground your plan. Use the web when necessary for current or external information rather than relying on assumptions.\n\n' +
+    'You have a hard budget of 20 iterations to call `conclude` with the produced plan. If the full implementation cannot yet be predicted reliably, plan the portions that can be determined with confidence and explicitly account for a later re-planning step.'
   )
 }
 
-// Resumes the Planner to detail exactly ONE task, informed by the plan it already
-// gave and everything completed so far (including any failures — the Planner sees
-// them here and decides what, if anything, to do about it; there is no separate
-// harness-triggered replan). Pure and exported so the exact prompt text is directly
-// testable without spawning a real frame.
-export function buildNextTaskPrompt(
-  overallPlan: string,
-  completedTasks: ReadonlyArray<{ prompt: string; conclusion: string; tested: boolean }>,
-): string {
-  const completedBlock = completedTasks.length > 0
-    ? '\n\nWork completed so far:\n' + completedTasks
-        .map(t => `- Task: ${t.prompt}\n  Result: ${t.conclusion}\n  Tested: ${t.tested ? 'yes' : 'no'}`)
-        .join('\n')
-    : ''
-  return (
-    `Your overall plan:\n${overallPlan}${completedBlock}\n\n` +
-    'Detail the NEXT implementing task. Produce a concrete, self-contained prompt for the Implementer agent ' +
-    '(it will only see this prompt, not your plan). State whether this task needs a separate testing pass ' +
-    'afterward.\n\n' +
-    'End your answer with exactly one of:\n' +
-    '- TASK: <the implementer prompt>\nTEST: yes|no\n' +
-    '- DONE (if the objective is fully met and no more tasks are needed)'
-  )
-}
-
-// The per-task detail reply's parsed shape. `parsed: false` (text/prompt then '')
-// means neither TASK:/TEST: nor a bare DONE could be read — see detailNextTask's
-// retry-then-PlanningFailed handling, the same "never fail open to an invented
-// decision" discipline H13 established for the old task-graph parse.
-export interface NextTaskResult {
-  done: boolean
-  prompt: string
-  needsTesting: boolean
-  parsed: boolean
-}
-
-// TASK:/TEST:/DONE — the per-iteration detail reply's ending convention (2026-09,
-// "iterative planner"). TASK: is checked FIRST deliberately: it is the more
-// specific, harder-to-produce-by-accident marker (it requires both a prompt AND a
-// following TEST: yes/no line), so a stray use of the word "done" elsewhere in a
-// TASK-bearing reply (e.g. "once this is done, the next task is...") cannot
-// false-positive it into the terminal branch. DONE is only checked once no TASK:
-// block was found.
-export function parseNextTask(plannerAnswer: string): NextTaskResult {
-  const taskMatch = /TASK\s*:\s*([\s\S]*?)\n\s*TEST\s*:\s*(yes|no)\b/i.exec(plannerAnswer)
-  if (taskMatch) {
-    const prompt = taskMatch[1].trim()
-    if (prompt) {
-      return { done: false, prompt, needsTesting: /^yes$/i.test(taskMatch[2]), parsed: true }
-    }
-  }
-  if (/\bDONE\b/.test(plannerAnswer)) {
-    return { done: true, prompt: '', needsTesting: false, parsed: true }
-  }
-  return { done: false, prompt: '', needsTesting: false, parsed: false }
-}
-
-// The format-retry nudge for a per-task detail reply — the same targeted-recovery
-// shape as task-start's marker retry (the decision may well be there and only the
-// marker line is missing/mangled), not a blind "try again".
-const NEXT_TASK_RETRY_NUDGE =
-  'Your last answer did not end with one of the required lines, so nothing could be dispatched from it. Reply ' +
-  'again and end your answer with exactly one of: TASK: <the implementer prompt> followed by TEST: yes or ' +
-  'TEST: no on the next line, or the single word DONE — nothing else after it.'
-
-// Resumes the Planner frame to detail exactly one task, retrying ONCE with a
-// format-only nudge before giving up. Returns the parsed result and the (possibly
-// updated) frame; throws PlanningFailed rather than inventing a task or silently
-// treating an unparseable reply as DONE. The retry is a resume of the SAME Planner
-// frame, so it keeps the reasoning it already did (H14).
-async function detailNextTask(
-  plannerFrame: SpawnedFrame,
-  overallPlan: string,
-  completedTasks: ReadonlyArray<{ prompt: string; conclusion: string; tested: boolean }>,
-  emit: Emit,
-): Promise<{ next: NextTaskResult; frame: SpawnedFrame }> {
-  const first = await resumeFrame(plannerFrame.result.frameId, plannerFrame.agent, buildNextTaskPrompt(overallPlan, completedTasks))
-  let frame: SpawnedFrame = { agent: plannerFrame.agent, result: first }
-  const next = parseNextTask(first.summary)
-  if (next.parsed) return { next, frame }
-
-  emit({
-    type: 'warning',
-    message: `Planner frame ${first.frameId} produced no readable TASK/DONE line `
-      + `(frame ended: ${frame.agent.getLastRunOutcome()}) — asking once for the marker only. `
-      + 'An unreadable detail reply is NOT treated as DONE.',
-  })
-
-  // A capped frame's "final answer" is agent.ts's own cap-hit notice, not a decision —
-  // there is nothing in it to restate, and resuming it would just re-hit the same cap
-  // (H14's own reasoning, reused here).
-  if (frame.agent.hitIterationCap()) {
-    throw new PlanningFailed(
-      `Planning failed: the Planner hit its iteration cap while detailing the next task and never produced a `
-      + `readable TASK/DONE line (frame ${first.frameId}).\nLast raw output:\n${first.summary}`,
+// Resumes the Planner frame to detail exactly ONE task. `completedMessage` is null
+// for the very FIRST detail call (right after the initial plan, no Implementer has
+// run yet) and the previous Implementer's own `conclude` answer for every call after
+// that. Deliberately does NOT re-state the overall plan or any prior completed-task
+// list in the prompt text itself — this is a RESUME of the same Planner frame/Agent
+// instance (see resumeFrame above), so the plan and the full back-and-forth already
+// live in its own conversation history; restating them here would just be redundant
+// context competing with that history rather than a substitute for it. VERBATIM per
+// this task's brief; pure and exported so this exact text is directly testable
+// without spawning a real frame.
+export function buildNextTaskPrompt(completedMessage: string | null): string {
+  if (completedMessage === null) {
+    return (
+      'According to your plan, create the assignment for the next implementation sub-agent.\n\n' +
+      'The implementation agent will NOT see the overall plan or any previous planner context. Its assignment must therefore be fully self-contained and include everything needed to understand and complete this specific sub-task.\n\n' +
+      'Your task is complete once you call `conclude` with the complete sub-objective for that implementation agent.\n' +
+      'It should:\n' +
+      '- Clearly state what must be implemented and define the expected outcome in concrete, verifiable terms.\n' +
+      '- Where relevant, include a brief description of the surrounding context and overall goal.\n' +
+      '- Include all context from the overall objective and plan that is relevant to this sub-task.\n' +
+      '- State any dependencies on previously completed work without assuming the agent has seen earlier assignments.\n' +
+      '- Identify relevant files, components, interfaces, constraints, or existing behaviour when already known.\n' +
+      '- Clearly distinguish what is in scope from what should remain unchanged or be deferred.\n' +
+      '- Include appropriate testing or validation expectations.\n' +
+      '- Exclude context that does not affect this implementation step.\n\n' +
+      'Inspect relevant project files as needed to ground the assignment in the current codebase. Also inspect `AGENTS.md` and `MEMORY.md`, and include directly in the sub-objective any relevant instructions, conventions, architectural constraints, project facts, or prior decisions. But remember, the project remains READ-ONLY at this point: do not implement anything yourself.\n\n' +
+      'You have a hard budget of 20 iterations to call `conclude` with the final self-contained sub-objective. If the next planned step is no longer appropriate given the current project state, adapt the sub-objective while preserving the intent and sequencing of the overall plan.'
     )
   }
-
-  const retry = await resumeFrame(first.frameId, frame.agent, NEXT_TASK_RETRY_NUDGE)
-  frame = { agent: frame.agent, result: retry }
-  const second = parseNextTask(retry.summary)
-  if (second.parsed) return { next: second, frame }
-
-  throw new PlanningFailed(
-    `Planning failed: the Planner produced no readable TASK/DONE line even after an explicit format retry `
-    + `(frame ${first.frameId} ended: ${frame.agent.getLastRunOutcome()}).\nLast raw output:\n${retry.summary}`,
+  return (
+    'The previous implementation sub-agent concluded with:\n' +
+    `<argo-implemented>\n${completedMessage}\n</argo-implemented>\n\n` +
+    'Review this result against your plan and the current project state, then create the self-contained assignment for the next implementation sub-agent.\n\n' +
+    'As before, formulate it as a clear implementation task with a verifiable expected outcome. Include any relevant consequences of the completed work, dependencies, and instructions or context from `AGENTS.md` and `MEMORY.md` that the next agent will need. Explicitly scope what to change, preserve, or defer, including what to test.\n\n' +
+    'If the result changes or invalidates your original plan, adapt the next step accordingly. If no further implementation work is required, conclude that the objective is complete.\n\n' +
+    'The project remains READ-ONLY for you. You have a hard budget of 20 iterations to call `conclude`.'
   )
+}
+
+// Detects a Planner `conclude` answer that means "no further work needed" rather
+// than a real Implementer assignment — the harness's only signal to stop the
+// OBJECTIVE loop and treat the objective as complete.
+//
+// Why a heuristic over `conclude` text rather than a rigid marker (e.g. a required
+// "DONE:"/"COMPLETE:" prefix): the brief's own instruction is to try natural
+// language first, since a required prefix is one more formatting rule a small local
+// model can drop under load — exactly the class of failure this project's H13/H14
+// notes already catalogue for the OLDER TASK:/TEST:/DONE convention this replaces
+// (a missing marker line silently read as either "approval" or "one more task",
+// never as "unreadable"). A phrase-based heuristic degrades more gracefully here:
+// worst case, a genuinely-finished Planner phrases its answer unusually and this
+// misreads it as one more (harmless, if slightly redundant) assignment — never the
+// other way around, an assignment misread as "done" and dropped, because the
+// phrase list below only matches completion language, not the absence of a
+// keyword. If real-world false negatives (a done-Planner not recognized) turn out
+// to be common, the fix that best fits this codebase's own stated preference is a
+// LOOSER phrase list here, not a required prefix — see this module's report to the
+// cone (/shared/argo-ui/PLANNER-V2.md) for the concrete proposal to reconsider a
+// "DONE:" prefix if this heuristic proves too narrow in practice.
+//
+// Two independent triggers, either is sufficient:
+//   1. Completion phrasing — the answer explicitly says the objective is finished
+//      or that no further implementation is needed, in any of several common
+//      phrasings a model might use ("the objective is complete", "no further
+//      implementation is needed", "all planned work is done", "fully addressed",
+//      "nothing more to implement", ...).
+//   2. Length + no imperative language — a real assignment is inherently a
+//      multi-sentence, actionable brief (see buildNextTaskPrompt's own required
+//      content list above: outcome, context, dependencies, files, scope, testing).
+//      A SHORT reply that also contains none of the common implementation verbs
+//      ("implement", "add", "fix", "create", ...) reads as a wrap-up note, not an
+//      assignment — this is the "too short/doesn't look like a task" fallback the
+//      brief calls for, checked ONLY when phrase (1) didn't already match.
+const PLANNER_DONE_PHRASES: RegExp[] = [
+  /\bobjective is (?:now |already )?(?:fully )?(?:complete|met|done|achieved|satisfied)\b/i,
+  /\bno (?:further|more|additional) implementation(?: work)? (?:is )?(?:needed|required|remains)\b/i,
+  /\bno (?:further|more|additional) (?:work|tasks?|steps?) (?:is |are )?(?:needed|required|remain(?:ing)?)\b/i,
+  /\ball (?:planned )?(?:work|tasks?|sub-?tasks?) (?:is |are )?(?:complete|done|finished)\b/i,
+  /\bnothing (?:more|further|else) (?:to|needs to|left to) (?:be )?(?:done|implement(?:ed)?)\b/i,
+  /\bfully (?:implemented|addresses|addressed|completed)\b/i,
+  /\bthe (?:objective|implementation) is (?:now )?complete\b/i,
+]
+
+// A reply shorter than this AND with no implementation verb reads as a wrap-up
+// note rather than a real assignment — see the block comment above for why this is
+// the second, weaker trigger rather than the primary signal. Chosen well below a
+// realistic self-contained assignment: buildNextTaskPrompt's own required content
+// (outcome, context, dependencies, files, scope, testing) makes a genuine sub-task
+// prompt run to several sentences in practice; 160 chars is roughly one short
+// sentence, comfortably below that.
+const PLANNER_DONE_SHORT_CHARS = 160
+
+const IMPLEMENTATION_VERB = /\b(implement|add|fix|create|write|update|change|modify|refactor|remove|delete|build|configure|wire|integrate|migrate|rename|extract|replace|test|verify)\w*\b/i
+
+export function isPlannerDone(concludeText: string): boolean {
+  const text = concludeText.trim()
+  if (!text) return false // conclude itself rejects an empty answer — nothing to read as "done" here
+  if (PLANNER_DONE_PHRASES.some(re => re.test(text))) return true
+  if (text.length < PLANNER_DONE_SHORT_CHARS && !IMPLEMENTATION_VERB.test(text)) return true
+  return false
 }
 
 export async function runDispatchLoop(
@@ -917,10 +773,10 @@ export async function runDispatchLoop(
       await logger.flush()
       return stopped
     }
-    // H13: planning that could not produce a readable decision is a REPORTED
-    // failure, not an "unexpected error" and emphatically not an invented task.
-    // Same event shape as the generic branch below (error + no assistant bubble),
-    // with the diagnosis as the returned text so the user/eval sees why nothing ran.
+    // H13: planning that could not produce a usable decision is a REPORTED failure,
+    // not an "unexpected error" and emphatically not an invented task. Same event
+    // shape as the generic branch below (error + no assistant bubble), with the
+    // diagnosis as the returned text so the user/eval sees why nothing ran.
     if (err instanceof PlanningFailed) {
       emit({ type: 'error', message: err.message })
       await logger.flush()
@@ -933,12 +789,25 @@ export async function runDispatchLoop(
   }
 }
 
+// Builds the diagnostic PlanningFailed message for a Planner call (initial or a
+// per-task resume) that hit its own iteration cap without ever calling `conclude`.
+// Factored out because the OBJECTIVE loop below checks this after BOTH the initial
+// plan call and every per-task resume — a capped frame's "final answer" is agent.ts's
+// own cap-hit notice, not a decision, and there is nothing to salvage from it (H14's
+// own reasoning: resuming a capped frame would just re-hit the same cap).
+function plannerCapFailure(stage: string, frameId: string, rawOutput: string): PlanningFailed {
+  return new PlanningFailed(
+    `Planning failed: the Planner hit its iteration cap while ${stage} and never called \`conclude\` `
+    + `(frame ${frameId}).\nLast raw output:\n${rawOutput}`,
+  )
+}
+
 async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<string> {
   await ledger.ensureGitignored(root())
 
   const taskStart = await runBossTaskStart(userMessage, emit)
 
-  // ANSWER: the Boss already knows, verified it himself — no Planner/Implementer/Tester
+  // ANSWER: the Boss already knows, verified it himself — no Planner/Implementer
   // frame ever spawns. The whole point of this mode is zero further iteration.
   if (taskStart.mode === 'answer') {
     await ledger.setObjective(root(), taskStart.text)
@@ -955,78 +824,78 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
   // specific role), so a run that never spawns a Planner still has one.
   let commitAgent: Agent | null = null
 
-  // TRIVIAL/SIMPLE skip the Planner entirely — a single well-scoped Implementer task,
-  // with a Tester pass added only for SIMPLE. There is no plan OBJECT built for this
-  // any more (buildTaskStartGraph, removed) — just a direct spawn.
+  // TRIVIAL/SIMPLE skip the Planner entirely and — this rewrite — skip the Tester
+  // entirely too: a single well-scoped Implementer, instructed to test its own work
+  // if the assignment calls for it (see this module's header). SIMPLE is no longer
+  // distinguished from TRIVIAL in HOW it is dispatched, only in what the Boss's own
+  // classification text says the objective involves.
   if (taskStart.mode === 'trivial' || taskStart.mode === 'simple') {
-    let frame = await spawnFrame(
+    const frame = await spawnFrame(
       { role: 'implementer', parentFrameId: null, assignment: buildImplementerAssignment(objective) },
       emit,
       undefined,
       objective,
     )
     commitAgent = frame.agent
-    if (taskStart.mode === 'simple') {
-      frame = await runTesterRounds(frame, objective, emit)
-    }
     if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
     return `Objective: ${objective}\n\n${frame.result.summary}`
   }
 
-  // OBJECTIVE: the Planner drives an ITERATIVE loop (2026-09, "iterative planner" —
-  // see the module header for the full design and why it replaces the earlier
-  // task-graph/task-list designs). One initial call produces a rough overall plan
-  // as plain text; each subsequent call resumes the SAME Planner frame to detail
-  // exactly one Implementer task, informed by everything completed so far —
-  // including any failures, which the Planner sees on its very next call and
-  // decides how to handle. There is no separate "replan" step: the Planner IS the
-  // loop.
-  let plannerFrame = await spawnFrame(
+  // OBJECTIVE: the Planner drives an ITERATIVE loop (this rewrite — see the module
+  // header for the full design). One initial call produces the overall plan (an
+  // ordered list of sub-tasks, delivered as its `conclude` answer); each subsequent
+  // call resumes the SAME Planner frame to produce exactly one self-contained
+  // Implementer assignment, informed by the previous Implementer's own conclusion.
+  // There is no separate "replan" step and no Tester round: the Planner IS the
+  // loop, and the Implementer is trusted to test its own work when instructed to.
+  const plannerFrame = await spawnFrame(
     { role: 'planner', parentFrameId: null, assignment: buildInitialPlannerPrompt(objective) },
     emit,
   )
   commitAgent = plannerFrame.agent
-  const overallPlan = plannerFrame.result.summary
+  if (plannerFrame.agent.hitIterationCap()) {
+    throw plannerCapFailure('producing the overall plan', plannerFrame.result.frameId, plannerFrame.result.summary)
+  }
 
-  const completedTasks: Array<{ prompt: string; conclusion: string; tested: boolean }> = []
-  let exhausted = true
+  const plannerAgent = plannerFrame.agent
+  const plannerFrameId = plannerFrame.result.frameId
+  let completedMessage: string | null = null
+  const completedTasks: Array<{ prompt: string; conclusion: string }> = []
+  let done = false
 
-  for (let i = 0; i < MAX_PLANNER_TASKS; i++) {
-    const detailed = await detailNextTask(plannerFrame, overallPlan, completedTasks, emit)
-    plannerFrame = detailed.frame
-    commitAgent = plannerFrame.agent
+  for (let round = 0; round < MAX_PLANNER_ROUNDS; round++) {
+    const detailResult = await resumeFrame(plannerFrameId, plannerAgent, buildNextTaskPrompt(completedMessage))
+    if (plannerAgent.hitIterationCap()) {
+      throw plannerCapFailure('detailing the next task', plannerFrameId, detailResult.summary)
+    }
 
-    if (detailed.next.done) {
-      exhausted = false
+    if (isPlannerDone(detailResult.summary)) {
+      done = true
       break
     }
 
-    // Seed the Implementer's plan with its own task prompt (2026-09-05's seedPlan
-    // mechanism, unchanged) so it can write from its FIRST iteration, never forced
-    // through update_plan just to restate what it was already told. The Planner's
-    // TASK: text is used VERBATIM as the assignment — it is already written to be
-    // "concrete, self-contained... it will only see this prompt, not your plan"
-    // (buildNextTaskPrompt above), so wrapping it again would be redundant.
-    let implFrame = await spawnFrame(
-      { role: 'implementer', parentFrameId: plannerFrame.result.frameId, assignment: detailed.next.prompt },
+    const nextAssignment = detailResult.summary
+
+    // Implementer failure/partial/gave-up is NOT retried here — the failing task's
+    // own conclusion simply becomes what the Planner sees on its next detail call
+    // (via completedMessage below), and the Planner decides what to do about it,
+    // exactly like the pre-existing "no harness-level retry" discipline this
+    // module has followed since H13.
+    const implFrame = await spawnFrame(
+      { role: 'implementer', parentFrameId: plannerFrameId, assignment: nextAssignment },
       emit,
       undefined,
-      detailed.next.prompt,
+      nextAssignment,
     )
     commitAgent = implFrame.agent
 
-    let tested = false
-    if (detailed.next.needsTesting) {
-      implFrame = await runTesterRounds(implFrame, detailed.next.prompt, emit)
-      tested = true
-    }
-
-    completedTasks.push({ prompt: detailed.next.prompt, conclusion: implFrame.result.summary, tested })
+    completedTasks.push({ prompt: nextAssignment, conclusion: implFrame.result.summary })
+    completedMessage = implFrame.result.summary
   }
 
-  if (exhausted) {
+  if (!done) {
     if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
-    return `Could not complete the objective within ${MAX_PLANNER_TASKS} planner iterations. Objective: ${objective}\n\n`
+    return `Could not complete the objective within ${MAX_PLANNER_ROUNDS} planner rounds. Objective: ${objective}\n\n`
       + completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
   }
 
@@ -1040,5 +909,5 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
   // 'answer' early-return above.
   if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
 
-  return `Objective: ${objective}\n\n${doneSummary || overallPlan}`
+  return `Objective: ${objective}\n\n${doneSummary || 'No implementation tasks were required.'}`
 }

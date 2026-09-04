@@ -58,34 +58,59 @@ test('ROLE_TOOLS.boss still has bash (the Record<Role,...> default, currently un
   assert.equal(ROLE_TOOLS.boss.includes('write_file'), false, 'unchanged pre-existing guarantee — the Boss verifies, never fixes directly')
 })
 
-// ── Planner system prompt: the ITERATIVE two-phase design (2026-09) — replaces the
-// earlier task-graph and flattened-task-list designs entirely. The Planner is called
-// once for a rough overall plan (plain text), then resumed repeatedly to detail one
-// task at a time via TASK:/TEST:/DONE, with no separate "re-planning round" request
-// any more — adaptation is just what happens on the next detail call.
+// ── ROLE_TOOLS.tester: no live call site any more (this rewrite) ───────────────
+// dispatch.ts no longer spawns a Tester at all — not even for SIMPLE, which used
+// to run one Implementer + one Tester (see dispatch.ts's module header: "let's
+// forget about the testing agent... assuming the implementing agent will test
+// what it does if we instruct it to do so"). ROLE_TOOLS.tester/ROLE_MAX_ITERATIONS.
+// tester/ROLE_POLICY.tester/ROLE_SYSTEM_SUFFIX.tester (and frames.ts's own
+// parseTesterVerdict/TESTER_VERDICT_NUDGE) stay defined only because Role
+// (types.ts, off limits for this task) still enumerates 'tester', so every
+// Record<Role,...> table here needs an entry regardless of whether anything
+// spawns one — and batch2.test.ts (also off this task's write list) still
+// exercises parseTesterVerdict directly. This is dead-by-construction, not an
+// oversight; flagged in the report for the cone to decide whether to remove the
+// role from types.ts in a follow-up.
+test('ROLE_TOOLS.tester still exists as the Record<Role,...> default, with no live call site in dispatch.ts', () => {
+  assert.equal(ROLE_TOOLS.tester.includes('read_file'), true)
+  assert.equal(ROLE_TOOLS.tester.includes('write_file'), false, 'the Tester (if ever revived) never fixes directly')
+})
 
-test('planner system prompt: describes the two-phase flow — rough plan first, then resumed to detail one task at a time', () => {
+// ── Planner system prompt: the `conclude`-based ITERATIVE design (this rewrite) —
+// no TASK:/TEST:/DONE line convention, no Tester round. The Planner is called once
+// for an overall plan (an ordered list of sub-tasks, its `conclude` answer), then
+// resumed repeatedly to produce one fully self-contained Implementer assignment at
+// a time, also delivered via `conclude` — with no separate "re-planning round"
+// request; adaptation is just what happens on the next detail call.
+
+test('planner system prompt: describes the two-phase flow — overall plan first, then resumed to produce one assignment at a time', () => {
   const text = systemPromptFor('planner')
-  assert.ok(text.includes('ROUGH OVERALL PLAN'))
+  assert.ok(text.includes('ORDERED LIST'))
   assert.ok(text.includes('resumed repeatedly'))
-  assert.ok(text.includes('detail exactly ONE task'))
-  // No dangling reference to the old, now-removed graph/list mechanics.
+  assert.ok(text.includes('exactly ONE'))
+  // No dangling reference to the old, now-removed graph/list/marker mechanics.
   assert.equal(text.includes('dependsOn'), false)
   assert.equal(text.includes('frameGroup'), false)
   assert.equal(text.includes('task graph'), false)
+  assert.equal(text.includes('TASK:'), false)
+  assert.equal(text.includes('TEST: yes'), false)
+  assert.equal(text.includes('TEST: no'), false)
 })
 
-test('planner system prompt: states the TASK:/TEST:/DONE ending convention', () => {
+test('planner system prompt: mentions conclude as the way it delivers both the plan and each assignment', () => {
   const text = systemPromptFor('planner')
-  assert.ok(text.includes('TASK:'))
-  assert.ok(text.includes('TEST: yes'))
-  assert.ok(text.includes('TEST: no'))
-  assert.ok(text.includes('DONE'))
+  assert.ok(text.includes('`conclude`'))
 })
 
 test('planner system prompt: adaptation is natural, not a separate re-planning request', () => {
   const text = systemPromptFor('planner')
-  assert.ok(text.includes('no separate re-planning step'))
+  assert.ok(text.includes('no separate re-planning'))
+})
+
+test('planner system prompt: states there is no Tester any more — the assignment itself must say when to test', () => {
+  const text = systemPromptFor('planner')
+  assert.ok(/no separate Tester/.test(text))
+  assert.ok(text.includes('test its own work'))
 })
 
 test('planner system prompt: still states it never writes or edits (matches the assignment prompt\'s READ-ONLY statement)', () => {
@@ -102,23 +127,6 @@ test('planner system prompt: explicitly states it is READ-ONLY and points at rea
   const text = systemPromptFor('planner')
   assert.ok(/READ-ONLY/.test(text))
   assert.ok(text.includes('Use read_file to inspect files'))
-})
-
-// ── Planner task prompts must carry AGENTS.md/MEMORY.md context forward (2026-09-06,
-// still true under the iterative design) — the Implementer only sees its own task
-// prompt, never the Planner's own investigation, so anything the Planner learned that
-// matters for a specific task must be restated directly in that task's own prompt.
-
-test('planner system prompt: instructs restating relevant AGENTS.md/MEMORY.md content in each task\'s own prompt', () => {
-  const text = systemPromptFor('planner')
-  assert.ok(text.includes('AGENTS.md'))
-  assert.ok(text.includes('MEMORY.md'))
-  assert.ok(text.includes('self-contained'))
-})
-
-test('planner system prompt: TEST: no is for tasks too small to warrant a separate Tester pass', () => {
-  const text = systemPromptFor('planner')
-  assert.ok(text.includes('Answer TEST: no only when the task is small'))
 })
 
 // ── update_plan removed as a callable tool for every multi-agent role (2026-09-05) ──

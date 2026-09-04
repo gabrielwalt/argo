@@ -4,11 +4,12 @@
 // frame (spawnFrame/runBossTaskStart themselves still can't be, for the same reason
 // noted throughout this file: they write a ledger entry and run a real model turn).
 //
-// ITERATIVE PLANNER (2026-09) — buildInitialPlannerPrompt/buildNextTaskPrompt/
-// buildTesterPromptFromImpl/parseNextTask are pure, tested the same way; they
-// replace the earlier task-graph design (buildPlannerAssignment/
-// buildReplanAssignment/parseTaskGraph, all removed) and the interim flattened-
-// task-list pass entirely — see dispatch.ts's module header for the full flow.
+// PLANNER DISPATCH REWRITE (this task) — buildInitialPlannerPrompt/buildNextTaskPrompt/
+// isPlannerDone are pure, tested the same way; they replace the earlier TASK:/TEST:/
+// DONE line convention (buildNextTaskPrompt/parseNextTask/detailNextTask, all removed)
+// entirely — see dispatch.ts's module header for the full flow. There is no Tester in
+// this pipeline any more (not even for SIMPLE), so buildTesterAssignment/
+// buildTesterPromptFromImpl have no dispatch.ts callers left and are not re-tested here.
 //
 // PLAN/ACT GATE SEEDING (2026-09-05) — Agent.seedPlan's actual gate-bypass effect
 // DOES need a live chat() loop, so those tests use the SAME scripted-Ollama-client
@@ -25,11 +26,9 @@ import type { AgentEvent } from './types.js'
 import {
   buildTaskStartAssignment,
   buildImplementerAssignment,
-  buildTesterAssignment,
-  buildTesterPromptFromImpl,
   buildInitialPlannerPrompt,
   buildNextTaskPrompt,
-  parseNextTask,
+  isPlannerDone,
   TASK_START_MAX_ITERATIONS,
   TASK_START_HARD_CAP,
   TASK_START_CAP_FAILURE_MESSAGE,
@@ -148,9 +147,7 @@ test('TASK_START_CAP_FAILURE_MESSAGE is a plain user-facing failure, not the raw
   assert.equal(/Reached maximum iterations/.test(TASK_START_CAP_FAILURE_MESSAGE), false)
 })
 
-// ── buildImplementerAssignment / buildTesterAssignment — Implementer and Tester
-// assignments follow the same <argo-objective> tagging convention as the Boss
-// task-start checkpoint's <argo-user-prompt>.
+// ── buildImplementerAssignment — TRIVIAL/SIMPLE fast path, unchanged shape ─────
 
 test('buildImplementerAssignment: wraps the objective in <argo-objective> tags, framed as "implement"', () => {
   const text = buildImplementerAssignment('fix the off-by-one in nextId()')
@@ -158,85 +155,100 @@ test('buildImplementerAssignment: wraps the objective in <argo-objective> tags, 
   assert.ok(text.includes('<argo-objective>\nfix the off-by-one in nextId()\n</argo-objective>'))
 })
 
-test('buildTesterAssignment: wraps the claim in <argo-objective> tags, framed as "verify"', () => {
-  const text = buildTesterAssignment('Original assignment: fix nextId(). Conclusion (success): done.')
-  assert.ok(text.startsWith('Your task is to verify the following claimed work:'))
-  assert.ok(text.includes('<argo-objective>\nOriginal assignment: fix nextId(). Conclusion (success): done.\n</argo-objective>'))
-})
+// ── buildInitialPlannerPrompt — VERBATIM per this task's brief ─────────────────
 
-// ── ITERATIVE PLANNER (2026-09) — buildInitialPlannerPrompt / buildNextTaskPrompt /
-// buildTesterPromptFromImpl / parseNextTask. Replaces buildPlannerAssignment/
-// buildReplanAssignment/parseTaskGraph (task-graph design) and the interim
-// flattened-task-list pass entirely — see dispatch.ts's module header.
-
-test('buildInitialPlannerPrompt: wraps the objective in <argo-objective> tags verbatim', () => {
+test('buildInitialPlannerPrompt: matches the required prompt byte-for-byte', () => {
   const text = buildInitialPlannerPrompt('add pagination across three endpoints')
-  assert.ok(text.includes('<argo-objective>\nadd pagination across three endpoints\n</argo-objective>'))
+  const expected =
+    'Your task is to create an implementation plan for the following user-requested objective:\n' +
+    '<argo-objective>\nadd pagination across three endpoints\n</argo-objective>\n\n' +
+    'Your task is complete once you call `conclude` with an ordered list of concrete, actionable sub-tasks that can be assigned to implementation sub-agents. The plan should make dependencies and sequencing clear, and each sub-task should have a sufficiently specific and verifiable objective.\n\n' +
+    'Do not implement anything. The project is READ-ONLY: your role is to plan and orchestrate the implementation, and nothing may be modified. Inspect the relevant project files as needed to understand the codebase and ground your plan. Use the web when necessary for current or external information rather than relying on assumptions.\n\n' +
+    'You have a hard budget of 20 iterations to call `conclude` with the produced plan. If the full implementation cannot yet be predicted reliably, plan the portions that can be determined with confidence and explicitly account for a later re-planning step.'
+  assert.equal(text, expected)
 })
 
-test('buildInitialPlannerPrompt: states the project is read-only and asks for a ROUGH plan, not a formal structure', () => {
-  const text = buildInitialPlannerPrompt('do the thing')
-  assert.ok(/READ-ONLY/.test(text))
-  assert.ok(text.includes('rough overall plan'))
-  assert.equal(text.includes('```json'), false)
+// ── buildNextTaskPrompt — VERBATIM per this task's brief, two shapes ───────────
+
+test('buildNextTaskPrompt(null): matches the required "first task" prompt byte-for-byte', () => {
+  const text = buildNextTaskPrompt(null)
+  const expected =
+    'According to your plan, create the assignment for the next implementation sub-agent.\n\n' +
+    'The implementation agent will NOT see the overall plan or any previous planner context. Its assignment must therefore be fully self-contained and include everything needed to understand and complete this specific sub-task.\n\n' +
+    'Your task is complete once you call `conclude` with the complete sub-objective for that implementation agent.\n' +
+    'It should:\n' +
+    '- Clearly state what must be implemented and define the expected outcome in concrete, verifiable terms.\n' +
+    '- Where relevant, include a brief description of the surrounding context and overall goal.\n' +
+    '- Include all context from the overall objective and plan that is relevant to this sub-task.\n' +
+    '- State any dependencies on previously completed work without assuming the agent has seen earlier assignments.\n' +
+    '- Identify relevant files, components, interfaces, constraints, or existing behaviour when already known.\n' +
+    '- Clearly distinguish what is in scope from what should remain unchanged or be deferred.\n' +
+    '- Include appropriate testing or validation expectations.\n' +
+    '- Exclude context that does not affect this implementation step.\n\n' +
+    'Inspect relevant project files as needed to ground the assignment in the current codebase. Also inspect `AGENTS.md` and `MEMORY.md`, and include directly in the sub-objective any relevant instructions, conventions, architectural constraints, project facts, or prior decisions. But remember, the project remains READ-ONLY at this point: do not implement anything yourself.\n\n' +
+    'You have a hard budget of 20 iterations to call `conclude` with the final self-contained sub-objective. If the next planned step is no longer appropriate given the current project state, adapt the sub-objective while preserving the intent and sequencing of the overall plan.'
+  assert.equal(text, expected)
 })
 
-test('buildInitialPlannerPrompt: tells the Planner it will be asked to detail tasks one at a time afterward', () => {
-  const text = buildInitialPlannerPrompt('do the thing')
-  assert.ok(text.includes('detail each task one at a time afterward'))
+test('buildNextTaskPrompt(message): matches the required "after an Implementer completed" prompt byte-for-byte', () => {
+  const text = buildNextTaskPrompt('Added the --count flag; all existing tests pass.')
+  const expected =
+    'The previous implementation sub-agent concluded with:\n' +
+    '<argo-implemented>\nAdded the --count flag; all existing tests pass.\n</argo-implemented>\n\n' +
+    'Review this result against your plan and the current project state, then create the self-contained assignment for the next implementation sub-agent.\n\n' +
+    'As before, formulate it as a clear implementation task with a verifiable expected outcome. Include any relevant consequences of the completed work, dependencies, and instructions or context from `AGENTS.md` and `MEMORY.md` that the next agent will need. Explicitly scope what to change, preserve, or defer, including what to test.\n\n' +
+    'If the result changes or invalidates your original plan, adapt the next step accordingly. If no further implementation work is required, conclude that the objective is complete.\n\n' +
+    'The project remains READ-ONLY for you. You have a hard budget of 20 iterations to call `conclude`.'
+  assert.equal(text, expected)
 })
 
-test('buildNextTaskPrompt: with no completed tasks, carries the overall plan and the TASK:/TEST:/DONE format', () => {
-  const text = buildNextTaskPrompt('Step 1: read the config. Step 2: add the flag.', [])
-  assert.ok(text.includes('Your overall plan:\nStep 1: read the config. Step 2: add the flag.'))
-  assert.equal(text.includes('Work completed so far'), false)
-  assert.ok(text.includes('TASK: <the implementer prompt>'))
-  assert.ok(text.includes('TEST: yes|no'))
-  assert.ok(text.includes('DONE'))
+test('buildNextTaskPrompt: null vs a completed message select genuinely different prompts, not just a filled-in blank', () => {
+  const first = buildNextTaskPrompt(null)
+  const later = buildNextTaskPrompt('done')
+  assert.notEqual(first, later)
+  assert.ok(first.startsWith('According to your plan'))
+  assert.ok(later.startsWith('The previous implementation sub-agent concluded with:'))
 })
 
-test('buildNextTaskPrompt: with completed tasks, lists each one with its result and tested flag', () => {
-  const text = buildNextTaskPrompt('the plan', [
-    { prompt: 'add the flag', conclusion: 'flag added to config.js', tested: true },
-    { prompt: 'wire it up', conclusion: 'wired into main.js', tested: false },
-  ])
-  assert.ok(text.includes('Work completed so far:'))
-  assert.ok(text.includes('- Task: add the flag\n  Result: flag added to config.js\n  Tested: yes'))
-  assert.ok(text.includes('- Task: wire it up\n  Result: wired into main.js\n  Tested: no'))
+// ── isPlannerDone — the natural-language completion heuristic ─────────────────
+// No TASK:/TEST:/DONE marker any more: the Planner's `conclude` answer is read
+// straight through. isPlannerDone is the ONLY signal the dispatch loop uses to
+// stop asking for more tasks, so it is tested against both the phrasings the
+// prompt itself invites ("conclude that the objective is complete") and a set of
+// realistic self-contained assignments that must NOT be mistaken for completion.
+
+test('isPlannerDone: recognizes the phrasing the prompt itself asks for', () => {
+  assert.equal(isPlannerDone('The objective is complete.'), true)
+  assert.equal(isPlannerDone('The objective is now complete — all endpoints support pagination.'), true)
 })
 
-test('buildTesterPromptFromImpl: harness-authored, states what the Implementer was asked and what it reported', () => {
-  const text = buildTesterPromptFromImpl('add the --count flag', 'Added the flag; all existing tests pass.')
-  assert.ok(text.startsWith('Your task is to verify the following claimed work:'))
-  assert.ok(text.includes('<argo-objective>\nThe Implementer was asked to: add the --count flag\n'
-    + 'It reported: Added the flag; all existing tests pass.\n</argo-objective>'))
+test('isPlannerDone: recognizes common completion phrasings', () => {
+  assert.equal(isPlannerDone('No further implementation is needed.'), true)
+  assert.equal(isPlannerDone('All planned work is done; the feature is fully implemented and tested.'), true)
+  assert.equal(isPlannerDone('Nothing more needs to be done — every sub-task from the plan has been completed.'), true)
+  assert.equal(isPlannerDone('The implementation fully addresses the original objective.'), true)
 })
 
-test('parseNextTask: TASK:/TEST: yes parses as a task that needs testing', () => {
-  const result = parseNextTask('TASK: add input validation to parseArgs\nTEST: yes')
-  assert.deepEqual(result, { done: false, prompt: 'add input validation to parseArgs', needsTesting: true, parsed: true })
+test('isPlannerDone: a real, concrete self-contained assignment is NOT mistaken for completion', () => {
+  const assignment =
+    'Implement input validation in src/parseArgs.ts: reject a negative --count value with a clear error ' +
+    'message instead of silently accepting it. The CLI currently accepts any integer, including negatives, ' +
+    'which then causes an out-of-bounds slice further down the pipeline. Add a check right after parsing ' +
+    'and cover it with a unit test in src/parseArgs.test.ts. Do not change any other flag handling.'
+  assert.equal(isPlannerDone(assignment), false)
 })
 
-test('parseNextTask: TASK:/TEST: no parses as a task that skips testing', () => {
-  const result = parseNextTask('TASK: fix the typo on line 12\nTEST: no')
-  assert.equal(result.needsTesting, false)
-  assert.equal(result.parsed, true)
+test('isPlannerDone: a short but genuinely actionable reply is not mistaken for completion (contains an implementation verb)', () => {
+  assert.equal(isPlannerDone('Fix the typo on line 12 of README.md.'), false)
 })
 
-test('parseNextTask: bare DONE parses as done', () => {
-  const result = parseNextTask('All planned work is complete.\nDONE')
-  assert.deepEqual(result, { done: true, prompt: '', needsTesting: false, parsed: true })
+test('isPlannerDone: a short reply with no implementation verb reads as a wrap-up, not an assignment', () => {
+  assert.equal(isPlannerDone('Looks good, nothing else to do here.'), true)
 })
 
-test('parseNextTask: TASK: is checked before DONE — a stray "done" elsewhere in a TASK-bearing reply does not misfire', () => {
-  const result = parseNextTask('Once this task is done, the next one follows.\nTASK: run the migration\nTEST: no')
-  assert.equal(result.done, false)
-  assert.equal(result.prompt, 'run the migration')
-})
-
-test('parseNextTask: unparseable input (neither marker) reports parsed:false, never invents a decision', () => {
-  const result = parseNextTask('I think the work is progressing well.')
-  assert.deepEqual(result, { done: false, prompt: '', needsTesting: false, parsed: false })
+test('isPlannerDone: empty or blank text is never treated as done (conclude itself rejects an empty answer)', () => {
+  assert.equal(isPlannerDone(''), false)
+  assert.equal(isPlannerDone('   '), false)
 })
 
 // ── Agent.seedPlan — the plan/act gate is bypassed for a SEEDED frame, unchanged for
