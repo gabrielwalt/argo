@@ -7,20 +7,22 @@
 // HARD RULE: no two LLM calls ever run concurrently, for any reason — every `await`
 // below fully resolves before the next one starts. One GPU, one resident model.
 //
-// TESTER REMOVED (2026-09, this rewrite). The owner's own words: "let's forget about
-// the testing agent, and not rely on it anymore, assuming the implementing agent will
-// test what it does if we instruct it to do so." There is no Tester spawn anywhere in
-// this module any more — not just for the OBJECTIVE/Planner path (the original ask)
-// but for SIMPLE too, which used to run one Implementer + one Tester. SIMPLE is now
-// identical in shape to TRIVIAL: one Implementer, instructed (via the Boss's own
-// classification text) to test its own work when that is called for. `runTesterRounds`,
-// `buildTesterAssignment`'s dispatch-side callers, `buildTesterPromptFromImpl`, and
-// `MAX_TESTER_ROUNDS` are gone from this file. frames.ts's `ROLE_TOOLS.tester`/
+// TESTER IS BACK — HARNESS-DRIVEN, NOT PLANNER-DRIVEN (2026-09, "Testers are back").
+// A Tester briefly did not exist in an earlier rewrite of this module (the owner's own
+// words at the time: "let's forget about the testing agent... assuming the implementing
+// agent will test what it does if we instruct it to do so"), but that is no longer how
+// this module works: the HARNESS itself (not the Planner, and not the Implementer's own
+// say-so) spawns a real Tester frame (`runTesterValidation`, below) after every
+// Implementer that reports SUCCESS, for both the OBJECTIVE/Planner path AND the SIMPLE
+// fast path — up to MAX_TESTER_FIX_ATTEMPTS fix-and-retest rounds before the task is
+// escalated back to the Planner (OBJECTIVE) or to the full Planner pipeline (SIMPLE).
+// TRIVIAL is the one mode that still skips the Tester entirely (see its own comment
+// below) — everything else gets one. frames.ts's `ROLE_TOOLS.tester`/
 // `ROLE_MAX_ITERATIONS.tester`/`ROLE_POLICY.tester`/`ROLE_SYSTEM_SUFFIX.tester` and its
-// `parseTesterVerdict`/`TESTER_VERDICT_NUDGE` stay defined there — Role (types.ts, off
-// limits) still enumerates `'tester'` so those Record<Role,...> tables need an entry
-// regardless, and batch2.test.ts (also off this task's write list) still exercises
-// parseTesterVerdict directly — but nothing in this module ever spawns one.
+// `parseTesterVerdict`/`TESTER_VERDICT_NUDGE` stay defined there for the same reason as
+// ever — Role (types.ts, off limits) enumerates `'tester'` so those Record<Role,...>
+// tables need an entry regardless — but this module now spawns Testers directly via
+// `buildTesterAssignment`/`parseTesterResult` (below), not through either of those.
 //
 // PLANNER DISPATCH, REWRITTEN (this task). The Planner is called ONCE for an overall
 // plan (`buildInitialPlannerPrompt`, plain text, `conclude`d — no harness-owned plan
@@ -73,13 +75,14 @@ function root(): string {
 
 // Safety valve for the iterative Planner loop — bounds how many Implementer-then-
 // resume-Planner rounds one dispatch run will make before giving up. Raised 30->50
-// per this task's brief: the loop body per round is now cheaper (one Implementer
-// spawn + one Planner resume, no Tester rounds), so the same wall-clock budget buys
-// more rounds; 50 is still comfortably above the 2-5 steps a typical objective
-// decomposes into (docs/subagents-plan.md) while bounding a Planner that never
-// says it's done. If this is ever hit in practice, the real lever is almost
-// certainly the Planner's own per-call iteration budget (ROLE_MAX_ITERATIONS.planner,
-// frames.ts), not this count; raise that first before raising this.
+// per this task's brief; this count bounds PLANNER rounds specifically, not the
+// harness-spawned Tester validation cycle (runTesterValidation) that now runs inside
+// each round after an Implementer SUCCESS — 50 is still comfortably above the 2-5
+// steps a typical objective decomposes into (docs/subagents-plan.md) while bounding a
+// Planner that never says it's done. If this is ever hit in practice, the real lever
+// is almost certainly the Planner's own per-call iteration budget
+// (ROLE_MAX_ITERATIONS.planner, frames.ts), not this count; raise that first before
+// raising this.
 const MAX_PLANNER_ROUNDS = 50
 
 // Safety cap for repeated Implementer cap-hits on the SAME objective (this task,
@@ -210,11 +213,42 @@ export function getActiveFrameId(): string | null {
   return activeFrameId
 }
 
+// BUG-1 FIX (control-flow strings truncated at 2000 chars before the harness parses
+// them). FrameResult (types.ts) is off-limits to edit for this task, so the FULL,
+// uncapped `finalAnswer` text is carried as a dispatch-local extension of it rather
+// than a new field on that shared type. `summary` stays exactly what it always was —
+// capSummary's 2000-char-capped text, kept for ledger storage/display where a cap is
+// appropriate. `rawSummary` is the untruncated finalAnswer that every control-flow
+// decision below (isPlannerDone/isPlannerGiveUp, the next Implementer assignment,
+// parseImplementerResult/parseTesterResult, and every prompt built from any of their
+// text) must read instead — a phrase a model puts at the END of a long message, or a
+// fix assignment that runs past 2000 characters, must never be silently cut off
+// before the harness gets to look at it. Still structurally a FrameResult (extends,
+// doesn't replace), so it flows through every existing FrameResult-typed call
+// unchanged; the ONE place that would leak the extra field somewhere it shouldn't
+// (ledger.jsonl, which has no rawSummary column) strips it back out before writing —
+// see toLedgerResult, used by both spawnFrame and resumeFrame below.
+export interface FrameResultRaw extends FrameResult {
+  rawSummary: string
+}
+
+function toLedgerResult(result: FrameResultRaw): FrameResult {
+  return {
+    frameId: result.frameId,
+    status: result.status,
+    summary: result.summary,
+    filesTouched: result.filesTouched,
+    filesWritten: result.filesWritten,
+    ...(result.confidence !== undefined ? { confidence: result.confidence } : {}),
+    ...(result.issues ? { issues: result.issues } : {}),
+  }
+}
+
 // Exported so ctrlplane.test.ts can build a fixture (a fake Agent + a FrameResult) without
 // re-declaring the shape.
 export interface SpawnedFrame {
   agent: Agent
-  result: FrameResult
+  result: FrameResultRaw
 }
 
 // Tags EVERY event this frame's Agent instance ever emits (thought/tool_call/
@@ -295,7 +329,7 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
   activeFrameId = null
   checkAborted()
   const result = deriveFrameResult(frameId, finalAnswer, agent)
-  await ledger.recordConclusion(root(), result)
+  await ledger.recordConclusion(root(), toLedgerResult(result)) // never persist the uncapped rawSummary
   return { agent, result }
 }
 
@@ -315,7 +349,7 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
 // instance by construction — so `live` (computed from map membership) and the
 // entry's role/parentFrameId/startedAt all stay correct with no changes on this
 // path.
-async function resumeFrame(frameId: string, agent: Agent, followUp: string): Promise<FrameResult> {
+async function resumeFrame(frameId: string, agent: Agent, followUp: string): Promise<FrameResultRaw> {
   checkAborted()
   activeFrameAgent = agent
   activeFrameId = frameId
@@ -324,7 +358,7 @@ async function resumeFrame(frameId: string, agent: Agent, followUp: string): Pro
   activeFrameId = null
   checkAborted()
   const result = deriveFrameResult(frameId, finalAnswer, agent)
-  await ledger.recordConclusion(root(), result)
+  await ledger.recordConclusion(root(), toLedgerResult(result)) // never persist the uncapped rawSummary
   return result
 }
 
@@ -357,7 +391,7 @@ async function resumeFrame(frameId: string, agent: Agent, followUp: string): Pro
 // harness-level retry mechanism.
 // Exported for unit tests: spawnFrame itself needs a ledger and a live model, but the
 // cap-hit → 'partial' mapping is the whole of H13 and must be provable without either.
-export function deriveFrameResult(frameId: string, finalAnswer: string, agent: Agent): FrameResult {
+export function deriveFrameResult(frameId: string, finalAnswer: string, agent: Agent): FrameResultRaw {
   const editedPaths = agent.getEditedPaths()
   const outcome = agent.getLastRunOutcome()
   const lower = finalAnswer.toLowerCase()
@@ -381,7 +415,8 @@ export function deriveFrameResult(frameId: string, finalAnswer: string, agent: A
   return {
     frameId,
     status,
-    summary: capSummary(finalAnswer),
+    summary: capSummary(finalAnswer), // capped — ledger storage/display only, see FrameResultRaw
+    rawSummary: finalAnswer, // uncapped — every control-flow consumer reads THIS, see FrameResultRaw
     filesTouched: editedPaths,
     filesWritten: editedPaths,
     ...(issues ? { issues } : {}),
@@ -524,7 +559,7 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
   // TASK_START_TOOLS (frames.ts), not ROLE_TOOLS.boss — this checkpoint is read-only
   // classification, see that constant's comment for why and the incident that forced it.
   const { agent, result } = await spawnFrame(req, emit, TASK_START_TOOLS)
-  let verdict = parseTaskStartVerdict(result.summary)
+  let verdict = parseTaskStartVerdict(result.rawSummary) // BUG-1: read the uncapped text, not the ledger-capped summary
 
   // Retry once, only when the frame actually concluded on its own (a frame that stalled
   // at its cap has no budget to spend re-asking) and the model didn't already commit to a
@@ -539,7 +574,7 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
       // final answer, no extra frame turn, no tools, think:false. The ledger conclusion
       // is deliberately left untouched — nothing about the frame's own run changes,
       // only how the harness reads what it already said.
-      const extracted = await extractTaskStart(effectiveModel(), result.summary)
+      const extracted = await extractTaskStart(effectiveModel(), result.rawSummary)
       if (extracted) {
         verdict = { mode: extracted.mode, text: extracted.text, parsed: true }
         emit({
@@ -550,7 +585,7 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
       }
     } else {
       const retry = await resumeFrame(result.frameId, agent, TASK_START_MARKER_RETRY_NUDGE)
-      const retryVerdict = parseTaskStartVerdict(retry.summary)
+      const retryVerdict = parseTaskStartVerdict(retry.rawSummary)
       if (retryVerdict.parsed) verdict = retryVerdict
     }
   }
@@ -980,8 +1015,9 @@ function plannerCapFailure(stage: string, frameId: string, rawOutput: string): P
 // `conclude` answer), then resumes that same Planner frame round by round to produce
 // exactly one self-contained Implementer assignment at a time, informed by the previous
 // Implementer's own conclusion, until the Planner reports the objective complete. There
-// is no separate "replan" step and no Tester round: the Planner IS the loop, and the
-// Implementer is trusted to test its own work when instructed to.
+// is no separate "replan" step: the Planner IS the loop. There IS a Tester round —
+// the harness (not the Planner) spawns one after every Implementer SUCCESS
+// (runTesterValidation, below) to validate the work before the Planner is resumed.
 //
 // TWO CALLERS (this task, "SIMPLE cap-hit escalation"): the OBJECTIVE task-start mode
 // (its original, sole caller) and — new — the SIMPLE mode's ESCALATION path, when its
