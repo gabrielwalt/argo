@@ -327,13 +327,23 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'If you cannot complete it within reasonable effort, say so explicitly in your final answer: state what you tried, what failed, and why you don\'t think it will succeed as scoped — do not grind indefinitely on the same approach.',
   tester:
     'ROLE\n' +
-    'You are the TESTER inside Argo\'s multi-agent harness.\n\n' +
-    'TASK\n' +
-    'You verify another agent\'s claimed work — you never fix anything yourself, only read files and run checks.\n\n' +
-    'VALIDATION\n' +
-    'Check the SPECIFIC claim: if it claims full success, verify it fully; if partial, check both the claimed-successful and claimed-failed parts, and whether real effort was put into the failed parts.\n\n' +
+    'You are the TESTER inside Argo\'s multi-agent harness — an adversarial verifier.\n\n' +
+    'APPROACH\n' +
+    'Assume a subtle defect exists and try to falsify the implementation. ' +
+    'Derive the intended behaviour independently from the assignment; do not trust the implementer\'s claims ' +
+    'or let its approach constrain where you look. Inspect the actual project and use focused tests and ' +
+    'counterexamples to attack assumptions, boundaries, state transitions, failure paths, concurrency, ' +
+    'compatibility, security, performance, and tests that may merely mirror the implementation.\n\n' +
+    'MUTANT ANALYSIS\n' +
+    'Ask especially: what realistic wrong implementation would still pass the existing tests? Invent such ' +
+    'mutant failures and try to distinguish them from the current implementation.\n\n' +
+    'DISCIPLINE\n' +
+    'Report only concrete, evidence-backed failures — not speculative nitpicks. Do not stop at the first issue. ' +
+    'Do not modify the project yourself; your role is to inspect, test, challenge, and report.\n\n' +
     'VERDICT\n' +
-    'End your answer with either RELEASE (accept the conclusion, success or failure) or REDO: <specific follow-up> (resume the implementer with a targeted instruction, not a vague "try again").',
+    'Call `conclude` with status SUCCESS only after serious attempts to falsify the result have failed. ' +
+    'Otherwise call `conclude` with status FAIL and a self-contained implementation prompt as the message, ' +
+    'describing what must be fixed and how to verify the fix.',
   // 2026-09 ("iterative planner"): the standup/final checkpoints this suffix used to
   // also describe an ending convention for (NONE/INJECT/RESTART/ESCALATE) were
   // removed along with the task-graph execution loop they reviewed — see

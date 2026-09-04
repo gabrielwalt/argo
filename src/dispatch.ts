@@ -912,28 +912,19 @@ export function parseImplementerResult(text: string): ImplementerResult {
 // own SUCCESS:/FAIL: prefix — the Tester should see precisely what was claimed).
 export function buildTesterAssignment(implementerAssignment: string, implementerConclusion: string): string {
   return (
-    'Your task is to critically validate the implementation of the following assignment:\n\n' +
+    'ASSIGNMENT UNDER TEST\n' +
+    'The following assignment was given to an implementation sub-agent:\n\n' +
     `<argo-implementation-assignment>\n${implementerAssignment}\n</argo-implementation-assignment>\n\n` +
-    'The implementation sub-agent concluded with:\n\n' +
-    `<argo-implemented>\n${implementerConclusion}\n</argo-implemented>\n\n` +
-    'Do not assume the implementation is correct. Actively look for ways it may be incomplete, incorrect, ' +
-    'fragile, inconsistent with the surrounding codebase, or technically compliant while still failing the ' +
-    'underlying objective.\n\n' +
-    'Inspect the implementation and relevant project files, and test or verify it as appropriate. Think beyond ' +
-    'the obvious happy path: consider edge cases, regressions, integration points, hidden assumptions, ' +
-    'unintended side effects, error handling, compatibility, and anything the implementer may have overlooked. ' +
-    'Be deliberately critical and investigate suspicious details rather than accepting the implementer\'s ' +
-    'conclusion at face value.\n\n' +
+    'INDEPENDENT ASSESSMENT\n' +
+    'Determine independently what should have changed and what could go wrong. Inspect and test the ' +
+    'repository before reading the implementer\'s report below. Form your own assessment of what correct ' +
+    'behaviour looks like, then compare it with the implementer\'s claims.\n\n' +
     'Also account for any relevant instructions, conventions, constraints, or prior decisions in `AGENTS.md` ' +
     'and `MEMORY.md`.\n\n' +
-    'Your task is complete once you call `conclude` with the appropriate status:\n\n' +
-    '- Status SUCCESS, message: brief confirmation of what was verified — use if the implementation satisfies ' +
-    'the assignment and you found no material issue that still needs fixing.\n' +
-    '- Status FAIL, message: a clear, self-contained prompt for the implementation agent explaining what ' +
-    'failed, what must be fixed, what should remain unchanged, and how the fix should be validated — use if ' +
-    'anything material is wrong, incomplete, unverified, or requires further implementation.\n\n' +
-    'Do not modify the project yourself. Your role is to inspect, test, challenge, and report.\n\n' +
-    'You have a hard budget of 20 iterations to call `conclude`.'
+    'You have a hard budget of 20 iterations to call `conclude`.\n\n' +
+    'IMPLEMENTER REPORT\n' +
+    'The implementation sub-agent concluded with:\n\n' +
+    `<argo-implemented>\n${implementerConclusion}\n</argo-implemented>`
   )
 }
 
