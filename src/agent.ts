@@ -8,7 +8,7 @@ import { bash, NO_OUTPUT } from './tools/bash.js'
 import { truncateOutput } from './tools/truncate.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
 import type { AgentEvent, ToolName, ModelOptions, FramePolicy, Role } from './types.js'
-import { PROGRESS_CHECK_ITERATIONS, PROGRESS_CHECK_MESSAGES } from './frames.js'
+import { PROGRESS_CHECK_ITERATIONS, PROGRESS_CHECK_MESSAGES, ROLE_CONCLUDE_STATUSES, concludeStatusError } from './frames.js'
 import { runCritic, isTestOrSpecPath, type Critique, type CriticCheckpoint } from './critic.js'
 import { runGroundingCritic, isDocPath, findNumericConflicts } from './grounding.js'
 import { checkLayout, selectLayoutArtifact, type LayoutVerdict } from './layout.js'
@@ -100,7 +100,7 @@ function buildSystemPrompt(tools: ToolName[] | null, roleInstructions?: string, 
     has('fetch_url') && '- fetch_url: fetch a page\'s text content (no JavaScript execution).',
     has('browser_fetch') && '- browser_fetch: fetch a page and run its JavaScript — for pages that need it to render.',
     has('web_search') && '- web_search: look up things you do not already know.',
-    '- conclude: end your session with your final answer.',
+    '- conclude(status, message): end your session with a status keyword and a message.',
     // Read-only roles (Planner, Tester, Boss) get told explicitly what to use
     // instead of write_file/edit_file, rather than left to infer it from the
     // absence of a bullet.
@@ -129,7 +129,7 @@ PRECISION
 - Distinguish what you verified from what you assumed; do not present a guess as a fact.
 - Never reconstruct an exact identifier, path, URL, flag, or package name from memory — copy it verbatim from the tool result where it appeared, or re-read the source.
 
-To finish, call \`conclude\` with your final answer to end your session.`
+To finish, call \`conclude\` with the appropriate status keyword and your message to end your session.`
 }
 
 // Parses tool calls that a model wrote as JSON code blocks in its text content
@@ -508,6 +508,7 @@ export class Agent {
   // returned text or from an iteration-count comparison (which resume now breaks: the
   // counter is cumulative across turns, so `count >= max` no longer means "stalled").
   private lastRunOutcome: RunOutcome = 'ok'
+  private lastConcludeStatus = ''
   // this.loopState.mutationCount recorded at the last 20/35/45 stall/progress
   // checkpoint (see chat()) — lets that checkpoint tell "genuinely stuck" apart from
   // "still landing real edits, just needed more than 20 iterations for a bigger task,"
@@ -784,6 +785,10 @@ export class Agent {
 
   getLastRunOutcome(): RunOutcome {
     return this.lastRunOutcome
+  }
+
+  getConcludeStatus(): string {
+    return this.lastConcludeStatus
   }
 
   // True ⇔ the last chat() turn ran out of iteration budget without producing a final
@@ -1651,6 +1656,7 @@ export class Agent {
     // case so a normal final answer needs no bookkeeping, and overwrite on the cap /
     // error / abort paths. Reset for a resumed turn too: it describes the LAST turn.
     this.lastRunOutcome = 'ok'
+    this.lastConcludeStatus = ''
     if (resume) {
       // RESUMED TURN (H14): keep every piece of frame state. Continue the iteration
       // count from where the previous turn stopped, so a resumed frame reports "ITER
@@ -2051,13 +2057,25 @@ export class Agent {
           // intercepted here regardless of role.
           if (name === 'conclude' && (this.allowedTools === null || this.allowedTools.includes('conclude'))) {
             emitAndLog({ type: 'tool_call', tool: name, args })
-            const answer = typeof args.answer === 'string' ? args.answer.trim() : ''
-            if (!answer) {
-              const err = 'conclude needs a non-empty "answer" string — nothing was concluded. Call it again with your final answer.'
+            const status = typeof args.status === 'string' ? args.status.trim().toUpperCase() : ''
+            const answer = typeof args.message === 'string' ? args.message.trim() : ''
+            if (!status || !answer) {
+              const err = 'conclude needs both a "status" keyword and a non-empty "message" string. Call it again with both parameters.'
               emitAndLog({ type: 'tool_result', tool: name, output: '', error: err, duration_ms: 0 })
               this.pushCtx({ role: 'tool', content: `Error: ${err}` })
               continue
             }
+            // Validate status against the role's allowed keywords
+            if (this.roleTag) {
+              const validStatuses = ROLE_CONCLUDE_STATUSES[this.roleTag]
+              if (validStatuses && !validStatuses.includes(status)) {
+                const err = concludeStatusError(this.roleTag, status)
+                emitAndLog({ type: 'tool_result', tool: name, output: '', error: err, duration_ms: 0 })
+                this.pushCtx({ role: 'tool', content: `Error: ${err}` })
+                continue
+              }
+            }
+            this.lastConcludeStatus = status
 
             // Everything below used to gate the OLD "no tool call = done" terminal
             // condition (the thinking-turn branch above is now clean of all of it) —

@@ -218,13 +218,14 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'conclude',
-      description: 'End your session and deliver your final answer to the user. This is the ONLY way to finish — a turn with no tool calls is a thinking turn, not a termination signal.',
+      description: 'End your session with a structured result. This is the ONLY way to finish — a turn with no tool calls is a thinking turn, not a termination signal.',
       parameters: {
         type: 'object',
         properties: {
-          answer: { type: 'string', description: 'Your final answer or summary for the user.' },
+          status: { type: 'string', description: 'A keyword indicating the outcome. The valid keywords depend on your role and are stated in your assignment.' },
+          message: { type: 'string', description: 'Your detailed answer, summary, or explanation.' },
         },
-        required: ['answer'],
+        required: ['status', 'message'],
       },
     },
   },

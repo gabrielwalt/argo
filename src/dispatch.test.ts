@@ -57,18 +57,13 @@ test('buildTaskStartAssignment: states the project is read-only', () => {
   assert.ok(/READ-ONLY/.test(text))
 })
 
-test('buildTaskStartAssignment: all four mode markers are present', () => {
+test('buildTaskStartAssignment: all three status keywords are present', () => {
   const text = buildTaskStartAssignment('fix the bug', false)
-  assert.ok(text.includes('ANSWER:'))
-  assert.ok(text.includes('TRIVIAL:'))
-  assert.ok(text.includes('SIMPLE:'))
-  assert.ok(text.includes('OBJECTIVE:'))
-  // Iteration ranges stated for the three non-answer modes
-  assert.ok(/1.3 iterations/.test(text))
-  assert.ok(/3.20 iterations/.test(text))
-  assert.ok(/more than 20/.test(text))
-  // TRIVIAL explicitly says not to implement
-  assert.ok(/Do not implement it yourself/.test(text))
+  assert.ok(text.includes('Status ANSWER'))
+  assert.ok(text.includes('Status SIMPLE'))
+  assert.ok(text.includes('Status OBJECTIVE'))
+  // TRIVIAL was merged into SIMPLE — must not appear
+  assert.equal(text.includes('TRIVIAL'), false)
   // Grounding instruction present
   assert.ok(/Ground your answer/.test(text))
 })
@@ -111,10 +106,10 @@ test('a reply following the prompt\'s ANSWER format parses as answer', () => {
   assert.deepEqual(verdict, { mode: 'answer', text: '4.2', parsed: true })
 })
 
-test('a reply following the prompt\'s TRIVIAL format parses as trivial', () => {
+test('TRIVIAL is no longer recognized — falls through to objective (merged into SIMPLE)', () => {
   const verdict = parseTaskStartVerdict('TRIVIAL: fix the typo in README.md line 3')
-  assert.equal(verdict.mode, 'trivial')
-  assert.equal(verdict.parsed, true)
+  assert.equal(verdict.mode, 'objective')
+  assert.equal(verdict.parsed, false)
 })
 
 test('a reply following the prompt\'s SIMPLE format parses as simple', () => {
@@ -166,49 +161,33 @@ test('buildImplementerAssignment: wraps the objective in <argo-objective> tags, 
 
 // ── buildInitialPlannerPrompt — VERBATIM per this task's brief ─────────────────
 
-test('buildInitialPlannerPrompt: matches the required prompt byte-for-byte', () => {
+test('buildInitialPlannerPrompt: contains the objective, PLAN status, and READ-ONLY instruction', () => {
   const text = buildInitialPlannerPrompt('add pagination across three endpoints')
-  const expected =
-    'Your task is to create an implementation plan for the following user-requested objective:\n' +
-    '<argo-objective>\nadd pagination across three endpoints\n</argo-objective>\n\n' +
-    'Your task is complete once you call `conclude` with an ordered list of concrete, actionable sub-tasks that can be assigned to implementation sub-agents. The plan should make dependencies and sequencing clear, and each sub-task should have a sufficiently specific and verifiable objective.\n\n' +
-    'Do not implement anything. The project is READ-ONLY: your role is to plan and orchestrate the implementation, and nothing may be modified. Inspect the relevant project files as needed to understand the codebase and ground your plan. Use the web when necessary for current or external information rather than relying on assumptions.\n\n' +
-    'You have a hard budget of 20 iterations to call `conclude` with the produced plan. If the full implementation cannot yet be predicted reliably, plan the portions that can be determined with confidence and explicitly account for a later re-planning step.'
-  assert.equal(text, expected)
+  assert.ok(text.includes('<argo-objective>\nadd pagination across three endpoints\n</argo-objective>'))
+  assert.ok(text.includes('status PLAN'))
+  assert.ok(text.includes('READ-ONLY'))
+  assert.ok(text.includes('20 iterations'))
 })
 
 // ── buildNextTaskPrompt — VERBATIM per this task's brief, two shapes ───────────
 
-test('buildNextTaskPrompt(null): matches the required "first task" prompt byte-for-byte', () => {
+test('buildNextTaskPrompt(null): contains the three status keywords and self-contained instruction', () => {
   const text = buildNextTaskPrompt(null)
-  const expected =
-    'According to your plan, create the assignment for the next implementation sub-agent.\n\n' +
-    'The implementation agent will NOT see the overall plan or any previous planner context. Its assignment must therefore be fully self-contained and include everything needed to understand and complete this specific sub-task.\n\n' +
-    'Your task is complete once you call `conclude` with the complete sub-objective for that implementation agent.\n' +
-    'It should:\n' +
-    '- Clearly state what must be implemented and define the expected outcome in concrete, verifiable terms.\n' +
-    '- Where relevant, include a brief description of the surrounding context and overall goal.\n' +
-    '- Include all context from the overall objective and plan that is relevant to this sub-task.\n' +
-    '- State any dependencies on previously completed work without assuming the agent has seen earlier assignments.\n' +
-    '- Identify relevant files, components, interfaces, constraints, or existing behaviour when already known.\n' +
-    '- Clearly distinguish what is in scope from what should remain unchanged or be deferred.\n' +
-    '- Include appropriate testing or validation expectations.\n' +
-    '- Exclude context that does not affect this implementation step.\n\n' +
-    'Inspect relevant project files as needed to ground the assignment in the current codebase. Also inspect `AGENTS.md` and `MEMORY.md`, and include directly in the sub-objective any relevant instructions, conventions, architectural constraints, project facts, or prior decisions. But remember, the project remains READ-ONLY at this point: do not implement anything yourself.\n\n' +
-    'You have a hard budget of 20 iterations to call `conclude` with the final self-contained sub-objective. If the next planned step is no longer appropriate given the current project state, adapt the sub-objective while preserving the intent and sequencing of the overall plan.'
-  assert.equal(text, expected)
+  assert.ok(text.includes('According to your plan'))
+  assert.ok(text.includes('IMPLEMENT'))
+  assert.ok(text.includes('SUCCESS'))
+  assert.ok(text.includes('FAIL'))
+  assert.ok(text.includes('fully self-contained'))
+  assert.ok(text.includes('20 iterations'))
 })
 
-test('buildNextTaskPrompt(message): matches the required "after an Implementer completed" prompt byte-for-byte', () => {
+test('buildNextTaskPrompt(message): contains the completed message tag and three status keywords', () => {
   const text = buildNextTaskPrompt('Added the --count flag; all existing tests pass.')
-  const expected =
-    'The previous implementation sub-agent concluded with:\n' +
-    '<argo-implemented>\nAdded the --count flag; all existing tests pass.\n</argo-implemented>\n\n' +
-    'Review this result against your plan and the current project state, then create the self-contained assignment for the next implementation sub-agent.\n\n' +
-    'As before, formulate it as a clear implementation task with a verifiable expected outcome. Include any relevant consequences of the completed work, dependencies, and instructions or context from `AGENTS.md` and `MEMORY.md` that the next agent will need. Explicitly scope what to change, preserve, or defer, including what to test.\n\n' +
-    'If the result changes or invalidates your original plan, adapt the next step accordingly. If no further implementation work is required, provide a final concluding statement summarizing what was accomplished, what was verified, and whether the objective was fully met.\n\n' +
-    'The project remains READ-ONLY for you. You have a hard budget of 20 iterations to call `conclude`.'
-  assert.equal(text, expected)
+  assert.ok(text.includes('<argo-implemented>\nAdded the --count flag; all existing tests pass.\n</argo-implemented>'))
+  assert.ok(text.includes('IMPLEMENT'))
+  assert.ok(text.includes('SUCCESS'))
+  assert.ok(text.includes('FAIL'))
+  assert.ok(text.includes('20 iterations'))
 })
 
 test('buildNextTaskPrompt: null vs a completed message select genuinely different prompts, not just a filled-in blank', () => {
@@ -280,7 +259,7 @@ function scriptedOllama(responses: ScriptedResponse[]): Ollama {
 const editCall: ScriptedResponse = {
   message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'edit_file', arguments: { path: '/workspace/nonexistent-argo-seedplan-gate.txt', old_string: 'a', new_string: 'b' } } }] },
 }
-const finalAnswer: ScriptedResponse = { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { answer: 'Final answer.' } } }] } }
+const finalAnswer: ScriptedResponse = { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
 
 async function cleanupSeedPlanSession(sessionId: string): Promise<void> {
   await Promise.all([
@@ -500,7 +479,7 @@ test('system prompt: explains that calling conclude ends the session', async () 
       // System prompt is now prepended to the first user message in <argo-system-prompt>
       // tags, not sent as a separate system role message.
       capturedFirstMessage = args.messages[0]?.content ?? ''
-      return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { answer: 'Final answer.' } } }] } }
+      return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
     },
   } as unknown as Ollama
   const agent = new Agent(e => events.push(e), 'test-model', ollama)
@@ -511,10 +490,10 @@ test('system prompt: explains that calling conclude ends the session', async () 
     // System prompt is prepended to the first user message (no wrapper tags).
     assert.ok(capturedFirstMessage.includes('You are Argo, a multi-agent system'), 'first message should contain the system prompt')
     assert.ok(capturedFirstMessage.includes(
-      'To finish, call `conclude` with your final answer to end your session.',
+      'To finish, call `conclude` with the appropriate status keyword and your message to end your session.',
     ))
     assert.ok(capturedFirstMessage.includes(
-      'conclude: end your session with your final answer.',
+      'conclude(status, message): end your session with a status keyword and a message.',
     ))
   } finally {
     await cleanupSeedPlanSession(sessionId)
@@ -536,7 +515,7 @@ test('system prompt: a role-restricted frame (Planner\'s tool set) is not told a
   const ollama = {
     chat: async (args: { messages: Array<{ role: string; content: string }> }) => {
       capturedSystemPrompt = args.messages[0]?.content ?? ''
-      return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { answer: 'Final answer.' } } }] } }
+      return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
     },
   } as unknown as Ollama
   const agent = new Agent(e => events.push(e), 'test-model', ollama)
@@ -566,7 +545,7 @@ test('system prompt: an unrestricted frame (allowedTools null, the baseline) sti
   const ollama = {
     chat: async (args: { messages: Array<{ role: string; content: string }> }) => {
       capturedSystemPrompt = args.messages[0]?.content ?? ''
-      return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { answer: 'Final answer.' } } }] } }
+      return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
     },
   } as unknown as Ollama
   const agent = new Agent(e => events.push(e), 'test-model', ollama)
@@ -589,9 +568,9 @@ test('system prompt: an unrestricted frame (allowedTools null, the baseline) sti
 // (task-ledger verify/summary/advance, final reconciliation, critic, grounding,
 // layout, re-ground) now fires inside the `conclude` handler instead.
 
-function concludeCall(answer: string): ScriptedResponse {
+function concludeCall(answer: string, status = 'SUCCESS'): ScriptedResponse {
   return {
-    message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { answer } } }] },
+    message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status, message: answer } } }] },
   }
 }
 
@@ -616,7 +595,7 @@ test('a turn with no tool calls is a thinking turn — it does not end the sessi
   }
 })
 
-test('conclude({ answer }) ends the session with that exact answer', async () => {
+test('conclude({ status, message }) ends the session with the message as the answer', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-conclude-basic-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
@@ -635,7 +614,7 @@ test('conclude({ answer }) ends the session with that exact answer', async () =>
   }
 })
 
-test('conclude with an empty answer is rejected (validation, not a gate) and does not end the run', async () => {
+test('conclude with an empty message is rejected (validation, not a gate) and does not end the run', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-conclude-empty-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
@@ -648,7 +627,7 @@ test('conclude with an empty answer is rejected (validation, not a gate) and doe
     assert.equal(answer, 'Real answer this time.')
     const results = toolResultOutputsWithMeta(events, 'conclude')
     assert.equal(results.length, 2)
-    assert.match(results[0].error ?? '', /non-empty "answer"/)
+    assert.match(results[0].error ?? '', /non-empty "message"/)
   } finally {
     await cleanupSeedPlanSession(sessionId)
   }

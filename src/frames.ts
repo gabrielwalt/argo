@@ -53,7 +53,7 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
   planner: ['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude'],
   // Deliberately NO update_plan (removed 2026-09-05, alongside the Planner's own
   // removal above). dispatch.ts's spawnFrame now calls Agent.seedPlan with this
-  // frame's own assignment (the TRIVIAL/SIMPLE objective, or a Planner step's own
+  // frame's own assignment (the SIMPLE objective, or a Planner step's own
   // sub-objective) before chat() ever runs, so the plan/act gate is already
   // satisfied on the Implementer's very first turn — a real session had it call
   // update_plan 8 times with byte-identical content, 7 no-op revisions that read as
@@ -93,7 +93,7 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
 // param plus offset/limit line paging — 8656de9, fa5b497 — specifically so a role
 // without bash can still find a symbol); `web_search`/`fetch_url` cover the
 // checkpoint's own "ground it" instruction. `conclude` (2026-09-06) is how this
-// checkpoint now delivers its ANSWER/TRIVIAL/SIMPLE/OBJECTIVE marker line — a turn
+// checkpoint now delivers its ANSWER/SIMPLE/OBJECTIVE status — a turn
 // with no tool calls no longer ends anything (agent.ts's chat() loop), so without
 // it this checkpoint could investigate forever but never actually classify.
 // The Boss classification checkpoint is READ-ONLY but needs bash for investigation
@@ -263,6 +263,31 @@ export const ROLE_NAME: Record<Role, string> = {
   tester: 'Tester',
 }
 
+// Valid `conclude` status keywords per role. When an agent calls conclude(status, message),
+// agent.ts validates `status` against this set and returns an error (visible to the model)
+// if invalid, repeating the expected keywords. This replaces all regex-based parsing of
+// conclude text in dispatch.ts.
+export const ROLE_CONCLUDE_STATUSES: Record<Role, string[]> = {
+  // Boss: ANSWER (knows the answer), SIMPLE (one implementer + tester),
+  // OBJECTIVE (needs a planner to decompose), SUMMARY (end-of-run conclusion).
+  boss: ['ANSWER', 'SIMPLE', 'OBJECTIVE', 'SUMMARY'],
+  // Planner initial call: PLAN (the plan is the message).
+  // Planner detail calls: IMPLEMENT (assignment for next sub-agent), SUCCESS (objective
+  // fully met, final statement), FAIL (cannot complete, explain why).
+  planner: ['PLAN', 'IMPLEMENT', 'SUCCESS', 'FAIL'],
+  // Implementer: SUCCESS (did the work) or FAIL (couldn't do it).
+  implementer: ['SUCCESS', 'FAIL'],
+  // Tester: SUCCESS (implementation is correct) or FAIL (found problems, fix assignment in message).
+  tester: ['SUCCESS', 'FAIL'],
+}
+
+export function concludeStatusError(role: Role, invalidStatus: string): string {
+  const valid = ROLE_CONCLUDE_STATUSES[role]
+  return `Invalid conclude status "${invalidStatus}". For your role (${ROLE_NAME[role]}), ` +
+    `the valid status keywords are: ${valid.join(', ')}. ` +
+    `Call conclude again with status set to one of these keywords and your message in the message parameter.`
+}
+
 const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
   // ITERATIVE PLANNER, `conclude`-based (this rewrite — no TASK:/TEST:/DONE line
   // convention). The Planner is called in two phases: ONCE for an overall plan (an
@@ -313,7 +338,7 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
   // also describe an ending convention for (NONE/INJECT/RESTART/ESCALATE) were
   // removed along with the task-graph execution loop they reviewed — see
   // dispatch.ts's module header. task-start is now the ONLY Boss checkpoint that
-  // ever spawns (runBossTaskStart), and its own ANSWER/TRIVIAL/SIMPLE/OBJECTIVE
+  // ever spawns (runBossTaskStart), and its own ANSWER/SIMPLE/OBJECTIVE
   // convention is stated entirely in its own assignment text
   // (dispatch.ts's buildTaskStartAssignment), not here. The generic
   // "follow the assignment below" framing is kept deliberately future-proof: it
@@ -499,16 +524,16 @@ export const TESTER_VERDICT_NUDGE =
   'answer with exactly one of: RELEASE (you accept the conclusion, success or failure) or ' +
   'REDO: <specific follow-up instruction> — nothing else after it.'
 
-// Task-start checkpoint, a FOUR-way fork rather than always producing an objective +
+// Task-start checkpoint, a THREE-way fork rather than always producing an objective +
 // full plan (docs/subagents-plan.md, "skippable phases" + the Magentic-One-grounded
-// redesign of 2026-09-03): a pure Q&A needs no frame at all; a truly tiny change (~1-2
-// iterations) is the ONE case the Boss may attempt directly, tightly capped; a
-// single-file change that isn't trivial to DIAGNOSE (but is still just one piece of
-// work) goes straight to one Implementer + Tester with no Planner ceremony; and only
+// redesign of 2026-09-03; collapsed from four ways to three when TRIVIAL was merged
+// into SIMPLE, see dispatch.ts's buildTaskStartAssignment): a pure Q&A needs no frame
+// at all; anything from a trivial one-line fix up to a single-file/single-function
+// change goes straight to one Implementer + Tester with no Planner ceremony; and only
 // work anticipated to need MULTIPLE distinct pieces gets the full Planner pipeline.
 // Fails open to 'objective' (the safest, most-capable path) on anything unparseable.
 export interface TaskStartVerdict {
-  mode: 'answer' | 'trivial' | 'simple' | 'objective'
+  mode: 'answer' | 'simple' | 'objective'
   text: string // the final answer (mode 'answer') or the objective statement (otherwise)
   parsed: boolean // false ⇔ no marker line was found (text is then '')
 }
@@ -516,16 +541,14 @@ export interface TaskStartVerdict {
 export function parseTaskStartVerdict(finalAnswer: string): TaskStartVerdict {
   const answer = /ANSWER\s*:\s*([\s\S]+)/i.exec(finalAnswer)
   if (answer) return { mode: 'answer', text: answer[1].trim(), parsed: true }
-  const trivial = /TRIVIAL\s*:\s*([\s\S]+)/i.exec(finalAnswer)
-  if (trivial) return { mode: 'trivial', text: trivial[1].trim(), parsed: true }
   const simple = /SIMPLE\s*:\s*([\s\S]+)/i.exec(finalAnswer)
   if (simple) return { mode: 'simple', text: simple[1].trim(), parsed: true }
   const objective = /OBJECTIVE\s*:\s*([\s\S]+)/i.exec(finalAnswer)
   if (objective) return { mode: 'objective', text: objective[1].trim(), parsed: true }
   // No marker found at all — do NOT fall back to the raw final answer text. A real
   // failure observed in eval: the Boss did the fix itself via bash instead of just
-  // classifying, then reported that as free-form prose with no ANSWER/TRIVIAL/
-  // SIMPLE/OBJECTIVE line; the raw prose ("All 7 tests pass. The three functions are
+  // classifying, then reported that as free-form prose with no ANSWER/SIMPLE/
+  // OBJECTIVE line; the raw prose ("All 7 tests pass. The three functions are
   // now implemented: ...") became the "objective" fed to the Planner, which had no
   // idea what to plan for a COMPLETION REPORT and hallucinated an entire unrelated
   // project structure trying to find something to do. Returning empty text here

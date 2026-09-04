@@ -78,7 +78,7 @@ type JsonSchema = Record<string, unknown>
 export const TASK_START_SCHEMA: JsonSchema = {
   type: 'object',
   properties: {
-    mode: { type: 'string', enum: ['answer', 'trivial', 'simple', 'objective'] },
+    mode: { type: 'string', enum: ['answer', 'simple', 'objective'] },
     text: { type: 'string', minLength: 1 },
   },
   required: ['mode', 'text'],
@@ -112,7 +112,7 @@ export const BOSS_VERDICT_SCHEMA: JsonSchema = {
 // frames.ts call sites do the mapping into those shapes.
 
 export interface ExtractedTaskStart {
-  mode: 'answer' | 'trivial' | 'simple' | 'objective'
+  mode: 'answer' | 'simple' | 'objective'
   text: string
 }
 export interface ExtractedTesterVerdict {
@@ -141,7 +141,7 @@ const TASK_START_EXTRACTION_PROMPT =
   "the BOSS's own final answer to a task-start checkpoint, which already ends (or was meant to end) with one " +
   'of four markers: ANSWER:, TRIVIAL:, SIMPLE:, or OBJECTIVE:, each followed by text. Find which of the four ' +
   'it already committed to — from the marker if present, or from what the prose clearly states if the marker ' +
-  'itself was dropped or garbled — and restate it as {mode, text}: mode is exactly one of answer/trivial/' +
+  'itself was dropped or garbled — and restate it as {mode, text}: mode is exactly one of answer/' +
   'simple/objective (lowercase), and text is the same content that followed (or was clearly intended to ' +
   'follow) that marker, verbatim where possible. Never pick a mode the text does not support, and never write ' +
   'your own answer, fix, or classification. If the text genuinely commits to none of the four, respond with ' +
@@ -283,7 +283,7 @@ export function parseExtractedTaskStart(raw: string): ExtractedTaskStart | null 
   if (!obj) return null
   const mode = obj.mode
   const text = obj.text
-  if (mode !== 'answer' && mode !== 'trivial' && mode !== 'simple' && mode !== 'objective') return null
+  if (mode !== 'answer' && mode !== 'simple' && mode !== 'objective') return null
   if (typeof text !== 'string' || text.trim().length === 0) return null
   const trimmed = text.trim()
   if (trimmed === NO_DECISION_SENTINEL) return null

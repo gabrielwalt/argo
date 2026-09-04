@@ -16,8 +16,8 @@
 // Implementer that reports SUCCESS, for both the OBJECTIVE/Planner path AND the SIMPLE
 // fast path — up to MAX_TESTER_FIX_ATTEMPTS fix-and-retest rounds before the task is
 // escalated back to the Planner (OBJECTIVE) or to the full Planner pipeline (SIMPLE).
-// TRIVIAL is the one mode that still skips the Tester entirely (see its own comment
-// below) — everything else gets one. frames.ts's `ROLE_TOOLS.tester`/
+// TRIVIAL was merged into SIMPLE (this task) — there is no longer a mode that skips
+// the Tester entirely; every Implementer that reports SUCCESS gets one. frames.ts's `ROLE_TOOLS.tester`/
 // `ROLE_MAX_ITERATIONS.tester`/`ROLE_POLICY.tester`/`ROLE_SYSTEM_SUFFIX.tester` and its
 // `parseTesterVerdict`/`TESTER_VERDICT_NUDGE` stay defined there for the same reason as
 // ever — Role (types.ts, off limits) enumerates `'tester'` so those Record<Role,...>
@@ -59,7 +59,7 @@ import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, systemPromptFor, buildAssignment, capS
 import * as ledger from './ledger.js'
 // SCHEMA-CONSTRAINED CONTROL PLANE (config.schemaControlPlane, docs/research/
 // 09-small-model-scaffolding.md §1/§7; see src/schema.ts for the full design rationale).
-// Still used for the task-start checkpoint's ANSWER/TRIVIAL/SIMPLE/OBJECTIVE marker
+// Still used for the task-start checkpoint's ANSWER/SIMPLE/OBJECTIVE marker
 // recovery below. There is no schema-constrained recovery path for the Planner's
 // `conclude` answers any more — that answer is always usable free text (there is no
 // marker line to fail to produce), so nothing here calls extractTesterVerdict any more.
@@ -398,7 +398,7 @@ export function applyFramePolicy(agent: Agent, role: Role): void {
 // seedObjective (2026-09-05): pre-satisfies agent.ts's plan/act gate for an
 // Implementer that already has a concrete objective before its first turn — see
 // Agent.seedPlan's own comment for the full reasoning. Every Implementer spawn site
-// below passes its own task prompt here (the TRIVIAL/SIMPLE objective, or the
+// below passes its own task prompt here (the SIMPLE objective, or the
 // Planner's own per-task detail prompt); every other role omits it (the Planner
 // never writes at all, so the gate can never trip for it).
 async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: ToolName[], seedObjective?: string): Promise<SpawnedFrame> {
@@ -534,7 +534,7 @@ export function deriveFrameResult(frameId: string, finalAnswer: string, agent: A
 // 'preempted'/'preempted-incomplete', for a workspace change the Boss made ITSELF
 // during classification (detected via a before/after git diff) — removed (2026-09-05)
 // along with the Boss's ability to touch the workspace at all during this checkpoint
-// (see frames.ts's TASK_START_TOOLS), so `mode` is now exactly the four values the
+// (see frames.ts's TASK_START_TOOLS), so `mode` is now exactly the three values the
 // model itself can express. `frameId`/`agent` are also gone: both existed only for the
 // deleted 'preempted' branch below to hand the classification frame straight to a
 // Tester — every remaining caller only ever reads `.mode`/`.text`.
@@ -581,9 +581,8 @@ export const TASK_START_HARD_CAP = 20
 // exact (marker missing, answer otherwise already given), so the nudge asks for
 // precisely that — reformat, don't re-derive.
 const TASK_START_MARKER_RETRY_NUDGE =
-  'Your last answer didn\'t end with one of the four required lines. Reply again, and end ' +
-  'your answer with exactly one of: ANSWER: <...>, TRIVIAL: <...>, SIMPLE: <...>, or ' +
-  'OBJECTIVE: <...> — nothing else after it.'
+  'Your last answer didn\'t use one of the three required statuses. Call conclude again with ' +
+  'status set to one of: ANSWER, SIMPLE, or OBJECTIVE — and your message as the answer or objective.'
 
 // Returned to the USER (as the run's final answer, mode 'answer' — see
 // runBossTaskStart below) when the Boss exhausts TASK_START_HARD_CAP without ever
@@ -606,49 +605,31 @@ export const TASK_START_CAP_FAILURE_MESSAGE =
 // buildAssignment, which wraps EVERY frame's assignment with dependency summaries —
 // this IS the assignment passed to that wrapper for the task-start Boss specifically).
 // Pure and exported so the exact prompt — the <argo-user-prompt> tagging, the
-// READ-ONLY statement, the four mode markers — is directly testable without spawning
-// a real frame; the cone reviewing this change can also just call it to see exactly
-// what reaches the model.
-//
-// LOCKED — do not modify. This is the Boss prompt referenced by the task brief as
-// off-limits; the SIMPLE mode's description below is unchanged text, even though
-// SIMPLE no longer spawns a Tester (see this module's header) — "handled by an
-// Implementer and a Tester agent" is now inaccurate to the actual pipeline, but this
-// exact function body is explicitly out of scope for this rewrite.
+// READ-ONLY statement, the three status keywords — is directly testable without
+// spawning a real frame.
 export function buildTaskStartAssignment(userMessage: string, verbatimRequestOn: boolean): string {
   return (
     'CHECKPOINT: task-start\n' +
-    'Your task is to classify the following user request into exactly one of the four modes below:\n' +
+    'Your task is to classify the following user request into exactly one of the three modes below:\n' +
     `<argo-user-prompt>\n${userMessage}\n</argo-user-prompt>\n\n` +
-    // VERBATIM REQUEST THREADING (config.verbatimRequest): when on, the raw user
-    // message is also attached to every downstream frame's assignment (see
-    // buildAssignment / renderVerbatimRequestBlock in frames.ts), so this checkpoint
-    // is no longer the request's only surviving record and the mode line can be a
-    // concise digest rather than a defensive transcription. Flag-gated so the OFF
-    // path's prompt text is byte-identical to before this existed.
     (verbatimRequestOn
       ? 'Note: the user\'s request above is ALSO threaded verbatim to every downstream frame (Planner, ' +
         'Implementer, Tester) alongside whatever you write below — this checkpoint is no longer the only place ' +
         'it survives, so your mode line can be a concise digest rather than an exhaustive transcription; the ' +
         'original is preserved separately for anyone who needs the exact wording.\n\n'
       : '') +
-    'Your task is done once you call `conclude` with exactly one of these formats:\n' +
-    '- `ANSWER: {complete final answer}` — Use only if you already know the answer with certainty and no ' +
-    'project changes are required.\n' +
-    '- `TRIVIAL: {concrete, verifiable objective}` — Use only for the most trivial changes when you are ' +
-    'certain no testing is needed, such as a one-character typo or a single obvious constant change. Do not ' +
-    'implement it yourself; instead, formulate a clear objective for the Implementer agent, which has write ' +
-    'access. Such tasks typically take 1\u20133 iterations.\n' +
-    '- `SIMPLE: {concrete, verifiable objective}` — Use for a well-scoped change that will typically take ' +
-    '3\u201320 iterations to diagnose and implement, such as a bug confined to one file or a single function ' +
-    'to fix. The objective will be handled by an Implementer and a Tester agent.\n' +
-    '- `OBJECTIVE: {concrete, verifiable objective}` — Use if you expect the task to take more than 20 ' +
-    'iterations, require deeper upfront analysis, involve several distinct pieces of work, or contain genuine ' +
-    'ambiguity about the approach. The objective will be given to a Planner agent to break down into an ' +
-    'actionable plan.\n\n' +
+    'Your task is done once you call `conclude` with the appropriate status and message:\n' +
+    '- Status ANSWER, message: the complete final answer — use only if you already know the answer with ' +
+    'certainty and no project changes are required.\n' +
+    '- Status SIMPLE, message: a concrete, verifiable objective — Use for a well-scoped change that can be ' +
+    'handled by a single Implementer and verified by a Tester agent. This covers everything from trivial ' +
+    'fixes to single-function changes.\n' +
+    '- Status OBJECTIVE, message: a concrete, verifiable objective — Use if the task requires deeper upfront ' +
+    'analysis, involves several distinct pieces of work, or contains genuine ambiguity about the approach. A ' +
+    'Planner agent will break it down.\n\n' +
     'Do not implement anything. The project is READ-ONLY: you may inspect files to understand the codebase, but you must not modify anything.\n' +
     'Ground your answer or objective whenever it depends on project-specific details, current facts, or anything you cannot know with certainty. Inspect the relevant files or use the web when necessary rather than relying on assumptions.\n' +
-    `You have a hard budget of ${TASK_START_MAX_ITERATIONS} iterations to call \`conclude\` with the classified task, using exactly the required format.`
+    `You have a hard budget of ${TASK_START_MAX_ITERATIONS} iterations to call \`conclude\` with the classified status and message.`
   )
 }
 
@@ -670,6 +651,18 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
   // TASK_START_TOOLS (frames.ts), not ROLE_TOOLS.boss — this checkpoint is read-only
   // classification, see that constant's comment for why and the incident that forced it.
   const { agent, result } = await spawnFrame(req, emit, TASK_START_TOOLS)
+
+  // STRUCTURED CONCLUDE STATUS: the `conclude` tool now validates the Boss's status
+  // against ['ANSWER', 'SIMPLE', 'OBJECTIVE', 'SUMMARY']. A frame that concluded has
+  // an authoritative status — prefer it over regex parsing. Falls through to the
+  // legacy path only when the frame never concluded (cap-hit).
+  const concludeStatus = agent.getConcludeStatus()
+  if (concludeStatus) {
+    const modeMap: Record<string, TaskStartVerdict['mode']> = { ANSWER: 'answer', SIMPLE: 'simple', OBJECTIVE: 'objective' }
+    const mode = modeMap[concludeStatus]
+    if (mode) return { mode, text: result.rawSummary }
+  }
+
   let verdict = parseTaskStartVerdict(result.rawSummary) // BUG-1: read the uncapped text, not the ledger-capped summary
 
   // Retry once, only when the frame actually concluded on its own (a frame that stalled
@@ -744,7 +737,7 @@ export class PlanningFailed extends Error {}
 // string. Pure and exported so the exact text is directly testable without spawning
 // a real frame.
 //
-// Used for the TRIVIAL/SIMPLE task-start fast paths below, which hand the Boss's own
+// Used for the SIMPLE task-start fast path below, which hands the Boss's own
 // classified objective straight to one Implementer. The OBJECTIVE path's per-task
 // Implementer assignment is the Planner's OWN `conclude` answer, unwrapped — see
 // buildNextTaskPrompt and runDispatchLoopBody below.
@@ -766,9 +759,9 @@ export function buildInitialPlannerPrompt(objective: string): string {
   return (
     'Your task is to create an implementation plan for the following user-requested objective:\n' +
     `<argo-objective>\n${objective}\n</argo-objective>\n\n` +
-    'Your task is complete once you call `conclude` with an ordered list of concrete, actionable sub-tasks that can be assigned to implementation sub-agents. The plan should make dependencies and sequencing clear, and each sub-task should have a sufficiently specific and verifiable objective.\n\n' +
+    'Your task is complete once you call `conclude` with status PLAN and your ordered list of concrete, actionable sub-tasks that can be assigned to implementation sub-agents as the message. The plan should make dependencies and sequencing clear, and each sub-task should have a sufficiently specific and verifiable objective.\n\n' +
     'Do not implement anything. The project is READ-ONLY: your role is to plan and orchestrate the implementation, and nothing may be modified. Inspect the relevant project files as needed to understand the codebase and ground your plan. Use the web when necessary for current or external information rather than relying on assumptions.\n\n' +
-    'You have a hard budget of 20 iterations to call `conclude` with the produced plan. If the full implementation cannot yet be predicted reliably, plan the portions that can be determined with confidence and explicitly account for a later re-planning step.'
+    'You have a hard budget of 20 iterations to call `conclude` with status PLAN and the produced plan as the message. If the full implementation cannot yet be predicted reliably, plan the portions that can be determined with confidence and explicitly account for a later re-planning step.'
   )
 }
 
@@ -807,7 +800,7 @@ export function buildBossConclusionAssignment(
     '2. What concrete changes were made?\n' +
     '3. What was verified and how?\n' +
     '4. Any caveats, remaining issues, or follow-up recommendations?\n\n' +
-    'Call `conclude` with your summary.'
+    'Call `conclude` with status SUMMARY and your summary as the message.'
   )
 }
 
@@ -816,8 +809,11 @@ export function buildNextTaskPrompt(completedMessage: string | null): string {
     return (
       'According to your plan, create the assignment for the next implementation sub-agent.\n\n' +
       'The implementation agent will NOT see the overall plan or any previous planner context. Its assignment must therefore be fully self-contained and include everything needed to understand and complete this specific sub-task.\n\n' +
-      'Your task is complete once you call `conclude` with the complete sub-objective for that implementation agent.\n' +
-      'It should:\n' +
+      'Call `conclude` with one of these statuses:\n' +
+      '- IMPLEMENT: your message is the complete sub-objective for the implementation agent.\n' +
+      '- SUCCESS: the objective is fully met; your message is a final concluding statement.\n' +
+      '- FAIL: the objective cannot be completed; your message explains why.\n\n' +
+      'When using IMPLEMENT, the message should:\n' +
       '- Clearly state what must be implemented and define the expected outcome in concrete, verifiable terms.\n' +
       '- Where relevant, include a brief description of the surrounding context and overall goal.\n' +
       '- Include all context from the overall objective and plan that is relevant to this sub-task.\n' +
@@ -835,7 +831,11 @@ export function buildNextTaskPrompt(completedMessage: string | null): string {
     `<argo-implemented>\n${completedMessage}\n</argo-implemented>\n\n` +
     'Review this result against your plan and the current project state, then create the self-contained assignment for the next implementation sub-agent.\n\n' +
     'As before, formulate it as a clear implementation task with a verifiable expected outcome. Include any relevant consequences of the completed work, dependencies, and instructions or context from `AGENTS.md` and `MEMORY.md` that the next agent will need. Explicitly scope what to change, preserve, or defer, including what to test.\n\n' +
-    'If the result changes or invalidates your original plan, adapt the next step accordingly. If no further implementation work is required, provide a final concluding statement summarizing what was accomplished, what was verified, and whether the objective was fully met.\n\n' +
+    'If the result changes or invalidates your original plan, adapt the next step accordingly.\n\n' +
+    'Call `conclude` with one of these statuses:\n' +
+    '- IMPLEMENT: your message is the complete sub-objective for the implementation agent.\n' +
+    '- SUCCESS: the objective is fully met; your message is a final concluding statement summarizing what was accomplished and verified.\n' +
+    '- FAIL: the objective cannot be completed; your message explains why.\n\n' +
     'The project remains READ-ONLY for you. You have a hard budget of 20 iterations to call `conclude`.'
   )
 }
@@ -875,9 +875,9 @@ export function buildImplementerCapFollowUp(assignment: string, lastStatus: stri
 // task description available for the Tester's "{implementer prompt}" field, which
 // should describe the TASK, not this harness bookkeeping suffix.
 export function appendImplementerResultFormat(assignment: string): string {
-  return `${assignment}\n\nWhen you are done, call \`conclude\` with your result in one of these formats:\n`
-    + '- `SUCCESS: {description of what you implemented and how you verified it}`\n'
-    + '- `FAIL: {description of what you tried, what failed, and why}`'
+  return `${assignment}\n\nWhen you are done, call \`conclude\` with the appropriate status:\n`
+    + '- Status SUCCESS, message: description of what you implemented and how you verified it.\n'
+    + '- Status FAIL, message: description of what you tried, what failed, and why.'
 }
 
 export interface ImplementerResult {
@@ -926,13 +926,12 @@ export function buildTesterAssignment(implementerAssignment: string, implementer
     'conclusion at face value.\n\n' +
     'Also account for any relevant instructions, conventions, constraints, or prior decisions in `AGENTS.md` ' +
     'and `MEMORY.md`.\n\n' +
-    'Your task is complete once you call `conclude` with exactly one of these outcomes:\n\n' +
-    '- `SUCCESS` — if the implementation satisfies the assignment and you found no material issue that still ' +
-    'needs fixing.\n' +
-    '- `FAIL: {self-contained fix assignment}` — if anything material is wrong, incomplete, unverified, or ' +
-    'requires further implementation. The text after `FAIL:` must be a clear, self-contained prompt for the ' +
-    'implementation agent explaining what failed, what must be fixed, what should remain unchanged, and how ' +
-    'the fix should be validated.\n\n' +
+    'Your task is complete once you call `conclude` with the appropriate status:\n\n' +
+    '- Status SUCCESS, message: brief confirmation of what was verified — use if the implementation satisfies ' +
+    'the assignment and you found no material issue that still needs fixing.\n' +
+    '- Status FAIL, message: a clear, self-contained prompt for the implementation agent explaining what ' +
+    'failed, what must be fixed, what should remain unchanged, and how the fix should be validated — use if ' +
+    'anything material is wrong, incomplete, unverified, or requires further implementation.\n\n' +
     'Do not modify the project yourself. Your role is to inspect, test, challenge, and report.\n\n' +
     'You have a hard budget of 20 iterations to call `conclude`.'
   )
@@ -1258,16 +1257,14 @@ async function runTesterValidation(
     lastAgent = testerFrame.agent
 
     if (testerFrame.agent.hitIterationCap()) {
-      // The Tester itself never concluded — its own cap-hit string is not a real
-      // verdict to extract a fix assignment from. Read as "still failing" rather
-      // than risk spawning a fix-Implementer with garbage as its assignment.
       return { passed: false, message: testerFrame.result.rawSummary, lastAgent, fixAttempts }
     }
 
-    // BUG-1: parseTesterResult must see the FULL conclude text — a fix assignment
-    // that runs past capSummary's 2000-char cap must never reach the next
-    // Implementer truncated mid-sentence.
-    const testerResult = parseTesterResult(testerFrame.result.rawSummary)
+    // STRUCTURED CONCLUDE STATUS: prefer the Tester's validated status over regex.
+    const testerStatus = testerFrame.agent.getConcludeStatus()
+    const testerResult: TesterResult = testerStatus === 'SUCCESS' || testerStatus === 'FAIL'
+      ? { passed: testerStatus === 'SUCCESS', fixAssignment: testerStatus === 'FAIL' ? testerFrame.result.rawSummary : undefined }
+      : parseTesterResult(testerFrame.result.rawSummary)
     if (testerResult.passed) {
       return { passed: true, message: currentConclusion, lastAgent, fixAttempts }
     }
@@ -1322,6 +1319,8 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
   }
 
   const plannerAgent = plannerFrame.agent
+  // Capture the initial plan's status for parity (always PLAN when concluded)
+  const _initialPlanStatus = plannerAgent.getConcludeStatus()
   const plannerFrameId = plannerFrame.result.frameId
   // What the Planner is resumed with on the NEXT round — normally buildNextTaskPrompt's
   // generic "previous sub-agent concluded with..." wording, but overridden to
@@ -1356,21 +1355,19 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
       throw plannerCapFailure('detailing the next task', plannerFrameId, detailResult.summary)
     }
 
-    // GIVE-UP (this task) is checked BEFORE "done" — an explicit failure signal must
-    // never be misread as quiet success. Ends the run immediately with a failure
-    // message that includes the Planner's own explanation, per the brief.
-    // BUG-1: isPlannerGiveUp/isPlannerDone and the assignment handed to the next
-    // Implementer must all read the Planner's FULL conclude text — a "the objective
-    // is complete" or "GIVE_UP:" phrase the model puts at the end of a long answer,
-    // or an assignment that itself runs past 2000 characters, must never be silently
-    // cut off before the harness gets to look at it.
-    if (isPlannerGiveUp(detailResult.rawSummary)) {
+    // STRUCTURED CONCLUDE STATUS: the Planner detail call now uses IMPLEMENT/SUCCESS/FAIL.
+    const plannerStatus = plannerAgent.getConcludeStatus()
+
+    // GIVE-UP / FAIL: checked BEFORE "done" — an explicit failure signal must
+    // never be misread as quiet success.
+    if (plannerStatus === 'FAIL' || (!plannerStatus && isPlannerGiveUp(detailResult.rawSummary))) {
       if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
       return `Objective: ${objective}\n\nThe Planner gave up: ${detailResult.rawSummary}\n\n`
         + completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
     }
 
-    if (isPlannerDone(detailResult.rawSummary)) {
+    // SUCCESS: objective fully met, no more tasks.
+    if (plannerStatus === 'SUCCESS' || (!plannerStatus && isPlannerDone(detailResult.rawSummary))) {
       plannerConclusionText = detailResult.rawSummary
       done = true
       break
@@ -1418,10 +1415,11 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
       continue
     }
 
-    // NEW (this task): the Implementer's own SUCCESS/FAIL verdict decides whether the
-    // harness spawns a Tester at all — a FAIL skips the Tester entirely and goes
-    // straight back to the Planner with the failure details, per the brief.
-    const implResult = parseImplementerResult(implFrame.result.rawSummary)
+    // Implementer's SUCCESS/FAIL decides whether the harness spawns a Tester.
+    const implStatus = implFrame.agent.getConcludeStatus()
+    const implResult: ImplementerResult = implStatus === 'SUCCESS' || implStatus === 'FAIL'
+      ? { succeeded: implStatus === 'SUCCESS', message: implFrame.result.rawSummary }
+      : parseImplementerResult(implFrame.result.rawSummary)
     if (!implResult.succeeded) {
       plannerFollowUp = buildNextTaskPrompt(implFrame.result.rawSummary)
       continue
@@ -1507,32 +1505,9 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
   await ledger.setObjective(root(), objective)
   emit({ type: 'objective', text: objective })
 
-  // TRIVIAL: skips the Planner AND the Tester entirely — a single well-scoped
-  // Implementer, instructed to test its own work if the assignment calls for it (see
-  // this module's header). Deliberately untouched by this task's Tester/escalation
-  // machinery: a TRIVIAL classification means the Boss judged this 1-3 iterations, so
-  // hitting the 80-iteration hard cap on it is a genuine failure to report as-is, not
-  // something to escalate — whatever the Implementer concluded IS the final answer.
-  // It still gets appendImplementerResultFormat's SUCCESS:/FAIL: instructions (every
-  // Implementer's assignment does, per this task's brief), but that verdict is never
-  // parsed here — it's just echoed back verbatim as part of the raw conclusion, same
-  // as any other text the model might have concluded with before this task existed.
-  if (taskStart.mode === 'trivial') {
-    const frame = await spawnFrame(
-      { role: 'implementer', parentFrameId: null, assignment: appendImplementerResultFormat(buildImplementerAssignment(objective)) },
-      emit,
-      undefined,
-      objective,
-    )
-    if (config.autoCommit) await frame.agent.autoCommit(emit)
-    // BUG-1: rawSummary — this comment's own words are "echoed back verbatim", which
-    // capSummary's 2000-char cap would silently violate for a long conclusion.
-    return `Objective: ${objective}\n\n${frame.result.rawSummary}`
-  }
-
-  // SIMPLE: tries ONE well-scoped Implementer first, exactly like TRIVIAL — no Planner
-  // ceremony up front. Per the brief: "Implementer → Tester → done (same SUCCESS/FAIL
-  // parsing). If Implementer hits cap → escalate to OBJECTIVE path."
+  // SIMPLE: tries ONE well-scoped Implementer first — no Planner ceremony up front.
+  // Also covers what used to be TRIVIAL (merged into SIMPLE). Implementer → Tester →
+  // done. If Implementer hits cap → escalate to OBJECTIVE path.
   if (taskStart.mode === 'simple') {
     const implementerAssignment = buildImplementerAssignment(objective)
     const frame = await spawnFrame(
@@ -1549,11 +1524,11 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
       return await runObjectiveViaPlanner(objective, emit)
     }
 
-    // BUG-1: rawSummary — same reasoning as the OBJECTIVE loop's Implementer handling
-    // above: parseImplementerResult and the Tester assignment below must see the full
-    // conclude text, and a FAIL's own explanation, returned verbatim as the final
-    // answer just below, must never be silently cut off.
-    const implResult = parseImplementerResult(frame.result.rawSummary)
+    // STRUCTURED CONCLUDE STATUS for SIMPLE path — same as the OBJECTIVE loop.
+    const implFrameStatus = frame.agent.getConcludeStatus()
+    const implResult: ImplementerResult = implFrameStatus === 'SUCCESS' || implFrameStatus === 'FAIL'
+      ? { succeeded: implFrameStatus === 'SUCCESS', message: frame.result.rawSummary }
+      : parseImplementerResult(frame.result.rawSummary)
     if (!implResult.succeeded) {
       // FAIL, and SIMPLE has no Planner conversation to route the failure back to —
       // the Implementer's own explanation of what it tried and why it failed IS the

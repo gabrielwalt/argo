@@ -180,9 +180,9 @@ const readCall: ScriptedResponse = {
 }
 // conclude tool call: the ONLY way to end a session (2026-09-05). A bare no-tool-call
 // turn is now a thinking turn and does NOT terminate — only calling conclude does.
-const finalAnswer: ScriptedResponse = { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { answer: 'Final answer.' } } }] } }
-function concludeCall(answer: string): ScriptedResponse {
-  return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { answer } } }] } }
+const finalAnswer: ScriptedResponse = { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
+function concludeCall(answer: string, status = 'SUCCESS'): ScriptedResponse {
+  return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status, message: answer } } }] } }
 }
 
 // Excludes rejected (harness-blocked) calls — Agent.rejectToolCall deliberately
