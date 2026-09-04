@@ -325,6 +325,8 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'TASK\n' +
     'Work one well-scoped task handed to you. ' +
     'Before editing, inspect the relevant existing implementation and tests. Prefer the smallest coherent change that satisfies the assignment and preserves unrelated behaviour.\n\n' +
+    'TESTING\n' +
+    'Focus on a clean, correct implementation. Do not spend iterations on extensive testing or verification — a dedicated adversarial Tester agent will independently verify your work and iterate with you on any issues found. A quick sanity check (e.g. one build or one obvious test run) is fine; methodical edge-case testing is the Tester\'s job.\n\n' +
     'FAILURE\n' +
     'If you cannot complete it within reasonable effort, say so explicitly in your final answer: state what you tried, what failed, and why you don\'t think it will succeed as scoped — do not grind indefinitely on the same approach.',
   tester:
