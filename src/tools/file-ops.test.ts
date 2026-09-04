@@ -185,3 +185,118 @@ test('readFile with offset/limit still enforces the workspace boundary (symlink 
     await fs.unlink(link)
   }
 })
+
+// ── read_file pattern (search mode) — see task write-up: Planner frames
+// have no bash/grep, could page but not find, and two frames each burned
+// their whole 40-iteration budget attempting bash 9 and 7 times, every
+// attempt rejected on role. pattern lets them find a line, then page to it. ──
+
+test('readFile with pattern absent is byte-identical to the no-argument default path — strictly additive requirement', async () => {
+  const content = 'y'.repeat(9000) + 'TAIL_MARKER_pattern_control'
+  await writeFile('/workspace/pattern-control.txt', content)
+  const withoutFourthArg = await readFile('/workspace/pattern-control.txt')
+  const withUndefinedPattern = await readFile('/workspace/pattern-control.txt', undefined, undefined, undefined)
+  assert.equal(withoutFourthArg.output, truncateOutput(content, 8000))
+  assert.equal(withUndefinedPattern.output, withoutFourthArg.output)
+})
+
+test('readFile with pattern absent but offset/limit present is byte-identical to the existing paged path', async () => {
+  const lines = Array.from({ length: 20 }, (_, i) => `line${i + 1}`)
+  await writeFile('/workspace/pattern-control-paged.txt', lines.join('\n'))
+  const paged = await readFile('/workspace/pattern-control-paged.txt', 5, 3)
+  const pagedNoPattern = await readFile('/workspace/pattern-control-paged.txt', 5, 3, undefined)
+  assert.equal(paged.output, pagedNoPattern.output)
+  assert.match(paged.output, /^\[file has 20 lines; showing lines 5-7 of 20; use offset\/limit to read another range\]\n/)
+})
+
+test('readFile with an empty-string pattern is treated as no pattern, not "match every line"', async () => {
+  await writeFile('/workspace/pattern-empty.txt', 'a\nb\nc')
+  const r = await readFile('/workspace/pattern-empty.txt', undefined, undefined, '')
+  assert.equal(r.output, 'a\nb\nc')
+})
+
+test('readFile with pattern returns matching lines prefixed with correct 1-based line numbers', async () => {
+  const lines = ['const a = 1', 'const option = 1', '  return option.requires', '}', 'const b = 2']
+  await writeFile('/workspace/search-basic.txt', lines.join('\n'))
+  const r = await readFile('/workspace/search-basic.txt', undefined, undefined, 'option')
+  assert.equal(r.error, undefined)
+  assert.match(r.output, /^\[pattern "option" matched 2 times in 5 lines; use offset\/limit to read near a line number\]\n/)
+  assert.match(r.output, /^2: const option = 1$/m)
+  assert.match(r.output, /^3: {3}return option\.requires$/m)
+  assert.doesNotMatch(r.output, /^1: /m)
+})
+
+test('readFile with pattern and no matches returns a clear statement, not an empty string or an error', async () => {
+  await writeFile('/workspace/search-nomatch.txt', 'alpha\nbeta\ngamma')
+  const r = await readFile('/workspace/search-nomatch.txt', undefined, undefined, 'ZZZ_NOT_PRESENT')
+  assert.equal(r.error, undefined)
+  assert.notEqual(r.output, '')
+  assert.equal(r.output, '[pattern "ZZZ_NOT_PRESENT" matched 0 times in 3 lines; try a shorter or different substring]')
+})
+
+test('readFile with pattern caps the number of matches returned and reports the true total when truncated', async () => {
+  // 200 lines all containing "hit" — well past MAX_PATTERN_MATCHES (50).
+  const lines = Array.from({ length: 200 }, (_, i) => `hit line ${i + 1}`)
+  await writeFile('/workspace/search-many.txt', lines.join('\n'))
+  const r = await readFile('/workspace/search-many.txt', undefined, undefined, 'hit')
+  assert.equal(r.error, undefined)
+  assert.match(r.output, /matched 200 times \(showing first 50\) in 200 lines/)
+  const matchLines = r.output.split('\n').filter((l) => /^\d+: hit/.test(l))
+  assert.equal(matchLines.length, 50)
+  assert.match(matchLines[0] ?? '', /^1: hit line 1$/)
+})
+
+test('readFile pattern is a literal substring, not a regular expression — metacharacters match themselves only', async () => {
+  const lines = ['a.b', 'axb', 'a(b)', 'plain text with (parens) and a.b again']
+  await writeFile('/workspace/search-literal.txt', lines.join('\n'))
+  // If "a.b" were treated as a regex, it would also match "axb" (line 2).
+  // It must match only the literal occurrences (lines 1 and 4).
+  const r = await readFile('/workspace/search-literal.txt', undefined, undefined, 'a.b')
+  assert.equal(r.error, undefined)
+  assert.match(r.output, /matched 2 times/)
+  assert.match(r.output, /^1: a\.b$/m)
+  assert.match(r.output, /^4: plain text with \(parens\) and a\.b again$/m)
+  assert.doesNotMatch(r.output, /^2: axb$/m)
+})
+
+test('readFile pattern with an invalid-regex-looking string does not throw — literal matching has no invalid-pattern case', async () => {
+  await writeFile('/workspace/search-invalid-regex-shape.txt', 'a.b\naxb\na(b)')
+  const r = await readFile('/workspace/search-invalid-regex-shape.txt', undefined, undefined, '(unclosed[')
+  assert.equal(r.error, undefined)
+  assert.match(r.output, /matched 0 times/)
+})
+
+test('readFile pattern combined with offset/limit searches only within that line range, using absolute line numbers', async () => {
+  const lines = Array.from({ length: 30 }, (_, i) => (i === 4 || i === 24 ? `needle ${i + 1}` : `filler ${i + 1}`))
+  await writeFile('/workspace/search-scoped.txt', lines.join('\n'))
+  // Scope the search to lines 1-10: only the needle at line 5 should be found.
+  const scoped = await readFile('/workspace/search-scoped.txt', 1, 10, 'needle')
+  assert.equal(scoped.error, undefined)
+  assert.match(scoped.output, /^\[pattern "needle" matched 1 time in lines 1-10 of 30; use offset\/limit to read near a line number\]\n/)
+  assert.match(scoped.output, /^5: needle 5$/m)
+  // The full, unscoped search finds both.
+  const full = await readFile('/workspace/search-scoped.txt', undefined, undefined, 'needle')
+  assert.match(full.output, /matched 2 times/)
+  assert.match(full.output, /^5: needle 5$/m)
+  assert.match(full.output, /^25: needle 25$/m)
+})
+
+test('readFile pattern with offset past end of file reports the true length rather than throwing or silently returning no matches', async () => {
+  const lines = Array.from({ length: 12 }, (_, i) => `line${i + 1}`)
+  await writeFile('/workspace/search-past-end.txt', lines.join('\n'))
+  const r = await readFile('/workspace/search-past-end.txt', 500, undefined, 'line')
+  assert.equal(r.error, undefined)
+  assert.equal(r.output, '[file has 12 lines; offset 500 is past end of file; nothing to search]')
+})
+
+test('readFile with pattern still enforces the workspace boundary (symlink escape rejected)', async () => {
+  const outsideDir = path.dirname(config.workspacePath)
+  const link = path.join(config.workspacePath, 'escape-link-search')
+  await fs.symlink(path.join(outsideDir, 'outside'), link)
+  try {
+    const r = await readFile('/workspace/escape-link-search/marker.txt', undefined, undefined, 'SECRET')
+    assert.match(r.error ?? '', /traversal/)
+  } finally {
+    await fs.unlink(link)
+  }
+})

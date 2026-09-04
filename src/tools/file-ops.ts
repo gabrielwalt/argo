@@ -112,10 +112,113 @@ function normalizePositiveInt(n: number | undefined): number | undefined {
 // scored 0/60. The marker's wording is deliberately short, literal, and
 // names the exact parameters ("offset/limit") a small model needs to type
 // to aim its next call, instead of just reporting how much was cut.
-export async function readFile(filePath: string, offset?: number, limit?: number): Promise<ToolResult> {
+// SEARCH MODE (pattern). Measured tonight: two Planner frames on the harder
+// task each burned their full 40-iteration budget and ended in error — one
+// consuming 94% of its run's tokens — while attempting `bash` 9 and 7 times
+// respectively to grep for `option.requires` call sites in a 2790-line
+// file; every attempt was rejected on role (ROLE_TOOLS.planner has no
+// `bash`, therefore no `grep`). Paging (offset/limit, below) fixed READING
+// an already-known range; it did nothing for FINDING that range in the
+// first place — the model could now reach any line, but had no way to pick
+// which line to reach without scanning page after page. This is the fix
+// for that, built on read_file's own boundary/symlink checks and byte-cap
+// discipline (reused verbatim below) rather than a second tool or a bash
+// grant to a planning role — a role this codebase has already logged 48
+// rejected implement attempts from.
+//
+// pattern is matched as a LITERAL SUBSTRING, never a regular expression. A
+// small local model asked to "search" reaches for whatever it already has
+// in front of it: a bare identifier, a dotted call like "option.requires",
+// a fragment of code with parens/brackets/dots. Every one of those is a
+// valid literal substring; almost none is a valid *regex* without escaping
+// first, and "option.requires" as a regex matches "option<any-char>
+// requires" — a plausible-looking wrong hit, not an error, so the model
+// would not even know to distrust it. That silent-wrong-answer failure
+// mode is strictly worse than the one this task is fixing. Literal
+// substring is exactly the contract `grep -F` gives, and str.includes()
+// gives it for free with no escaping step and therefore no invalid-pattern
+// case to ever report.
+//
+// Matches are returned as `<1-based line number>: <line text>`, with no
+// surrounding context lines. That is deliberate: the point of pairing this
+// with offset/limit is a two-call workflow — search, then page to the hit
+// — so folding context into every match here would just re-introduce, in
+// miniature, the exact bulk-output problem paging exists to avoid, while a
+// dedicated offset/limit follow-up already shows context perfectly well.
+//
+// Matches are capped at MAX_PATTERN_MATCHES AND the assembled match text is
+// still run through the same truncateOutput(_, 8000) every other read_file
+// path uses. The count cap keeps a common pattern (e.g. "option" in a
+// 2790-line file — hundreds of hits) from ever reaching truncateOutput
+// with an enormous input; the char cap backstops the case the count cap
+// doesn't cover, e.g. unusually long matched lines. Either way the marker
+// states the true total match count rather than silently clamping — the
+// same rule the offset-past-end-of-file branch below already follows.
+//
+// Interaction with offset/limit: when pattern is given, offset/limit stop
+// meaning "which lines of the file to RETURN" and instead mean "which
+// lines of the file to SEARCH" — the scan window, not the output window.
+// Chosen over rejecting the combination because it is strictly more useful
+// with no added ambiguity: a model that has already paged to roughly the
+// right area can narrow a search to that area instead of rescanning the
+// whole file, and reported line numbers are always absolute (real file
+// line numbers), so they feed straight back into a plain offset/limit call
+// next turn.
+const MAX_PATTERN_MATCHES = 50
+
+function searchLines(content: string, pattern: string, offset?: number, limit?: number): ToolResult {
+  const lines = splitLines(content)
+  const totalLines = lines.length
+  const startLine = normalizePositiveInt(offset) ?? 1  // 1-based
+  const startIdx = startLine - 1
+  if (startIdx >= totalLines) {
+    // Same "state the true length, don't silently clamp" rule as the
+    // plain-paging past-end-of-file branch below, restated for search so
+    // the model isn't left guessing whether an empty result means "no
+    // matches" or "range was invalid".
+    return { output: `[file has ${totalLines} lines; offset ${startLine} is past end of file; nothing to search]` }
+  }
+  const count = normalizePositiveInt(limit)
+  const endIdx = count === undefined ? totalLines : Math.min(totalLines, startIdx + count)  // 0-based exclusive == 1-based last line scanned
+  const scoped = offset !== undefined || limit !== undefined
+  const scope = scoped ? `lines ${startLine}-${endIdx} of ${totalLines}` : `${totalLines} lines`
+  let totalMatches = 0
+  const shown: string[] = []
+  for (let i = startIdx; i < endIdx; i++) {
+    if (lines[i].includes(pattern)) {
+      totalMatches++
+      if (shown.length < MAX_PATTERN_MATCHES) shown.push(`${i + 1}: ${lines[i]}`)
+    }
+  }
+  if (totalMatches === 0) {
+    // A clear statement, not an empty string and not an error — the read
+    // succeeded and the pattern legitimately isn't there. An empty string
+    // here would be indistinguishable from a bug; an error would make the
+    // model retry the exact same call, wasting the turn the whole feature
+    // exists to save.
+    return { output: `[pattern ${JSON.stringify(pattern)} matched 0 times in ${scope}; try a shorter or different substring]` }
+  }
+  const countNote = shown.length < totalMatches
+    ? `${totalMatches} times (showing first ${shown.length})`
+    : `${totalMatches} time${totalMatches === 1 ? '' : 's'}`
+  const marker = `[pattern ${JSON.stringify(pattern)} matched ${countNote} in ${scope}; use offset/limit to read near a line number]`
+  return { output: `${marker}\n${truncateOutput(shown.join('\n'), 8000)}` }
+}
+
+export async function readFile(filePath: string, offset?: number, limit?: number, pattern?: string): Promise<ToolResult> {
   try {
     const abs = await safePath(filePath)
     const content = await fs.readFile(abs, 'utf-8')
+    // pattern present (and non-empty) is the ONLY branch point added by
+    // this change — everything below is untouched from before it existed.
+    // An explicit empty string is treated the same as absent (not "match
+    // every line"): a model that sent '' almost certainly meant "no
+    // pattern", and treating it as "match everything" would dump the
+    // entire file through the match-formatting path, recreating exactly
+    // the flood this feature exists to prevent.
+    if (pattern) {
+      return searchLines(content, pattern, offset, limit)
+    }
     if (offset === undefined && limit === undefined) {
       return { output: truncateOutput(content, 8000) }
     }
