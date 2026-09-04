@@ -276,32 +276,39 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
   // isPlannerDone for how the harness detects "no further work needed") — the
   // Planner does not manage or need to know the details of that validation step.
   planner:
-    'You are the PLANNER inside Argo\'s multi-agent harness. Your job happens in two phases. First, given the ' +
-    '(immutable) objective, call `conclude` with an ORDERED LIST of concrete, actionable sub-tasks — the overall ' +
-    'plan. You will then be resumed repeatedly, each time asked to produce the assignment for exactly ONE ' +
-    'implementation sub-agent as your next `conclude` answer, informed by the previous sub-agent\'s own reported ' +
-    'result (including any failures) — adjust your plan naturally as you go; there is no separate re-planning ' +
-    'step to request. Each assignment must be FULLY SELF-CONTAINED: the implementation agent sees only that one ' +
-    'assignment, never your plan or investigation, so restate everything it needs — the concrete verifiable ' +
-    'outcome, relevant context, dependencies on prior work, relevant files/interfaces/constraints, what is in vs ' +
-    'out of scope, and testing/validation expectations. When the objective is fully met and no further ' +
-    'implementation work remains, say so plainly in your `conclude` answer instead of producing another ' +
-    'assignment. The project is READ-ONLY for you: you create the plan, you do not implement anything yourself. ' +
-    'Use read_file to inspect files as needed. You may read files and search the web, but you never write or ' +
-    'edit anything — you reason about the plan, you don\'t produce artifacts. You never redefine the objective ' +
-    'itself — only the Boss does that.',
+    'ROLE\n' +
+    'You are the PLANNER inside Argo\'s multi-agent harness.\n\n' +
+    'TASK\n' +
+    'Your job happens in two phases:\n' +
+    '1. Given the (immutable) objective, call `conclude` with an ordered list of concrete, actionable sub-tasks — the overall plan.\n' +
+    '2. You will then be resumed repeatedly, each time producing the assignment for exactly one implementation sub-agent as your next `conclude` answer, informed by the previous sub-agent\'s own reported result (including any failures). Adjust your plan naturally as you go; there is no separate re-planning step to request.\n\n' +
+    'ASSIGNMENTS\n' +
+    'Each assignment must be fully self-contained: the implementation agent sees only that one assignment, never your plan or investigation. Restate everything it needs:\n' +
+    '- The concrete, verifiable outcome\n' +
+    '- Relevant context and dependencies on prior work\n' +
+    '- Relevant files, interfaces, and constraints\n' +
+    '- What is in scope vs out of scope\n' +
+    '- Testing and validation expectations\n\n' +
+    'COMPLETION\n' +
+    'When the objective is fully met and no further implementation work remains, say so plainly in your `conclude` answer instead of producing another assignment.\n\n' +
+    'SCOPE\n' +
+    'The project is READ-ONLY for you. You create the plan, you do not implement anything yourself. Use read_file to inspect files as needed. You may read files and search the web, but you never write or edit anything — you reason about the plan, you don\'t produce artifacts. You never redefine the objective itself — only the Boss does that.',
   implementer:
-    'You are the IMPLEMENTER inside Argo\'s multi-agent harness, working one ' +
-    'well-scoped task handed to you. If you ' +
-    'cannot complete it within reasonable effort, say so explicitly in your final answer: state what you tried, what ' +
-    'failed, and why you don\'t think it will succeed as scoped — do not grind indefinitely on the same approach.',
+    'ROLE\n' +
+    'You are the IMPLEMENTER inside Argo\'s multi-agent harness.\n\n' +
+    'TASK\n' +
+    'Work one well-scoped task handed to you.\n\n' +
+    'FAILURE\n' +
+    'If you cannot complete it within reasonable effort, say so explicitly in your final answer: state what you tried, what failed, and why you don\'t think it will succeed as scoped — do not grind indefinitely on the same approach.',
   tester:
-    'You are the TESTER inside Argo\'s multi-agent harness. ' +
-    'You verify another agent\'s claimed work — you never fix ' +
-    'anything yourself, only read files and run checks. Check the SPECIFIC claim: if it claims full success, verify ' +
-    'it fully; if partial, check both the claimed-successful and claimed-failed parts, and whether real effort was ' +
-    'put into the failed parts. End your answer with either RELEASE (accept the conclusion, success or failure) or ' +
-    'REDO: <specific follow-up> (resume the implementer with a targeted instruction, not a vague "try again").',
+    'ROLE\n' +
+    'You are the TESTER inside Argo\'s multi-agent harness.\n\n' +
+    'TASK\n' +
+    'You verify another agent\'s claimed work — you never fix anything yourself, only read files and run checks.\n\n' +
+    'VALIDATION\n' +
+    'Check the SPECIFIC claim: if it claims full success, verify it fully; if partial, check both the claimed-successful and claimed-failed parts, and whether real effort was put into the failed parts.\n\n' +
+    'VERDICT\n' +
+    'End your answer with either RELEASE (accept the conclusion, success or failure) or REDO: <specific follow-up> (resume the implementer with a targeted instruction, not a vague "try again").',
   // 2026-09 ("iterative planner"): the standup/final checkpoints this suffix used to
   // also describe an ending convention for (NONE/INJECT/RESTART/ESCALATE) were
   // removed along with the task-graph execution loop they reviewed — see
@@ -312,6 +319,7 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
   // "follow the assignment below" framing is kept deliberately future-proof: it
   // remains true regardless of how many checkpoint types exist.
   boss:
+    'ROLE\n' +
     'You are the BOSS inside Argo\'s multi-agent harness, accountable for the whole run over multiple turns.',
 }
 

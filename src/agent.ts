@@ -86,7 +86,7 @@ import { recordEpisode, markEpisodeEvicted, newId as newLedgerId } from './ledge
 // TOOLS section from only what `has()` says is actually there — a role that lacks
 // write_file/edit_file is never told about them, and gets an explicit note instead
 // pointing at what it DOES have for reading/investigating.
-function buildSystemPrompt(tools: ToolName[] | null): string {
+function buildSystemPrompt(tools: ToolName[] | null, roleInstructions?: string): string {
   const has = (t: ToolName): boolean => tools === null || tools.includes(t)
   const hasUpdatePlan = has('update_plan')
   const canWrite = has('write_file') || has('edit_file')
@@ -108,7 +108,7 @@ function buildSystemPrompt(tools: ToolName[] | null): string {
   ].filter((line): line is string => typeof line === 'string').join('\n')
 
   return `You are Argo, a multi-agent system with a coding harness. Your project is mounted at /workspace in an isolated Ubuntu Docker container. Your thoughts, tool calls, and results stream live to the user, and changes under /workspace are committed to git when auto-commit is enabled.
-
+${roleInstructions ? '\n' + roleInstructions + '\n' : ''}
 TOOLS — invoke them through the function-calling API; never as text in your reply.
 ${toolLines}
 
@@ -371,7 +371,7 @@ export class Agent {
   private ollama: Ollama
   private history: Message[] = []
   private model: string
-  private options: ModelOptions = {}
+  private options: ModelOptions = { temperature: 0.6, top_p: 0.95, top_k: 20 }
   // Per-run toggle for the grounding guard (see runGroundingCheckpoint). Defaults to
   // config.grounding (env ARGO_GROUNDING, default ON); the web UI's "Grounding check"
   // toggle overrides it per run via setGrounding().
@@ -618,7 +618,7 @@ export class Agent {
   }
 
   setOptions(opts: ModelOptions) {
-    this.options = opts
+    this.options = { ...this.options, ...opts }
   }
 
   setMaxIterations(n: number) {
@@ -1727,29 +1727,27 @@ export class Agent {
     // tool set — buildSystemPrompt derives hasUpdatePlan from it internally the
     // same way canUpdatePlan() does, so passing it here (rather than the boolean)
     // is also what lets the TOOLS section itself stay truthful per role.
-    const rolePrompt = buildSystemPrompt(this.allowedTools)
-    const baseSystemPrompt = this.roleInstructions ? `${rolePrompt}\n\n${this.roleInstructions}` : rolePrompt
-    const systemPrompt = projectContext ? `${baseSystemPrompt}\n\n${projectContext}` : baseSystemPrompt
+    const rolePrompt = buildSystemPrompt(this.allowedTools, this.roleInstructions || undefined)
+    const systemPrompt = projectContext ? `${rolePrompt}\n\n${projectContext}` : rolePrompt
     // Logging-only: makes the full prompt (tool list + role suffix + AGENTS.md/
     // MEMORY.md context) visible in the run log. Emitted before the first
     // iteration/tool_call so a reader sees it ahead of anything it produced.
     // Does not affect what is sent to the model.
     emitAndLog({ type: 'system_prompt', content: systemPrompt })
 
-    // Prepend the system prompt to the FIRST user message of this run only, wrapped
-    // in <argo-system-prompt> tags, instead of sending it as a separate Ollama
-    // 'system' role message on every call. currentRunStart still points at the entry
-    // pushCtx added for userMessage above (compaction/eviction haven't run yet at this
-    // point in chat()), so mutate it in place. On a RESUMED turn (opts.resume) this is
+    // Prepend the system prompt to the FIRST user message of this run only,
+    // instead of sending it as a separate Ollama 'system' role message on every
+    // call. currentRunStart still points at the entry pushCtx added for
+    // userMessage above (compaction/eviction haven't run yet at this point in
+    // chat()), so mutate it in place. On a RESUMED turn (opts.resume) this is
     // skipped: the follow-up text pushed for this turn is a continuation of a frame
     // whose history already carries the system prompt embedded in its own first
     // message from the original (non-resumed) chat() call — prepending again would
     // duplicate it on every resumed turn.
     if (!resume) {
-      const systemBlock = `<argo-system-prompt>\n${systemPrompt}\n</argo-system-prompt>`
       const startEntry = this.history[currentRunStart]
       if (startEntry && startEntry.role === 'user' && typeof startEntry.content === 'string') {
-        startEntry.content = `${systemBlock}\n\n${startEntry.content}`
+        startEntry.content = `${systemPrompt}\n\n${startEntry.content}`
       }
     }
 
@@ -1898,9 +1896,9 @@ export class Agent {
         emitAndLog({ type: 'ollama_request', iteration: i + 1, message_count: this.history.length + 1, model: this.model })
 
         // '' — the system prompt is no longer sent as a separate Ollama 'system' role
-        // message; it was already prepended (wrapped in <argo-system-prompt> tags) to
-        // the first user message in this.history above, and chatCall omits the system
-        // message entirely when passed an empty string.
+        // message; it was already prepended to the first user message in this.history
+        // above, and chatCall omits the system message entirely when passed an empty
+        // string.
         const response = await this.chatWithRetry('', emitAndLog)
         if (response === null) {
           // The user aborted while chatWithRetry was waiting to retry. Mirror the

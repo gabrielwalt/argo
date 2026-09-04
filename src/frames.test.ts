@@ -91,13 +91,14 @@ test('ROLE_TOOLS.tester exists and is a live default — dispatch.ts spawns Test
 
 test('planner system prompt: describes the two-phase flow — overall plan first, then resumed to produce one assignment at a time', () => {
   const text = systemPromptFor('planner')
-  assert.ok(text.includes('ORDERED LIST'))
+  assert.ok(text.includes('ordered list'))
   assert.ok(text.includes('resumed repeatedly'))
-  assert.ok(text.includes('exactly ONE'))
+  assert.ok(text.includes('exactly one'))
   // No dangling reference to the old, now-removed graph/list/marker mechanics.
   assert.equal(text.includes('dependsOn'), false)
   assert.equal(text.includes('frameGroup'), false)
   assert.equal(text.includes('task graph'), false)
+  // TASK is now a section title in the structured prompt, so only check for the old marker convention.
   assert.equal(text.includes('TASK:'), false)
   assert.equal(text.includes('TEST: yes'), false)
   assert.equal(text.includes('TEST: no'), false)

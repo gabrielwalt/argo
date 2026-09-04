@@ -508,7 +508,8 @@ test('system prompt: explains that calling conclude ends the session', async () 
   try {
     const answer = await agent.chat('argo system prompt end-of-turn case')
     assert.equal(answer, 'Final answer.')
-    assert.ok(capturedFirstMessage.includes('<argo-system-prompt>'), 'first message should contain <argo-system-prompt> tag')
+    // System prompt is prepended to the first user message (no wrapper tags).
+    assert.ok(capturedFirstMessage.includes('You are Argo, a multi-agent system'), 'first message should contain the system prompt')
     assert.ok(capturedFirstMessage.includes(
       'To finish, call `conclude` with your final answer to end your session.',
     ))

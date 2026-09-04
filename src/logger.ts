@@ -274,9 +274,7 @@ export class SessionLogger {
           break
 
         case 'system_prompt':
-          lines.push(`<argo-system-prompt>`)
           lines.push(event.content)
-          lines.push(`</argo-system-prompt>`)
           lines.push(``)
           break
 
