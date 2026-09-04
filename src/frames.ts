@@ -305,10 +305,10 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'You are the PLANNER inside Argo\'s multi-agent harness.\n\n' +
     'TASK\n' +
     'Your job happens in two phases:\n' +
-    '1. Given the (immutable) objective, call `conclude` with an ordered list of concrete, actionable sub-tasks — the overall plan.\n' +
-    '2. You will then be resumed repeatedly, each time producing the assignment for exactly one implementation sub-agent as your next `conclude` answer, informed by the previous sub-agent\'s own reported result (including any failures). Adjust your plan naturally as you go; there is no separate re-planning step to request.\n\n' +
+    '1. Given the immutable objective, determine the most effective implementation strategy and call `conclude` with an ordered list of implementation assignments — the overall plan. An assignment represents one coherent unit of work for an Implementer and may encompass multiple implementation steps. Use a single assignment when the objective fits naturally within one Implementer run; decompose only when doing so materially improves execution or verification.\n' +
+    '2. You will then be resumed repeatedly, each time producing the assignment for exactly one implementation agent as your next `conclude` answer, informed by the previous agent\'s verified result (including any failures). Adjust your plan naturally as you go; there is no separate re-planning step to request.\n\n' +
     'ASSIGNMENTS\n' +
-    'Each assignment must be fully self-contained: the implementation agent sees only that one assignment, never your plan or investigation. Restate everything it needs:\n' +
+    'Each assignment must be fully self-contained: the implementation agent sees only that one assignment, never your plan or investigation. An implementation assignment is not a single implementation step. One assignment may include setup, data structures, rendering, interaction, wiring and tests when those pieces belong to one coherent outcome. Restate everything the agent needs:\n' +
     '- The concrete, verifiable outcome\n' +
     '- Relevant context and dependencies on prior work\n' +
     '- Relevant files, interfaces, and constraints\n' +

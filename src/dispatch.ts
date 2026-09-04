@@ -763,10 +763,60 @@ export function buildInitialPlannerPrompt(objective: string): string {
     'CHECKPOINT: planning-start\n' +
     'Your task is to create an implementation plan for the following user-requested objective:\n' +
     `<argo-objective>\n${objective}\n</argo-objective>\n\n` +
-    'Your task is complete once you call `conclude` with status PLAN and your ordered list of concrete, actionable sub-tasks that can be assigned to implementation sub-agents as the message. The plan should make dependencies and sequencing clear, and each sub-task should have a sufficiently specific and verifiable objective.\n\n' +
-    'Prefer the smallest number of independently verifiable sub-tasks that preserve coherent implementation boundaries. Do not split work merely to create more agents.\n\n' +
-    'Do not implement anything. The project is READ-ONLY: your role is to plan and orchestrate the implementation, and nothing may be modified. Inspect the relevant project files as needed to understand the codebase and ground your plan. Use the web when necessary for current or external information rather than relying on assumptions.\n\n' +
-    'You have a hard budget of 20 iterations to call `conclude` with status PLAN and the produced plan as the message. If the full implementation cannot yet be predicted reliably, plan the portions that can be determined with confidence and identify the decision point that should be reassessed after those parts are implemented and verified.'
+    'IMPLEMENTATION SIZING\n' +
+    'Plan around coherent implementation work, not around the wording or number of requirements in the objective.\n\n' +
+    'First decide whether the entire objective can reasonably be completed and verified by one implementation ' +
+    'agent within a single run. If so, prefer ONE implementation assignment. Do not decompose merely because ' +
+    'the objective contains several requirements.\n\n' +
+    'An implementation assignment may contain multiple closely related implementation steps — including setup, ' +
+    'data structures, implementation, wiring, interaction, and tests — when they naturally belong to one ' +
+    'coherent outcome.\n\n' +
+    'Prefer grouping work that:\n' +
+    '- operates on the same feature, behaviour, data flow, or closely related files;\n' +
+    '- must be designed together for the result to make sense;\n' +
+    '- would leave an incomplete or artificial intermediate state if separated;\n' +
+    '- consists of setup immediately consumed by the implementation that follows;\n' +
+    '- can be implemented and verified more efficiently by one agent retaining the relevant context.\n\n' +
+    'Split work only when there is a meaningful implementation boundary, such as:\n' +
+    '- the combined work is unlikely to fit reliably within one Implementer\'s run;\n' +
+    '- distinct subsystems can be changed and verified largely independently;\n' +
+    '- a risky or uncertain dependency should be resolved before later implementation can be planned reliably;\n' +
+    '- an intermediate result is independently meaningful and provides a useful verified checkpoint;\n' +
+    '- later work genuinely benefits from receiving the completed earlier result rather than being implemented together.\n\n' +
+    'Strong signals to MERGE proposed assignments: one merely sets up the next, they operate on the same files ' +
+    'or concepts, or neither produces a meaningful result on its own.\n\n' +
+    'Strong signals to SPLIT: different subsystems with a clean contract between them, substantial independent ' +
+    'verification, unresolved risk that affects the later design, or expected work beyond one Implementer\'s ' +
+    'execution budget.\n\n' +
+    'Every assignment boundary introduces context loss and coordination overhead. Create a boundary only when ' +
+    'its benefit outweighs that cost.\n\n' +
+    'There is NO preferred number of implementation assignments. One is correct when one is sufficient; several ' +
+    'are correct only when the implementation has natural boundaries.\n\n' +
+    'As a final check, examine every boundary between adjacent assignments: "If these were given to the same ' +
+    'Implementer, would separating them make the implementation clearer, safer, or more reliable?" If not, merge them.\n\n' +
+    'GRANULARITY EXAMPLE\n' +
+    'For a request to create a canvas containing a shared-edge hexagonal grid whose cells contain draggable ' +
+    'vector segments, do NOT mechanically produce separate assignments for: (1) page/canvas scaffolding, ' +
+    '(2) hex-grid rendering, (3) vector rendering, (4) drag interaction. Those are tightly coupled implementation ' +
+    'steps of one modest interactive feature and would create artificial intermediate states.\n\n' +
+    'Prefer one assignment such as: "Implement the complete interactive hexagonal-vector canvas: establish the ' +
+    'minimal page/canvas structure, render the shared-edge hex grid, represent zero-length vectors at cell ' +
+    'centres, implement endpoint dragging, and verify the specified visual and interaction behaviour."\n\n' +
+    'Only split such a task if inspection reveals substantial pre-existing architecture, uncertainty, or scope ' +
+    'that makes one Implementer run unreasonable.\n\n' +
+    'PLAN OUTPUT\n' +
+    'Your task is complete once you call `conclude` with status PLAN and your ordered list of implementation ' +
+    'assignments as the message. Each assignment should make dependencies and sequencing clear, and have a ' +
+    'sufficiently specific and verifiable objective.\n\n' +
+    'Prefer the smallest number of independently verifiable assignments that preserve coherent implementation boundaries. Do not split work merely to create more agents.\n\n' +
+    'Do not implement anything. The project is READ-ONLY: your role is to plan and orchestrate the implementation, ' +
+    'and nothing may be modified. Inspect the relevant project files as needed to understand the codebase and ' +
+    'ground your plan. Use the web when necessary for current or external information rather than relying on ' +
+    'assumptions.\n\n' +
+    'You have a hard budget of 20 iterations to call `conclude` with status PLAN and the produced plan as the ' +
+    'message. If the full implementation cannot yet be predicted reliably, plan the portions that can be ' +
+    'determined with confidence and identify the decision point that should be reassessed after those parts are ' +
+    'implemented and verified.'
   )
 }
 
@@ -815,10 +865,10 @@ export function buildNextTaskPrompt(completedMessage: string | null, taskNumber:
   if (completedMessage === null) {
     return (
       `CHECKPOINT: task-${taskNumber}\n` +
-      'According to your plan, create the assignment for the next implementation sub-agent.\n\n' +
-      'The implementation agent will NOT see the overall plan or any previous planner context. Its assignment must therefore be fully self-contained and include everything needed to understand and complete this specific sub-task.\n\n' +
+      'According to your plan, create the next implementation assignment.\n\n' +
+      'The implementation agent will NOT see the overall plan or any previous planner context. Its assignment must therefore be fully self-contained and include everything needed to understand and complete this implementation unit.\n\n' +
       'Call `conclude` with one of these statuses:\n' +
-      '- IMPLEMENT: your message is the complete sub-objective for the implementation agent.\n' +
+      '- IMPLEMENT: your message is the complete implementation assignment for the agent.\n' +
       '- SUCCESS: inspection shows the objective is already satisfied and no implementation work remains; your message is a final concluding statement.\n' +
       '- FAIL: the objective cannot be completed; your message explains why.\n\n' +
       'When using IMPLEMENT, the message should:\n' +
@@ -832,18 +882,18 @@ export function buildNextTaskPrompt(completedMessage: string | null, taskNumber:
       '- Exclude context that does not affect this implementation step.\n' +
       '- Specify required behaviour and constraints without prescribing an implementation technique, unless the technique itself is required by the objective or project architecture.\n\n' +
       'Inspect relevant project files as needed to ground the assignment in the current codebase. Also inspect `AGENTS.md` and `MEMORY.md`, and include directly in the sub-objective any relevant instructions, conventions, architectural constraints, project facts, or prior decisions. But remember, the project remains READ-ONLY at this point: do not implement anything yourself.\n\n' +
-      'You have a hard budget of 20 iterations to call `conclude` with the final self-contained sub-objective. If the next planned step is no longer appropriate given the current project state, adapt the sub-objective while preserving the intent and sequencing of the overall plan.'
+      'You have a hard budget of 20 iterations to call `conclude` with the final self-contained implementation assignment. If the next planned step is no longer appropriate given the current project state, adapt the assignment while preserving the intent and sequencing of the overall plan.'
     )
   }
   return (
     `CHECKPOINT: task-${taskNumber}\n` +
-    'The previous implementation sub-agent concluded with:\n' +
+    'The previous implementation agent concluded with:\n' +
     `<argo-implemented>\n${completedMessage}\n</argo-implemented>\n\n` +
-    'Review this result against your plan and the current project state, then create the self-contained assignment for the next implementation sub-agent.\n\n' +
-    'As before, formulate it as a clear implementation task with a verifiable expected outcome. Include any relevant consequences of the completed work, dependencies, and instructions or context from `AGENTS.md` and `MEMORY.md` that the next agent will need. Explicitly scope what to change, preserve, or defer, including what to test.\n\n' +
+    'Review this result against your plan and the current project state, then create the next self-contained implementation assignment.\n\n' +
+    'Formulate it as a clear implementation assignment with a verifiable expected outcome. Include any relevant consequences of the completed work, dependencies, and instructions or context from `AGENTS.md` and `MEMORY.md` that the agent will need. Explicitly scope what to change, preserve, or defer, including what to test.\n\n' +
     'If the result changes or invalidates your original plan, adapt the next step accordingly.\n\n' +
     'Call `conclude` with one of these statuses:\n' +
-    '- IMPLEMENT: your message is the complete sub-objective for the implementation agent.\n' +
+    '- IMPLEMENT: your message is the complete implementation assignment for the agent.\n' +
     '- SUCCESS: inspection shows the objective is already satisfied and no implementation work remains; your message is a final concluding statement summarizing what was accomplished and verified.\n' +
     '- FAIL: the objective cannot be completed; your message explains why.\n\n' +
     'The project remains READ-ONLY for you. You have a hard budget of 20 iterations to call `conclude`.'

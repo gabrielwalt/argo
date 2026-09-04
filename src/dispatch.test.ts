@@ -198,7 +198,7 @@ test('buildNextTaskPrompt: null vs a completed message select genuinely differen
   const later = buildNextTaskPrompt('done', 2)
   assert.notEqual(first, later)
   assert.ok(first.includes('According to your plan'))
-  assert.ok(later.includes('The previous implementation sub-agent concluded with:'))
+  assert.ok(later.includes('The previous implementation agent concluded with:'))
 })
 
 // ── isPlannerDone — the natural-language completion heuristic ─────────────────
