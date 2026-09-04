@@ -845,8 +845,10 @@ export function buildBossConclusionAssignment(
     'CHECKPOINT: run-conclusion\n' +
     'The run is complete. Your task is to provide a final summary of how the entire run went.\n\n' +
     `<argo-objective>\n${objective}\n</argo-objective>\n\n` +
-    'The Planner concluded with:\n' +
-    `<argo-planner-conclusion>\n${plannerConclusion}\n</argo-planner-conclusion>\n\n` +
+    (plannerConclusion
+      ? 'The Planner concluded with:\n' +
+        `<argo-planner-conclusion>\n${plannerConclusion}\n</argo-planner-conclusion>\n\n`
+      : '') +
     (taskSummaries
       ? `Implementation results:\n<argo-implementation-results>\n${taskSummaries}\n</argo-implementation-results>\n\n`
       : '') +
@@ -981,8 +983,13 @@ export function buildTesterAssignment(implementerAssignment: string, iteration =
     'correctness from intent or apparent implementation shape.\n\n' +
     'Also account for any relevant instructions, conventions, constraints, or prior decisions in `AGENTS.md` ' +
     'and `MEMORY.md`.\n\n' +
-    'When you have formed your independent assessment, call `conclude` with status SUCCESS if serious attempts ' +
-    'to falsify the result have failed, or status FAIL with evidence of the defects found.'
+    'When you have formed your independent assessment, call `conclude` with status ASSESSMENT.\n\n' +
+    'Your message must record:\n' +
+    '- whether you found any apparent defects;\n' +
+    '- the concrete evidence and reproductions obtained;\n' +
+    '- what you tested;\n' +
+    '- any important uncertainty remaining.\n\n' +
+    'This is an independent assessment, not the final verdict. Do not use SUCCESS or FAIL until the comparison turn.'
   )
 }
 
@@ -994,7 +1001,8 @@ export function buildTesterComparePrompt(implementerConclusion: string): string 
     `<argo-implemented>\n${implementerConclusion}\n</argo-implemented>\n\n` +
     'If this report reveals issues you missed, investigate them. If your findings contradict the report, ' +
     'the repository state is the ground truth.\n\n' +
-    'Call `conclude` with your final verdict: status SUCCESS if the implementation is correct, or status FAIL ' +
+    'Call `conclude` with your final verdict: status SUCCESS if no evidence-backed defect remains after your ' +
+    'verification, or status FAIL ' +
     'with evidence (observed behaviour, expected behaviour, reproduction steps, smallest known defect scope) ' +
     'and a self-contained fix prompt.'
   )
@@ -1343,14 +1351,26 @@ async function runTesterValidation(
         testerFrameId, testerAgent, buildTesterComparePrompt(currentConclusion),
       )
     } else {
-      // Re-test: RESUME the same Tester frame (context retained, fresh budget).
+      // Re-test, turn 1: blind — Tester knows a repair was made but does NOT see
+      // the repair report yet, preventing anchoring on the Implementer's claims.
+      testerAgent.resetIterations()
+      await resumeFrame(
+        testerFrameId,
+        testerAgent,
+        `CHECKPOINT: iteration-${testerIteration}\n`
+          + 'A repair attempt has been made. Re-test the current repository against:\n'
+          + '1. the original assignment;\n'
+          + '2. the defects you previously identified;\n'
+          + '3. relevant regressions or adjacent behaviour.\n\n'
+          + 'You are deliberately not given the repair agent\'s account yet.\n\n'
+          + 'Call `conclude` with status ASSESSMENT recording your independent re-test findings.',
+      )
+      // Re-test, turn 2: compare with the repair report, then final verdict.
       testerAgent.resetIterations()
       testerResultRaw = await resumeFrame(
         testerFrameId,
         testerAgent,
-        `CHECKPOINT: iteration-${testerIteration}\n`
-          + 'The Implementer attempted a fix. Re-test the implementation against the original assignment.\n\n'
-          + `<argo-implemented>\n${currentConclusion}\n</argo-implemented>`,
+        buildTesterComparePrompt(currentConclusion),
       )
     }
     lastAgent = testerAgent
@@ -1380,7 +1400,13 @@ async function runTesterValidation(
       `CHECKPOINT: iteration-${implIteration}\n`
         + 'The Tester found issues with your implementation:\n\n'
         + `<argo-tester-feedback>\n${fixAssignment}\n</argo-tester-feedback>\n\n`
-        + 'Fix the issues described above. When done, call `conclude` with the appropriate status:\n'
+        + 'Fix the underlying issues described above while preserving all requirements of the original assignment '
+        + 'and unrelated working behaviour.\n\n'
+        + 'Treat the Tester\'s reproduction as evidence of the defect, not necessarily as the complete scope of the '
+        + 'problem. Identify and correct the underlying cause rather than special-casing the demonstrated failure.\n\n'
+        + 'Re-run the Tester\'s reproduction where possible and the relevant broader tests. Do not weaken, remove, '
+        + 'or rewrite valid tests merely to obtain a passing result.\n\n'
+        + 'When done, call `conclude` with the appropriate status:\n'
         + '- Status SUCCESS, message: description of what you fixed and how you verified it.\n'
         + '- Status FAIL, message: description of what you tried, what failed, and why.',
     )

@@ -92,7 +92,7 @@ test('ROLE_TOOLS.tester exists and is a live default — dispatch.ts spawns Test
 test('planner system prompt: describes the two-phase flow — overall plan first, then resumed to produce one assignment at a time', () => {
   const text = systemPromptFor('planner')
   assert.ok(text.includes('ordered list'))
-  assert.ok(text.includes('resumed repeatedly'))
+  assert.ok(text.includes('resumed for each unit'))
   assert.ok(text.includes('exactly one'))
   // No dangling reference to the old, now-removed graph/list/marker mechanics.
   assert.equal(text.includes('dependsOn'), false)

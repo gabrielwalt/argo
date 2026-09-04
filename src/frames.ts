@@ -277,8 +277,9 @@ export const ROLE_CONCLUDE_STATUSES: Record<Role, string[]> = {
   planner: ['PLAN', 'IMPLEMENT', 'SUCCESS', 'FAIL'],
   // Implementer: SUCCESS (did the work) or FAIL (couldn't do it).
   implementer: ['SUCCESS', 'FAIL'],
-  // Tester: SUCCESS (implementation is correct) or FAIL (found problems, fix assignment in message).
-  tester: ['SUCCESS', 'FAIL'],
+  // Tester: ASSESSMENT (blind-turn independent assessment, not a final verdict),
+  // SUCCESS (implementation is correct) or FAIL (found problems, fix assignment in message).
+  tester: ['ASSESSMENT', 'SUCCESS', 'FAIL'],
 }
 
 export function concludeStatusError(role: Role, invalidStatus: string): string {
@@ -305,10 +306,10 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'You are the PLANNER inside Argo\'s multi-agent harness.\n\n' +
     'TASK\n' +
     'Your job happens in two phases:\n' +
-    '1. Given the immutable objective, determine the most effective implementation strategy and call `conclude` with an ordered list of implementation assignments — the overall plan. An assignment represents one coherent unit of work for an Implementer and may encompass multiple implementation steps. Use a single assignment when the objective fits naturally within one Implementer run; decompose only when doing so materially improves execution or verification.\n' +
-    '2. You will then be resumed repeatedly, each time producing the assignment for exactly one implementation agent as your next `conclude` answer, informed by the previous agent\'s verified result (including any failures). Adjust your plan naturally as you go; there is no separate re-planning step to request.\n\n' +
-    'ASSIGNMENTS\n' +
-    'Each assignment must be fully self-contained: the implementation agent sees only that one assignment, never your plan or investigation. An implementation assignment is not a single implementation step. One assignment may include setup, data structures, rendering, interaction, wiring and tests when those pieces belong to one coherent outcome. Restate everything the agent needs:\n' +
+    '1. Given the immutable objective, determine the most effective implementation strategy and call `conclude` with an ordered list of IMPLEMENTATION UNITS — the overall plan. Each unit represents one coherent body of work for one Implementer. At this stage describe the intended outcome, meaningful boundary, dependencies and verification goal concisely. Do not expand each unit into its full agent assignment yet. Use a single unit when the objective fits naturally within one Implementer run; decompose only when doing so materially improves execution or verification.\n' +
+    '2. You will then be resumed for each unit and asked to produce exactly one fully self-contained IMPLEMENTATION ASSIGNMENT for the next Implementer, informed by the previous agent\'s verified result (including any failures). Adjust your plan naturally as you go; there is no separate re-planning step to request.\n\n' +
+    'DETAILED ASSIGNMENTS\n' +
+    'When detailing a unit into its full assignment, it must be fully self-contained: the implementation agent sees only that one assignment, never your plan or investigation. An implementation assignment is not a single implementation step. One assignment may include setup, data structures, rendering, interaction, wiring and tests when those pieces belong to one coherent outcome. Restate everything the agent needs:\n' +
     '- The concrete, verifiable outcome\n' +
     '- Relevant context and dependencies on prior work\n' +
     '- Relevant files, interfaces, and constraints\n' +
@@ -345,7 +346,9 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'Report only concrete, evidence-backed failures — not speculative nitpicks. Do not stop at the first issue. ' +
     'Do not modify the project yourself; your role is to inspect, test, challenge, and report.\n\n' +
     'VERDICT\n' +
-    'Call `conclude` with status SUCCESS only after serious attempts to falsify the result have failed. ' +
+    'Call `conclude` with status SUCCESS only if no evidence-backed defect remains after your verification. ' +
+    'The message must concisely state what was actually inspected or exercised, including the important tests or ' +
+    'counterexamples used and any relevant verification limitations. ' +
     'Otherwise call `conclude` with status FAIL. Include the evidence: observed behaviour, expected behaviour, ' +
     'reproduction steps or test, and the smallest known scope of the defect. Then describe what must be fixed ' +
     'and how to verify the fix.',
