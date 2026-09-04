@@ -741,8 +741,9 @@ export class PlanningFailed extends Error {}
 // classified objective straight to one Implementer. The OBJECTIVE path's per-task
 // Implementer assignment is the Planner's OWN `conclude` answer, unwrapped — see
 // buildNextTaskPrompt and runDispatchLoopBody below.
-export function buildImplementerAssignment(objective: string): string {
+export function buildImplementerAssignment(objective: string, iteration = 1): string {
   return (
+    `CHECKPOINT: iteration-${iteration}\n` +
     'Your task is to implement the following objective:\n' +
     `<argo-objective>\n${objective}\n</argo-objective>`
   )
@@ -757,6 +758,7 @@ export function buildImplementerAssignment(objective: string): string {
 // this exact text is directly testable without spawning a real frame.
 export function buildInitialPlannerPrompt(objective: string): string {
   return (
+    'CHECKPOINT: planning-start\n' +
     'Your task is to create an implementation plan for the following user-requested objective:\n' +
     `<argo-objective>\n${objective}\n</argo-objective>\n\n` +
     'Your task is complete once you call `conclude` with status PLAN and your ordered list of concrete, actionable sub-tasks that can be assigned to implementation sub-agents as the message. The plan should make dependencies and sequencing clear, and each sub-task should have a sufficiently specific and verifiable objective.\n\n' +
@@ -804,9 +806,10 @@ export function buildBossConclusionAssignment(
   )
 }
 
-export function buildNextTaskPrompt(completedMessage: string | null): string {
+export function buildNextTaskPrompt(completedMessage: string | null, taskNumber: number): string {
   if (completedMessage === null) {
     return (
+      `CHECKPOINT: task-${taskNumber}\n` +
       'According to your plan, create the assignment for the next implementation sub-agent.\n\n' +
       'The implementation agent will NOT see the overall plan or any previous planner context. Its assignment must therefore be fully self-contained and include everything needed to understand and complete this specific sub-task.\n\n' +
       'Call `conclude` with one of these statuses:\n' +
@@ -827,6 +830,7 @@ export function buildNextTaskPrompt(completedMessage: string | null): string {
     )
   }
   return (
+    `CHECKPOINT: task-${taskNumber}\n` +
     'The previous implementation sub-agent concluded with:\n' +
     `<argo-implemented>\n${completedMessage}\n</argo-implemented>\n\n` +
     'Review this result against your plan and the current project state, then create the self-contained assignment for the next implementation sub-agent.\n\n' +
@@ -910,8 +914,9 @@ export function parseImplementerResult(text: string): ImplementerResult {
 // told to format its own sign-off), and `{implementer's conclude message}` is exactly
 // what the Implementer's own `conclude` call returned (its FULL text, including its
 // own SUCCESS:/FAIL: prefix — the Tester should see precisely what was claimed).
-export function buildTesterAssignment(implementerAssignment: string, implementerConclusion: string): string {
+export function buildTesterAssignment(implementerAssignment: string, implementerConclusion: string, iteration = 1): string {
   return (
+    `CHECKPOINT: iteration-${iteration}\n` +
     'ASSIGNMENT UNDER TEST\n' +
     'The following assignment was given to an implementation sub-agent:\n\n' +
     `<argo-implementation-assignment>\n${implementerAssignment}\n</argo-implementation-assignment>\n\n` +
@@ -1222,71 +1227,96 @@ interface TesterValidationResult {
   fixAttempts: TesterFixAttempt[]
 }
 
-// THE TESTER VALIDATION CYCLE (this task, "Testers are back, harness-driven, not
-// Planner-driven"). Spawns a Tester to validate an Implementer's SUCCESS conclusion;
-// if the Tester finds a problem, spawns a NEW Implementer with the Tester's own
-// self-contained fix assignment and re-tests — up to MAX_TESTER_FIX_ATTEMPTS times —
-// before giving up on this one task. Shared by BOTH the OBJECTIVE loop
-// (parentFrameId = the Planner's frameId) and the SIMPLE fast path (parentFrameId =
-// null) per the brief's "same SUCCESS/FAIL parsing" for both paths.
+// THE TESTER VALIDATION CYCLE. Spawns a Tester ONCE to validate an Implementer's
+// SUCCESS conclusion; if the Tester finds a problem, RESUMES the SAME Implementer
+// frame (context retained) with the Tester's fix assignment, then RESUMES the SAME
+// Tester frame to re-test — up to MAX_TESTER_FIX_ATTEMPTS times — before giving up.
+// `implAgent`/`implFrameId` are the already-concluded Implementer's own Agent instance
+// and frameId (its iteration-1, spawned by the caller). This function never spawns a
+// fresh Implementer frame, only resumes the existing one for fixes.
 async function runTesterValidation(
   parentFrameId: string | null,
   assignment: string,
   conclusion: string,
   emit: Emit,
+  implAgent: Agent,
+  implFrameId: string,
 ): Promise<TesterValidationResult> {
-  let currentAssignment = assignment
   let currentConclusion = conclusion
-  let lastAgent!: Agent
+  let lastAgent: Agent = implAgent
   const fixAttempts: TesterFixAttempt[] = []
 
-  for (let attempt = 0; attempt <= MAX_TESTER_FIX_ATTEMPTS; attempt++) {
-    const testerFrame = await spawnFrame(
-      { role: 'tester', parentFrameId, assignment: buildTesterAssignment(currentAssignment, currentConclusion) },
-      emit,
-    )
-    lastAgent = testerFrame.agent
+  let testerAgent: Agent | null = null
+  let testerFrameId = ''
+  let testerIteration = 1
+  let implIteration = 2 // iteration-1 was the original implementation
 
-    if (testerFrame.agent.hitIterationCap()) {
-      return { passed: false, message: testerFrame.result.rawSummary, lastAgent, fixAttempts }
+  for (let attempt = 0; attempt <= MAX_TESTER_FIX_ATTEMPTS; attempt++) {
+    let testerResultRaw: FrameResultRaw
+
+    if (testerAgent === null) {
+      // First test: spawn a fresh Tester frame (full system prompt + context).
+      const testerFrame = await spawnFrame(
+        { role: 'tester', parentFrameId, assignment: buildTesterAssignment(assignment, currentConclusion, testerIteration) },
+        emit,
+      )
+      testerAgent = testerFrame.agent
+      testerFrameId = testerFrame.result.frameId
+      testerResultRaw = testerFrame.result
+    } else {
+      // Re-test: RESUME the same Tester frame (context retained, fresh budget).
+      testerAgent.resetIterations()
+      testerResultRaw = await resumeFrame(
+        testerFrameId,
+        testerAgent,
+        `CHECKPOINT: iteration-${testerIteration}\n`
+          + 'The Implementer attempted a fix. Re-test the implementation against the original assignment.\n\n'
+          + `<argo-implemented>\n${currentConclusion}\n</argo-implemented>`,
+      )
+    }
+    lastAgent = testerAgent
+
+    if (testerAgent.hitIterationCap()) {
+      return { passed: false, message: testerResultRaw.rawSummary, lastAgent, fixAttempts }
     }
 
-    // STRUCTURED CONCLUDE STATUS: prefer the Tester's validated status over regex.
-    const testerStatus = testerFrame.agent.getConcludeStatus()
+    const testerStatus = testerAgent.getConcludeStatus()
     const testerResult: TesterResult = testerStatus === 'SUCCESS' || testerStatus === 'FAIL'
-      ? { passed: testerStatus === 'SUCCESS', fixAssignment: testerStatus === 'FAIL' ? testerFrame.result.rawSummary : undefined }
-      : parseTesterResult(testerFrame.result.rawSummary)
+      ? { passed: testerStatus === 'SUCCESS', fixAssignment: testerStatus === 'FAIL' ? testerResultRaw.rawSummary : undefined }
+      : parseTesterResult(testerResultRaw.rawSummary)
     if (testerResult.passed) {
       return { passed: true, message: currentConclusion, lastAgent, fixAttempts }
     }
     if (attempt === MAX_TESTER_FIX_ATTEMPTS) {
-      // Out of fix attempts — still failing, escalate.
-      return { passed: false, message: testerFrame.result.rawSummary, lastAgent, fixAttempts }
+      return { passed: false, message: testerResultRaw.rawSummary, lastAgent, fixAttempts }
     }
 
-    const fixAssignment = testerResult.fixAssignment ?? testerFrame.result.rawSummary
-    const fixFrame = await spawnFrame(
-      { role: 'implementer', parentFrameId, assignment: appendImplementerResultFormat(fixAssignment) },
-      emit,
-      undefined,
-      fixAssignment,
+    const fixAssignment = testerResult.fixAssignment ?? testerResultRaw.rawSummary
+
+    // RESUME the original Implementer for the fix (context retained, fresh budget).
+    implAgent.resetIterations()
+    const fixResult = await resumeFrame(
+      implFrameId,
+      implAgent,
+      `CHECKPOINT: iteration-${implIteration}\n`
+        + 'The Tester found issues with your implementation:\n\n'
+        + `<argo-tester-feedback>\n${fixAssignment}\n</argo-tester-feedback>\n\n`
+        + 'Fix the issues described above. When done, call `conclude` with the appropriate status:\n'
+        + '- Status SUCCESS, message: description of what you fixed and how you verified it.\n'
+        + '- Status FAIL, message: description of what you tried, what failed, and why.',
     )
-    lastAgent = fixFrame.agent
-    const capped = fixFrame.agent.hitIterationCap()
-    fixAttempts.push({ assignment: fixAssignment, conclusion: fixFrame.result.rawSummary, capped })
+    lastAgent = implAgent
+    const capped = implAgent.hitIterationCap()
+    fixAttempts.push({ assignment: fixAssignment, conclusion: fixResult.rawSummary, capped })
     if (capped) {
-      return { passed: false, message: fixFrame.result.rawSummary, lastAgent, fixAttempts }
+      return { passed: false, message: fixResult.rawSummary, lastAgent, fixAttempts }
     }
 
-    currentAssignment = fixAssignment
-    currentConclusion = fixFrame.result.rawSummary
-    // Loop again — re-test the fix. Deliberately NOT parsing the fix-Implementer's
-    // own SUCCESS/FAIL here: the Tester is the one gate that decides whether a fix
-    // actually landed, not the Implementer's own self-report (that's the entire
-    // point of a Tester existing).
+    currentConclusion = fixResult.rawSummary
+    implIteration++
+    testerIteration++
   }
 
-  // Unreachable — the loop above always returns — but TypeScript needs a value here.
   return { passed: false, message: currentConclusion, lastAgent, fixAttempts }
 }
 
@@ -1318,7 +1348,8 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
   // buildImplementerCapFollowUp when the Implementer that just ran hit its own hard
   // iteration cap (see the branch below). Starts as the first detail call (no
   // Implementer has run yet).
-  let plannerFollowUp: string = buildNextTaskPrompt(null)
+  let taskNumber = 1
+  let plannerFollowUp: string = buildNextTaskPrompt(null, taskNumber)
   const completedTasks: Array<{ prompt: string; conclusion: string }> = []
   let done = false
   // The Planner's own concluding text — captured from the detailResult that trips
@@ -1369,7 +1400,7 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
     // SUCCESS:/FAIL: sign-off convention (this task, "Testers are back"). nextAssignment
     // itself stays the plain task text, used for completedTasks/buildImplementerCapFollowUp
     // and as the Tester's own "{implementer prompt}" field.
-    const implementerAssignment = appendImplementerResultFormat(nextAssignment)
+    const implementerAssignment = appendImplementerResultFormat(`CHECKPOINT: iteration-1\n${nextAssignment}`)
 
     // Implementer FAIL is NOT retried here — the failing task's own conclusion simply
     // becomes what the Planner sees on its next detail call (via plannerFollowUp
@@ -1412,13 +1443,23 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
       ? { succeeded: implStatus === 'SUCCESS', message: implFrame.result.rawSummary }
       : parseImplementerResult(implFrame.result.rawSummary)
     if (!implResult.succeeded) {
-      plannerFollowUp = buildNextTaskPrompt(implFrame.result.rawSummary)
+      taskNumber++
+      plannerFollowUp = buildNextTaskPrompt(implFrame.result.rawSummary, taskNumber)
       continue
     }
 
     // SUCCESS → the harness spawns a Tester to validate, with up to
-    // MAX_TESTER_FIX_ATTEMPTS fix-and-retest rounds if it finds a problem.
-    const cycle = await runTesterValidation(plannerFrameId, nextAssignment, implFrame.result.rawSummary, emit)
+    // MAX_TESTER_FIX_ATTEMPTS fix-and-retest rounds if it finds a problem. The
+    // Implementer's own Agent/frameId are threaded through so a fix attempt RESUMES
+    // it (retaining context) instead of spawning a fresh frame.
+    const cycle = await runTesterValidation(
+      plannerFrameId,
+      nextAssignment,
+      implFrame.result.rawSummary,
+      emit,
+      implFrame.agent,
+      implFrame.result.frameId,
+    )
     commitAgent = cycle.lastAgent
     for (const fa of cycle.fixAttempts) completedTasks.push({ prompt: fa.assignment, conclusion: fa.conclusion })
 
@@ -1436,10 +1477,12 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
       continue
     }
 
+    taskNumber++
     plannerFollowUp = cycle.passed
-      ? buildNextTaskPrompt(cycle.message)
+      ? buildNextTaskPrompt(cycle.message, taskNumber)
       : buildNextTaskPrompt(
           `Tester could not validate this task after ${MAX_TESTER_FIX_ATTEMPTS} fix attempt(s). ${cycle.message}`,
+          taskNumber,
         )
   }
 
@@ -1531,7 +1574,10 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
     // SUCCESS → the harness spawns a Tester, with up to MAX_TESTER_FIX_ATTEMPTS
     // fix-and-retest rounds if it finds a problem — "same SUCCESS/FAIL parsing" as
     // the OBJECTIVE path, via the SAME shared runTesterValidation helper.
-    const cycle = await runTesterValidation(null, implementerAssignment, frame.result.rawSummary, emit)
+    const cycle = await runTesterValidation(
+      null, implementerAssignment, frame.result.rawSummary, emit,
+      frame.agent, frame.result.frameId,
+    )
 
     // Either a fix-attempt Implementer hit its own hard cap, or the Tester still
     // found a problem after using up its fix attempts. SIMPLE has no ongoing Planner

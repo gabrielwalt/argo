@@ -155,7 +155,8 @@ test('TASK_START_CAP_FAILURE_MESSAGE is a plain user-facing failure, not the raw
 
 test('buildImplementerAssignment: wraps the objective in <argo-objective> tags, framed as "implement"', () => {
   const text = buildImplementerAssignment('fix the off-by-one in nextId()')
-  assert.ok(text.startsWith('Your task is to implement the following objective:'))
+  assert.ok(text.startsWith('CHECKPOINT: iteration-1\n'))
+  assert.ok(text.includes('Your task is to implement the following objective:'))
   assert.ok(text.includes('<argo-objective>\nfix the off-by-one in nextId()\n</argo-objective>'))
 })
 
@@ -172,7 +173,8 @@ test('buildInitialPlannerPrompt: contains the objective, PLAN status, and READ-O
 // ── buildNextTaskPrompt — VERBATIM per this task's brief, two shapes ───────────
 
 test('buildNextTaskPrompt(null): contains the three status keywords and self-contained instruction', () => {
-  const text = buildNextTaskPrompt(null)
+  const text = buildNextTaskPrompt(null, 1)
+  assert.ok(text.startsWith('CHECKPOINT: task-1\n'))
   assert.ok(text.includes('According to your plan'))
   assert.ok(text.includes('IMPLEMENT'))
   assert.ok(text.includes('SUCCESS'))
@@ -182,7 +184,8 @@ test('buildNextTaskPrompt(null): contains the three status keywords and self-con
 })
 
 test('buildNextTaskPrompt(message): contains the completed message tag and three status keywords', () => {
-  const text = buildNextTaskPrompt('Added the --count flag; all existing tests pass.')
+  const text = buildNextTaskPrompt('Added the --count flag; all existing tests pass.', 2)
+  assert.ok(text.startsWith('CHECKPOINT: task-2\n'))
   assert.ok(text.includes('<argo-implemented>\nAdded the --count flag; all existing tests pass.\n</argo-implemented>'))
   assert.ok(text.includes('IMPLEMENT'))
   assert.ok(text.includes('SUCCESS'))
@@ -191,11 +194,11 @@ test('buildNextTaskPrompt(message): contains the completed message tag and three
 })
 
 test('buildNextTaskPrompt: null vs a completed message select genuinely different prompts, not just a filled-in blank', () => {
-  const first = buildNextTaskPrompt(null)
-  const later = buildNextTaskPrompt('done')
+  const first = buildNextTaskPrompt(null, 1)
+  const later = buildNextTaskPrompt('done', 2)
   assert.notEqual(first, later)
-  assert.ok(first.startsWith('According to your plan'))
-  assert.ok(later.startsWith('The previous implementation sub-agent concluded with:'))
+  assert.ok(first.includes('According to your plan'))
+  assert.ok(later.includes('The previous implementation sub-agent concluded with:'))
 })
 
 // ── isPlannerDone — the natural-language completion heuristic ─────────────────
