@@ -220,6 +220,14 @@
         <button id="close-diff">✕ Close</button>
       </div>
     </div>
+    <!-- Frame selector for the context viewer (per-frame inspection, see viewContext()
+         in app.js). Hidden for the git-diff use of this modal (showDiff()) and rebuilt
+         fresh every time viewContext() opens; when /frames is unavailable it drops the
+         select and shows a plain fallback note instead (.note-only). -->
+    <div id="ctx-frame-bar" class="hidden">
+      <select id="ctx-frame-select"></select>
+      <span id="ctx-frame-hint"></span>
+    </div>
     <div id="diff-content"></div>
   </div>
 </div>

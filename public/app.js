@@ -14,6 +14,9 @@ const gitLog = $('git-log')
 const diffModal = $('diff-modal')
 const diffContent = $('diff-content')
 const diffTitle = $('diff-title')
+const ctxFrameBar = $('ctx-frame-bar')
+const ctxFrameSelect = $('ctx-frame-select')
+const ctxFrameHint = $('ctx-frame-hint')
 const tokenCounter = $('token-counter')
 const indicatorArea = $('indicator-area')
 const settingsPanel = $('settings-panel')
@@ -60,7 +63,11 @@ scrollBottomBtn.addEventListener('click', () => {
 // fires (fetched once from /status on boot). The donut's ring+tick are drawn
 // from these and redrawn on every token_usage; precise numbers live in the
 // dropdown. The donut's CENTER communicates agent state (see indicatorState).
-let ctxState = { promptTokens: 0, numCtx: 0, pct: 0 }
+// frameId/role: null for the baseline agent's own token_usage (untagged events,
+// the pre-multi-agent path); set to the owning frame's identity when the reading
+// came from a frame-tagged token_usage instead (see handleEvent), so the dropdown
+// can always say WHOSE numbers it's showing rather than an unattributed count.
+let ctxState = { promptTokens: 0, numCtx: 0, pct: 0, frameId: null, role: null }
 let compactThreshold = 0.667
 // True while a user-triggered /compact-now is in flight — used to (a) disable the
 // dropdown/modal action and (b) let compaction trace events render even when
@@ -129,11 +136,20 @@ function renderDonut() {
 
 // Update stored context size + redraw. Precise numbers show in the dropdown;
 // the donut itself only ever shows the ring (usage), tick (threshold) and
-// core+center-text (agent state / iteration).
-function updateCtx(promptTokens, numCtx) {
+// core+center-text (agent state / iteration). frameId/role identify which
+// agent this reading belongs to (see ctxState above); omitted for the baseline.
+function updateCtx(promptTokens, numCtx, frameId = null, role = null) {
   const pct = numCtx ? Math.round(promptTokens / numCtx * 100) : 0
-  ctxState = { promptTokens, numCtx, pct }
+  ctxState = { promptTokens, numCtx, pct, frameId, role }
   renderDonut()
+}
+
+// Compact k-token formatting for the dropdown's frame-owned reading, where the
+// role name added ahead of it (see buildCtxDropdown) eats into the available
+// width — the baseline reading keeps the original full toLocaleString() format.
+function fmtTokensK(n) {
+  if (n == null) return '—'
+  return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
 }
 
 // ── Confirm dialog / toast — replace native confirm()/alert() ────
@@ -533,6 +549,17 @@ function handleEvent(event) {
   // the switch below. Also nudges the status bar to name the active role, the
   // "boss-level" glance the multi-agent UI is built around.
   if (event.__frameId) {
+    // token_usage is handled HERE, before the routing below, and deliberately not
+    // inside handleFrameEvent: in multi-agent mode the baseline agent is bypassed
+    // (see CONTEXT-VIEWER-CONTRACT.md) and never emits its own token_usage, so the
+    // donut would otherwise sit frozen near-zero regardless of what the frames are
+    // actually doing. The per-frame Agent instances are the only ones that ever
+    // call the model, so the donut has to read straight off whichever frame's
+    // token_usage just arrived. This does NOT skip the routing below — it falls
+    // through to handleFrameEvent()/the early return exactly as before, since
+    // token_usage has no role-card representation of its own (see the comment at
+    // the bottom of handleFrameEvent).
+    if (event.type === 'token_usage') updateCtx(event.prompt_tokens, event.num_ctx, event.__frameId, event.__role)
     handleFrameEvent(event)
     if (event.type === 'start') {
       const meta = ROLE_META[event.__role] || { name: event.__role, title: event.__role }
@@ -977,7 +1004,13 @@ function buildCtxDropdown() {
   if (ctxState.numCtx) {
     const line2 = document.createElement('div')
     line2.className = 'ctx-status-line2'
-    line2.textContent = `${ctxState.promptTokens.toLocaleString()} / ${ctxState.numCtx.toLocaleString()} tokens · ${ctxState.pct}%`
+    // A frame-owned reading (multi-agent mode) is prefixed with WHOSE context this
+    // is, so a number never appears without an owner — see the token_usage handling
+    // in handleEvent(). The baseline (ctxState.role === null) keeps the original
+    // precise format unchanged.
+    line2.textContent = ctxState.role
+      ? `${(ROLE_META[ctxState.role] || { title: ctxState.role }).title} · ${fmtTokensK(ctxState.promptTokens)} / ${fmtTokensK(ctxState.numCtx)} (${ctxState.pct}%)`
+      : `${ctxState.promptTokens.toLocaleString()} / ${ctxState.numCtx.toLocaleString()} tokens · ${ctxState.pct}%`
     head.appendChild(line2)
   } else {
     const line2 = document.createElement('div')
@@ -1100,31 +1133,158 @@ function cleanupManualCompaction(createdBlock) {
   manualCompacting = false
 }
 
-// View the exact context the model currently sees. Read-only; reuses #diff-modal.
-// The modal's title bar carries a "Compact now" action (replacing the old
-// dropdown item), enabled only when the agent is idle and not already
-// compacting.
+// ── Frame-aware context viewer ──────────────────────────────────────
+// GET /frames lists every frame of the current session (see CONTEXT-VIEWER-CONTRACT.md);
+// GET /context?frame=<id> loads one of them, GET /context with no param is still the
+// baseline agent (bypassed entirely in multi-agent mode — see renderContext()). /frames
+// is the newer of the two routes, so it may 404 if this half of the feature isn't deployed
+// yet on the running server; ctxFramesData stays null in that case and the viewer falls
+// back to the single-context view it always had.
+let ctxFramesData = null       // last /frames response, or null when the route is unavailable
+let ctxSelectedFrame = null    // frameId currently shown in #diff-content, or null for the baseline
+
+// Fetches JSON defensively: an unreachable/not-yet-deployed route can 404 with an HTML
+// "Cannot GET …" body, and parsing that as JSON is exactly the
+// `Unexpected token '<', "<!DOCTYPE"` failure this guards against — treat anything that
+// isn't a successful, actually-JSON response as absent rather than letting it throw.
+async function fetchJson(url) {
+  try {
+    const resp = await fetch(url)
+    if (!resp.ok) return null
+    const ct = resp.headers.get('content-type') || ''
+    if (!ct.includes('application/json')) return null
+    return await resp.json()
+  } catch {
+    return null
+  }
+}
+
+// Default selection per the contract: the frame currently running, else the largest by
+// totalChars (the one actually worth reading) — falling back to the baseline when there
+// are no frames at all yet (a fresh session, or agents mode simply off).
+function pickDefaultFrame(framesData) {
+  if (framesData.active) return framesData.active
+  const frames = framesData.frames || []
+  if (!frames.length) return null
+  let best = frames[0]
+  for (const f of frames) if ((f.totalChars ?? 0) > (best.totalChars ?? 0)) best = f
+  return best.frameId
+}
+
+function baselineOptionLabel(baselineBypassed) {
+  return baselineBypassed
+    ? '⏸ Baseline agent — bypassed in multi-agent mode'
+    : '🧵 Baseline agent (single-loop)'
+}
+
+// Reuses ROLE_META (the same names/icons the role cards use) rather than inventing a
+// second vocabulary for the same four roles.
+function frameOptionLabel(f) {
+  const meta = ROLE_META[f.role] || { icon: '🤖', title: f.role }
+  return `${meta.icon} ${meta.title} (${f.frameId}) · ${(f.totalChars ?? 0).toLocaleString()} chars${f.live ? ' · live' : ''}`
+}
+
+// Rebuilds the selector from ctxFramesData — or, when it's null (no /frames route),
+// drops the select entirely and shows a plain explanatory line instead.
+function renderCtxFrameBar() {
+  ctxFrameBar.classList.remove('hidden')
+  if (!ctxFramesData) {
+    ctxFrameBar.classList.add('note-only')
+    ctxFrameHint.textContent = 'Per-frame inspection needs a server restart — showing the baseline context only.'
+    return
+  }
+  ctxFrameBar.classList.remove('note-only')
+  ctxFrameHint.textContent = ''
+  ctxFrameSelect.innerHTML = ''
+  const baseOpt = document.createElement('option')
+  baseOpt.value = ''
+  baseOpt.textContent = baselineOptionLabel(ctxFramesData.baselineBypassed)
+  ctxFrameSelect.appendChild(baseOpt)
+  for (const f of ctxFramesData.frames || []) {
+    const opt = document.createElement('option')
+    opt.value = f.frameId
+    opt.textContent = frameOptionLabel(f)
+    ctxFrameSelect.appendChild(opt)
+  }
+  ctxFrameSelect.value = ctxSelectedFrame ?? ''
+}
+
+// "Compact now" acts on the baseline agent only (src/server.ts's /compact-now targets
+// the single baseline Agent instance) — never offer it for a frame it cannot act on, or
+// for a bypassed baseline that has nothing to compact. Always visible, disabled with an
+// explanatory title rather than hidden, so it doesn't look like a button that silently
+// does nothing.
+function updateCompactBtnState(data) {
+  diffCompactBtn.classList.remove('hidden')
+  const isBaseline = ctxSelectedFrame == null
+  if (!isBaseline) {
+    diffCompactBtn.disabled = true
+    diffCompactBtn.title = 'Compact now only acts on the baseline agent — select it above to use it'
+  } else if (data.baselineBypassed) {
+    diffCompactBtn.disabled = true
+    diffCompactBtn.title = 'Baseline agent is bypassed in multi-agent mode — nothing to compact'
+  } else {
+    diffCompactBtn.disabled = busy || manualCompacting
+    diffCompactBtn.title = 'Compact context now'
+  }
+  diffCompactBtn.textContent = '⚡ Compact now'
+}
+
+// Loads one frame's context (or the baseline's, when frameId is null) into the already-open
+// modal. Shared by viewContext() (initial load) and the selector's change handler / the
+// "Compact now" refresh (neither of which should re-fetch /frames or re-pick a default).
+async function loadFrameContext(frameId) {
+  ctxSelectedFrame = frameId
+  if (ctxFramesData) ctxFrameSelect.value = frameId ?? ''
+  diffContent.textContent = 'Loading…'
+  const qs = frameId ? `?frame=${encodeURIComponent(frameId)}` : ''
+  const data = await fetchJson(`${API_BASE}/context${qs}`)
+  if (!data) {
+    diffContent.textContent = 'Failed to load context.'
+    showToast('Failed to load context')
+    return
+  }
+  // Title names the owner (never a bare, unattributed count) but keeps the bypass
+  // explanation itself inside the body (renderContext) rather than repeating it here.
+  const meta = data.role ? (ROLE_META[data.role] || { title: data.role, icon: '🤖' }) : null
+  const owner = meta ? `${meta.icon} ${meta.title}` : '🧵 Baseline agent'
+  diffTitle.textContent = `${owner} — Context (${data.messageCount ?? 0} messages · ${(data.totalChars ?? 0).toLocaleString()} chars · num_ctx ${(data.numCtx ?? 0).toLocaleString()})`
+  diffContent.innerHTML = renderContext(data)
+  updateCompactBtnState(data)
+}
+
+ctxFrameSelect.addEventListener('change', () => {
+  loadFrameContext(ctxFrameSelect.value || null)
+})
+
+// View the exact context the model currently sees. Read-only; reuses #diff-modal. The
+// modal's title bar carries a "Compact now" action (replacing the old dropdown item);
+// see updateCompactBtnState() for when it's actually enabled.
 async function viewContext() {
   diffTitle.textContent = 'Context'
   diffContent.textContent = 'Loading…'
-  diffCompactBtn.classList.remove('hidden')
-  diffCompactBtn.disabled = busy || manualCompacting
-  diffCompactBtn.textContent = '⚡ Compact now'
+  diffCompactBtn.classList.add('hidden')
+  ctxFrameBar.classList.add('hidden')
   diffModal.classList.add('open')
-  try {
-    const resp = await fetch(`${API_BASE}/context`)
-    if (!resp.ok) throw new Error('bad status')
-    const data = await resp.json()
-    diffTitle.textContent = `Context (${data.messageCount ?? 0} messages · ${(data.totalChars ?? 0).toLocaleString()} chars · num_ctx ${(data.numCtx ?? 0).toLocaleString()})`
-    diffContent.innerHTML = renderContext(data)
-  } catch {
-    diffModal.classList.remove('open')
-    showToast('Failed to load context')
-  }
+
+  // /frames is the newer of the two routes and may not be deployed yet (see
+  // fetchJson) — that is an expected, quiet fallback, not an error toast.
+  ctxFramesData = await fetchJson(`${API_BASE}/frames`)
+  renderCtxFrameBar()
+  const defaultFrame = ctxFramesData ? pickDefaultFrame(ctxFramesData) : null
+  await loadFrameContext(defaultFrame)
 }
 
 function renderContext(data) {
   let html = ''
+  // The baseline is bypassed entirely in multi-agent mode (never accumulates history) —
+  // say so plainly instead of letting an empty context read as a bug (see
+  // CONTEXT-VIEWER-CONTRACT.md). Only applies to the baseline (frameId == null); a frame
+  // that is genuinely empty (e.g. spawned but never ran) still falls through to the
+  // ordinary "(empty context)" fallback below.
+  if (data.frameId == null && data.baselineBypassed) {
+    html += '<div class="ctx-msg ctx-bypassed"><div class="ctx-content">⏸ Baseline loop — bypassed in multi-agent mode. It never ran this session, so there is nothing here to show. Select a frame above to see what the agents actually did.</div></div>'
+  }
   // Right-aligned wall-clock time (when the message entered the model context, from the
   // backend WeakMap via getContext). Omitted when unknown (e.g. messages restored from disk).
   const timeTag = (ts) => ts != null ? `<span class="ctx-time">${escHtml(new Date(ts).toLocaleTimeString())}</span>` : ''
@@ -1916,6 +2076,7 @@ async function showDiff(hash) {
   diffContent.textContent = 'Loading…'
   diffTitle.textContent = hash.slice(0, 7)
   diffCompactBtn.classList.add('hidden')
+  ctxFrameBar.classList.add('hidden')   // this modal use has no frames to pick from
   diffModal.classList.add('open')
 
   try {
@@ -1950,15 +2111,26 @@ diffModal.addEventListener('click', (e) => { if (e.target === diffModal) diffMod
 // busy/manualCompacting guard here is a defensive backstop.
 const diffCompactBtn = $('diff-compact-now')
 diffCompactBtn.addEventListener('click', async () => {
-  if (busy || manualCompacting) return
+  // updateCompactBtnState() only ever leaves this enabled while the baseline (not a
+  // frame) is selected and not bypassed — but disabled buttons can still receive a
+  // click from some assistive tech, so keep the same defensive re-check as before.
+  if (diffCompactBtn.disabled || busy || manualCompacting) return
   diffCompactBtn.disabled = true
   diffCompactBtn.textContent = 'Compacting…'
   await compactNow()
-  diffCompactBtn.disabled = busy || manualCompacting
-  diffCompactBtn.textContent = '⚡ Compact now'
-  // Refresh the numbers shown if the context viewer is still the open modal.
-  if (diffModal.classList.contains('open') && diffTitle.textContent.startsWith('Context')) {
-    viewContext()
+  // Reload just the currently selected frame (the baseline, since that's the only
+  // state this button is ever enabled in) rather than the full viewContext() — that
+  // would re-fetch /frames and re-run the active/largest-frame default, silently
+  // switching the view away from what the click was actually about. Guarded by
+  // whether the context viewer (not the git-diff use of this modal, which hides
+  // ctxFrameBar) is still the open view.
+  if (diffModal.classList.contains('open') && !ctxFrameBar.classList.contains('hidden')) {
+    await loadFrameContext(ctxSelectedFrame)
+  } else {
+    // Modal closed (or showing a git diff) mid-compaction — nothing to reload, but
+    // still leave the button in a clean state for whenever it's shown again.
+    diffCompactBtn.disabled = busy || manualCompacting
+    diffCompactBtn.textContent = '⚡ Compact now'
   }
 })
 
