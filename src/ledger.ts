@@ -20,7 +20,6 @@ import type {
   LedgerEntry,
   LedgerDelegationEntry,
   LedgerConclusionEntry,
-  LedgerStandupEntry,
   LedgerInjectionEntry,
   LedgerEpisodeEntry,
 } from './types.js'
@@ -142,10 +141,6 @@ export async function recordConclusion(root: string, e: Omit<LedgerConclusionEnt
   await append(root, { kind: 'conclusion', ts: Date.now(), ...e })
 }
 
-export async function recordStandup(root: string, e: Omit<LedgerStandupEntry, 'kind' | 'ts'>): Promise<void> {
-  await append(root, { kind: 'standup', ts: Date.now(), ...e })
-}
-
 export async function recordInjection(root: string, e: Omit<LedgerInjectionEntry, 'kind' | 'ts'>): Promise<void> {
   await append(root, { kind: 'injection', ts: Date.now(), ...e })
 }
@@ -196,13 +191,14 @@ export async function setObjective(
   return { ok: true }
 }
 
+// setPlan REMOVED (this task, dead-code pass): zero call sites project-wide (only
+// comment mentions) — the current iterative Planner (dispatch.ts) never writes a
+// TaskGraph any more, only reads through the ledger tool's get_plan action
+// (tools/index.ts), so getPlan now permanently returns null. getPlan itself is kept
+// because that live call site exists; the type it returns (TaskGraph, tasks.ts) is
+// otherwise unused machinery this scoop cannot fully remove — see DEAD-CODE.md.
 export async function getPlan(root: string): Promise<TaskGraph | null> {
   return (await readState(root)).plan
-}
-
-export async function setPlan(root: string, plan: TaskGraph): Promise<void> {
-  const state = await readState(root)
-  await writeState(root, { ...state, plan })
 }
 
 export async function getConclusion(root: string, frameId: string): Promise<LedgerConclusionEntry | null> {

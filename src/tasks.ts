@@ -288,14 +288,15 @@ export function renderTaskSummaries(list: TaskList): string {
 // rewrite that also dropped the Tester entirely from this pipeline). See dispatch.ts's
 // module header for the full current flow.
 //
-// TaskGraph itself (below) is NOT fully deleted — kept to the minimal shape two
-// off-limits files still need to type-check against: ledger.ts's PinnedState.plan
-// (getPlan/setPlan) and eviction.ts's renderPinnedAnchor (which calls
-// renderTaskGraph). Neither is on this task's write list. dispatch.ts's new flow
-// never calls setPlan any more, so getPlan will simply return null for every future
-// run — this type+function pair is inert legacy weight, not active machinery. Safe
-// to delete outright once ledger.ts/eviction.ts are migrated off the graph concept;
-// flagged for the cone in the report rather than done here.
+// TaskGraph itself (below) is NOT fully deleted — kept to the minimal shape a
+// still-live call site needs to type-check against: ledger.ts's getPlan (read by
+// tools/index.ts's ledger tool) returns TaskGraph | null, and eviction.ts's
+// renderPinnedAnchor (off-limits, itself dead — zero call sites) calls
+// renderTaskGraph below. setPlan (the only writer) was removed this task (dead —
+// zero call sites); getPlan now permanently returns null every run, so this
+// type+function pair is inert legacy weight, not active machinery. Safe to delete
+// outright once ledger.ts/eviction.ts are migrated off the graph concept; flagged
+// for the cone in the report rather than done here.
 //
 // `skipTest` (2026-XX rewrite): removed from `steps` — grepped every reference
 // project-wide (src/**, docs/**) and the only ones left were this type's own

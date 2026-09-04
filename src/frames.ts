@@ -15,7 +15,6 @@
 // recitation is a real refinement, not a correctness requirement for v1.
 
 import type { Role, ToolName, FrameSpawnRequest, FramePolicy } from './types.js'
-import { getConclusion } from './ledger.js'
 
 // `conclude` (2026-09-06) is in EVERY role's tool set below — it is not role-
 // specific, it is how any frame ends its turn now (agent.ts's chat() loop: a turn
@@ -88,8 +87,8 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
 // capability that no longer exists.
 // `ledger` stays: the TOOL only exposes read actions (get_goal/get_plan/get_recent/
 // get_conclusion/get_frame_trail/expand — see tools/index.ts's ledger case); the
-// harness's OWN ledger.setObjective/setPlan/recordDelegation calls are direct module
-// calls from dispatch.ts, never reachable through this tool, so including it does not
+// harness's OWN ledger.setObjective/recordDelegation calls are direct module calls
+// from dispatch.ts, never reachable through this tool, so including it does not
 // reopen a write path. `read_file` covers investigation (it gained a `pattern` search
 // param plus offset/limit line paging — 8656de9, fa5b497 — specifically so a role
 // without bash can still find a symbol); `web_search`/`fetch_url` cover the
@@ -244,16 +243,17 @@ export const ROLE_NAME: Record<Role, string> = {
 }
 
 const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
-  // ITERATIVE PLANNER, `conclude`-based (this rewrite — no Tester, no TASK:/TEST:/
-  // DONE line convention). The Planner is called in two phases: ONCE for an overall
-  // plan (an ordered list of concrete sub-tasks, delivered as its `conclude`
-  // answer), then RESUMED repeatedly, each time producing exactly one fully
-  // self-contained Implementer assignment as its `conclude` answer, informed by
-  // the previous Implementer's own conclusion. There is no separate re-planning
-  // step and no Tester round any more — adaptation is just what happens naturally
-  // on the next detail call, and the Implementer is trusted to test its own work
-  // when its assignment calls for it (see dispatch.ts's module header for the full
-  // flow, and isPlannerDone for how the harness detects "no further work needed").
+  // ITERATIVE PLANNER, `conclude`-based (this rewrite — no TASK:/TEST:/DONE line
+  // convention). The Planner is called in two phases: ONCE for an overall plan (an
+  // ordered list of concrete sub-tasks, delivered as its `conclude` answer), then
+  // RESUMED repeatedly, each time producing exactly one fully self-contained
+  // Implementer assignment as its `conclude` answer, informed by the previous
+  // Implementer's own conclusion. There is no separate re-planning step any more —
+  // adaptation is just what happens naturally on the next detail call. The harness
+  // (not the Planner) spawns a real Tester after every successful Implementer to
+  // validate its work (see dispatch.ts's module header for the full flow, and
+  // isPlannerDone for how the harness detects "no further work needed") — the
+  // Planner does not manage or need to know the details of that validation step.
   planner:
     'You are the PLANNER inside Argo\'s multi-agent harness. Your job happens in two phases. First, given the ' +
     '(immutable) objective, call `conclude` with an ORDERED LIST of concrete, actionable sub-tasks — the overall ' +
@@ -263,8 +263,7 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'step to request. Each assignment must be FULLY SELF-CONTAINED: the implementation agent sees only that one ' +
     'assignment, never your plan or investigation, so restate everything it needs — the concrete verifiable ' +
     'outcome, relevant context, dependencies on prior work, relevant files/interfaces/constraints, what is in vs ' +
-    'out of scope, and testing/validation expectations, including telling it to test its own work when that ' +
-    'matters (there is no separate Tester agent any more). When the objective is fully met and no further ' +
+    'out of scope, and testing/validation expectations. When the objective is fully met and no further ' +
     'implementation work remains, say so plainly in your `conclude` answer instead of producing another ' +
     'assignment. The project is READ-ONLY for you: you create the plan, you do not implement anything yourself. ' +
     'Use read_file to inspect files as needed. You may read files and search the web, but you never write or ' +
@@ -305,7 +304,6 @@ export function systemPromptFor(role: Role): string {
 }
 
 const SUMMARY_CHAR_CAP = 2000
-const DEP_SUMMARY_CHAR_CAP = 500
 
 // VERBATIM REQUEST THREADING (config.verbatimRequest; docs/research/
 // 10-hermes-differential.md, finding 1). Argo's Boss task-start checkpoint paraphrases
@@ -401,24 +399,18 @@ export function capSummary(s: string): string {
 // own prefix is byte-identical across sibling frames of one run, rather than burying an
 // immutable block after content that already varies frame to frame, where it could never
 // anchor a cache hit at all.
-// FLATTENED TASK LIST (2026-09): req.dependsOn is a list of frameIds (FrameSpawnRequest,
-// types.ts) — always distinct from tasks.ts's now-removed TaskStep.dependsOn (step ids in
-// a dependency graph). It never needed to change here: dispatch.ts's step-execution loop
-// now passes at most ONE entry, the immediately preceding step's frameId, so what this
-// renders as "PRIOR WORK" is simply the previous step's conclusion carried forward
-// linearly — still the right mechanism for "the next Implementer should know what the
-// last one did," just fed a single-item list instead of a graph edge.
+// DEAD CODE REMOVED (this task): buildAssignment used to also render a "PRIOR WORK"
+// block from req.dependsOn (a list of prior frameIds whose conclusions it fetched via
+// ledger.getConclusion) — unreachable under the current iterative Planner design.
+// Every dispatch.ts spawnFrame call site constructs its FrameSpawnRequest literal
+// without a dependsOn field, so it was always undefined; the harness now threads prior
+// work forward through the Planner's own follow-up prompt (buildNextTaskPrompt) and
+// each frame's self-contained assignment text instead of a harness-rendered summary
+// block. See DEAD-CODE.md for the corresponding type field dispatch.ts/types.ts still
+// carry.
 export async function buildAssignment(root: string, req: FrameSpawnRequest, verbatimRequest?: string): Promise<string> {
-  const deps = await Promise.all(
-    (req.dependsOn ?? []).map(async id => {
-      const c = await getConclusion(root, id)
-      if (!c) return `PRIOR WORK (frame ${id}): no conclusion recorded.`
-      const summary = c.summary.length > DEP_SUMMARY_CHAR_CAP ? `${c.summary.slice(0, DEP_SUMMARY_CHAR_CAP)}…` : c.summary
-      return `PRIOR WORK (frame ${id}, ${c.status}): ${summary}\nFiles: ${c.filesWritten.join(', ') || 'none'}`
-    }),
-  )
   const verbatimBlock = verbatimRequest ? renderVerbatimRequestBlock(verbatimRequest) : ''
-  return [verbatimBlock, ...deps, req.assignment].filter(Boolean).join('\n\n')
+  return [verbatimBlock, req.assignment].filter(Boolean).join('\n\n')
 }
 
 // ── Tester / Boss verdict parsing ──────────────────────────────────────────────────
