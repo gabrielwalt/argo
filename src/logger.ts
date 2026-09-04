@@ -274,15 +274,9 @@ export class SessionLogger {
           break
 
         case 'system_prompt':
-          // Full system prompt (tool list + role suffix + AGENTS.md/MEMORY.md context)
-          // can run several hundred words — collapsed by default so the trace stays
-          // scannable, but the full text is always present when a reader needs it.
-          lines.push(`<details>`)
-          lines.push(`<summary>System prompt (${event.content.length} chars)</summary>`)
-          lines.push(``)
+          lines.push(`<argo-system-prompt>`)
           lines.push(event.content)
-          lines.push(``)
-          lines.push(`</details>`)
+          lines.push(`</argo-system-prompt>`)
           lines.push(``)
           break
 

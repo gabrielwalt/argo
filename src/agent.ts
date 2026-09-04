@@ -107,40 +107,29 @@ function buildSystemPrompt(tools: ToolName[] | null): string {
     !canWrite && '- You have no file-modification tools in this role: use the tools above (read_file, and bash/web_search/fetch_url where listed) to investigate — you cannot change the project.',
   ].filter((line): line is string => typeof line === 'string').join('\n')
 
-  return `You are the coding agent inside Argo, a local-first coding harness. Your project is mounted at /workspace in an isolated Ubuntu Docker container (the host is not accessible). Your thoughts, tool calls, and results stream live to the user, and changes under /workspace are committed to git when auto-commit is enabled.
+  return `You are Argo, a multi-agent system with a coding harness. Your project is mounted at /workspace in an isolated Ubuntu Docker container. Your thoughts, tool calls, and results stream live to the user, and changes under /workspace are committed to git when auto-commit is enabled.
 
-TOOLS — invoke them through the function-calling API; never write a tool call as text, JSON, or XML in your reply.
+TOOLS — invoke them through the function-calling API; never as text in your reply.
 ${toolLines}
-
-To finish, call \`conclude\` with your final answer — that is the ONLY way to end your session. A turn with no tool calls is treated as a thinking turn and your session continues, so you can reason freely without accidentally finishing.
-
-HOW TO WORK
-- A simple question or a one-line change: answer or do it directly — no plan needed.
-${hasUpdatePlan
-    ? '- Non-trivial work: read the relevant files first, then call update_plan with ONE concrete, verifiable objective — exactly what the user asked for, never a broader or more interesting goal — plus the steps to reach it, and carry it out. You cannot modify files under /workspace until a plan is recorded.'
-    : '- Your plan is set by the harness before you start — your job is to execute it, not to define or refine it. Read the relevant files first, then carry out the objective.'}
-- Weigh the request against the project before you plan: if it is unclear, or looks mistaken or counter-productive in this project's context, ask one concise question or say what seems off — do not blindly execute something that does not make sense. Otherwise proceed.
-${hasUpdatePlan
-    ? '- Stay on the plan. Call update_plan again only when the work contradicts one of its assumptions. Rewriting the same thing many different ways with nothing forcing it is drift — stop and return to the plan.'
-    : '- Stay on this objective; do not drift to a different goal. If it cannot be met as scoped, say so explicitly in your final answer rather than grinding indefinitely — state what you tried, what failed, and why.'}
-- For repetitive work (many files or pages), write one script instead of repeating a tool call.
-- Before finishing, verify the objective against the original request — run the relevant command or test — then call conclude with your final answer.
-
-PRECISION
-- Never reconstruct an exact identifier, path, URL, flag, or package name from memory — copy it verbatim from the tool result where it appeared, or re-read the source.
-- Distinguish what you verified from what you assumed; do not present a guess as a fact.
-
-FILESYSTEM
-- /workspace is the git-tracked project — the only place that is committed. Keep scratch, experiments, and downloads elsewhere (/tmp, your home directory); none of that is committed or shown to the user.
-- Use absolute paths.${has('bash') ? ' For commands about the project itself (npm test, git, node <file>), set the bash cwd to /workspace.' : ''}
-
-MEMORY
-- /workspace/AGENTS.md (project instructions) and /workspace/MEMORY.md (durable memory), if present, are already appended below.${canWrite ? ' Update MEMORY.md only for durable, reusable facts — tersely, in place — never one-off task state.' : ''}
 
 ENVIRONMENT
 ${has('bash')
     ? '- Ubuntu 24.04. CLI includes bash, git, jq, node, python3, rg, fd, sqlite3, curl. In Node use require() (NODE_PATH is set), not import; native fetch() is available; cheerio and playwright are preinstalled.'
-    : '- Ubuntu 24.04 container. This role has no direct shell access — investigate using the tools listed above.'}`
+    : '- Ubuntu 24.04 container. This role has no direct shell access — investigate using the tools listed above.'}
+
+FILESYSTEM
+- /workspace is the git-tracked project folder — the only place that is committed. Keep scratch, experiments, and downloads elsewhere (/tmp, your home directory).
+- Use absolute paths.${has('bash') ? ' For commands about the project itself (npm test, git, node <file>), set the bash cwd to /workspace.' : ''}
+
+MEMORY
+- /workspace/AGENTS.md (project instructions) and /workspace/MEMORY.md (durable memory), are appended below.${canWrite ? ' Update MEMORY.md only for durable, reusable facts — tersely, in place — never one-off task state.' : ''}
+
+PRECISION
+- Before finishing, verify the objective against the original request.
+- Distinguish what you verified from what you assumed; do not present a guess as a fact.
+- Never reconstruct an exact identifier, path, URL, flag, or package name from memory — copy it verbatim from the tool result where it appeared, or re-read the source.
+
+To finish, call \`conclude\` with your final answer to end your session.`
 }
 
 // Parses tool calls that a model wrote as JSON code blocks in its text content
@@ -346,10 +335,13 @@ export async function loadProjectContext(workspaceRoot = '/workspace'): Promise<
     readProjectContextFile(path.join(workspaceRoot, 'AGENTS.md')),
     readProjectContextFile(path.join(workspaceRoot, 'MEMORY.md')),
   ])
-  const sections: string[] = []
-  if (agentsMd) sections.push(`--- /workspace/AGENTS.md (project instructions) ---\n${agentsMd}`)
-  if (memoryMd) sections.push(`--- /workspace/MEMORY.md (durable project memory) ---\n${memoryMd}`)
-  return sections.join('\n\n')
+  const agentsContent = agentsMd
+    ? `/workspace/AGENTS.md:\n${agentsMd}`
+    : `/workspace/AGENTS.md:\n(file is empty or does not exist yet)`
+  const memoryContent = memoryMd
+    ? `/workspace/MEMORY.md:\n${memoryMd}`
+    : `/workspace/MEMORY.md:\n(file is empty or does not exist yet)`
+  return `<argo-agents-file>\n${agentsContent}\n</argo-agents-file>\n\n<argo-memory-file>\n${memoryContent}\n</argo-memory-file>`
 }
 
 // HOW A chat() TURN ENDED, as a fact rather than an inference (H13, 2026-09-04):
@@ -1187,7 +1179,7 @@ export class Agent {
     const toolPos: number[] = []
     this.history.forEach((m, i) => { if (m.role === 'tool') toolPos.push(i) })
     const collapse = new Set(toolPos.slice(0, Math.max(0, toolPos.length - KEEP_RECENT_TOOL_RESULTS)))
-    const messages: Message[] = [{ role: 'system', content: systemPrompt }]
+    const messages: Message[] = systemPrompt ? [{ role: 'system', content: systemPrompt }] : []
     this.history.forEach((m, i) => {
       const c = m.content
       if (collapse.has(i) && typeof c === 'string' && c.length > TOOL_RESULT_COLLAPSE_OVER) {
@@ -1337,9 +1329,14 @@ export class Agent {
     // inject nothing here — the per-task tail injection in chatCall handles it, and the
     // recall pointer below already tells the model the full file is on disk.
     const sel = selectAgentsSections(this.agentsRaw, { text: userMessage })
-    const agentsBlock = (sel.mode === 'whole' && sel.text) ? '--- /workspace/AGENTS.md (project instructions) ---\n' + sel.text : ''
+    const agentsBlock = (sel.mode === 'whole' && sel.text)
+      ? `<argo-agents-file>\n/workspace/AGENTS.md:\n${sel.text}\n</argo-agents-file>`
+      : `<argo-agents-file>\n/workspace/AGENTS.md:\n(file is empty or does not exist yet)\n</argo-agents-file>`
+    const memoryBlock = this.memoryRaw
+      ? `<argo-memory-file>\n/workspace/MEMORY.md:\n(content retrieved per-iteration based on current task)\n</argo-memory-file>`
+      : `<argo-memory-file>\n/workspace/MEMORY.md:\n(file is empty or does not exist yet)\n</argo-memory-file>`
     const pointer = renderRecallPointer({ agentsPresent: !!this.agentsRaw, memoryPresent: !!this.memoryRaw })
-    return [agentsBlock, pointer].filter(Boolean).join('\n\n')
+    return [agentsBlock, memoryBlock, pointer].filter(Boolean).join('\n\n')
   }
 
   // Harness handler for the update_plan tool. Sets the run's plan, surfaces it as
@@ -1739,6 +1736,23 @@ export class Agent {
     // Does not affect what is sent to the model.
     emitAndLog({ type: 'system_prompt', content: systemPrompt })
 
+    // Prepend the system prompt to the FIRST user message of this run only, wrapped
+    // in <argo-system-prompt> tags, instead of sending it as a separate Ollama
+    // 'system' role message on every call. currentRunStart still points at the entry
+    // pushCtx added for userMessage above (compaction/eviction haven't run yet at this
+    // point in chat()), so mutate it in place. On a RESUMED turn (opts.resume) this is
+    // skipped: the follow-up text pushed for this turn is a continuation of a frame
+    // whose history already carries the system prompt embedded in its own first
+    // message from the original (non-resumed) chat() call — prepending again would
+    // duplicate it on every resumed turn.
+    if (!resume) {
+      const systemBlock = `<argo-system-prompt>\n${systemPrompt}\n</argo-system-prompt>`
+      const startEntry = this.history[currentRunStart]
+      if (startEntry && startEntry.role === 'user' && typeof startEntry.content === 'string') {
+        startEntry.content = `${systemBlock}\n\n${startEntry.content}`
+      }
+    }
+
     // Stall/progress-check iteration numbers for THIS run, scaled to THIS run's own
     // budget (2026-09-03: multi-agent roles run short, fixed budgets — Boss/Planner
     // 15, Tester 20, a Boss task-start checkpoint as low as 6 — and the original
@@ -1883,7 +1897,11 @@ export class Agent {
 
         emitAndLog({ type: 'ollama_request', iteration: i + 1, message_count: this.history.length + 1, model: this.model })
 
-        const response = await this.chatWithRetry(systemPrompt, emitAndLog)
+        // '' — the system prompt is no longer sent as a separate Ollama 'system' role
+        // message; it was already prepended (wrapped in <argo-system-prompt> tags) to
+        // the first user message in this.history above, and chatCall omits the system
+        // message entirely when passed an empty string.
+        const response = await this.chatWithRetry('', emitAndLog)
         if (response === null) {
           // The user aborted while chatWithRetry was waiting to retry. Mirror the
           // top-of-loop stop handling exactly rather than retrying into a run the

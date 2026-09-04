@@ -312,12 +312,7 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
   // "follow the assignment below" framing is kept deliberately future-proof: it
   // remains true regardless of how many checkpoint types exist.
   boss:
-    'You are the BOSS inside Argo\'s multi-agent harness, accountable for the whole ' +
-    'run. Verify independently (read files, run checks, search the web) rather than trusting ' +
-    'self-reports. Verify each specific claim ONCE — one clean check that confirms or refutes it — then ' +
-    'conclude immediately with your verdict for THIS checkpoint. ' +
-    'The specific CHECKPOINT assignment below tells you exactly which one-line convention to end with; follow ' +
-    'that one, not a checkpoint you handled earlier in this same conversation.',
+    'You are the BOSS inside Argo\'s multi-agent harness, accountable for the whole run over multiple turns.',
 }
 
 export function systemPromptFor(role: Role): string {

@@ -206,7 +206,7 @@ test('buildNextTaskPrompt(message): matches the required "after an Implementer c
     '<argo-implemented>\nAdded the --count flag; all existing tests pass.\n</argo-implemented>\n\n' +
     'Review this result against your plan and the current project state, then create the self-contained assignment for the next implementation sub-agent.\n\n' +
     'As before, formulate it as a clear implementation task with a verifiable expected outcome. Include any relevant consequences of the completed work, dependencies, and instructions or context from `AGENTS.md` and `MEMORY.md` that the next agent will need. Explicitly scope what to change, preserve, or defer, including what to test.\n\n' +
-    'If the result changes or invalidates your original plan, adapt the next step accordingly. If no further implementation work is required, conclude that the objective is complete.\n\n' +
+    'If the result changes or invalidates your original plan, adapt the next step accordingly. If no further implementation work is required, provide a final concluding statement summarizing what was accomplished, what was verified, and whether the objective was fully met.\n\n' +
     'The project remains READ-ONLY for you. You have a hard budget of 20 iterations to call `conclude`.'
   assert.equal(text, expected)
 })
@@ -491,13 +491,15 @@ function toolResultOutputsWithMeta(events: AgentEvent[], tool: string): Array<{ 
 // now describe a thinking turn that never ends, not a same-iteration final answer.
 // Rewritten to match: captures the same system message, but via a `conclude` call
 // so the run actually finishes, and checks the NEW terminal-condition text.
-test('system prompt: explains that calling conclude is the only way to end the session', async () => {
+test('system prompt: explains that calling conclude ends the session', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-system-prompt-eot-${Date.now()}`
-  let capturedSystemPrompt = ''
+  let capturedFirstMessage = ''
   const ollama = {
     chat: async (args: { messages: Array<{ role: string; content: string }> }) => {
-      capturedSystemPrompt = args.messages[0]?.content ?? ''
+      // System prompt is now prepended to the first user message in <argo-system-prompt>
+      // tags, not sent as a separate system role message.
+      capturedFirstMessage = args.messages[0]?.content ?? ''
       return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { answer: 'Final answer.' } } }] } }
     },
   } as unknown as Ollama
@@ -506,11 +508,12 @@ test('system prompt: explains that calling conclude is the only way to end the s
   try {
     const answer = await agent.chat('argo system prompt end-of-turn case')
     assert.equal(answer, 'Final answer.')
-    assert.ok(capturedSystemPrompt.includes(
-      'To finish, call `conclude` with your final answer — that is the ONLY way to end your session.',
+    assert.ok(capturedFirstMessage.includes('<argo-system-prompt>'), 'first message should contain <argo-system-prompt> tag')
+    assert.ok(capturedFirstMessage.includes(
+      'To finish, call `conclude` with your final answer to end your session.',
     ))
-    assert.ok(capturedSystemPrompt.includes(
-      'A turn with no tool calls is treated as a thinking turn and your session continues, so you can reason freely without accidentally finishing.',
+    assert.ok(capturedFirstMessage.includes(
+      'conclude: end your session with your final answer.',
     ))
   } finally {
     await cleanupSeedPlanSession(sessionId)

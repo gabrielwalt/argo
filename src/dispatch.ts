@@ -782,6 +782,35 @@ export function buildInitialPlannerPrompt(objective: string): string {
 // context competing with that history rather than a substitute for it. VERBATIM per
 // this task's brief; pure and exported so this exact text is directly testable
 // without spawning a real frame.
+// Builds the Boss's end-of-run conclusion assignment. The Boss sees what the Planner
+// concluded with and each Implementer's own conclusion, then provides a final summary
+// of the entire run — what was done, what was verified, and the overall outcome.
+export function buildBossConclusionAssignment(
+  objective: string,
+  plannerConclusion: string,
+  completedTasks: Array<{ prompt: string; conclusion: string }>,
+): string {
+  const taskSummaries = completedTasks
+    .map((t, i) => `Task ${i + 1}: ${t.prompt}\nResult: ${t.conclusion}`)
+    .join('\n\n')
+  return (
+    'CHECKPOINT: run-conclusion\n' +
+    'The run is complete. Your task is to provide a final summary of how the entire run went.\n\n' +
+    `<argo-objective>\n${objective}\n</argo-objective>\n\n` +
+    'The Planner concluded with:\n' +
+    `<argo-planner-conclusion>\n${plannerConclusion}\n</argo-planner-conclusion>\n\n` +
+    (taskSummaries
+      ? `Implementation results:\n<argo-implementation-results>\n${taskSummaries}\n</argo-implementation-results>\n\n`
+      : '') +
+    'Summarize concisely:\n' +
+    '1. What was the objective and was it fully met?\n' +
+    '2. What concrete changes were made?\n' +
+    '3. What was verified and how?\n' +
+    '4. Any caveats, remaining issues, or follow-up recommendations?\n\n' +
+    'Call `conclude` with your summary.'
+  )
+}
+
 export function buildNextTaskPrompt(completedMessage: string | null): string {
   if (completedMessage === null) {
     return (
@@ -806,7 +835,7 @@ export function buildNextTaskPrompt(completedMessage: string | null): string {
     `<argo-implemented>\n${completedMessage}\n</argo-implemented>\n\n` +
     'Review this result against your plan and the current project state, then create the self-contained assignment for the next implementation sub-agent.\n\n' +
     'As before, formulate it as a clear implementation task with a verifiable expected outcome. Include any relevant consequences of the completed work, dependencies, and instructions or context from `AGENTS.md` and `MEMORY.md` that the next agent will need. Explicitly scope what to change, preserve, or defer, including what to test.\n\n' +
-    'If the result changes or invalidates your original plan, adapt the next step accordingly. If no further implementation work is required, conclude that the objective is complete.\n\n' +
+    'If the result changes or invalidates your original plan, adapt the next step accordingly. If no further implementation work is required, provide a final concluding statement summarizing what was accomplished, what was verified, and whether the objective was fully met.\n\n' +
     'The project remains READ-ONLY for you. You have a hard budget of 20 iterations to call `conclude`.'
   )
 }
@@ -1302,6 +1331,10 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
   let plannerFollowUp: string = buildNextTaskPrompt(null)
   const completedTasks: Array<{ prompt: string; conclusion: string }> = []
   let done = false
+  // The Planner's own concluding text — captured from the detailResult that trips
+  // isPlannerDone below — so the end-of-run Boss conclusion frame can quote exactly
+  // what the Planner itself said, not a re-derived summary.
+  let plannerConclusionText = ''
   // Counts Implementer cap-hits across THIS objective's whole OBJECTIVE loop — see
   // MAX_IMPLEMENTER_CAP_RETRIES above. Shared across BOTH the initial per-task
   // Implementer and any Tester fix-attempt Implementers (runTesterValidation) — any
@@ -1338,6 +1371,7 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
     }
 
     if (isPlannerDone(detailResult.rawSummary)) {
+      plannerConclusionText = detailResult.rawSummary
       done = true
       break
     }
@@ -1428,6 +1462,19 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
 
   const doneSummary = completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
 
+  // Boss conclusion: spawn a Boss frame at the END of the run to summarize
+  // the entire objective, what the Planner and Implementers concluded, and
+  // the overall outcome. Uses the same TASK_START_TOOLS (read-only) and
+  // TASK_START_HARD_CAP as the classification checkpoint.
+  const conclusionReq: FrameSpawnRequest = {
+    role: 'boss',
+    parentFrameId: null,
+    maxIterations: TASK_START_HARD_CAP,
+    assignment: buildBossConclusionAssignment(objective, plannerConclusionText, completedTasks),
+  }
+  const conclusionFrame = await spawnFrame(conclusionReq, emit, TASK_START_TOOLS)
+  commitAgent = conclusionFrame.agent
+
   // Mirrors the baseline loop's own end-of-run auto-commit (agent.ts), opt-in via the
   // same config.autoCommit flag. Reuses whichever frame's Agent instance most recently
   // did real work purely as a vehicle — autoCommit() only needs git + a model to write
@@ -1436,7 +1483,10 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
   // above.
   if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
 
-  return `Objective: ${objective}\n\n${doneSummary || 'No implementation tasks were required.'}`
+  // Use the Boss's conclusion as the run's final answer, with a fallback
+  // to the task summary if the Boss somehow fails to conclude.
+  const bossConclusion = conclusionFrame.result.rawSummary
+  return bossConclusion || `Objective: ${objective}\n\n${doneSummary || 'No implementation tasks were required.'}`
 }
 
 async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<string> {

@@ -105,36 +105,39 @@ test('compactNow folds prior history and marks the emitted events manual, same s
   }
 })
 
-test('loadProjectContext: neither AGENTS.md nor MEMORY.md present returns empty string, no behavior change', async () => {
+test('loadProjectContext: neither AGENTS.md nor MEMORY.md present — both shown with empty placeholders', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'argo-project-context-'))
   try {
-    assert.equal(await loadProjectContext(dir), '')
+    const result = await loadProjectContext(dir)
+    assert.match(result, /<argo-agents-file>/)
+    assert.match(result, /AGENTS\.md:\n\(file is empty or does not exist yet\)/)
+    assert.match(result, /<argo-memory-file>/)
+    assert.match(result, /MEMORY\.md:\n\(file is empty or does not exist yet\)/)
   } finally {
     await fs.rm(dir, { recursive: true, force: true })
   }
 })
 
-test('loadProjectContext: only one of the two files present includes just that one, clearly labeled', async () => {
+test('loadProjectContext: only AGENTS.md present — content shown, MEMORY.md shows placeholder', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'argo-project-context-'))
   try {
     await fs.writeFile(path.join(dir, 'AGENTS.md'), 'Use pnpm, not npm.')
     const result = await loadProjectContext(dir)
-    assert.match(result, /AGENTS\.md \(project instructions\)/)
-    assert.match(result, /Use pnpm, not npm\./)
-    assert.doesNotMatch(result, /MEMORY\.md/)
+    assert.match(result, /<argo-agents-file>[\s\S]*AGENTS\.md:[\s\S]*Use pnpm, not npm\.[\s\S]*<\/argo-agents-file>/)
+    assert.match(result, /<argo-memory-file>[\s\S]*MEMORY\.md:\n\(file is empty or does not exist yet\)[\s\S]*<\/argo-memory-file>/)
   } finally {
     await fs.rm(dir, { recursive: true, force: true })
   }
 })
 
-test('loadProjectContext: both files present are both included, each clearly labeled', async () => {
+test('loadProjectContext: both files present — both included in XML tags with content', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'argo-project-context-'))
   try {
     await fs.writeFile(path.join(dir, 'AGENTS.md'), 'Project instructions content.')
     await fs.writeFile(path.join(dir, 'MEMORY.md'), 'Durable memory content.')
     const result = await loadProjectContext(dir)
-    assert.match(result, /AGENTS\.md \(project instructions\)[\s\S]*Project instructions content\./)
-    assert.match(result, /MEMORY\.md \(durable project memory\)[\s\S]*Durable memory content\./)
+    assert.match(result, /<argo-agents-file>[\s\S]*AGENTS\.md:[\s\S]*Project instructions content\.[\s\S]*<\/argo-agents-file>/)
+    assert.match(result, /<argo-memory-file>[\s\S]*MEMORY\.md:[\s\S]*Durable memory content\.[\s\S]*<\/argo-memory-file>/)
   } finally {
     await fs.rm(dir, { recursive: true, force: true })
   }
