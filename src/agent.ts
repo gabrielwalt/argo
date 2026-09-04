@@ -86,7 +86,7 @@ import { recordEpisode, markEpisodeEvicted, newId as newLedgerId } from './ledge
 // TOOLS section from only what `has()` says is actually there — a role that lacks
 // write_file/edit_file is never told about them, and gets an explicit note instead
 // pointing at what it DOES have for reading/investigating.
-function buildSystemPrompt(tools: ToolName[] | null, roleInstructions?: string): string {
+function buildSystemPrompt(tools: ToolName[] | null, roleInstructions?: string, role?: string): string {
   const has = (t: ToolName): boolean => tools === null || tools.includes(t)
   const hasUpdatePlan = has('update_plan')
   const canWrite = has('write_file') || has('edit_file')
@@ -121,8 +121,8 @@ FILESYSTEM
 - /workspace is the git-tracked project folder — the only place that is committed. Keep scratch, experiments, and downloads elsewhere (/tmp, your home directory).
 - Use absolute paths.${has('bash') ? ' For commands about the project itself (npm test, git, node <file>), set the bash cwd to /workspace.' : ''}
 
-MEMORY
-- /workspace/AGENTS.md (project instructions) and /workspace/MEMORY.md (durable memory), are appended below.${canWrite ? ' Update MEMORY.md only for durable, reusable facts — tersely, in place — never one-off task state.' : ''}
+${(role === 'implementer' || role === 'tester') ? '' : `MEMORY
+- /workspace/AGENTS.md (project instructions) and /workspace/MEMORY.md (durable memory), are appended below.${canWrite ? ' Update MEMORY.md only for durable, reusable facts — tersely, in place — never one-off task state.' : ''}`}
 
 PRECISION
 - Before finishing, verify the objective against the original request.
@@ -1727,7 +1727,7 @@ export class Agent {
     // tool set — buildSystemPrompt derives hasUpdatePlan from it internally the
     // same way canUpdatePlan() does, so passing it here (rather than the boolean)
     // is also what lets the TOOLS section itself stay truthful per role.
-    const rolePrompt = buildSystemPrompt(this.allowedTools, this.roleInstructions || undefined)
+    const rolePrompt = buildSystemPrompt(this.allowedTools, this.roleInstructions || undefined, this.roleTag || undefined)
     const systemPrompt = projectContext ? `${rolePrompt}\n\n${projectContext}` : rolePrompt
     // Logging-only: makes the full prompt (tool list + role suffix + AGENTS.md/
     // MEMORY.md context) visible in the run log. Emitted before the first
