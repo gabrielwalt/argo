@@ -377,7 +377,12 @@ export class Agent {
   private ollama: Ollama
   private history: Message[] = []
   private model: string
-  private options: ModelOptions = { temperature: 0.6, top_p: 0.95, top_k: 20 }
+  // num_predict caps the maximum tokens (including thinking tokens) per Ollama call.
+  // Without it, qwen3.6 with thinking enabled can generate up to num_ctx (65536)
+  // tokens of thinking before producing any content, which intermittently hangs
+  // Ollama's MLX runner on Apple M5 (ollama/ollama#17426). 8192 is generous for any
+  // single tool-calling turn (thinking + content + tool call JSON).
+  private options: ModelOptions = { temperature: 0.6, top_p: 0.95, top_k: 20, num_predict: 8192 }
   // Per-run toggle for the grounding guard (see runGroundingCheckpoint). Defaults to
   // config.grounding (env ARGO_GROUNDING, default ON); the web UI's "Grounding check"
   // toggle overrides it per run via setGrounding().
