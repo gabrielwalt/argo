@@ -102,6 +102,8 @@ function isThoughtDuplicateOfFinal(thoughtText: string, finalText: string): bool
   return normalizeForCompare(finalText).startsWith(t)
 }
 
+let logFileSeq = 0
+
 export class SessionLogger {
   private entries: LogEntry[] = []
   private startTs = Date.now()
@@ -113,7 +115,8 @@ export class SessionLogger {
   constructor(query: string, model: string, options: ModelOptions = {}, sessionId?: string) {
     const slug = query.slice(0, 40).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')
     const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-    this.filename = `${ts}_${slug}`
+    const seq = String(++logFileSeq).padStart(4, '0')
+    this.filename = `${ts}_${seq}_${slug}`
     this.meta = {
       filename: this.filename,
       query,
