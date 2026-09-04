@@ -1709,7 +1709,7 @@ export class Agent {
     // thrash the identical-call guard misses); noProgressSteers escalates the re-anchor.
     let callsSinceMutation = 0
     let noProgressSteers = 0
-    let regrounded = false
+    // regrounded removed (2026-09-04) — re-grounding done-gate was removed per owner directive.
     let groundingChecked = false
     // At most one (render + vision-model) layout check per run, mirroring
     // groundingChecked — a bounded block, never an infinite one.
@@ -2149,10 +2149,13 @@ export class Agent {
             // finalReconciled, so a later allDone re-arms exactly one more pass) or
             // truly conclude. At most once per run (finalReconciled) so this cannot
             // loop.
-            if (this.tasks && tlGate && tasksAllDone(tlGate) && !this.finalReconciled) {
+            // Re-read the task list AFTER any advance above — tlGate was captured
+            // before the advance and is stale when the last task was just completed.
+            const tlReconcile = this.taskList as TaskList | null
+            if (this.tasks && tlReconcile && tasksAllDone(tlReconcile) && !this.finalReconciled) {
               this.finalReconciled = true
-              const objective = activePlan?.objective || tlGate.objective
-              const reconcileMsg = `ALL PLANNED TASKS ARE DONE — final check before concluding. Objective: "${objective}". What was done per task:\n${renderTaskSummaries(tlGate)}\nVerify this FULLY addresses the objective. If ANYTHING is missing, incomplete, or inconsistent, call update_plan to add/adjust the remaining work and keep going. If it is genuinely complete, call conclude again with your FINAL ANSWER: a clear summary for the user of what was accomplished, and suggest a sensible next step.`
+              const objective = activePlan?.objective || tlReconcile.objective
+              const reconcileMsg = `ALL PLANNED TASKS ARE DONE — final check before concluding. Objective: "${objective}". What was done per task:\n${renderTaskSummaries(tlReconcile)}\nVerify this FULLY addresses the objective. If ANYTHING is missing, incomplete, or inconsistent, call update_plan to add/adjust the remaining work and keep going. If it is genuinely complete, call conclude again with your FINAL ANSWER: a clear summary for the user of what was accomplished, and suggest a sensible next step.`
               emitAndLog({ type: 'tool_result', tool: name, output: reconcileMsg, duration_ms: 0 })
               this.pushCtx({ role: 'tool', content: reconcileMsg })
               continue iterations
@@ -2198,18 +2201,11 @@ export class Agent {
                 }
               }
             }
-            // Re-grounding done-gate: if a plan is active for THIS run, don't take
-            // the first conclude call at face value — nudge once to verify the
-            // recorded objective is actually met. A run with no plan (simple task /
-            // question) concludes immediately, so versatility is untouched. At most
-            // once per run (regrounded), so it cannot loop.
-            if (activePlan && !regrounded) {
-              regrounded = true
-              const nudge = `Before concluding, re-ground against your plan. Objective: "${activePlan.objective}". Think critically: is the objective TRULY met — not just that a command exited 0, with no corner cut and the real request satisfied? State how you verified it (the check you ran and its result). If it is not genuinely met, keep working toward THIS objective (do not drift to a different one) and call conclude again once it is. If it is met, call conclude again with your final answer: (1) a brief summary of what you did to achieve the objective, and (2) only if there is a clear, sensible next step for this project, one short suggestion of what to do next.`
-              emitAndLog({ type: 'tool_result', tool: name, output: nudge, duration_ms: 0 })
-              this.pushCtx({ role: 'tool', content: nudge })
-              continue iterations
-            }
+            // Re-grounding done-gate REMOVED (2026-09-04, owner directive: "this doesn't
+            // help at all"). The gate used to reject the first conclude call when a plan
+            // was active and nudge the model to verify the objective — measured as pure
+            // overhead with no quality improvement. Conclude now goes straight through
+            // to the remaining gates (critic/grounding/layout) and the final return.
             // All gates passed — genuinely done.
             emitAndLog({ type: 'tool_result', tool: name, output: 'Concluded.', duration_ms: 0 })
             this.pushCtx({ role: 'tool', content: 'Concluded.' })

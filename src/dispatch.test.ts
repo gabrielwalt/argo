@@ -699,7 +699,7 @@ test('the iteration cap is still a hard stop when the model never calls conclude
   }
 })
 
-test('conclude drives the task ledger exactly like a no-tool-call turn used to: ask for a summary, then advance, then pass reconciliation and re-ground', async () => {
+test('conclude drives the task ledger exactly like a no-tool-call turn used to: ask for a summary, then advance, then pass reconciliation', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-conclude-tasks-${Date.now()}`
   const summaryText = 'Built widget.ts and wired it in; demo renders correctly.'
@@ -712,8 +712,9 @@ test('conclude drives the task ledger exactly like a no-tool-call turn used to: 
   agent.setTasks(true)
   try {
     // scriptedOllama repeats the LAST response (concludeCall(summaryText)) for as
-    // many further iterations as the moved gates need — final reconciliation and
-    // re-ground each need one more turn before the run can genuinely conclude.
+    // many further iterations as the moved gates need — final reconciliation needs
+    // one more turn before the run can genuinely conclude. Re-ground done-gate was
+    // removed (2026-09-04, owner directive).
     const answer = await agent.chat('argo conclude tasks case')
     const results = toolResultOutputsWithMeta(events, 'conclude')
     // The ask fired once, for the current task, before any advance.
@@ -723,11 +724,9 @@ test('conclude drives the task ledger exactly like a no-tool-call turn used to: 
     )
     assert.equal(advanced.length, 1)
     assert.equal(advanced[0].done, 1)
-    // Final reconciliation and re-ground (both moved into the conclude handler,
-    // both still one-shot) each fired exactly once before the run genuinely
-    // concluded with the model's own (repeated) summary as the final answer.
+    // Final reconciliation (moved into the conclude handler, one-shot) fired
+    // exactly once before the run genuinely concluded.
     assert.equal(results.filter(r => r.output.includes('ALL PLANNED TASKS ARE DONE')).length, 1)
-    assert.equal(results.filter(r => r.output.includes('Before concluding, re-ground')).length, 1)
     assert.equal(answer, summaryText)
   } finally {
     await cleanupSeedPlanSession(sessionId)
