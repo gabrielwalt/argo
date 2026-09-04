@@ -492,9 +492,16 @@ test('H17: applying a frame policy does not depend on config defaults', () => {
   }
 })
 
-test('H17: the Planner no longer holds update_plan; the Implementer still does', () => {
+test('H17: no multi-agent role holds update_plan (harness-only via seedPlan)', () => {
+  // update_plan was removed from every role (2026-09-05): the harness seeds the
+  // plan via Agent.seedPlan before chat() for every Implementer frame, so no agent
+  // ever needs to set or refine its own plan. The baseline single-loop agent
+  // (allowedTools null, no per-role restriction) still has it as the only path to
+  // satisfy the plan/act gate — but that is not a ROLE_TOOLS entry.
   assert.equal(ROLE_TOOLS.planner.includes('update_plan'), false)
-  assert.equal(ROLE_TOOLS.implementer.includes('update_plan'), true)
+  assert.equal(ROLE_TOOLS.implementer.includes('update_plan'), false)
+  assert.equal(ROLE_TOOLS.tester.includes('update_plan'), false)
+  assert.equal(ROLE_TOOLS.boss.includes('update_plan'), false)
   // Unchanged guarantees the rest of the harness relies on.
   assert.equal(ROLE_TOOLS.planner.includes('write_file'), false)
   assert.equal(ROLE_TOOLS.tester.includes('write_file'), false)

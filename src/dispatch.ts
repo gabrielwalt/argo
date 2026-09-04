@@ -20,13 +20,11 @@
 //    completed real-world work is never blindly redone — but step-tracking bookkeeping
 //    resets on a replan rather than being merged positionally).
 
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import { Agent } from './agent.js'
 import { config } from './config.js'
 import { SessionLogger } from './logger.js'
-import type { AgentEvent, FrameSpawnRequest, FrameResult, FrameStatus, ModelOptions, Role } from './types.js'
-import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, systemPromptFor, buildAssignment, capSummary, parseTesterVerdict, parseBossVerdict, parseTaskStartVerdict, policyFor, TESTER_VERDICT_NUDGE, type TaskStartVerdict } from './frames.js'
+import type { AgentEvent, FrameSpawnRequest, FrameResult, FrameStatus, ModelOptions, Role, ToolName } from './types.js'
+import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, systemPromptFor, buildAssignment, capSummary, parseTesterVerdict, parseBossVerdict, parseTaskStartVerdict, policyFor, TESTER_VERDICT_NUDGE, TASK_START_TOOLS, type TaskStartVerdict } from './frames.js'
 import * as ledger from './ledger.js'
 import { createTaskGraph, readyGroups, allStepsDone, type TaskGraph, type TaskStep } from './tasks.js'
 // SCHEMA-CONSTRAINED CONTROL PLANE (config.schemaControlPlane, docs/research/
@@ -48,44 +46,12 @@ function root(): string {
   return config.workspacePath || '/workspace'
 }
 
-const execFileAsync = promisify(execFile)
-// Fails open to '' ("nothing changed") on any error — not a git repo, git unavailable,
-// etc. — same fail-open convention as every other checkpoint here; this is a detection
-// heuristic, not a correctness-critical path.
-async function gitStatusShort(cwd: string): Promise<string> {
-  try {
-    const { stdout } = await execFileAsync('git', ['status', '--short'], { cwd })
-    return stdout
-  } catch {
-    return ''
-  }
-}
-
-// Total changed lines (added + removed) in the working tree right now — used to size a
-// TRIVIAL self-attempt's actual blast radius. The Boss only has `bash`, not edit_file:
-// its ONLY way to "fix" a file is a full heredoc rewrite, which is an inherently blunt,
-// all-or-nothing instrument (unlike edit_file's precise, scoped replacement). Observed
-// in eval: a Boss judged a 6-method feature TRIVIAL, rewrote the entire target file
-// from scratch via `cat > file << EOF` to "fix" it, hallucinated large parts of the
-// surrounding code it never needed to touch, and broke an unrelated constructor
-// signature other files depended on — a real, damaging failure a mere `dirty` check
-// (any change at all) can't distinguish from a genuinely tiny, safe edit.
-async function gitDiffLineCount(cwd: string): Promise<number> {
-  try {
-    const { stdout } = await execFileAsync('git', ['diff', '--shortstat'], { cwd })
-    const m = /(\d+) insertion.*?(\d+) deletion|(\d+) insertion|(\d+) deletion/.exec(stdout)
-    if (!m) return 0
-    const nums = m.slice(1).filter(Boolean).map(Number)
-    return nums.reduce((a, b) => a + b, 0)
-  } catch {
-    return 0
-  }
-}
-// Above this many changed lines, a self-attempt no longer counts as evidence of a
-// genuinely TRIVIAL (1-2 iteration) fix, regardless of whether the Boss claims it
-// finished — generous enough for a real one-or-two-line change plus its imports/
-// braces, nowhere near enough for a full-file rewrite.
-const TRIVIAL_DIFF_LINE_LIMIT = 15
+// git-diff sizing helpers (gitStatusShort/gitDiffLineCount/TRIVIAL_DIFF_LINE_LIMIT)
+// used to live here, sizing a TRIVIAL self-attempt's blast radius because the task-
+// start Boss could edit the workspace itself via bash. Removed (2026-09-05) along
+// with that capability — see frames.ts's TASK_START_TOOLS for why and the incident
+// that forced the issue. Guard code for a capability that no longer exists is worse
+// than no guard at all.
 const ACTION_EPISODES_PER_STANDUP = 10
 // A frame that alone burns more iterations than this earns an immediate post-hoc
 // standup regardless of the aggregate action-episode pacing (docs/subagents-plan.md,
@@ -252,7 +218,21 @@ export function applyFramePolicy(agent: Agent, role: Role): void {
   agent.setPolicy(policyFor(role))
 }
 
-async function spawnFrame(req: FrameSpawnRequest, emit: Emit): Promise<SpawnedFrame> {
+// toolOverride lets ONE call site (runBossTaskStart's classification frame) restrict
+// tools below ROLE_TOOLS[role] without a parallel spawning mechanism — every other
+// caller omits it and gets the per-role default exactly as before. Deliberately not a
+// FrameSpawnRequest field: that type is shared with the schema-extraction/planner-
+// graph JSON shape (dispatch.ts's parseTaskGraph), and a tool override is a harness
+// decision about ONE hardcoded checkpoint, never something a model-produced task
+// graph should be able to request for itself.
+//
+// seedObjective (2026-09-05): pre-satisfies agent.ts's plan/act gate for an
+// Implementer that already has a concrete objective before its first turn — see
+// Agent.seedPlan's own comment for the full reasoning. Every Implementer spawn site
+// in the step-execution loop below passes its own step's prompt here; every other
+// role omits it (Tester/Boss never hold write_file/edit_file, so the gate can never
+// trip for them; the Planner never writes either).
+async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: ToolName[], seedObjective?: string): Promise<SpawnedFrame> {
   checkAborted()
   const frameId = ledger.newId(req.role)
   await ledger.recordDelegation(root(), {
@@ -266,12 +246,13 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit): Promise<SpawnedFr
 
   const agent = new Agent(tagEmit(emit, frameId, req.role, req.parentFrameId), currentModel)
   if (currentOptions) agent.setOptions(currentOptions)
-  agent.setAllowedTools(ROLE_TOOLS[req.role])
+  agent.setAllowedTools(toolOverride ?? ROLE_TOOLS[req.role])
   agent.setRoleInstructions(systemPromptFor(req.role))
   agent.setFrameId(frameId)
   agent.setMaxIterations(req.maxIterations ?? ROLE_MAX_ITERATIONS[req.role])
   agent.setSessionId(frameId) // isolates history/compaction-state files per frame
   applyFramePolicy(agent, req.role) // H17 — never inherit the single-loop baseline's mechanisms
+  if (seedObjective) agent.seedPlan(seedObjective) // BEFORE chat() — see the param comment above
 
   const assignment = await buildAssignment(root(), req, currentVerbatimRequest)
   const startedAt = Date.now()
@@ -388,13 +369,17 @@ export function deriveFrameResult(frameId: string, finalAnswer: string, agent: A
   }
 }
 
-// dispatch.ts's own harness-level override on top of the Boss's text verdict — see
-// the 'preempted'/'preempted-incomplete' cases in runBossTaskStart below.
+// Task-start's routed decision. Used to carry two harness-level override modes,
+// 'preempted'/'preempted-incomplete', for a workspace change the Boss made ITSELF
+// during classification (detected via a before/after git diff) — removed (2026-09-05)
+// along with the Boss's ability to touch the workspace at all during this checkpoint
+// (see frames.ts's TASK_START_TOOLS), so `mode` is now exactly the four values the
+// model itself can express. `frameId`/`agent` are also gone: both existed only for the
+// deleted 'preempted' branch below to hand the classification frame straight to a
+// Tester — every remaining caller only ever reads `.mode`/`.text`.
 interface RoutedTaskStart {
-  mode: TaskStartVerdict['mode'] | 'preempted' | 'preempted-incomplete'
+  mode: TaskStartVerdict['mode']
   text: string
-  frameId: string
-  agent: Agent
 }
 
 // Deliberately tiny — this is the STRUCTURAL enforcement of "the Boss shouldn't do
@@ -421,70 +406,100 @@ const TASK_START_MARKER_RETRY_NUDGE =
   'your answer with exactly one of: ANSWER: <...>, TRIVIAL: <...>, SIMPLE: <...>, or ' +
   'OBJECTIVE: <...> — nothing else after it.'
 
+// The one-step graph task-start's TRIVIAL/SIMPLE modes build (runDispatchLoopBody).
+// Pure — no ledger, no model — so it's exported and directly testable: TRIVIAL sets
+// skipTest, SIMPLE does not.
+//
+// TRIVIAL skipping the Tester is a deliberate 2026-09-05 change from the previous
+// rule here, "at least two independent frames, always" — that floor was justified by
+// the Boss's own ability to self-edit during task-start: if Jason could already have
+// written a file himself with nothing else checking it, a single Implementer's own
+// verification wasn't enough to trust either. That justification is gone now that
+// task-start is read-only (TASK_START_TOOLS, frames.ts) — Jason cannot touch the
+// workspace at all during classification, so a genuinely TRIVIAL classification is
+// purely the Implementer's own work, and its own verification is a reasonable
+// stopping point. This is also what makes TRIVIAL worth distinguishing from SIMPLE at
+// all: without it, the two modes built the identical graph and differed in name only.
+export function buildTaskStartGraph(objective: string, mode: 'trivial' | 'simple'): TaskGraph {
+  return createTaskGraph(objective, [{
+    role: 'implementer',
+    prompt: objective,
+    dependsOn: [],
+    ...(mode === 'trivial' ? { skipTest: true } : {}),
+  }])
+}
+
 // Boss, checkpoint task-start: a FOUR-way router (docs/subagents-plan.md, "skippable
 // phases" + the 2026-09-03 redesign). Never re-fires within one dispatch — the
 // objective is set exactly once per task by construction (setObjective's own
 // immutability guard is the backstop if this were ever called twice).
+// The task-start checkpoint's own assignment text (distinct from frames.ts's
+// buildAssignment, which wraps EVERY frame's assignment with dependency summaries —
+// this IS the assignment passed to that wrapper for the task-start Boss specifically).
+// Pure and exported so the exact prompt — the <argo-user-prompt> tagging, the
+// READ-ONLY statement, the four mode markers — is directly testable without spawning
+// a real frame; the cone reviewing this change can also just call it to see exactly
+// what reaches the model.
+//
+// 2026-09-05: rewritten to make classification's read-only-ness explicit in the
+// prompt itself (matching the tool-set change, TASK_START_TOOLS in frames.ts) and
+// roughly halved in length — every mode now states its own iteration-budget as a
+// uniform field (0 / 1-3 / 3-20 / 20+) instead of burying it in prose, and the "you
+// MAY fix it yourself" / "verify it once" guidance is gone: there is no longer a
+// fix-it-yourself path to guide. The <argo-user-prompt> tagging and per-mode budgets
+// are deliberate and must survive any future edit of this prompt.
+export function buildTaskStartAssignment(userMessage: string, verbatimRequestOn: boolean): string {
+  return (
+    'CHECKPOINT: task-start\n' +
+    `The user asked:\n<argo-user-prompt>\n${userMessage}\n</argo-user-prompt>\n\n` +
+    // VERBATIM REQUEST THREADING (config.verbatimRequest): this checkpoint's whole
+    // reason for existing was to compress the request into one mode line for
+    // everything downstream — under that pressure, two traced eval failures came from
+    // the compression silently dropping a seeded-test-file pointer and a "do NOT
+    // modify existing tests" clause (docs/research/10-hermes-differential.md, finding
+    // 1). With the flag on, this checkpoint is no longer that request's only surviving
+    // record (spawnFrame attaches the raw message to every downstream frame's
+    // assignment too — see frames.ts), so telling the model that changes what its
+    // mode line should optimize for: a concise digest rather than a defensive
+    // transcription attempt. Flag-gated so the OFF path's prompt text is byte-
+    // identical to before this existed.
+    (verbatimRequestOn
+      ? 'Note: the user\'s request above is ALSO threaded verbatim to every downstream frame (Planner, ' +
+        'Implementer, Tester) alongside whatever you write below — this checkpoint is no longer the only place ' +
+        'it survives, so your mode line can be a concise digest rather than an exhaustive transcription; the ' +
+        'original is preserved separately for anyone who needs the exact wording.\n\n'
+      : '') +
+    'Ground this if it references project specifics, current facts, or anything you cannot already verify — ' +
+    'check real files or the web where it matters, rather than answering from assumption. You have a hard ' +
+    `budget of ${TASK_START_MAX_ITERATIONS} iterations for this checkpoint — read only enough to classify, not ` +
+    'enough to fully understand the codebase: the moment you notice real complexity (an unfamiliar multi-file ' +
+    'area, several functions/modules involved, a design decision to make), STOP reading and classify OBJECTIVE ' +
+    'immediately; Tiphys (the Planner) has a longer budget for that deeper reading.\n\n' +
+    'The project is READ-ONLY: you are only classifying this request, so nothing can be modified. Classify it ' +
+    'into exactly ONE of four modes and end your answer with exactly one line in that mode\'s format:\n' +
+    '- ANSWER: <complete final answer> — you already know it for certain, or one quick lookup settles it, and ' +
+    'nothing in the project needs to change.\n' +
+    '- TRIVIAL: <concrete, verifiable objective> — 1-3 iterations, and you are SURE it needs neither testing ' +
+    'nor numerous iterations (a one-character typo, a single obvious constant). Goes to an Implementer.\n' +
+    '- SIMPLE: <concrete, verifiable objective> — a well-scoped change taking 3-20 iterations to diagnose or ' +
+    'implement (a bug in one file, one function to fix). Goes to an Implementer and a Tester.\n' +
+    '- OBJECTIVE: <concrete, verifiable objective> — more than 20 iterations, or it needs deeper upfront ' +
+    'analysis (several distinct pieces of work, or genuine ambiguity about the approach). Goes to a Planner ' +
+    'to be broken down. Never "NONE" or "no objective" here, regardless of how simple the request is or ' +
+    'whether it involves this project at all.'
+  )
+}
+
 async function runBossTaskStart(userMessage: string, emit: Emit): Promise<RoutedTaskStart> {
   const req: FrameSpawnRequest = {
     role: 'boss',
     parentFrameId: null,
     maxIterations: TASK_START_MAX_ITERATIONS,
-    assignment:
-      `CHECKPOINT: task-start\nThe user asked: "${userMessage}"\n` +
-      // VERBATIM REQUEST THREADING (config.verbatimRequest): this checkpoint's whole
-      // reason for existing was to compress the request into one OBJECTIVE line for
-      // everything downstream — under that pressure, two traced eval failures came from
-      // the compression silently dropping a seeded-test-file pointer and a "do NOT
-      // modify existing tests" clause (docs/research/10-hermes-differential.md, finding
-      // 1). With the flag on, this checkpoint is no longer that request's only surviving
-      // record (spawnFrame attaches the raw message to every downstream frame's
-      // assignment too — see frames.ts), so telling the model that changes what its
-      // OBJECTIVE line should optimize for: a concise, readable digest rather than a
-      // defensive transcription attempt. Flag-gated so the OFF path's prompt text is
-      // byte-identical to before this existed.
-      (config.verbatimRequest
-        ? 'Note: the user\'s request above is ALSO threaded verbatim to every downstream frame (Planner, ' +
-          'Implementer, Tester) alongside whatever you write below — this checkpoint is no longer the only place ' +
-          'it survives. Your ANSWER/TRIVIAL/SIMPLE/OBJECTIVE line can therefore be a concise, readable digest of ' +
-          'the request rather than an exhaustive transcription of every file path and clause — just enough for a ' +
-          'reader to know what the work is at a glance; the original is preserved separately for anyone who needs ' +
-          'the exact wording.\n'
-        : '') +
-      'Ground this if it references project specifics, current facts, or anything you cannot already verify — ' +
-      'check real files or the web where it matters, rather than answering from assumption. ' +
-      `You have a hard budget of ${TASK_START_MAX_ITERATIONS} iterations for this checkpoint — plenty for reading ` +
-      'and classifying, not enough for a real implementation effort, by design. Read only enough to classify, not ' +
-      'enough to fully understand the codebase — the moment you notice real complexity (an unfamiliar multi-file ' +
-      'area, several functions/modules involved, a design decision to make), STOP reading and classify OBJECTIVE ' +
-      'immediately; Tiphys (the Planner) has a longer budget specifically to do that deeper reading, so spending ' +
-      'your own short budget on it first only shrinks the room you have left to classify at all. If you do attempt ' +
-      'a fix yourself (TRIVIAL below), verify it ONCE — one clean test/check run confirming it — and then CONCLUDE ' +
-      'immediately with your answer line. Do not re-run the same check again "to be sure": repeated re-verification ' +
-      'of a fix you already confirmed wastes the very budget that makes this checkpoint safe, and a fresh Tester ' +
-      'independently re-checks your work right after anyway, so your own one-time confirmation is enough. ' +
-      'Classify the request into exactly ONE of four modes and end your answer with exactly one line in that ' +
-      'mode\'s format:\n' +
-      '- ANSWER: <complete final answer> — you already know the full answer (a question, a lookup, something you ' +
-      'just verified) and no project change is needed at all. No further frame ever spawns.\n' +
-      '- TRIVIAL: <what you did, or will do> — genuinely 1-2 iterations of work (a one-character typo, a single ' +
-      'obvious constant, a one-line change you can name without reading anything else first). You MAY fix it ' +
-      'yourself right now, within your small budget above, before answering — a fresh Tester will independently ' +
-      'verify whatever you did before this returns to the user, so you are never the only check on your own work. ' +
-      'If you are not confident it is genuinely this small, do NOT attempt it — classify SIMPLE instead and let ' +
-      'the Implementer do it.\n' +
-      '- SIMPLE: <concrete, verifiable objective> — a single well-scoped change, even if it takes real effort to ' +
-      'diagnose or isn\'t trivial to write (a bug in one file, a fix to one function) — but still ONE piece of ' +
-      'work. Do NOT attempt this yourself, no matter how tempting. This delegates straight to one Implementer, ' +
-      'independently verified by a Tester — no Planner ceremony.\n' +
-      '- OBJECTIVE: <concrete, verifiable objective> — you anticipate this needs MULTIPLE distinct pieces of work ' +
-      '(several files, several unrelated concerns, or genuine ambiguity about the approach) — the only case that ' +
-      'goes to the Planner for real decomposition. Never "NONE" or "no objective" here, regardless of how simple ' +
-      'the request is or whether it involves this project at all.',
+    assignment: buildTaskStartAssignment(userMessage, config.verbatimRequest),
   }
-  const before = await gitStatusShort(root())
-  const { agent, result } = await spawnFrame(req, emit)
-  let finalResult = result
+  // TASK_START_TOOLS (frames.ts), not ROLE_TOOLS.boss — this checkpoint is read-only
+  // classification, see that constant's comment for why and the incident that forced it.
+  const { agent, result } = await spawnFrame(req, emit, TASK_START_TOOLS)
   let verdict = parseTaskStartVerdict(result.summary)
 
   // Retry once, only when the frame actually concluded on its own (a frame that stalled
@@ -497,9 +512,9 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
     if (config.schemaControlPlane) {
       // Replaces the resumeFrame retry entirely (see the module-header comment on the
       // import above): a single bounded, schema-constrained restatement of the SAME
-      // final answer, no extra frame turn, no tools, think:false. finalResult/the ledger
-      // conclusion are deliberately left untouched — nothing about the frame's own run
-      // changes, only how the harness reads what it already said.
+      // final answer, no extra frame turn, no tools, think:false. The ledger conclusion
+      // is deliberately left untouched — nothing about the frame's own run changes,
+      // only how the harness reads what it already said.
       const extracted = await extractTaskStart(effectiveModel(), result.summary)
       if (extracted) {
         verdict = { mode: extracted.mode, text: extracted.text, parsed: true }
@@ -512,48 +527,18 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
     } else {
       const retry = await resumeFrame(result.frameId, agent, TASK_START_MARKER_RETRY_NUDGE)
       const retryVerdict = parseTaskStartVerdict(retry.summary)
-      if (retryVerdict.parsed) {
-        verdict = retryVerdict
-        finalResult = retry
-      }
+      if (retryVerdict.parsed) verdict = retryVerdict
     }
   }
 
-  // Snapshot AFTER any retry above — a retry turn can in principle also call a tool,
-  // so the dirty-check below must reflect everything the frame actually did, not just
-  // its first pass.
-  const after = await gitStatusShort(root())
-  // Terminal state, not an iteration-count comparison (H13/H14): a frame that stalled at
-  // its cap OR ended in an error mid-attempt is "incomplete" for the routing decision
-  // below, and a resumed frame's cumulative counter can no longer stand in for either.
-  const hitCap = agent.hitIterationCap() || agent.getLastRunOutcome() === 'error'
+  // The harness-level 'preempted'/'preempted-incomplete' override that used to live
+  // here (a before/after git-status diff, routing around a workspace change the Boss
+  // made itself) is gone along with the Boss's ability to make one during this
+  // checkpoint — see frames.ts's TASK_START_TOOLS. Fails open to 'objective' (the
+  // safest, most-capable path) exactly as TaskStartVerdict's own parse does when
+  // nothing was parseable.
   const base = verdict.parsed ? verdict : { mode: 'objective' as const, text: userMessage }
-  const dirty = after !== before && after.trim() !== ''
-
-  // HARNESS-LEVEL OVERRIDE, not a text convention the model can express: a git-status
-  // diff is unambiguous and needs no model cooperation, unlike trusting whatever the
-  // Boss's own wording claims. Three distinct outcomes once we know the workspace
-  // changed: the attempt looks complete and SMALL (didn't exhaust its tiny budget, and
-  // the diff is genuinely tiny) — verify it independently and move on; it ran out of
-  // budget mid-attempt, OR it claims completion but the diff is suspiciously large for
-  // something classified TRIVIAL (a real observed failure: a full heredoc file rewrite
-  // that hallucinated most of the file and broke an unrelated constructor signature) —
-  // either way, don't gamble on it, hand it to a real Implementer with the attempt as
-  // context and an explicit instruction to critically review (and revert, if it isn't
-  // actually minimal/correct) rather than build on top of a hasty rewrite.
-  if (dirty) {
-    const changedLines = await gitDiffLineCount(root())
-    const suspiciouslyLarge = changedLines > TRIVIAL_DIFF_LINE_LIMIT
-    return {
-      mode: (hitCap || suspiciouslyLarge) ? 'preempted-incomplete' : 'preempted',
-      text: base.text,
-      frameId: finalResult.frameId,
-      agent,
-    }
-  }
-  // Built explicitly rather than by spreading `base` — TaskStartVerdict now carries a
-  // `parsed` flag that RoutedTaskStart has no business holding.
-  return { mode: base.mode, text: base.text, frameId: finalResult.frameId, agent }
+  return { mode: base.mode, text: base.text }
 }
 
 interface BossOutcome {
@@ -871,6 +856,52 @@ const PLANNER_FORMAT_INSTRUCTION =
   '{"steps": [{"role": "implementer"|"tester", "prompt": "...", "dependsOn": ["s1", ...], "frameGroup": "optional", ' +
   '"skipTest": false}]}. Reference earlier steps in dependsOn by their 1-based position (s1, s2, ...).'
 
+// The Planner's initial-plan assignment. Owner-drafted structure (2026-09-05),
+// replacing a single opaque line (`Objective: ${objective}\nProduce a task graph for
+// this objective. ${PLANNER_FORMAT_INSTRUCTION}`) that said nothing about what the
+// Planner is, what it can do, or what its output must look like. `<argo-objective>`
+// tags mirror the same unmistakable-boundary convention as the task-start
+// checkpoint's `<argo-user-prompt>` tags (buildTaskStartAssignment, above) — pure and
+// exported so this exact text is directly testable without spawning a real frame.
+export function buildPlannerAssignment(objective: string): string {
+  return (
+    `<argo-objective>\n${objective}\n</argo-objective>\n\n` +
+    'The project is READ-ONLY: you are tasked with creating the plan to address the above objective, ' +
+    'so nothing can be modified. Read files as needed to understand the codebase.\n\n' +
+    'Produce a task graph: an ordered list of agents (implementer or tester), each with a focused ' +
+    'sub-objective, and their dependency order. A step\'s sub-objective must be self-contained — the ' +
+    'agent receiving it will not see the full plan, only its own assignment and the conclusions of ' +
+    'its dependencies.\n\n' +
+    'If the work is too large to fully predict, plan only the part you can and include a final ' +
+    'step that requests a re-planning round. On a re-plan you will be resumed with what each ' +
+    `agent produced.\n\n${PLANNER_FORMAT_INSTRUCTION}`
+  )
+}
+
+// The Planner's replan assignment — same structure as buildPlannerAssignment (the
+// objective tag, the READ-ONLY statement, the format instruction) plus what changed
+// since the last plan (the reason replan() was called: a step's failure, a Boss
+// escalation, an empty ready-set, ...) and the REMAINING-work-only framing, so a
+// replan never re-litigates work that already succeeded. Used identically whether
+// this resumes an EXISTING Planner frame or spawns a fresh one (a TRIVIAL/SIMPLE
+// start that never spawned a Planner needing its first replan) — the objective tag
+// means neither path needs a separate "restate the objective" prefix.
+export function buildReplanAssignment(objective: string, reason: string): string {
+  return (
+    `<argo-objective>\n${objective}\n</argo-objective>\n\n` +
+    'The project is READ-ONLY: you are tasked with revising the plan to address the above objective, ' +
+    'so nothing can be modified. Read files as needed to understand the codebase.\n\n' +
+    `REPLANNING ROUND. What happened since the last plan: ${reason}\n\n` +
+    'Produce a revised task graph for the objective\'s REMAINING work only (do not redo what already ' +
+    'succeeded): an ordered list of agents (implementer or tester), each with a focused sub-objective, ' +
+    'and their dependency order. A step\'s sub-objective must be self-contained — the agent receiving ' +
+    'it will not see the full plan, only its own assignment and the conclusions of its dependencies.\n\n' +
+    'If the work is too large to fully predict, plan only the part you can and include a final step ' +
+    'that requests a re-planning round. On a re-plan you will be resumed with what each agent ' +
+    `produced.\n\n${PLANNER_FORMAT_INSTRUCTION}`
+  )
+}
+
 export async function runDispatchLoop(
   userMessage: string,
   rawEmit: Emit,
@@ -969,8 +1000,8 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
 
   // plannerFrame stays null until/unless something actually goes wrong (replan()
   // below spawns one lazily at that point) for every mode except 'objective' — the
-  // whole point of TRIVIAL/SIMPLE/preempted is skipping Tiphys's ceremony for work
-  // that isn't anticipated to need MULTIPLE distinct pieces.
+  // whole point of TRIVIAL/SIMPLE is skipping Tiphys's ceremony for work that isn't
+  // anticipated to need MULTIPLE distinct pieces.
   let plannerFrame: SpawnedFrame | null = null
   // Whichever frame's Agent instance most recently did real work — reused purely as
   // the vehicle for the end-of-run autoCommit (it only needs git + a model, not a
@@ -982,48 +1013,7 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
   const stepFrameId = new Map<string, string>()
 
   if (taskStart.mode === 'trivial' || taskStart.mode === 'simple') {
-    // Both delegate to exactly one Implementer, always followed by a Tester pass
-    // (no skipTest here — "at least two independent frames" is the floor, not
-    // something a task-start classification alone should be able to waive; only
-    // Tiphys's own per-step OBJECTIVE-graph decisions use skipTest, see tasks.ts).
-    graph = createTaskGraph(objective, [{ role: 'implementer', prompt: objective, dependsOn: [] }])
-  } else if (taskStart.mode === 'preempted-incomplete') {
-    // The Boss attempted a TRIVIAL fix itself but either ran out of its small
-    // task-start budget mid-attempt, or produced a suspiciously large diff for
-    // something it judged trivial (see runBossTaskStart's TRIVIAL_DIFF_LINE_LIMIT —
-    // the Boss's only editing tool is bash, so its "fix" may be a full heredoc file
-    // rewrite, an inherently blunt instrument prone to hallucinating large parts of
-    // a file it never needed to touch). Hand it to a REAL Implementer with an
-    // explicit instruction to CRITICALLY review — not just build on top of — what
-    // was done. Goes through the normal Implementer+Tester path below like any
-    // other single-step task.
-    graph = createTaskGraph(objective, [{
-      role: 'implementer',
-      prompt: `${objective}\n\nA PREVIOUS ATTEMPT (by the task-start classifier, under a small iteration budget, ` +
-        'with only bash available — no precise file-editing tool) got partway through, or produced a change too ' +
-        `large to trust unreviewed. What it attempted: ${taskStart.text}\n` +
-        'First, examine the CURRENT diff against the actual objective above: if it looks like a careful, correct, ' +
-        'minimal change, finish whatever is left. If it looks like an unwarranted full-file rewrite, unrelated ' +
-        'code hallucinated in, or a broken API other files depend on, REVERT it (e.g. `git checkout -- <file>`) ' +
-        'and implement the objective cleanly yourself instead of building on top of a hasty rewrite.',
-      dependsOn: [],
-    }])
-  } else if (taskStart.mode === 'preempted') {
-    // The Boss already made (and, within its own small budget, apparently
-    // completed) the change during task-start — detected via a workspace diff, see
-    // runBossTaskStart. No Implementer frame spawns, but this still gets a genuine,
-    // independent Tester pass before being marked done — never just Jason grading
-    // his own work as the only check (the whole point of keeping >=2 frames
-    // involved even on the fastest path).
-    graph = createTaskGraph(objective, [{ role: 'implementer', prompt: objective, dependsOn: [] }])
-    const preemptedFrame: SpawnedFrame = {
-      agent: taskStart.agent,
-      result: { frameId: taskStart.frameId, status: 'success', summary: taskStart.text, filesTouched: [], filesWritten: [] },
-    }
-    const verified = await runTesterRounds(preemptedFrame, objective, emit)
-    stepFrameId.set(graph.steps[0].id, verified.result.frameId)
-    doneStepIds.add(graph.steps[0].id)
-    commitAgent = verified.agent
+    graph = buildTaskStartGraph(objective, taskStart.mode)
   } else {
     // Held in a local const as well as in plannerFrame: graphFromPlanner may resume the
     // frame, and the local keeps the non-null Agent reference obvious without depending on
@@ -1032,7 +1022,7 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
       {
         role: 'planner',
         parentFrameId: null,
-        assignment: `Objective: ${objective}\nProduce a task graph for this objective. ${PLANNER_FORMAT_INSTRUCTION}`,
+        assignment: buildPlannerAssignment(objective),
       },
       emit,
     )
@@ -1053,9 +1043,7 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
   async function replan(reason: string): Promise<void> {
     replanRounds++
     emit({ type: 'replan', reason })
-    const followUp =
-      `REPLANNING ROUND.\n${reason}\nProduce a revised task graph for the objective's REMAINING work only ` +
-      `(do not redo what already succeeded). ${PLANNER_FORMAT_INSTRUCTION}`
+    const followUp = buildReplanAssignment(objective, reason)
     let result: FrameResult
     if (plannerFrame) {
       result = await resumeFrame(plannerFrame.result.frameId, plannerFrame.agent, followUp)
@@ -1063,9 +1051,11 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
     } else {
       // A TRIVIAL start never spawned a Planner — this is the first time one is
       // actually needed, so spawn it fresh rather than resuming a frame that never
-      // existed.
+      // existed. buildReplanAssignment already carries the objective (its own
+      // <argo-objective> tag), so unlike before, this needs no separate prefix —
+      // the fresh-spawn and resume branches now send the IDENTICAL text.
       plannerFrame = await spawnFrame(
-        { role: 'planner', parentFrameId: null, assignment: `Objective: ${objective}\n${followUp}` },
+        { role: 'planner', parentFrameId: null, assignment: followUp },
         emit,
       )
       result = plannerFrame.result
@@ -1161,16 +1151,24 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
         .filter((x): x is string => !!x)
       const combinedPrompt = steps.map(s => s.prompt).join('\n\n---\n\n')
 
+      // Seed the Implementer's plan with its own assignment (TRIVIAL/SIMPLE's top-
+      // level objective, or a Planner step's sub-objective — combinedPrompt is
+      // exactly that in every mode this loop handles) so it can write from its FIRST
+      // iteration, never forced through update_plan just to restate what it was
+      // already told. Tester never gets this — it holds no write_file/edit_file, so
+      // the plan/act gate can never trip for it regardless.
       let frame = await spawnFrame(
         { role, parentFrameId: plannerFrame?.result.frameId ?? null, assignment: combinedPrompt, dependsOn: depFrameIds },
         emit,
+        undefined,
+        role === 'implementer' ? combinedPrompt : undefined,
       )
       commitAgent = frame.agent
 
-      // skipTest is now ONLY a per-step decision Tiphys makes for a Planner-produced
-      // OBJECTIVE graph (tasks.ts) — task-start's own trivial/simple/preempted paths
-      // never set it, since "at least two independent frames" is a floor those paths
-      // don't get to waive on their own.
+      // skipTest is set by Tiphys per-step for a Planner-produced OBJECTIVE graph
+      // (tasks.ts), and by task-start's own TRIVIAL classification (runBossTaskStart,
+      // above) for its one-step graph — SIMPLE and every Planner step default to
+      // false (a real Tester pass) unless explicitly waived.
       if (role === 'implementer' && !steps[0].skipTest) {
         frame = await runTesterRounds(frame, combinedPrompt, emit)
       }
@@ -1224,7 +1222,16 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
       for (const steps of groups.values()) {
         const role = steps[0].role
         const combinedPrompt = steps.map(s => s.prompt).join('\n\n---\n\n')
-        const frame = await spawnFrame({ role, parentFrameId: plannerFrame?.result.frameId ?? null, assignment: combinedPrompt }, emit)
+        // Same seed as the main step-execution loop above — this is the SAME kind of
+        // step-execution spawn (post-replan remaining work after a Boss final-
+        // verification escalation), so an Implementer here must not hit the plan/act
+        // gate either.
+        const frame = await spawnFrame(
+          { role, parentFrameId: plannerFrame?.result.frameId ?? null, assignment: combinedPrompt },
+          emit,
+          undefined,
+          role === 'implementer' ? combinedPrompt : undefined,
+        )
         commitAgent = frame.agent
         for (const s of steps) { stepFrameId.set(s.id, frame.result.frameId); doneStepIds.add(s.id) }
       }

@@ -28,12 +28,44 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
   // gate then refused to let the frame conclude, so the graph was never delivered. The
   // 6 Planner frames that never called it concluded in two messages.
   planner: ['read_file', 'web_search', 'fetch_url', 'ledger'],
-  implementer: ['read_file', 'write_file', 'edit_file', 'bash', 'fetch_url', 'web_search', 'browser_fetch', 'ledger', 'update_plan'],
+  // Deliberately NO update_plan (removed 2026-09-05, alongside the Planner's own
+  // removal above). dispatch.ts's spawnFrame now calls Agent.seedPlan with this
+  // frame's own assignment (the TRIVIAL/SIMPLE objective, or a Planner step's own
+  // sub-objective) before chat() ever runs, so the plan/act gate is already
+  // satisfied on the Implementer's very first turn — a real session had it call
+  // update_plan 8 times with byte-identical content, 7 no-op revisions that read as
+  // pure log noise. The harness owns the plan; the Implementer's job is to execute
+  // it, not define or refine it (see agent.ts's canUpdatePlan/buildSystemPrompt).
+  implementer: ['read_file', 'write_file', 'edit_file', 'bash', 'fetch_url', 'web_search', 'browser_fetch', 'ledger'],
   // Deliberately no write_file/edit_file — Tester directs fixes, never makes them.
   tester: ['read_file', 'bash', 'ledger'],
   // Deliberately no write_file/edit_file — the Boss verifies, it never fixes.
   boss: ['read_file', 'bash', 'web_search', 'fetch_url', 'ledger'],
 }
+
+// The task-start checkpoint's tool set (dispatch.ts's runBossTaskStart) — deliberately
+// NOT ROLE_TOOLS.boss. The owner asked classification to be STRICTLY read-only
+// (2026-09-05): ROLE_TOOLS.boss's only real editing path was `bash` (no write_file/
+// edit_file there either) — its one way to "fix" something was a full heredoc file
+// rewrite, an inherently blunt, all-or-nothing instrument. Measured damage from
+// exactly that: in eval, a Boss judged a 6-method feature TRIVIAL, rewrote the whole
+// target file via `cat > file << EOF`, hallucinated surrounding code, and broke an
+// unrelated constructor signature other files depended on; the same failure recurred
+// in a real session (frame boss-mtmm1gcc-1: refused write_file, then ran the same
+// heredoc trick via bash on its very next turn and committed). Removing `bash` here
+// removes the capability at its root, so the git-diff-sizing guard rails that used to
+// contain it (TRIVIAL_DIFF_LINE_LIMIT, the before/after dirty check in
+// runBossTaskStart) are removed alongside it, not left behind as dead code for a
+// capability that no longer exists.
+// `ledger` stays: the TOOL only exposes read actions (get_goal/get_plan/get_recent/
+// get_conclusion/get_frame_trail/expand — see tools/index.ts's ledger case); the
+// harness's OWN ledger.setObjective/setPlan/recordDelegation calls are direct module
+// calls from dispatch.ts, never reachable through this tool, so including it does not
+// reopen a write path. `read_file` covers investigation (it gained a `pattern` search
+// param plus offset/limit line paging — 8656de9, fa5b497 — specifically so a role
+// without bash can still find a symbol); `web_search`/`fetch_url` cover the
+// checkpoint's own "ground it" instruction.
+export const TASK_START_TOOLS: ToolName[] = ['read_file', 'web_search', 'fetch_url', 'ledger']
 
 // Per-role iteration budgets. Implementer keeps the most headroom (real work happens
 // there); Planner/Tester/Boss are short bounded loops, not open-ended. Planner raised
@@ -137,9 +169,9 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'prompt, and any dependsOn relationships on earlier steps. You may read files and search the web, but you never ' +
     'write or edit anything — you reason about the plan, you don\'t produce artifacts. If several steps would ' +
     'otherwise duplicate the same investigation, schedule a dedicated early step to produce that shared context ' +
-    'instead of investigating it yourself. If the task is too large to fully predict, plan only the part you can, ' +
-    'say so explicitly, and expect to be resumed later with what happened so far. You never redefine the objective ' +
-    'itself — only the Boss does that, and only as a deliberate, rare act. ' +
+    'instead of investigating it yourself. If the task is too large to fully predict, plan only the part you can ' +
+    'and include a final step that requests a re-planning round — you will be resumed later with what each agent ' +
+    'produced. You never redefine the objective itself — only the Boss does that, and only as a deliberate, rare act. ' +
     'Isolating a step into its own frame costs a fresh context and its own overhead — only worth paying when that ' +
     'step\'s own work would otherwise run about 20-40+ iterations, or when it must not share context/mutations with ' +
     'unrelated work. Small or tightly-related steps (quick edits, steps that touch the same files or the same piece ' +

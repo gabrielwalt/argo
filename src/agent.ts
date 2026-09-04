@@ -64,21 +64,37 @@ import { recordEpisode, markEpisodeEvicted, newId as newLedgerId } from './ledge
 // the HARNESS (a better tool with real feedback, a loop steer, a guard) over
 // adding a line here — e.g. the edit_file tool replaced a prompt rule about not
 // reusing a stale remembered block; the harness now makes that failure impossible.
-const SYSTEM_PROMPT = `You are the coding agent inside Argo, a local-first coding harness. Your project is mounted at /workspace in an isolated Ubuntu Docker container (the host is not accessible). Your thoughts, tool calls, and results stream live to the user, and changes under /workspace are committed to git when auto-commit is enabled.
+// hasUpdatePlan (2026-09-05): true only for the baseline single-loop agent
+// (allowedTools null — no per-role restriction, nothing else ever seeds its plan,
+// so update_plan is its only path to satisfy the plan/act gate at all) and any
+// future role whose ROLE_TOOLS entry still lists the tool — currently none. False
+// for every multi-agent frame (dispatch.ts's seedPlan runs before chat() for the
+// only role that used to hold it, the Implementer — see frames.ts's ROLE_TOOLS and
+// Agent.canUpdatePlan). Teaching a role a tool it does not have would tell it to do
+// something that then gets rejected as "not available in this role" on its very
+// first attempt — the same class of contradiction fixed for the Boss task-start
+// checkpoint (frames.ts, dispatch.ts) earlier in this project.
+function buildSystemPrompt(hasUpdatePlan: boolean): string {
+  return `You are the coding agent inside Argo, a local-first coding harness. Your project is mounted at /workspace in an isolated Ubuntu Docker container (the host is not accessible). Your thoughts, tool calls, and results stream live to the user, and changes under /workspace are committed to git when auto-commit is enabled.
 
 TOOLS — invoke them through the function-calling API; never write a tool call as text, JSON, or XML in your reply.
 - bash: run shell commands. Pass the working directory via the cwd argument (e.g. /workspace); do not prefix with "cd /workspace &&".
 - read_file / write_file: whole-file I/O at any absolute path.
 - edit_file: replace an exact string in a file; it reports the changed lines and errors if the text is missing or matches more than once.
-- update_plan: record or refine your plan (a concrete objective plus steps). It is a tool call, so it does not end your turn.
-- fetch_url / browser_fetch: fetch a page (browser_fetch runs JavaScript). web_search: look up things you do not already know.
+${hasUpdatePlan ? '- update_plan: record or refine your plan (a concrete objective plus steps). It is a tool call, so it does not end your turn.\n' : ''}- fetch_url / browser_fetch: fetch a page (browser_fetch runs JavaScript). web_search: look up things you do not already know.
 When the task is complete, give your final answer and stop.
+
+A turn where you make no tool calls is how you signal completion — the harness treats your text as the final answer and ends the session. There is no "finish" or "done" tool to call.
 
 HOW TO WORK
 - A simple question or a one-line change: answer or do it directly — no plan needed.
-- Non-trivial work: read the relevant files first, then call update_plan with ONE concrete, verifiable objective — exactly what the user asked for, never a broader or more interesting goal — plus the steps to reach it, and carry it out. You cannot modify files under /workspace until a plan is recorded.
+${hasUpdatePlan
+    ? '- Non-trivial work: read the relevant files first, then call update_plan with ONE concrete, verifiable objective — exactly what the user asked for, never a broader or more interesting goal — plus the steps to reach it, and carry it out. You cannot modify files under /workspace until a plan is recorded.'
+    : '- Your plan is set by the harness before you start — your job is to execute it, not to define or refine it. Read the relevant files first, then carry out the objective.'}
 - Weigh the request against the project before you plan: if it is unclear, or looks mistaken or counter-productive in this project's context, ask one concise question or say what seems off — do not blindly execute something that does not make sense. Otherwise proceed.
-- Stay on the plan. Call update_plan again only when the work contradicts one of its assumptions. Rewriting the same thing many different ways with nothing forcing it is drift — stop and return to the plan.
+${hasUpdatePlan
+    ? '- Stay on the plan. Call update_plan again only when the work contradicts one of its assumptions. Rewriting the same thing many different ways with nothing forcing it is drift — stop and return to the plan.'
+    : '- Stay on this objective; do not drift to a different goal. If it cannot be met as scoped, say so explicitly in your final answer rather than grinding indefinitely — state what you tried, what failed, and why.'}
 - For repetitive work (many files or pages), write one script instead of repeating a tool call.
 - Before finishing, verify the objective against the original request — run the relevant command or test — then give your final answer.
 
@@ -95,6 +111,7 @@ MEMORY
 
 ENVIRONMENT
 - Ubuntu 24.04. CLI includes bash, git, jq, node, python3, rg, fd, sqlite3, curl. In Node use require() (NODE_PATH is set), not import; native fetch() is available; cheerio and playwright are preinstalled.`
+}
 
 // Parses tool calls that a model wrote as JSON code blocks in its text content
 // instead of using the native tool-calling API (common with smaller models).
@@ -211,10 +228,14 @@ export function repetitionKey(name: string, args: Record<string, unknown>): stri
 // A "project mutation" is an edit_file/write_file targeting the git-tracked
 // workspace (scratch writes elsewhere don't count). The plan/act gate in chat()
 // uses this to enforce plan-before-act: the model may investigate (read/grep)
-// freely, but cannot change the project until it has recorded a plan via
-// update_plan — separating "figure out what to do" from "do it" as a state with
-// different rules, gated by *about to mutate the project* rather than a task
-// classifier, so read-only runs and plain questions never trigger planning.
+// freely, but cannot change the project until a plan exists — either recorded by
+// the model itself via update_plan (the baseline single-loop agent, which has no
+// other path to one) or pre-seeded by the harness before chat() ever runs (every
+// multi-agent Implementer frame — dispatch.ts's seedPlan; that role no longer
+// holds update_plan at all, see frames.ts's ROLE_TOOLS) — separating "figure out
+// what to do" from "do it" as a state with different rules, gated by *about to
+// mutate the project* rather than a task classifier, so read-only runs and plain
+// questions never trigger planning.
 export function isProjectMutation(name: string, args: Record<string, unknown>): boolean {
   if (name !== 'edit_file' && name !== 'write_file') return false
   const p = typeof args.path === 'string' ? args.path : ''
@@ -363,6 +384,14 @@ export class Agent {
   // and finishes immediately — the re-grounding done-gate only fires when a plan
   // exists, which is what keeps simple Q&A fast.
   private currentPlan: { objective: string; steps: string[]; revision: number } | null = null
+  // Set by seedPlan(), consumed by chat()'s run-start reset (immediately after it
+  // sets `this.currentPlan = null`) and cleared right after — see seedPlan's own
+  // comment for why this indirection exists instead of seedPlan setting
+  // currentPlan directly (that reset used to run AFTER seedPlan and silently wipe
+  // it before the tool loop ever saw it). null on a resumed turn too: the reset
+  // block that applies it only runs in the fresh-run branch, so a resumed frame
+  // (which never re-seeds) can never accidentally re-apply a stale seed.
+  private pendingSeed: string | null = null
   // HARNESS TASK LEDGER (ARGO_TASKS / this.tasks). Built from the LLM's plan in
   // handleUpdatePlan (createTaskList) and reconciled on a re-plan; the harness drives
   // it ONE task at a time (recite → verify → summary → advance). null until the first
@@ -598,6 +627,64 @@ export class Agent {
 
   setFrameId(id: string | null) {
     this.frameId = id
+  }
+
+  // MULTI-AGENT ARCHITECTURE (config.agents, dispatch.ts). Seeds a plan for a frame
+  // that ALREADY has a concrete objective before its first turn: dispatch.ts calls
+  // this on every Implementer frame before chat() runs, with the top-level objective
+  // for a TRIVIAL/SIMPLE task or a Planner step's own sub-objective for an OBJECTIVE
+  // task. Forcing that same frame to restate its own assignment back through
+  // update_plan just to satisfy the plan/act gate below is exactly the per-agent
+  // busywork the gate was never meant to impose — a plan is an orchestration
+  // artefact for decomposition ACROSS agents, not something every Implementer must
+  // perform on itself before it can write.
+  //
+  // BUG FIX (2026-09-05, found via the seedPlan visibility test failing: expected 0
+  // gate rejections, got 1): this used to set this.currentPlan DIRECTLY, right here,
+  // at spawn time — but chat()'s own run-start reset (the fresh-run branch) then
+  // unconditionally set this.currentPlan = null AFTER seedPlan ran and BEFORE the
+  // tool loop ever saw it, silently wiping the seed before it took effect. Setting
+  // this.pendingSeed instead defers the actual assignment to chat() itself,
+  // immediately after that same reset line (see its own comment there) — the seed
+  // now survives the reset because it's applied AFTER it, not before. pendingSeed is
+  // cleared the instant it's applied, so it can never leak into a resumed turn
+  // (which takes the OTHER branch of that same reset and never touches it).
+  //
+  // The plan/act gate itself (isProjectMutation && !this.currentPlan, below) is
+  // UNCHANGED: this only ensures a SEEDED frame never reaches it with a null plan.
+  // Any future caller that does NOT seed a plan hits the exact same gate as always —
+  // it remains the safety net, not something this makes conditional.
+  //
+  // Deliberately does NOT touch this.taskList: an empty explicit step list wouldn't
+  // meaningfully engage the per-task ledger gate anyway (every this.taskList check
+  // site guards on `.tasks.length > 0`, and createTaskList(objective, []) is
+  // vacuously "all done"), and this is a SEED, not a plan the model actually
+  // composed. One real, accepted consequence: the harness's one-time "ALL PLANNED
+  // TASKS ARE DONE" final-reconciliation nudge (chat(), guarded on `this.taskList`
+  // being non-null) will not fire for a seeded frame — reported in
+  // BOSS-READONLY.md rather than silently accepted. (2026-09-05 update: this is now
+  // permanent for the Implementer, not just "unless it calls update_plan later" —
+  // that role no longer holds the tool at all, see canUpdatePlan() below.)
+  seedPlan(objective: string) {
+    this.pendingSeed = objective
+  }
+
+  // UPDATE_PLAN REMOVED AS A CALLABLE TOOL FOR MULTI-AGENT ROLES (2026-09-05). With
+  // seedPlan always called before chat() for every Implementer frame (the only role
+  // that ever held update_plan — frames.ts's ROLE_TOOLS), no multi-agent agent ever
+  // needs to set or refine its own plan; a real session had the Implementer call it
+  // 8 times with identical content, producing 7 no-op revisions that read as log
+  // noise (see handleUpdatePlan's own no-op-suppression comment). The BASELINE
+  // single-loop agent (config.agents off — allowedTools stays null, no per-role
+  // restriction) is the one exception: nothing seeds ITS plan, so update_plan is
+  // still its only path to satisfy the plan/act gate at all — removing it there
+  // would permanently block every write in Argo's default, non-multi-agent mode.
+  // This predicate is the ONE place that distinction is made; every update_plan-
+  // referencing string in this file branches on it instead of assuming either
+  // universally. True for the baseline (`allowedTools === null`) and for any future
+  // role whose ROLE_TOOLS entry still lists it — currently none.
+  private canUpdatePlan(): boolean {
+    return this.allowedTools === null || this.allowedTools.includes('update_plan')
   }
 
   // MULTI-AGENT ARCHITECTURE (config.agents): appended after the baseline SYSTEM_PROMPT
@@ -1111,7 +1198,15 @@ export class Agent {
     const steps = plan.steps.length
       ? `\nSteps:\n${plan.steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}`
       : ''
-    return `[CURRENT PLAN — keep working toward this objective; do not drift onto a broader or different goal]\nObjective: ${plan.objective}${steps}\nRefine it with update_plan only if the work contradicts an assumption; finish only once the objective is verifiably met.`
+    // 2026-09-05: the closing instruction used to say "Refine it with update_plan
+    // only if the work contradicts an assumption" — a real instruction for the
+    // baseline agent, a reference to a tool that does not exist for a seeded
+    // multi-agent Implementer (canUpdatePlan() false — frames.ts's ROLE_TOOLS no
+    // longer lists it there). Branches the same way buildSystemPrompt does.
+    const closing = this.canUpdatePlan()
+      ? 'Refine it with update_plan only if the work contradicts an assumption; finish only once the objective is verifiably met.'
+      : 'Stay on this objective; do not drift to a different goal. If it cannot be met as scoped, say so explicitly in your final answer rather than grinding indefinitely — state what you tried, what failed, and why. Finish only once the objective is verifiably met.'
+    return `[CURRENT PLAN — keep working toward this objective; do not drift onto a broader or different goal]\nObjective: ${plan.objective}${steps}\n${closing}`
   }
 
   // Re-anchor text for the loop-recovery steer (this.loop): the same objective/plan
@@ -1191,6 +1286,25 @@ export class Agent {
       .filter(Boolean)
     if (!objective) {
       return 'update_plan needs an "objective": one concrete, verifiable success criterion. Nothing was recorded — call it again with an objective.'
+    }
+    // NO-OP SUPPRESSION (2026-09-05): a real session had the Implementer call
+    // update_plan 8 times with byte-for-byte the same objective/steps — 7 of those
+    // bumped the revision and emitted a 'plan' event for literally nothing, and the
+    // resulting log noise led the owner to suspect the TESTER was causing them.
+    // Compared with normalised (trim + collapse-internal-whitespace) equality only —
+    // deliberately NOT a fuzzy/prefix match: this is "nothing changed at all", not
+    // "close enough" — and deliberately position-sensitive on steps (a reorder IS a
+    // real change worth a revision). this.currentPlan is null only before the FIRST
+    // ever update_plan call, which can never be a no-op by definition.
+    if (this.currentPlan) {
+      const normalize = (s: string) => s.trim().replace(/\s+/g, ' ')
+      const current = this.currentPlan
+      const sameObjective = normalize(current.objective) === normalize(objective)
+      const sameSteps = current.steps.length === steps.length
+        && current.steps.every((s, i) => normalize(s) === normalize(steps[i]))
+      if (sameObjective && sameSteps) {
+        return 'Plan unchanged — no revision needed.'
+      }
     }
     const revision = (this.currentPlan?.revision ?? 0) + 1
     this.currentPlan = { objective, steps, revision }
@@ -1475,6 +1589,18 @@ export class Agent {
       this.loopSteerEscalated = false
       this.ollamaRetryCount = 0
       this.currentPlan = null
+      // Apply a plan seeded via seedPlan() (dispatch.ts, before chat() was called)
+      // — MUST run after the reset directly above, not before: this reset used to
+      // run unconditionally on every fresh run and silently wiped a seed set the
+      // moment before chat() was invoked, so the plan/act gate still saw
+      // !this.currentPlan on the frame's very first tool call. Applying it here,
+      // immediately after, is what makes the seed actually survive. Cleared right
+      // after so a SECOND chat() call on this same Agent (a resumed frame — the
+      // OTHER branch of this if/else, never reached from here) can never replay it.
+      if (this.pendingSeed !== null) {
+        this.currentPlan = { objective: this.pendingSeed.trim(), steps: [], revision: 0 }
+        this.pendingSeed = null
+      }
       // HARNESS TASK LEDGER + MEMORY per-run state (only used when this.tasks/this.memory
       // are on; resetting them unconditionally is a harmless local write for the baseline).
       this.taskList = null
@@ -1512,7 +1638,8 @@ export class Agent {
     const projectContext = this.memory
       ? await this.buildProjectMemoryContext(userMessage)
       : await loadProjectContext()
-    const baseSystemPrompt = this.roleInstructions ? `${SYSTEM_PROMPT}\n\n${this.roleInstructions}` : SYSTEM_PROMPT
+    const rolePrompt = buildSystemPrompt(this.canUpdatePlan())
+    const baseSystemPrompt = this.roleInstructions ? `${rolePrompt}\n\n${this.roleInstructions}` : rolePrompt
     const systemPrompt = projectContext ? `${baseSystemPrompt}\n\n${projectContext}` : baseSystemPrompt
 
     // Stall/progress-check iteration numbers for THIS run, scaled to THIS run's own
@@ -1576,21 +1703,17 @@ export class Agent {
           if (mutationsSinceLastCheck === 0) {
             const activePlan = this.currentPlan as { objective: string } | null
             const objective = activePlan?.objective || userMessage
-            // Boss/Tester (multi-agent roles) don't have update_plan in their
-            // restricted tool set — telling them to call it would be nonsensical.
-            // `allowedTools` is null for the baseline's own unrestricted loop, which
-            // always has update_plan, so the richer wording is the right default.
-            // Requiring write_file TOO (not just update_plan's presence) is deliberate:
-            // Tiphys (the Planner role) has update_plan in ITS tool set as well, but
-            // its own job is to emit a JSON task graph as its final TEXT ANSWER, not
-            // to call update_plan — that tool is the baseline/Implementer's own
-            // internal task-ledger mechanism, unrelated to the multi-agent TaskGraph.
-            // Telling a stalled Planner to "call update_plan" was a real observed
-            // failure: it just made the Planner MORE confused about what action to
-            // take, not less, while it burned its whole budget without ever emitting
-            // the JSON block dispatch.ts actually needs.
-            const hasUpdatePlan = this.allowedTools === null ||
-              (this.allowedTools.includes('update_plan') && this.allowedTools.includes('write_file'))
+            // Telling a role without update_plan to call it was a real observed
+            // failure (a stalled Planner just got MORE confused, burning its whole
+            // budget without ever emitting the JSON block dispatch.ts needed) — this
+            // used to need an extra write_file check to also exclude the Planner
+            // specifically, back when ROLE_TOOLS.planner still held update_plan
+            // itself (removed 2026-09-04) despite never calling it for this purpose.
+            // canUpdatePlan() (2026-09-05) now centralises the same distinction for
+            // every update_plan-referencing string in this file, including this one
+            // — no role holds the tool without also being the intended caller of it,
+            // so the extra check is no longer needed.
+            const hasUpdatePlan = this.canUpdatePlan()
             const isLastCheckpoint = iterNum === stallCheckpoints[stallCheckpoints.length - 1]
             const stall = isLastCheckpoint
               ? (hasUpdatePlan
@@ -1870,8 +1993,34 @@ export class Agent {
           // 'plan' event), not a sandbox tool — handle it here and skip the
           // repetition guard. It IS a tool call, so recording/refining a plan can
           // never be mistaken for "no tool call = done".
-          if (name === 'update_plan') {
-            this.pushCtx({ role: 'tool', content: this.handleUpdatePlan(args, emitAndLog) })
+          //
+          // Gated on canUpdatePlan() (2026-09-05, was unconditional): a role WITHOUT
+          // the tool (every multi-agent frame now — frames.ts's ROLE_TOOLS) must NOT
+          // have a call intercepted here at all, even a hallucinated one the model
+          // was never offered — this check used to run before the role-availability
+          // gate further below, so ANY role could silently mutate the plan through a
+          // call it was never given, bypassing that gate entirely. Falling through
+          // when canUpdatePlan() is false routes it to that same standard rejection
+          // ("not available in this role") every other disallowed tool already gets
+          // — one consistent rejection path instead of a special-cased one.
+          if (name === 'update_plan' && this.canUpdatePlan()) {
+            // TRACE VISIBILITY (2026-09-05): update_plan used to emit only a 'plan'
+            // event, never a tool_call/tool_result pair — every other tool goes
+            // through the normal execution path below and appears in the trace, so
+            // update_plan calls were invisible in the tool-call list. A real session
+            // had 8 of them and no way to see it from the trace at all. Same event
+            // shape the normal tool path uses (see the executeTool call further
+            // down): tool_call BEFORE, tool_result (output = handleUpdatePlan's
+            // return string) AFTER — emitted here rather than inside
+            // handleUpdatePlan itself, so a no-op call (handleUpdatePlan's own
+            // early return, see its comment) still gets its tool_call/tool_result
+            // pair — the model DID call the tool — but no 'plan' event follows,
+            // since handleUpdatePlan returns before ever reaching that emit.
+            emitAndLog({ type: 'tool_call', tool: name, args })
+            const planStart = Date.now()
+            const planOutput = this.handleUpdatePlan(args, emitAndLog)
+            emitAndLog({ type: 'tool_result', tool: name, output: planOutput, duration_ms: Date.now() - planStart })
+            this.pushCtx({ role: 'tool', content: planOutput })
             // POST-PLAN critic checkpoint: right after a plan is recorded, judge
             // whether it actually addresses the objective and is complete/ordered;
             // if weak, inject guidance BEFORE execution. Reuses the steer-injection
@@ -1907,17 +2056,31 @@ export class Agent {
             continue
           }
           // Plan/act gate: investigation (reads/greps) flows freely, but a project
-          // mutation is BLOCKED until a plan is recorded — separating plan from act
-          // as a state with different rules. Gated by "about to change the project"
+          // mutation is BLOCKED until a plan exists — separating plan from act as a
+          // state with different rules. Gated by "about to change the project"
           // (isProjectMutation), not a task classifier, so read-only runs and plain
-          // questions never plan (versatility). Blocked, not executed; a steer takes
-          // its place and it isn't counted as an EXECUTED-call repeat, so the retried
-          // call runs normally once the plan exists — but IS counted as a gate
-          // rejection (H21) until then, and cleared globally the instant a plan is
-          // recorded (handleUpdatePlan calls clearPlanGateRejections) so that
-          // legitimate retry is never treated as having "reached" any threshold.
+          // questions never plan (versatility).
+          //
+          // DEFENSE-IN-DEPTH, NOT THE NORMAL PATH, for every multi-agent frame
+          // (2026-09-05): dispatch.ts's seedPlan runs before chat() for every
+          // Implementer, so `!this.currentPlan` is never true there on the normal
+          // path — reaching this gate at all means seedPlan was skipped, an internal
+          // harness bug, not something the model caused or can fix by calling a tool
+          // (it no longer has update_plan — frames.ts's ROLE_TOOLS). It remains the
+          // NORMAL, primary mechanism for the baseline single-loop agent, which
+          // nothing ever seeds — canUpdatePlan() is what tells the rejection message
+          // below which situation this actually is.
+          //
+          // Blocked, not executed; a steer takes its place and it isn't counted as
+          // an EXECUTED-call repeat, so the retried call runs normally once a plan
+          // exists — but IS counted as a gate rejection (H21) until then, and
+          // cleared globally the instant a plan is recorded (handleUpdatePlan calls
+          // clearPlanGateRejections) so that legitimate retry is never treated as
+          // having "reached" any threshold.
           if (!this.currentPlan && isProjectMutation(name, args)) {
-            const gate = `REJECTED — this ${name} call was NOT applied, nothing changed on disk. You must record a plan first. Read the relevant files if you haven't, then call update_plan with one concrete, verifiable objective and the steps to reach it — THEN retry this exact change. Recording a plan does not end your turn.`
+            const gate = this.canUpdatePlan()
+              ? `REJECTED — this ${name} call was NOT applied, nothing changed on disk. You must record a plan first. Read the relevant files if you haven't, then call update_plan with one concrete, verifiable objective and the steps to reach it — THEN retry this exact change. Recording a plan does not end your turn.`
+              : `REJECTED — this ${name} call was NOT applied, nothing changed on disk. No plan is set for this frame. This is an internal error; report it in your final answer rather than attempting to fix it.`
             const stop = this.handleGateRejection(name, args, gateKey, 'plan', gate, emitAndLog)
             if (stop !== null) return this.endFrameStalled(stop, emitAndLog)
             continue
