@@ -166,42 +166,50 @@ function normalizePositiveInt(n: number | undefined): number | undefined {
 // next turn.
 const MAX_PATTERN_MATCHES = 50
 
-function searchLines(content: string, pattern: string, offset?: number, limit?: number): ToolResult {
+// A search always spans the WHOLE file. offset/limit are NOT consulted here, and that is a
+// correction of this function's first version rather than an oversight.
+//
+// MEASURED 2026-09-04, live Planner frame on commander-option-requires: scoping the search by
+// offset/limit was defensible on paper ("narrow a search to an already-paged area") but it
+// collided with a habit the model had already learned from the paging change that shipped three
+// hours earlier — it passes offset/limit on almost every read. Straight from the log:
+//
+//   [pattern "_checkForConflictingOptions" matched 0 times in lines 1-50 of 2790]
+//   [pattern "_checkForConflictingOptions" matched 0 times in lines 1-100 of 2790]
+//   [pattern "ConflictingOptions" matched 0 times in lines 1-20 of 2790]
+//
+// Six of seven searches in that frame returned zero matches for symbols that EXIST, purely
+// because a window was carried over from the previous read. The zero-match hint then pointed at
+// the wrong variable ("try a shorter or different substring"), so the model kept shortening the
+// pattern inside a 20-to-50-line window instead of widening the window. A false negative with a
+// plausible explanation is the same failure class that made this a literal substring rather than
+// a regex: a wrong answer the model has no reason to distrust.
+//
+// Whole-file search removes that class outright. When offset/limit were supplied they are named
+// as ignored rather than dropped in silence, because silently discarding an argument teaches the
+// model nothing about the tool's actual shape.
+function searchLines(content: string, pattern: string, windowIgnored: boolean): ToolResult {
   const lines = splitLines(content)
   const totalLines = lines.length
-  const startLine = normalizePositiveInt(offset) ?? 1  // 1-based
-  const startIdx = startLine - 1
-  if (startIdx >= totalLines) {
-    // Same "state the true length, don't silently clamp" rule as the
-    // plain-paging past-end-of-file branch below, restated for search so
-    // the model isn't left guessing whether an empty result means "no
-    // matches" or "range was invalid".
-    return { output: `[file has ${totalLines} lines; offset ${startLine} is past end of file; nothing to search]` }
-  }
-  const count = normalizePositiveInt(limit)
-  const endIdx = count === undefined ? totalLines : Math.min(totalLines, startIdx + count)  // 0-based exclusive == 1-based last line scanned
-  const scoped = offset !== undefined || limit !== undefined
-  const scope = scoped ? `lines ${startLine}-${endIdx} of ${totalLines}` : `${totalLines} lines`
+  const note = windowIgnored ? ' (offset/limit ignored: a search always covers the whole file)' : ''
   let totalMatches = 0
   const shown: string[] = []
-  for (let i = startIdx; i < endIdx; i++) {
+  for (let i = 0; i < totalLines; i++) {
     if (lines[i].includes(pattern)) {
       totalMatches++
       if (shown.length < MAX_PATTERN_MATCHES) shown.push(`${i + 1}: ${lines[i]}`)
     }
   }
   if (totalMatches === 0) {
-    // A clear statement, not an empty string and not an error — the read
-    // succeeded and the pattern legitimately isn't there. An empty string
-    // here would be indistinguishable from a bug; an error would make the
-    // model retry the exact same call, wasting the turn the whole feature
-    // exists to save.
-    return { output: `[pattern ${JSON.stringify(pattern)} matched 0 times in ${scope}; try a shorter or different substring]` }
+    // A clear statement, not an empty string and not an error — the read succeeded and the
+    // pattern legitimately is not there. An empty string is indistinguishable from a bug; an
+    // error makes the model retry the identical call, wasting the turn this exists to save.
+    return { output: `[pattern ${JSON.stringify(pattern)} matched 0 times in ${totalLines} lines${note}; try a shorter or different substring]` }
   }
   const countNote = shown.length < totalMatches
     ? `${totalMatches} times (showing first ${shown.length})`
     : `${totalMatches} time${totalMatches === 1 ? '' : 's'}`
-  const marker = `[pattern ${JSON.stringify(pattern)} matched ${countNote} in ${scope}; use offset/limit to read near a line number]`
+  const marker = `[pattern ${JSON.stringify(pattern)} matched ${countNote} in ${totalLines} lines${note}; use offset/limit to read near a line number]`
   return { output: `${marker}\n${truncateOutput(shown.join('\n'), 8000)}` }
 }
 
@@ -217,7 +225,10 @@ export async function readFile(filePath: string, offset?: number, limit?: number
     // entire file through the match-formatting path, recreating exactly
     // the flood this feature exists to prevent.
     if (pattern) {
-      return searchLines(content, pattern, offset, limit)
+      // Whole-file search; offset/limit are reported as ignored rather than applied.
+      // See searchLines' header for the measured reason (six of seven live searches
+      // returned false negatives when a carried-over window scoped them).
+      return searchLines(content, pattern, offset !== undefined || limit !== undefined)
     }
     if (offset === undefined && limit === undefined) {
       return { output: truncateOutput(content, 8000) }

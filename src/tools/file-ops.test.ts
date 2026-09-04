@@ -266,27 +266,36 @@ test('readFile pattern with an invalid-regex-looking string does not throw — l
   assert.match(r.output, /matched 0 times/)
 })
 
-test('readFile pattern combined with offset/limit searches only within that line range, using absolute line numbers', async () => {
+// A search is NEVER scoped by offset/limit — see searchLines' header for the measured
+// reason (six of seven live Planner searches returned false negatives when a window
+// carried over from the previous read narrowed them to lines 1-50 of a 2790-line file).
+// The window is reported as ignored rather than silently dropped.
+test('readFile pattern ignores offset/limit and always searches the whole file, saying so', async () => {
   const lines = Array.from({ length: 30 }, (_, i) => (i === 4 || i === 24 ? `needle ${i + 1}` : `filler ${i + 1}`))
   await writeFile('/workspace/search-scoped.txt', lines.join('\n'))
-  // Scope the search to lines 1-10: only the needle at line 5 should be found.
-  const scoped = await readFile('/workspace/search-scoped.txt', 1, 10, 'needle')
-  assert.equal(scoped.error, undefined)
-  assert.match(scoped.output, /^\[pattern "needle" matched 1 time in lines 1-10 of 30; use offset\/limit to read near a line number\]\n/)
-  assert.match(scoped.output, /^5: needle 5$/m)
-  // The full, unscoped search finds both.
+  // A window that WOULD have excluded the second needle under the old scoping contract.
+  const windowed = await readFile('/workspace/search-scoped.txt', 1, 10, 'needle')
+  assert.equal(windowed.error, undefined)
+  assert.match(windowed.output, /^\[pattern "needle" matched 2 times in 30 lines \(offset\/limit ignored: a search always covers the whole file\); use offset\/limit to read near a line number\]\n/)
+  assert.match(windowed.output, /^5: needle 5$/m)
+  assert.match(windowed.output, /^25: needle 25$/m)
+  // Without a window the result is identical apart from the ignored-window note.
   const full = await readFile('/workspace/search-scoped.txt', undefined, undefined, 'needle')
-  assert.match(full.output, /matched 2 times/)
+  assert.match(full.output, /^\[pattern "needle" matched 2 times in 30 lines; use offset\/limit to read near a line number\]\n/)
   assert.match(full.output, /^5: needle 5$/m)
   assert.match(full.output, /^25: needle 25$/m)
 })
 
-test('readFile pattern with offset past end of file reports the true length rather than throwing or silently returning no matches', async () => {
+test('readFile pattern with an offset past end of file still searches the whole file rather than reporting nothing to search', async () => {
   const lines = Array.from({ length: 12 }, (_, i) => `line${i + 1}`)
   await writeFile('/workspace/search-past-end.txt', lines.join('\n'))
   const r = await readFile('/workspace/search-past-end.txt', 500, undefined, 'line')
   assert.equal(r.error, undefined)
-  assert.equal(r.output, '[file has 12 lines; offset 500 is past end of file; nothing to search]')
+  // Under the old scoping contract this returned "offset 500 is past end of file;
+  // nothing to search" — a false negative caused entirely by an argument the model
+  // carried over from a previous read.
+  assert.match(r.output, /matched 12 times in 12 lines \(offset\/limit ignored: a search always covers the whole file\)/)
+  assert.match(r.output, /^1: line1$/m)
 })
 
 test('readFile with pattern still enforces the workspace boundary (symlink escape rejected)', async () => {

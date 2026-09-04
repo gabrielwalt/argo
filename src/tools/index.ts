@@ -94,13 +94,13 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'read_file',
-      description: 'Read a file, or search it. Any absolute path in the container works; use /workspace/path for the project. Whole-file output is capped at 8000 chars (head + tail, middle omitted) — for a file longer than that, pass offset/limit to page through it by line instead of guessing from the head and tail alone; the response tells you the total line count and exactly which lines you got. If you do not know which lines to read, pass pattern instead: it searches the file for that exact text and returns matching line numbers, e.g. "1523: function handleOptionValue(...) {" — then call read_file again with offset/limit set to that line number to read it in context. pattern is a literal substring, not a regular expression (dots, parens, and brackets in it are matched literally). When pattern is set, offset/limit narrow which lines are SEARCHED, not which lines are returned.',
+      description: 'Read a file, or search it. Any absolute path in the container works; use /workspace/path for the project. Whole-file output is capped at 8000 chars (head + tail, middle omitted) — for a file longer than that, pass offset/limit to page through it by line instead of guessing from the head and tail alone; the response tells you the total line count and exactly which lines you got. If you do not know which lines to read, pass pattern instead: it searches the file for that exact text and returns matching line numbers, e.g. "1523: function handleOptionValue(...) {" — then call read_file again with offset/limit set to that line number to read it in context. pattern is a literal substring, not a regular expression (dots, parens, and brackets in it are matched literally). A search ALWAYS covers the whole file: when pattern is set, offset/limit are ignored, so do not narrow a search by carrying them over from a previous read.',
       parameters: {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'Absolute path, e.g. /workspace/... or /tmp/...' },
-          offset: { type: 'number', description: 'Without pattern: first line to return, 1-based. With pattern: first line to search. Omit to start at line 1.' },
-          limit: { type: 'number', description: 'Without pattern: number of lines to return starting at offset. With pattern: number of lines to search starting at offset. Omit to run through end of file (still capped at 8000 chars).' },
+          offset: { type: 'number', description: 'First line to return, 1-based. Omit to start at line 1. Ignored when pattern is set (a search always covers the whole file).' },
+          limit: { type: 'number', description: 'Number of lines to return starting at offset. Omit to run through end of file (still capped at 8000 chars). Ignored when pattern is set.' },
           pattern: { type: 'string', description: 'Search the file for this exact literal text (not a regex) and return matching line numbers instead of file content, e.g. to find where a symbol you cannot see is defined or called before reading that spot with offset/limit. Omit to read normally.' },
         },
         required: ['path'],
