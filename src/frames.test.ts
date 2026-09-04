@@ -65,30 +65,29 @@ test('ROLE_TOOLS.boss still has bash (the Record<Role,...> default, currently un
   assert.equal(ROLE_TOOLS.boss.includes('write_file'), false, 'unchanged pre-existing guarantee — the Boss verifies, never fixes directly')
 })
 
-// ── ROLE_TOOLS.tester: no live call site any more (this rewrite) ───────────────
-// dispatch.ts no longer spawns a Tester at all — not even for SIMPLE, which used
-// to run one Implementer + one Tester (see dispatch.ts's module header: "let's
-// forget about the testing agent... assuming the implementing agent will test
-// what it does if we instruct it to do so"). ROLE_TOOLS.tester/ROLE_MAX_ITERATIONS.
-// tester/ROLE_POLICY.tester/ROLE_SYSTEM_SUFFIX.tester (and frames.ts's own
-// parseTesterVerdict/TESTER_VERDICT_NUDGE) stay defined only because Role
-// (types.ts, off limits for this task) still enumerates 'tester', so every
-// Record<Role,...> table here needs an entry regardless of whether anything
-// spawns one — and batch2.test.ts (also off this task's write list) still
-// exercises parseTesterVerdict directly. This is dead-by-construction, not an
-// oversight; flagged in the report for the cone to decide whether to remove the
-// role from types.ts in a follow-up.
-test('ROLE_TOOLS.tester still exists as the Record<Role,...> default, with no live call site in dispatch.ts', () => {
+// ── ROLE_TOOLS.tester: DESIGN-5 (flow audit) — the Tester is back and has a live
+// call site. A now-superseded claim used to live here ("dispatch.ts no longer
+// spawns a Tester at all"), left over from an earlier rewrite; dispatch.ts's
+// runTesterValidation spawns a real 'tester' frame (with no toolOverride, so it
+// gets exactly this default) after every Implementer SUCCESS, for both the
+// OBJECTIVE/Planner path and the SIMPLE fast path. ROLE_TOOLS.tester/
+// ROLE_MAX_ITERATIONS.tester/ROLE_POLICY.tester/ROLE_SYSTEM_SUFFIX.tester (and
+// frames.ts's own parseTesterVerdict/TESTER_VERDICT_NUDGE, which batch2.test.ts —
+// off this task's write list — still exercises directly) stay defined for the same
+// structural reason as before (Role, types.ts, off limits, still enumerates
+// 'tester'), but that reason is no longer the ONLY one: this table entry is live.
+test('ROLE_TOOLS.tester exists and is a live default — dispatch.ts spawns Tester frames with it', () => {
   assert.equal(ROLE_TOOLS.tester.includes('read_file'), true)
-  assert.equal(ROLE_TOOLS.tester.includes('write_file'), false, 'the Tester (if ever revived) never fixes directly')
+  assert.equal(ROLE_TOOLS.tester.includes('write_file'), false, 'the Tester never fixes directly')
 })
 
-// ── Planner system prompt: the `conclude`-based ITERATIVE design (this rewrite) —
-// no TASK:/TEST:/DONE line convention, no Tester round. The Planner is called once
-// for an overall plan (an ordered list of sub-tasks, its `conclude` answer), then
-// resumed repeatedly to produce one fully self-contained Implementer assignment at
-// a time, also delivered via `conclude` — with no separate "re-planning round"
-// request; adaptation is just what happens on the next detail call.
+// ── Planner system prompt: the `conclude`-based ITERATIVE design — no TASK:/
+// TEST:/DONE line convention, no separate "re-planning round" request (adaptation
+// is just what happens on the next detail call). There IS a Tester round — the
+// harness, not the Planner, spawns one after every Implementer SUCCESS (DESIGN-5,
+// flow audit); the Planner is called once for an overall plan (an ordered list of
+// sub-tasks, its `conclude` answer), then resumed repeatedly to produce one fully
+// self-contained Implementer assignment at a time, also delivered via `conclude`.
 
 test('planner system prompt: describes the two-phase flow — overall plan first, then resumed to produce one assignment at a time', () => {
   const text = systemPromptFor('planner')
@@ -114,10 +113,15 @@ test('planner system prompt: adaptation is natural, not a separate re-planning r
   assert.ok(text.includes('no separate re-planning'))
 })
 
-test('planner system prompt: states there is no Tester any more — the assignment itself must say when to test', () => {
+// DESIGN-5 (flow audit): the Planner suffix used to say "there is no separate Tester
+// agent any more" and told the Planner to instruct Implementers to test their own
+// work — false: the harness spawns a real Tester after every Implementer SUCCESS
+// (dispatch.ts's runTesterValidation). Fixed to remove both the false claim and the
+// self-test instruction; the Planner is not told the details of how testing works.
+test('planner system prompt: does not claim there is no Tester, and does not tell Implementers to test their own work', () => {
   const text = systemPromptFor('planner')
-  assert.ok(/no separate Tester/.test(text))
-  assert.ok(text.includes('test its own work'))
+  assert.equal(/no separate Tester/.test(text), false)
+  assert.equal(text.includes('test its own work'), false)
 })
 
 test('planner system prompt: still states it never writes or edits (matches the assignment prompt\'s READ-ONLY statement)', () => {
@@ -171,16 +175,20 @@ test('TASK_START_TOOLS (the read-only classification checkpoint) also holds conc
   assert.equal(TASK_START_TOOLS.includes('conclude'), true)
 })
 
-// ── ITERATION LIMITS AND PROGRESS NUDGES (this task) ────────────────────────────────
+// ── ITERATION LIMITS AND PROGRESS NUDGES ────────────────────────────────────────────
 // ROLE_MAX_ITERATIONS.planner stays 40 (already matched the brief); implementer is
-// raised 60->80 to leave real room after the new 50/60/70 escalation below. Boss/
-// Tester are untouched — the Boss's own soft-10/hard-20 classification budget lives
-// in dispatch.ts (TASK_START_MAX_ITERATIONS/TASK_START_HARD_CAP), not here.
+// raised 60->80 to leave real room after the new 50/60/70 escalation below. Boss is
+// untouched — its own soft-10/hard-20 classification budget lives in dispatch.ts
+// (TASK_START_MAX_ITERATIONS/TASK_START_HARD_CAP), not here. Tester raised 20->40
+// (owner directive, superseding the flow audit's "Tester has no soft/hard split"
+// finding) — buildTesterAssignment (dispatch.ts) still states the 20-iteration prompt
+// budget verbatim; 40 here is now the real hard cap, mirroring the Planner's own
+// soft-20/hard-40 split.
 
-test('ROLE_MAX_ITERATIONS: planner=40 (unchanged), implementer=80 (raised this task), tester/boss untouched', () => {
+test('ROLE_MAX_ITERATIONS: planner=40 (unchanged), implementer=80 (raised), tester=40 (raised, soft/hard split), boss untouched', () => {
   assert.equal(ROLE_MAX_ITERATIONS.planner, 40)
   assert.equal(ROLE_MAX_ITERATIONS.implementer, 80)
-  assert.equal(ROLE_MAX_ITERATIONS.tester, 20)
+  assert.equal(ROLE_MAX_ITERATIONS.tester, 40)
   assert.equal(ROLE_MAX_ITERATIONS.boss, 15)
 })
 
@@ -198,14 +206,35 @@ test('PROGRESS_CHECK_ITERATIONS: implementer escalates at 50/60/70, strictly bel
   }
 })
 
-test('PROGRESS_CHECK_ITERATIONS: no entry for tester or boss — they keep the generic fraction-based mechanism', () => {
-  assert.equal(PROGRESS_CHECK_ITERATIONS.tester, undefined)
+test('PROGRESS_CHECK_ITERATIONS: tester escalates at 20/30, strictly below its 40-iteration cap, matching the Planner\'s pattern', () => {
+  assert.deepEqual(PROGRESS_CHECK_ITERATIONS.tester, [20, 30])
+  assert.deepEqual(PROGRESS_CHECK_ITERATIONS.tester, PROGRESS_CHECK_ITERATIONS.planner)
+  for (const n of PROGRESS_CHECK_ITERATIONS.tester!) {
+    assert.ok(n < ROLE_MAX_ITERATIONS.tester, `${n} must be below the hard cap ${ROLE_MAX_ITERATIONS.tester}`)
+  }
+})
+
+test('PROGRESS_CHECK_ITERATIONS: no entry for boss — it keeps the generic fraction-based mechanism', () => {
   assert.equal(PROGRESS_CHECK_ITERATIONS.boss, undefined)
 })
 
-test('PROGRESS_CHECK_MESSAGES is index-aligned with PROGRESS_CHECK_ITERATIONS for both roles', () => {
+test('PROGRESS_CHECK_MESSAGES is index-aligned with PROGRESS_CHECK_ITERATIONS for every role that has an entry', () => {
   assert.equal(PROGRESS_CHECK_MESSAGES.planner!.length, PROGRESS_CHECK_ITERATIONS.planner!.length)
   assert.equal(PROGRESS_CHECK_MESSAGES.implementer!.length, PROGRESS_CHECK_ITERATIONS.implementer!.length)
+  assert.equal(PROGRESS_CHECK_MESSAGES.tester!.length, PROGRESS_CHECK_ITERATIONS.tester!.length)
+})
+
+test('PROGRESS_CHECK_MESSAGES: tester messages mirror the Planner\'s wording, "analysis" swapped for "validation"', () => {
+  assert.equal(
+    PROGRESS_CHECK_MESSAGES.tester![0],
+    'PROGRESS CHECK: 20 iterations in. Wrap up your validation and call conclude with your result.',
+  )
+  assert.equal(
+    PROGRESS_CHECK_MESSAGES.tester![1],
+    'PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.',
+  )
+  // Second rung is byte-identical to the Planner's own — only the first differs.
+  assert.equal(PROGRESS_CHECK_MESSAGES.tester![1], PROGRESS_CHECK_MESSAGES.planner![1])
 })
 
 test('PROGRESS_CHECK_MESSAGES: planner messages match the brief\'s exact wording and escalate in tone (gentle, then firmer)', () => {

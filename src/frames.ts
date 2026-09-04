@@ -142,45 +142,62 @@ export const TASK_START_TOOLS: ToolName[] = ['read_file', 'bash', 'web_search', 
 // on top of it — a model that genuinely needs a couple more turns to call `conclude` after
 // being told to wrap up should get them, same spirit as the Planner's own "not a hard kill,
 // an ideal chunk size" note below.
+//
+// Tester raised 20->40 (owner directive, superseding the flow audit's "Tester has no
+// soft/hard split" finding). buildTesterAssignment (dispatch.ts) already states a
+// 20-iteration SOFT budget in the prompt itself ("You have a hard budget of 20
+// iterations to call `conclude`" — that wording predates this change and is the
+// Tester's own stated target, not the actual enforced cap); 40 here is the real HARD
+// cap, mirroring the Planner's own soft-20/hard-40 split exactly. The
+// PROGRESS_CHECK_ITERATIONS/PROGRESS_CHECK_MESSAGES entry added below at [20, 30] is
+// what makes the soft budget an actual mid-run nudge instead of a number the model
+// only reads once at the top of its assignment.
 export const ROLE_MAX_ITERATIONS: Record<Role, number> = {
   planner: 40,
   implementer: 80,
-  tester: 20,
+  tester: 40,
   boss: 15,
 }
 
-// PER-ROLE PROGRESS-CHECK ESCALATION (this task). Distinct from the generic fraction-of-
-// maxIterations stall/progress mechanism already in agent.ts (the `stallCheckpoints` local
-// in chat(), scaled 0.4/0.65/0.85 of a run's own budget) — that mechanism stays exactly as
-// it is for every role NOT listed here (Tester, Boss, the unrestricted baseline). Planner and
-// Implementer instead get FIXED, ABSOLUTE per-call iteration thresholds with role-specific
-// wording, because the brief's numbers (Planner: two escalating nudges at 20/30 of a 40 cap;
-// Implementer: three escalating nudges at 50/60/70 of an 80 cap) don't fall out of the generic
-// fractions — 20/40 = 0.5 and 30/40 = 0.75 (not 0.4/0.65/0.85), and both roles need one more
-// rung than the generic table has. agent.ts reads these keyed by the frame's role (Agent.
-// setRole, called by dispatch.ts's spawnFrame alongside setAllowedTools/setMaxIterations/etc.)
-// and, when a role has an entry here, replaces the generic mechanism for that one frame's
-// checkpoints with these exact iteration numbers and exact message text — unconditionally (no
-// "skip if the model already edited something since the last check" allowance the generic
-// mechanism applies for Tester/Boss): these are fixed checkpoints on a countdown to a hard
-// cap, not a stall detector, so they fire every time regardless of how much real progress is
-// happening. Iteration numbers here are per-CALL (i.e. per resumeFrame/chat() turn on the
-// frame's Agent instance), matching the brief exactly ("PER CALL, not across the whole
-// session") — this falls out for free from how agent.ts's iteration loop already works: the
-// `for (let i = 0; i < this.maxIterations; i++)` loop always starts i at 0 on every chat()
-// call regardless of a resumed frame's cumulative `iterationBase` (that offset only shifts
-// REPORTED iteration numbers and this table's own thresholds together, so the comparison
-// still lands on the same LOCAL iteration count every call — see agent.ts's stallCheckpoints
-// computation).
+// PER-ROLE PROGRESS-CHECK ESCALATION (this task; Tester entry added later, owner
+// directive superseding the flow audit's "Tester has no soft/hard split" finding).
+// Distinct from the generic fraction-of-maxIterations stall/progress mechanism already
+// in agent.ts (the `stallCheckpoints` local in chat(), scaled 0.4/0.65/0.85 of a run's
+// own budget) — that mechanism stays exactly as it is for every role NOT listed here
+// (Boss, the unrestricted baseline). Planner/Implementer/Tester instead get FIXED,
+// ABSOLUTE per-call iteration thresholds with role-specific wording, because the
+// numbers involved (Planner: two escalating nudges at 20/30 of a 40 cap; Implementer:
+// three escalating nudges at 50/60/70 of an 80 cap; Tester: the same two-rung 20/30
+// pattern as the Planner, matching its own soft-20/hard-40 split) don't fall out of the
+// generic fractions — 20/40 = 0.5 and 30/40 = 0.75 (not 0.4/0.65/0.85), and none of the
+// three roles is well served by the generic table's coarser rungs. agent.ts reads these
+// keyed by the frame's role (Agent.setRole, called by dispatch.ts's spawnFrame alongside
+// setAllowedTools/setMaxIterations/etc.) and, when a role has an entry here, replaces
+// the generic mechanism for that one frame's checkpoints with these exact iteration
+// numbers and exact message text — unconditionally (no "skip if the model already
+// edited something since the last check" allowance the generic mechanism applies for
+// Boss): these are fixed checkpoints on a countdown to a hard cap, not a stall
+// detector, so they fire every time regardless of how much real progress is happening.
+// Iteration numbers here are per-CALL (i.e. per resumeFrame/chat() turn on the frame's
+// Agent instance) — this falls out for free from how agent.ts's iteration loop already
+// works: the `for (let i = 0; i < this.maxIterations; i++)` loop always starts i at 0 on
+// every chat() call regardless of a resumed frame's cumulative `iterationBase` (that
+// offset only shifts REPORTED iteration numbers and this table's own thresholds
+// together, so the comparison still lands on the same LOCAL iteration count every call —
+// see agent.ts's stallCheckpoints computation).
 export const PROGRESS_CHECK_ITERATIONS: Partial<Record<Role, number[]>> = {
   planner: [20, 30],
   implementer: [50, 60, 70],
+  tester: [20, 30],
 }
 
 // Message text is VERBATIM per this task's brief — index-aligned with
 // PROGRESS_CHECK_ITERATIONS[role] (message[i] fires at iteration[i]). Planner's own
 // two rungs mirror the Implementer's escalating tone (gentle reminder, then firmer)
 // at half the iteration count, since its hard cap (40) is half the Implementer's (80).
+// Tester mirrors the Planner's exact two rungs and cap (20/30 of a 40 cap), with
+// "validation" swapped in for "analysis" since the Tester's job is to validate the
+// Implementer's work, not analyze a plan.
 export const PROGRESS_CHECK_MESSAGES: Partial<Record<Role, string[]>> = {
   planner: [
     'PROGRESS CHECK: 20 iterations in. Wrap up your analysis and call conclude with your result.',
@@ -193,6 +210,10 @@ export const PROGRESS_CHECK_MESSAGES: Partial<Record<Role, string[]>> = {
       'what remains.',
     'PROGRESS CHECK: 70 iterations. Finish immediately. Call conclude with your final status — what was ' +
       'done, what failed, and what\'s left.',
+  ],
+  tester: [
+    'PROGRESS CHECK: 20 iterations in. Wrap up your validation and call conclude with your result.',
+    'PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.',
   ],
 }
 
