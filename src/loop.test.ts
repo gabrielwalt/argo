@@ -11,6 +11,11 @@ import {
   l0SteerMessage,
   l1SteerMessage,
   l2ReframeMessage,
+  lHaltMessage,
+  noteGateRejection,
+  clearPlanGateRejections,
+  gateEscalationMessage,
+  gateStopMessage,
   type LoopContext,
 } from './loop.js'
 
@@ -446,13 +451,142 @@ test('l1SteerMessage: mentions toolName and includes recite', () => {
 })
 
 test('l2ReframeMessage: mentions update_plan when hasTasks is true', () => {
-  const msg = l2ReframeMessage(ctx)
+  const msg = l2ReframeMessage(ctx, 6)
   assert.match(msg, /update_plan/)
   assert.ok(msg.includes(ctx.recite))
 })
 
 test('l2ReframeMessage: does not mention update_plan when hasTasks is false', () => {
-  const msg = l2ReframeMessage(ctxNoTasks)
+  const msg = l2ReframeMessage(ctxNoTasks, 6)
   assert.doesNotMatch(msg, /update_plan/)
   assert.ok(msg.includes(ctxNoTasks.recite))
+})
+
+test('l2ReframeMessage: includes the block count, so two consecutive firings are not byte-identical (H21b)', () => {
+  const first = l2ReframeMessage(ctx, 6)
+  const second = l2ReframeMessage(ctx, 7)
+  assert.match(first, /6 consecutive stalled calls/)
+  assert.match(second, /7 consecutive stalled calls/)
+  assert.notEqual(first, second)
+})
+
+// ── H21(b): the ladder's L2 rung is itself unbounded without the 'halt' tier —
+// captured live (commander/2026-09-04T01-48-24_fix-checkforrequiredlocaloptions-
+// at.jsonl): L2 fired ~30 times running, each ignored. This pins evaluateCall's
+// own escalation path all the way through 'halt', extending the existing L0/L1/L2
+// ladder test above (which stops at the first L2 firing).
+
+test('evaluateCall: L2 keeps firing (unbounded) until haltBlocksAfterAbort further blocks, then reports halt', () => {
+  const state = createLoopState()
+  evaluateCall(state, 'X', ARGS, ctx) // primes the key
+  const kinds: string[] = []
+  // DEFAULT_LOOP_CONFIG: l2BlocksBeforeAbort=6, haltBlocksAfterAbort=4 -> halt at blocks=10.
+  for (let i = 0; i < 10; i++) kinds.push(evaluateCall(state, 'X', ARGS, ctx).kind)
+  assert.deepEqual(kinds, ['steer', 'steer', 'compact', 'steer', 'steer', 'replan', 'replan', 'replan', 'replan', 'halt'])
+  assert.equal(state.blocks, 10)
+})
+
+test('evaluateCall: halt fires exactly once per streak reaching the threshold, and its message names the count', () => {
+  const state = createLoopState()
+  evaluateCall(state, 'X', ARGS, ctx)
+  for (let i = 0; i < 9; i++) evaluateCall(state, 'X', ARGS, ctx) // drive to blocks=9 (still L2)
+  const nineth = evaluateCall(state, 'X', ARGS, ctx) // blocks=10 -> halt
+  assert.equal(nineth.kind, 'halt')
+  if (nineth.kind === 'halt') assert.match(nineth.message, /10 consecutive calls/)
+})
+
+test('evaluateCall: a mutation resets the streak even after halt would otherwise have fired', () => {
+  const state = createLoopState()
+  evaluateCall(state, 'X', ARGS, ctx)
+  for (let i = 0; i < 9; i++) evaluateCall(state, 'X', ARGS, ctx) // blocks=9, one more away from halt
+  noteMutation(state)
+  assert.equal(state.blocks, 0)
+  const action = evaluateCall(state, 'X', ARGS, ctx)
+  assert.deepEqual(action, { kind: 'allow' })
+})
+
+// ── H21(a): the GATE-REJECTION counter — role gate / plan-act gate rejections
+// that never reach evaluateCall at all (agent.ts's tool-call loop `continue`s
+// past it on either gate). See loop.ts's H21 header note and noteGateRejection's
+// doc comment for the evidence (two Planner frames issuing 9 and 7 rejected
+// `bash` calls, all refused on role, DRIVER-LOG.md 2026-09-04 ~01:00) and for why
+// keying on (call, reason) — not the call alone — is what keeps the plan/act
+// gate's legitimate retry-after-plan safe.
+
+test('noteGateRejection: counts up per (key, reason), independent of the call\'s own key', () => {
+  const state = createLoopState()
+  const a = noteGateRejection(state, 'bash:{"command":"x"}', 'role')
+  const b = noteGateRejection(state, 'bash:{"command":"x"}', 'role')
+  const c = noteGateRejection(state, 'bash:{"command":"x"}', 'role')
+  assert.deepEqual([a.count, b.count, c.count], [1, 2, 3])
+  assert.deepEqual([a.escalate, b.escalate, c.escalate], [false, false, true])  // gateEscalateAfter=3
+  assert.deepEqual([a.stop, b.stop, c.stop], [false, false, false])              // gateStopAfter=6
+})
+
+test('noteGateRejection: a DIFFERENT reason for the SAME call key counts separately', () => {
+  const state = createLoopState()
+  noteGateRejection(state, 'edit_file:{"path":"/workspace/x"}', 'role')
+  noteGateRejection(state, 'edit_file:{"path":"/workspace/x"}', 'role')
+  // Same key, but refused by the OTHER gate — its own count starts at 1, not 3.
+  const planOutcome = noteGateRejection(state, 'edit_file:{"path":"/workspace/x"}', 'plan')
+  assert.equal(planOutcome.count, 1)
+  assert.equal(planOutcome.escalate, false)
+})
+
+test('noteGateRejection: reaches stop at gateStopAfter (default 6), not sooner', () => {
+  const state = createLoopState()
+  const outcomes = []
+  for (let i = 0; i < 6; i++) outcomes.push(noteGateRejection(state, 'K', 'role'))
+  assert.deepEqual(outcomes.map(o => o.stop), [false, false, false, false, false, true])
+})
+
+test('clearPlanGateRejections: clears every "plan"-reason key, but leaves "role" counts untouched', () => {
+  const state = createLoopState()
+  noteGateRejection(state, 'A', 'plan')
+  noteGateRejection(state, 'B', 'plan')
+  noteGateRejection(state, 'A', 'role')
+  clearPlanGateRejections(state)
+  // Both plan-reason keys are gone (a fresh call re-hitting the plan gate — which
+  // cannot happen once a plan exists, but the counter itself must not lie about
+  // it — starts back at count 1).
+  assert.equal(noteGateRejection(state, 'A', 'plan').count, 1)
+  assert.equal(noteGateRejection(state, 'B', 'plan').count, 1)
+  // The UNRELATED role-reason count for the same key A survived the clear —
+  // clearing 'plan' must never contaminate a different gate's count for the same call.
+  assert.equal(noteGateRejection(state, 'A', 'role').count, 2)
+})
+
+test('gateEscalationMessage: role reason names the tool as unavailable and forbids retrying it; plan reason names update_plan', () => {
+  const roleMsg = gateEscalationMessage('role', 'bash', 4, 'RECITE')
+  assert.match(roleMsg, /does not exist for you in this role/)
+  assert.match(roleMsg, /Do NOT call `bash` again/)
+  assert.match(roleMsg, /4 times/)
+  assert.ok(roleMsg.includes('RECITE'))
+
+  const planMsg = gateEscalationMessage('plan', 'edit_file', 5, 'RECITE')
+  assert.match(planMsg, /update_plan/)
+  assert.match(planMsg, /5 times/)
+})
+
+test('gateEscalationMessage: consecutive counts produce non-identical text (the defect this responds to)', () => {
+  const third = gateEscalationMessage('role', 'bash', 3, 'R')
+  const fourth = gateEscalationMessage('role', 'bash', 4, 'R')
+  assert.notEqual(third, fourth)
+})
+
+test('gateStopMessage: names the tool, the count, and the specific gate', () => {
+  const msg = gateStopMessage('role', 'bash', 6)
+  assert.match(msg, /bash/)
+  assert.match(msg, /6 times/)
+  assert.match(msg, /role tool restriction/)
+
+  const planMsg = gateStopMessage('plan', 'edit_file', 6)
+  assert.match(planMsg, /plan-before-mutation gate/)
+})
+
+test('lHaltMessage: names the block count and references the ignored L2 request', () => {
+  const msg = lHaltMessage(ctx, 10)
+  assert.match(msg, /10 consecutive calls/)
+  assert.match(msg, /update_plan/)
+  assert.match(msg, /STOPPING this frame/)
 })

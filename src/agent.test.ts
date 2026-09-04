@@ -1085,3 +1085,166 @@ test('loop ON + agents ON: a replayed tool call does not create a second ledger 
     await cleanupSession(sessionId, 'argo-loop-replay-episode-case')
   }
 })
+
+// ── H21 (2026-09-04, /shared/argo-gateloop/REPORT.md) — GATE-REJECTION counter +
+// the ladder's own 'halt' tier. Closes the unbounded-retry hole where a call the
+// role gate or the plan/act gate refuses `continue`s past the ladder entirely, and
+// bounds the pre-existing L2 rung itself (evaluateCall's 'replan' had no ceiling
+// before this — see loop.ts's LoopAction 'halt' doc comment). Captured live:
+// commander/2026-09-04T01-48-24_fix-checkforrequiredlocaloptions-at.jsonl (40
+// rejections in one frame, L2 alone firing ~30 times running) and DRIVER-LOG.md's
+// 2026-09-04 ~01:00 note (two Planner frames, 9 and 7 rejected `bash` calls, all
+// refused on role). No live model: a role-restricted or never-planning scripted
+// model exercises the same deterministic, side-effect-free calls the rest of this
+// file's ladder tests already rely on.
+
+const roleRejectedBashCall: ScriptedResponse = {
+  message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'bash', arguments: { command: "grep -n 'conflicts' /workspace/lib/help.js" } } }] },
+}
+
+test('role gate (H21): a role-restricted tool refused repeatedly escalates at the 3rd rejection, then STOPS the frame at the 6th', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-role-gate-h21-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([roleRejectedBashCall]))
+  agent.setSessionId(sessionId)
+  agent.setAllowedTools(['read_file']) // 'bash' is never available to this role
+  agent.setLoop(true)
+  agent.setMaxIterations(20) // plenty of room for the stop (fires at the 6th) to arrive well before any cap
+  try {
+    const answer = await agent.chat('argo role gate H21 case')
+
+    const rejections = events.filter((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'bash' && e.rejected === true)
+    // Stops EXACTLY at the 6th identical rejection (cfg.gateStopAfter) — never a 7th.
+    assert.equal(rejections.length, 6)
+
+    // Rejections 1-2: the gate's plain, unescalated message (no count, no "role" wording).
+    assert.doesNotMatch(rejections[0].error ?? '', /times/)
+    assert.doesNotMatch(rejections[1].error ?? '', /times/)
+    // Rejections 3-5: escalated wording — names the count and the concrete alternative.
+    for (const r of [rejections[2], rejections[3], rejections[4]]) {
+      assert.match(r.error ?? '', /does not exist for you in this role/)
+      assert.match(r.error ?? '', /Do NOT call `bash` again/)
+    }
+    assert.match(rejections[2].error ?? '', /3 times/)
+    assert.match(rejections[3].error ?? '', /4 times/)
+    assert.match(rejections[4].error ?? '', /5 times/)
+    // The 6th is the STOP message, not another escalation — and the frame ends.
+    assert.match(rejections[5].error ?? '', /STOPPING this frame/)
+    assert.match(rejections[5].error ?? '', /6 times/)
+
+    // Never fails open: this reads as a stall (reused 'cap' RunOutcome), never as
+    // a normal finish.
+    assert.equal(agent.getLastRunOutcome(), 'cap')
+    assert.equal(agent.hitIterationCap(), true)
+    assert.equal(events.some(e => e.type === 'done'), false)
+    assert.ok(events.some(e => e.type === 'error'))
+    assert.match(answer, /STOPPING this frame/)
+  } finally {
+    await cleanupSession(sessionId, 'argo-role-gate-h21-case')
+  }
+})
+
+test('role gate (H21) OFF: repeated rejections are plain and unbounded by this mechanism — the SAME message every time, ended only by the pre-existing iteration cap', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-role-gate-h21-off-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([roleRejectedBashCall]))
+  agent.setSessionId(sessionId)
+  agent.setAllowedTools(['read_file'])
+  agent.setLoop(false)
+  agent.setMaxIterations(10)
+  try {
+    const answer = await agent.chat('argo role gate H21 off case')
+
+    const rejections = events.filter((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'bash' && e.rejected === true)
+    assert.equal(rejections.length, 10) // every iteration rejected, all the way to the cap — never stopped early by H21
+    assert.ok(rejections.every(r => r.error === 'tool "bash" is not available in this role — it was NOT called.')) // byte-identical every time
+
+    assert.equal(agent.getLastRunOutcome(), 'cap') // the PRE-EXISTING iteration cap, unrelated to H21
+    assert.match(answer, /maximum iterations/i)
+  } finally {
+    await cleanupSession(sessionId, 'argo-role-gate-h21-off-case')
+  }
+})
+
+test('plan/act gate (H21): repeated pre-plan attempts escalate at the 3rd, then the retry succeeds normally once a plan is recorded — the legitimate retry is NOT penalised', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-plan-gate-h21-${Date.now()}`
+  // 3 pre-plan edits (escalating), plan recorded, edit now allowed, final answer.
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([editCall, editCall, editCall, planCall, editCall, finalAnswer]))
+  agent.setSessionId(sessionId)
+  agent.setLoop(true)
+  try {
+    const answer = await agent.chat('argo plan gate H21 escalation case')
+
+    const editResults = events.filter((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'edit_file')
+    assert.equal(editResults.length, 4) // 3 rejected pre-plan + 1 executed post-plan
+    assert.equal(editResults.filter(e => e.rejected === true).length, 3)
+    assert.equal(editResults[3].rejected, undefined) // the post-plan retry actually ran, not blocked/penalised
+
+    assert.doesNotMatch(editResults[0].error ?? '', /times/) // 1st: the gate's plain message
+    assert.match(editResults[2].error ?? '', /3 times/)      // 3rd: escalated wording
+    assert.match(editResults[2].error ?? '', /Call `update_plan` now/)
+
+    // Below cfg.gateStopAfter (3 rejections, not 6) — the frame was never stopped,
+    // and it finished normally via the model's own final answer.
+    assert.equal(answer, 'Final answer.')
+    assert.equal(events.some(e => e.type === 'error'), false)
+    assert.equal(agent.getLastRunOutcome(), 'ok')
+  } finally {
+    await cleanupSession(sessionId, 'argo-plan-gate-h21-case')
+  }
+})
+
+test('plan/act gate (H21): repeated pre-plan attempts are BOUNDED — the frame stops if a plan is never recorded', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-plan-gate-h21-stop-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([editCall])) // never plans, ever
+  agent.setSessionId(sessionId)
+  agent.setLoop(true)
+  agent.setMaxIterations(20)
+  try {
+    const answer = await agent.chat('argo plan gate H21 stop case')
+
+    const rejections = events.filter((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'edit_file' && e.rejected === true)
+    assert.equal(rejections.length, 6)
+    assert.match(rejections[5].error ?? '', /STOPPING this frame/)
+    assert.match(rejections[5].error ?? '', /plan-before-mutation gate/)
+
+    assert.equal(agent.getLastRunOutcome(), 'cap')
+    assert.equal(events.some(e => e.type === 'done'), false)
+    assert.match(answer, /STOPPING this frame/)
+  } finally {
+    await cleanupSession(sessionId, 'argo-plan-gate-h21-stop-case')
+  }
+})
+
+// H21(b) — the pre-existing L2 rung had no ceiling of its own: this extends the
+// "loop ON: repeated identical non-mutating call is blocked and escalates L0 ->
+// L1 -> L2" test above past its first L2 firing, to the point the cited frame
+// actually reached (L2, ignored, over and over) and proves the harness now stops
+// rather than repeating it indefinitely.
+test('loop ON (H21b): a model that never stops repeating past L2 is eventually HALTED — the frame ends, never as success', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-loop-halt-${Date.now()}`
+  // readCall is the only element, so it recurs every iteration — never stops on its own.
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall]))
+  agent.setSessionId(sessionId)
+  agent.setLoop(true)
+  agent.setMaxIterations(20) // DEFAULT_LOOP_CONFIG halts at blocks=10 (the 11th attempt) — well inside 20
+  try {
+    const answer = await agent.chat('argo loop halt case')
+
+    // Exactly one real execution; every further repeat is blocked/escalated by the
+    // ladder, until 'halt' fires and ends the frame — never a 12th attempt.
+    assert.equal(readResults(events).length, 1)
+    assert.equal(events.filter(e => e.type === 'tool_call' && e.tool === 'read_file').length, 11)
+
+    assert.match(answer, /STOPPING this frame/)
+    assert.match(answer, /10 consecutive calls/)
+    assert.equal(agent.getLastRunOutcome(), 'cap') // never reads as success
+    assert.equal(events.some(e => e.type === 'done'), false)
+    assert.ok(events.some(e => e.type === 'error'))
+  } finally {
+    await cleanupSession(sessionId, 'argo-loop-halt-case')
+  }
+})

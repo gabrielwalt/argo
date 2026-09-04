@@ -42,7 +42,15 @@ import {
   renderRecallPointer,
   persistToMemory,
 } from './memory.js'
-import { createLoopState, noteMutation, noteBashExecution, evaluateCall, normalizeCallKey, recordResult, type LoopState } from './loop.js'
+import {
+  createLoopState, noteMutation, noteBashExecution, evaluateCall, normalizeCallKey, recordResult, type LoopState,
+  // H21 (this batch, 2026-09-04): closes the unbounded-retry hole where a call the
+  // role gate or the plan/act gate refuses is invisible to evaluateCall (both
+  // `continue` past it on rejection — see the tool-call loop below). See loop.ts's
+  // H21 header note for the evidence and /shared/argo-gateloop/REPORT.md for the
+  // design.
+  noteGateRejection, clearPlanGateRejections, gateEscalationMessage, gateStopMessage, type GateReason,
+} from './loop.js'
 import { classifyTool, inferDependencies, evict, type EpisodeMeta } from './eviction.js'
 import { recordEpisode, markEpisodeEvicted, newId as newLedgerId } from './ledger.js'
 
@@ -701,6 +709,79 @@ export class Agent {
     this.pushCtx({ role: 'tool', content: `Error: ${reason}` })
   }
 
+  // H21 (2026-09-04, /shared/argo-gateloop/REPORT.md). Wraps rejectToolCall for the
+  // two gates that `continue` straight past the loop-recovery ladder on a
+  // rejection — the role gate and the plan/act gate (see their call sites below) —
+  // so an identical (call, reason) pair refused over and over is counted, and
+  // eventually bounded, the same way the ladder already bounds an identical
+  // EXECUTED call. Captured live: two Planner frames issued 9 and 7 rejected
+  // `bash` calls, all refused on role, with nothing watching (DRIVER-LOG.md,
+  // 2026-09-04 ~01:00) — genuinely invisible before this change, since the role
+  // gate's `continue` never reached evaluateCall.
+  //
+  // Returns null once the rejection has been emitted and the caller should
+  // `continue` the tool-call loop as before (the overwhelmingly common case —
+  // below cfg.gateStopAfter). Returns the STOP message once the (call, reason)
+  // pair has been refused cfg.gateStopAfter times in a row: the caller must then
+  // END THE FRAME (see the two call sites below) rather than continue, exactly
+  // like a genuine iteration-cap hit — never `continue` past a non-null return, or
+  // the frame just keeps asking (and being refused) the same thing forever, which
+  // is precisely the hole this closes.
+  //
+  // Gated on `this.loop` (ARGO_LOOP) — see this method's call sites for why this
+  // belongs under the SAME flag as the rest of the loop-recovery ladder rather
+  // than a separate one: with the flag off, `key` is undefined and this falls
+  // through to the plain, pre-H21 rejection unconditionally (byte-identical to
+  // before this change).
+  private handleGateRejection(
+    name: ToolName,
+    args: Record<string, unknown>,
+    key: string | undefined,
+    reason: GateReason,
+    plainMessage: string,
+    emitAndLog: (e: AgentEvent) => void,
+  ): string | null {
+    if (!this.loop || key === undefined) {
+      this.rejectToolCall(name, args, plainMessage, emitAndLog)
+      return null
+    }
+    const outcome = noteGateRejection(this.loopState, key, reason)
+    if (outcome.escalate) this.loopSteerEscalated = true  // friction, same as an L1/L2 ladder firing — see hadTrouble()
+    if (outcome.stop) {
+      const stopMsg = gateStopMessage(reason, name, outcome.count)
+      this.rejectToolCall(name, args, stopMsg, emitAndLog)
+      return stopMsg
+    }
+    const message = outcome.escalate
+      ? gateEscalationMessage(reason, name, outcome.count, this.buildLoopRecite())
+      : plainMessage
+    this.rejectToolCall(name, args, message, emitAndLog)
+    return null
+  }
+
+  // H21. Ends the CURRENT chat() turn as a stall — a call refused/repeated so many
+  // times in a row that continuing would only produce more identical refusals
+  // (see handleGateRejection above and the loop-recovery ladder's 'halt' kind
+  // below). Reuses the existing 'cap' RunOutcome rather than adding a new value:
+  // dispatch.ts's deriveFrameResult ALREADY maps 'cap' -> FrameStatus 'partial'
+  // (never 'success' — the exact "never fail open" property this must have, and
+  // the one this project already fixed once after 43 frames were found recorded
+  // success at a blank cap-hit). Reusing it means this closes the hole with ZERO
+  // changes outside this scoop's owned files: no new RunOutcome member, no
+  // dispatch.ts edit, no risk of a status this method's caller forgot to map. The
+  // cost is that dispatch.ts's cap-hit issue text ("frame hit its iteration cap...
+  // without producing a final answer") is imprecise about WHY here — see
+  // /shared/argo-gateloop/REPORT.md for the sharper alternative (a dedicated
+  // RunOutcome + a one-line dispatch.ts patch) offered but not applied, since it
+  // is not owned here and shipping it without that patch landing atomically would
+  // itself fail open.
+  private endFrameStalled(message: string, emitAndLog: (e: AgentEvent) => void): string {
+    this.lastRunOutcome = 'cap'
+    emitAndLog({ type: 'error', message })
+    this.phase = 'idle'
+    return message
+  }
+
   // LOOP-RECOVERY LADDER, L0 cached-replay form (ARGO_LOOP; H20). Unlike
   // rejectToolCall above — which deliberately frames a block as an ERROR so the
   // model can't tell a harness rejection from a real failure — a replay is telling
@@ -1113,6 +1194,12 @@ export class Agent {
     }
     const revision = (this.currentPlan?.revision ?? 0) + 1
     this.currentPlan = { objective, steps, revision }
+    // H21: the plan/act gate's OWN condition (`!this.currentPlan`) just became
+    // false for every call, project-wide — not just for whichever call happened to
+    // trigger this update_plan. Its gate-rejection counts must clear the same way
+    // (see noteGateRejection's reset-semantics doc comment in loop.ts); harmless
+    // no-op on a re-plan revision or when nothing was ever counted.
+    if (this.loop) clearPlanGateRejections(this.loopState)
     emitAndLog({ type: 'plan', objective, steps, revision })
     // HARNESS TASK LEDGER (this.tasks): instrument the plan as an ordered ledger. The
     // FIRST plan builds it (createTaskList); a later update_plan is a RE-PLAN that
@@ -1795,12 +1882,28 @@ export class Agent {
             }
             continue
           }
+          // H21: the normalised identity of this call, computed ONCE and shared by
+          // both gates below plus the ladder's own loopKey further down (all three
+          // need the identical value for their counts to compose correctly — see
+          // handleGateRejection's doc comment). undefined when this.loop is off, in
+          // which case handleGateRejection falls straight through to the plain,
+          // pre-H21 rejection (see its own doc comment for why this is gated on the
+          // SAME flag as the rest of the ladder).
+          const gateKey = this.loop ? normalizeCallKey(name, args) : undefined
           // MULTI-AGENT ARCHITECTURE (config.agents): a role-scoped frame rejects any
           // tool outside its ROLE_TOOLS set — enforced here too (not just in the tools
           // offered to Ollama above), since a model can still emit a call for a tool it
-          // wasn't offered. Not counted as a repeat; the call simply never runs.
+          // wasn't offered. Not counted as an EXECUTED-call repeat (evaluateCall below
+          // never sees it — the call simply never runs), but IS counted as a gate
+          // rejection (H21) since allowedTools is fixed for this frame's whole life and
+          // a role refusal can never later succeed here — see handleGateRejection.
           if (this.allowedTools && !this.allowedTools.includes(name)) {
-            this.rejectToolCall(name, args, `tool "${name}" is not available in this role — it was NOT called.`, emitAndLog)
+            const stop = this.handleGateRejection(
+              name, args, gateKey, 'role',
+              `tool "${name}" is not available in this role — it was NOT called.`,
+              emitAndLog,
+            )
+            if (stop !== null) return this.endFrameStalled(stop, emitAndLog)
             continue
           }
           // Plan/act gate: investigation (reads/greps) flows freely, but a project
@@ -1808,11 +1911,15 @@ export class Agent {
           // as a state with different rules. Gated by "about to change the project"
           // (isProjectMutation), not a task classifier, so read-only runs and plain
           // questions never plan (versatility). Blocked, not executed; a steer takes
-          // its place and it isn't counted as a repeat, so the retried call runs
-          // normally once the plan exists.
+          // its place and it isn't counted as an EXECUTED-call repeat, so the retried
+          // call runs normally once the plan exists — but IS counted as a gate
+          // rejection (H21) until then, and cleared globally the instant a plan is
+          // recorded (handleUpdatePlan calls clearPlanGateRejections) so that
+          // legitimate retry is never treated as having "reached" any threshold.
           if (!this.currentPlan && isProjectMutation(name, args)) {
             const gate = `REJECTED — this ${name} call was NOT applied, nothing changed on disk. You must record a plan first. Read the relevant files if you haven't, then call update_plan with one concrete, verifiable objective and the steps to reach it — THEN retry this exact change. Recording a plan does not end your turn.`
-            this.rejectToolCall(name, args, gate, emitAndLog)
+            const stop = this.handleGateRejection(name, args, gateKey, 'plan', gate, emitAndLog)
+            if (stop !== null) return this.endFrameStalled(stop, emitAndLog)
             continue
           }
           // Loop steering (see REPEAT_* above): recentCalls holds calls actually
@@ -1836,12 +1943,34 @@ export class Agent {
             // L0 -> L1 compaction -> L2 forced re-plan exactly as before; only the
             // key (normalised, not raw) and the L0 payload (replay, not just a
             // steer) changed. Replaces the count-based REPEAT_THRESHOLD steer.
-            loopKey = normalizeCallKey(name, args)
+            // Reuses gateKey (computed once, above, before either continue-past-
+            // the-ladder gate) rather than recomputing normalizeCallKey a second
+            // time — see gateKey's own doc comment for why all three consumers
+            // (role gate, plan/act gate, this ladder) must share the identical value.
+            loopKey = gateKey
             const recite = this.buildLoopRecite()
             // args passed through so evaluateCall can enforce FIX 2 (raw-args match
             // before a replay — /shared/argo-loopfix/REPORT.md): the block/escalation
             // decision below is still keyed on loopKey alone, exactly as before.
-            const action = evaluateCall(this.loopState, loopKey, args, { toolName: name, recite, hasTasks: this.tasks && recite.length > 0 })
+            // `loopKey as string`: gateKey is typed string|undefined because it is
+            // computed as `this.loop ? normalizeCallKey(...) : undefined` above, but this
+            // entire block is inside `if (this.loop)`, so it is always a string here.
+            // TypeScript cannot narrow through the intervening assignment; this is the
+            // same narrowing-cast pattern the file already uses for activePlan.
+            const action = evaluateCall(this.loopState, loopKey as string, args, { toolName: name, recite, hasTasks: this.tasks && recite.length > 0 })
+            // H21(b): 'halt' is handled SEPARATELY from the other non-allow kinds
+            // below — it has no `level` field (it fires only after L2 has already
+            // been reported once for this streak, see loop.ts's LoopAction doc
+            // comment), and unlike every other rung it must END THE FRAME rather
+            // than `continue`. Captured live: the frame that motivated this whole
+            // batch hit L2 roughly 30 times in a row with zero effect — nothing
+            // before this bounded how many more times L2 alone could fire.
+            if (action.kind === 'halt') {
+              this.loopSteerEscalated = true
+              emitAndLog({ type: 'warning', message: action.message, level: 'L2' })
+              this.rejectToolCall(name, args, `SKIPPED — identical to a call already run with nothing new since. ${action.message}`, emitAndLog)
+              return this.endFrameStalled(action.message, emitAndLog)
+            }
             if (action.kind !== 'allow') {
               if (action.kind === 'compact' || action.kind === 'replan') this.loopSteerEscalated = true
               if (action.kind === 'compact') {

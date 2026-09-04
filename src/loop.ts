@@ -53,6 +53,50 @@
 //      BYTES" (a trailing `2>&1` can change real stdout/stderr interleaving order —
 //      see StoredResult's doc comment below). See canonicalArgsKey below.
 
+// 2026-09-04 (H21, this batch) — GATE REJECTIONS, and the unbounded L2, both
+// captured live in the SAME frame. `commander/2026-09-04T01-48-24_fix-
+// checkforrequiredlocaloptions-at.jsonl` ran 45 iterations / 12 minutes without
+// spawning a new frame: 37 `bash` calls, 40 rejections total, one exact command
+// (`grep -n 'conflicts' /workspace/lib/help.js`) reissued dozens of times. Two
+// DISTINCT, evidenced problems were found reading that log directly (jq over the
+// raw JSONL, not just the summary that flagged it):
+//
+//   (a) The role gate and the plan/act gate in agent.ts's tool-call loop
+//       `continue` past evaluateCall entirely on a rejection — the loop's own
+//       comments say so ("Not counted as a repeat, the call simply never runs" /
+//       "it isn't counted as a repeat"), correctly, so a legitimate retry-after-
+//       plan is never penalised. But it also means EITHER gate can refuse the
+//       identical call forever with nothing watching. This is NOT what produced
+//       the 32/40-repeat frame above (its every `rejected: true` event traces to
+//       the pre-existing exact-repeat ladder below, not to either gate — see (b)),
+//       but it is real and separately evidenced: two Planner frames on the
+//       commander-option-requires hard task issued 9 and 7 rejected `bash` calls,
+//       respectively, ALL refused on role (DRIVER-LOG.md, 2026-09-04 ~01:00) —
+//       genuinely invisible to evaluateCall, since the role gate's `continue`
+//       never reaches it. Fixed by noteGateRejection/clearPlanGateRejections/
+//       GateReason below (agent.ts calls these at the role gate and the plan/act
+//       gate specifically — see agent.ts's tool-call loop for exactly where).
+//   (b) The cited 32/40-repeat frame's actual cause: its exact-repeat ladder DID
+//       fire and escalate correctly, L0 -> L1 -> L2, exactly as designed — jq over
+//       the log's `warning` events shows L2 ("You have repeatedly looped on
+//       `bash` without any progress. ABANDON this approach... call update_plan")
+//       firing roughly 30 times IN A ROW, ignored every time. `evaluateCall`'s L2
+//       branch below had no ceiling: once `state.blocks >= l2BlocksBeforeAbort`,
+//       every FURTHER no-progress repeat gets another identical 'replan', forever
+//       — the ladder can escalate but never stop. Fixed by the LoopAction 'halt'
+//       kind and haltBlocksAfterAbort below (agent.ts ends the frame on 'halt'
+//       rather than continuing).
+//
+// Both fixes bound the SAME failure shape (a small model ignoring an escalating
+// steer indefinitely) from the two different places it can originate — before the
+// ladder ever sees the call (a), or after it has already escalated as far as it
+// goes (b) — and both stop the FRAME rather than adding a further, softer rung: a
+// harness that has refused the same thing 6+ times in a row has detected a real
+// failure, and reporting that plainly is better than burning the remaining
+// iteration budget to reach the same conclusion less legibly (see /shared/argo-
+// gateloop/REPORT.md for the full design rationale and the "never fail open"
+// constraint this observes).
+
 export interface LoopConfig {
   // Consecutive no-progress blocks before an L1 compaction is triggered.
   l1BlocksBeforeCompact: number
@@ -62,12 +106,37 @@ export interface LoopConfig {
   // cached prior result (kind: 'replay') before falling back to the plain textual
   // L0 steer for further repeats of that same key. See evaluateCall's L0 branch.
   maxReplaysPerKey: number
+  // H21(a). Consecutive identical GATE rejections (role gate / plan-act gate — see
+  // noteGateRejection) of the SAME (call, reason) pair before the escalated
+  // wording (gateEscalationMessage) replaces the gate's normal message. 3: "on
+  // roughly the 3rd identical rejection" per this batch's design brief, and
+  // matches l1BlocksBeforeCompact's cadence — this project's models are not
+  // observed to self-correct from one or two identical refusals alone.
+  gateEscalateAfter: number
+  // H21(a). Consecutive identical GATE rejections of the SAME (call, reason) pair
+  // after which agent.ts stops the FRAME rather than asking (and refusing) again.
+  // 6, matching l2BlocksBeforeAbort's cadence: gateEscalateAfter (3) plus 3 further
+  // escalated refusals — enough to show the escalated wording is being ignored
+  // specifically, not just the plain one, before giving up on this frame.
+  gateStopAfter: number
+  // H21(b). Further consecutive no-progress ladder blocks AFTER L2 has already
+  // fired once, before evaluateCall reports 'halt' instead of yet another
+  // identical L2 'replan'. Captured live: the cited frame hit L2 ~30 times running
+  // with zero effect. 4: L2 itself plus 4 further identical asks is enough to show
+  // the model is not going to act on this specific reframe request (a model that
+  // ignores "ABANDON this approach" 4 times running is not about to act on a 5th),
+  // without cutting off a frame that might still self-correct on its first or
+  // second look at the reframe demand.
+  haltBlocksAfterAbort: number
 }
 
 export const DEFAULT_LOOP_CONFIG: LoopConfig = {
   l1BlocksBeforeCompact: 3,
   l2BlocksBeforeAbort: 6,
   maxReplaysPerKey: 1,
+  gateEscalateAfter: 3,
+  gateStopAfter: 6,
+  haltBlocksAfterAbort: 4,
 }
 
 // A previously-executed tool's result, cached verbatim so a later exact/normalised
@@ -129,6 +198,14 @@ export interface LoopState {
   // doc comment for why that pairing is kept even though it has no separately
   // observable effect through evaluateCall today.
   replaysByKey: Map<string, number>
+  // H21(a). Counts of identical GATE rejections — calls refused by the role gate
+  // or the plan/act gate in agent.ts's tool-call loop, BEFORE they ever reach
+  // evaluateCall (both gates `continue` past it on a rejection; see this file's
+  // H21 header note for the evidence). Keyed `${reason}:${normalizeCallKey(...)}`
+  // (see noteGateRejection/GateReason) — never read or written by evaluateCall
+  // itself, a strictly parallel counter for a strictly separate class of
+  // rejection that the rest of this module cannot see.
+  gateRejectCounts: Map<string, number>
 }
 
 // Fresh, empty state for the start of a run.
@@ -140,6 +217,7 @@ export function createLoopState(): LoopState {
     compactedForStreak: false,
     lastResultByKey: new Map(),
     replaysByKey: new Map(),
+    gateRejectCounts: new Map(),
   }
 }
 
@@ -206,6 +284,137 @@ export function recordResult(
   result: LoopCachedResult,
 ): void {
   state.lastResultByKey.set(key, { ...result, canonicalArgs: canonicalArgsKey(args) })
+}
+
+// ── GATE-REJECTION counter (H21) ─────────────────────────────────────────────
+//
+// See this file's header note for the evidence and the shape of the gap this
+// closes. Everything above this section governs calls that REACH evaluateCall —
+// i.e. calls the harness actually executes, replays, or blocks as a no-progress
+// repeat. `noteGateRejection` below is for the two OTHER call sites in agent.ts's
+// tool-call loop that never reach evaluateCall at all: the role gate (a tool
+// outside the current frame's allowedTools) and the plan/act gate (a project
+// mutation attempted before any plan exists). Both `continue` past evaluateCall on
+// a rejection, by design — see agent.ts's own comments at those two sites for why
+// that is correct in isolation (a plan/act rejection must stop counting once a
+// plan exists, or a legitimate retry-after-plan would read as a stuck loop).
+//
+// A third gate this batch's design brief asked to instrument — a "task-sequencing
+// gate" in tasks.ts said to reject a call for belonging to a not-yet-current task
+// — was searched for directly (grep across agent.ts/tasks.ts/tools/*.ts, and by
+// reading the cited log's raw JSONL event-by-event) and not found as a hard-reject
+// code path: `tasks.ts`'s `renderTaskLedger` only ever produces RECITED text
+// (`ctx.recite`, appended to whatever DOES reject a call — including, confusingly,
+// the exact-repeat ladder's own steer/reframe messages below, which is why its
+// "[PLAN — work ONLY the current task; do not jump ahead...]" wording shows up
+// inside every warning in the cited frame). There is no separate mechanism in this
+// codebase that blocks a read of a file belonging to a later task; see /shared/
+// argo-gateloop/REPORT.md for the full trace of the cited log that led to this
+// finding. Only 'role' and 'plan' are instrumented below as a result.
+export type GateReason = 'role' | 'plan'
+
+function gateRejectMapKey(reason: GateReason, key: string): string {
+  return `${reason}:${key}`
+}
+
+export interface GateRejectionOutcome {
+  // Total identical rejections of this (call, reason) pair so far, this frame.
+  count: number
+  // True from cfg.gateEscalateAfter onward — agent.ts should use
+  // gateEscalationMessage instead of the gate's normal rejection text.
+  escalate: boolean
+  // True from cfg.gateStopAfter onward — agent.ts must end the frame (see
+  // gateStopMessage) rather than continue the run.
+  stop: boolean
+}
+
+// Call from agent.ts's role gate / plan-act gate at the moment either one refuses
+// a call, with `key` = normalizeCallKey(name, args) — the SAME key evaluateCall
+// would use if the call ever reached it — and `reason` naming WHICH gate refused
+// it. Keying on the reason too (not just the call) is what keeps the plan/act
+// gate's legitimate retry-after-plan safe: once a plan is recorded, the plan/act
+// gate stops firing for good (see clearPlanGateRejections below), so its counter
+// for that key simply stops being reached — a role-gate rejection of the exact
+// same call is a DIFFERENT situation (the tool remains unavailable for the rest of
+// the frame) and gets its own independent count, never contaminated by, or
+// contaminating, the plan/act one.
+//
+// RESET SEMANTICS (deliberately NOT handled inside this function — each trigger
+// belongs to agent.ts state this pure module cannot see):
+//   - 'role': NEVER reset within a frame. `allowedTools` is fixed for the life of
+//     one role-scoped Agent instance (agent.ts: one frame = one scoped Agent), so
+//     a role-gate rejection of a given call can never later succeed in this same
+//     frame — there is no legitimate-retry case to protect here, unlike 'plan', so
+//     there is nothing to reset it FOR. It only ever grows until the frame ends.
+//   - 'plan': cleared GLOBALLY (clearPlanGateRejections, below), the instant a
+//     plan is first recorded this run — not per-key. The plan/act gate's own
+//     condition (`!this.currentPlan`) stops applying to EVERY call project-wide at
+//     that instant, not just to whichever key happened to trigger the update_plan
+//     call, so its rejection counts must clear the same way.
+//   - Deliberately NOT reset on a mutation, and NOT reset on a new task becoming
+//     current: neither changes the plan/act gate's or the role gate's own
+//     triggering condition, so resetting on either would be a reset with no
+//     corresponding change in what is actually being counted — exactly the
+//     over-eager reset this batch's design brief warns re-opens the hole (a model
+//     could rack up mutation- or task-advance-separated rejections of the SAME
+//     still-gated call indefinitely, each reset just before the threshold, and
+//     never reach escalation or the stop bound).
+export function noteGateRejection(
+  state: LoopState,
+  key: string,
+  reason: GateReason,
+  cfgIn: Partial<LoopConfig> = DEFAULT_LOOP_CONFIG,
+): GateRejectionOutcome {
+  // Callers may pass a partial override (existing tests supply only the three
+  // pre-2026-09-04 fields); merge over the defaults so a new tier never turns an
+  // omitted field into NaN and silently disables itself.
+  const cfg = { ...DEFAULT_LOOP_CONFIG, ...cfgIn }
+  const gk = gateRejectMapKey(reason, key)
+  const count = (state.gateRejectCounts.get(gk) ?? 0) + 1
+  state.gateRejectCounts.set(gk, count)
+  return { count, escalate: count >= cfg.gateEscalateAfter, stop: count >= cfg.gateStopAfter }
+}
+
+// Clears every 'plan'-reason gate-rejection count, for every key — call exactly
+// once, the moment a plan is first recorded this run (agent.ts's handleUpdatePlan,
+// right after it sets this.currentPlan). See noteGateRejection's reset-semantics
+// note above for why this must be a GLOBAL clear (every key, not just the one that
+// triggered this update_plan call) rather than a per-key one: the plan/act gate
+// itself stops firing for every call the instant a plan exists, so its counters
+// must stop existing the same way, not merely stop incrementing and linger as dead
+// entries that a later, unrelated 'role' rejection of the same key must never read.
+export function clearPlanGateRejections(state: LoopState): void {
+  for (const k of [...state.gateRejectCounts.keys()]) {
+    if (k.startsWith('plan:')) state.gateRejectCounts.delete(k)
+  }
+}
+
+// H21(a) escalated wording — fires once a (call, reason) pair has been refused
+// cfg.gateEscalateAfter times. Shaped for a small local model with the same
+// discipline as l0SteerMessage/l2ReframeMessage below: short, literal, imperative,
+// and naming the ONE concrete alternative action. Deliberately NOT "stop
+// repeating" alone — this project has measured that shape achieving its purpose
+// in only 6 of 143 firings (this file's H19/H20 note above,
+// /shared/argo-loopguard/REPORT.md) precisely because it names the problem
+// without saying what to do instead. Includes the live `count` so consecutive
+// escalated messages for a slow-to-stop model are never byte-identical either —
+// the same defect (identical text, repeated) this whole mechanism responds to.
+export function gateEscalationMessage(reason: GateReason, toolName: string, count: number, recite: string): string {
+  const alternative = reason === 'role'
+    ? `\`${toolName}\` does not exist for you in this role, and asking again will not change that. Do NOT call \`${toolName}\` again. Achieve the goal using only the tools you actually have, or give your best answer now with what you already know.`
+    : `\`${toolName}\` cannot run until a plan exists. Do NOT retry \`${toolName}\` yet. Call \`update_plan\` now with a concrete objective and steps — THEN retry \`${toolName}\`.`
+  return `You have now asked for \`${toolName}\` ${count} times and been refused every time for the SAME reason. It will keep being refused. ${alternative}\n\n${recite}`
+}
+
+// H21(a) stop wording — fires once a (call, reason) pair reaches cfg.gateStopAfter.
+// Paired with agent.ts ending the frame right after this (see /shared/argo-
+// gateloop/REPORT.md for the exact frame-stop contract and why it reuses the
+// existing 'cap' RunOutcome rather than adding a new one). Told to the model
+// mainly for the transcript's sake — the frame ends immediately after, so there is
+// no next turn for it to act on.
+export function gateStopMessage(reason: GateReason, toolName: string, count: number): string {
+  const gateName = reason === 'role' ? 'the role tool restriction' : 'the plan-before-mutation gate'
+  return `STOPPING this frame: \`${toolName}\` has been refused ${count} times in a row by ${gateName}, with no progress. Continuing would only repeat the same refusal.`
 }
 
 // ── L0 key normalisation (H20) ──────────────────────────────────────────────
@@ -396,6 +605,16 @@ export type LoopAction =
   | { kind: 'steer'; level: 'L0'; message: string }
   | { kind: 'compact'; level: 'L1'; message: string }
   | { kind: 'replan'; level: 'L2'; message: string }
+  // H21(b). L2 itself has no ceiling below this addition — evaluateCall returns
+  // 'replan' again on every FURTHER no-progress repeat once `blocks >=
+  // l2BlocksBeforeAbort`, forever. The frame that motivated this batch shows why
+  // that matters: L2 fired ~30 times in a row, each carrying "ABANDON this
+  // approach... call update_plan," never acted on. 'halt' fires once, after
+  // cfg.haltBlocksAfterAbort FURTHER blocks past the first L2 — agent.ts must END
+  // THE FRAME on this (never just `continue`), reusing the existing 'cap'
+  // RunOutcome so it reports as a stall, never success (see /shared/argo-gateloop/
+  // REPORT.md for the exact contract).
+  | { kind: 'halt'; message: string }
 
 export interface LoopContext {
   // The tool being repeated (for the message).
@@ -419,8 +638,9 @@ export function evaluateCall(
   key: string,
   args: Record<string, unknown>,
   ctx: LoopContext,
-  cfg: LoopConfig = DEFAULT_LOOP_CONFIG,
+  cfgIn: Partial<LoopConfig> = DEFAULT_LOOP_CONFIG,
 ): LoopAction {
+  const cfg = { ...DEFAULT_LOOP_CONFIG, ...cfgIn }
   const seen = state.lastMutationByKey.get(key)
   if (seen === undefined || seen !== state.mutationCount) {
     // New key, or a mutation happened since this key last ran — not a stall. A
@@ -440,8 +660,15 @@ export function evaluateCall(
   // the plain steer.
   state.blocks++
 
+  // H21(b) — checked BEFORE the plain L2 branch: once L2 has already fired once
+  // for this streak and cfg.haltBlocksAfterAbort further no-progress repeats have
+  // happened with no effect, stop escalating text and report a halt instead. See
+  // the LoopAction 'halt' doc comment above for the evidence this responds to.
+  if (state.blocks >= cfg.l2BlocksBeforeAbort + cfg.haltBlocksAfterAbort) {
+    return { kind: 'halt', message: lHaltMessage(ctx, state.blocks) }
+  }
   if (state.blocks >= cfg.l2BlocksBeforeAbort) {
-    return { kind: 'replan', level: 'L2', message: l2ReframeMessage(ctx) }
+    return { kind: 'replan', level: 'L2', message: l2ReframeMessage(ctx, state.blocks) }
   }
   if (state.blocks >= cfg.l1BlocksBeforeCompact && !state.compactedForStreak) {
     state.compactedForStreak = true
@@ -509,12 +736,29 @@ export function l1SteerMessage(ctx: LoopContext): string {
 }
 
 // L2 — strongest: abandon the current approach entirely and force a revised
-// plan rather than another steer nudge.
-export function l2ReframeMessage(ctx: LoopContext): string {
+// plan rather than another steer nudge. `blocks` (the running no-progress count,
+// H21(b)) is included so that consecutive L2 firings for the SAME stuck streak are
+// never byte-identical text — the cited frame's ~30 back-to-back identical L2
+// messages is exactly the "harness returns the same text N times" defect this
+// batch responds to, and it applies to L2's own wording just as much as it does
+// to the gate-rejection case above.
+export function l2ReframeMessage(ctx: LoopContext, blocks: number): string {
   const plan = ctx.hasTasks
     ? `Call \`update_plan\` now with a REVISED plan that solves the current task a different way — the harness will reconcile it, keeping already-completed tasks.`
     : `Produce a revised plan now for solving the current task a different way.`
   return (
-    `You have repeatedly looped on \`${ctx.toolName}\` without any progress. ABANDON this approach. ${plan}\n\n${ctx.recite}`
+    `You have repeatedly looped on \`${ctx.toolName}\` without any progress (${blocks} consecutive stalled calls now). ABANDON this approach. ${plan}\n\n${ctx.recite}`
+  )
+}
+
+// H21(b) — fires once, when evaluateCall reports 'halt' (see LoopAction). Told to
+// the model mainly for the transcript's sake: agent.ts ends the frame right after
+// this, so there is no next turn for it to act on. Names the concrete count and
+// the concrete steer that was already tried and ignored, rather than repeating
+// generic "you're stuck" wording a 4th distinct time.
+export function lHaltMessage(ctx: LoopContext, blocks: number): string {
+  return (
+    `STOPPING this frame: \`${ctx.toolName}\` has looped without progress for ${blocks} consecutive calls. ` +
+    `The request to abandon this approach and call update_plan was already given and ignored. Continuing would only repeat the same failed recovery.`
   )
 }
