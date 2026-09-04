@@ -18,7 +18,7 @@ import type { Ollama } from 'ollama'
 import { Agent } from './agent.js'
 import { LOGS_DIR } from './logger.js'
 import type { AgentEvent } from './types.js'
-import { buildTaskStartAssignment, buildTaskStartGraph, buildPlannerAssignment, buildReplanAssignment } from './dispatch.js'
+import { buildTaskStartAssignment, buildTaskStartGraph, buildPlannerAssignment, buildReplanAssignment, buildImplementerAssignment, buildTesterAssignment } from './dispatch.js'
 import { parseTaskStartVerdict } from './frames.js'
 
 // ── buildTaskStartAssignment — the exact prompt text ────────────────────────
@@ -179,6 +179,22 @@ test('buildReplanAssignment: fully self-contained — a fresh Planner spawn need
   // it must never depend on prior context existing.
   const text = buildReplanAssignment('add pagination', 'some reason')
   assert.ok(text.startsWith('<argo-objective>'))
+})
+
+// ── buildImplementerAssignment / buildTesterAssignment — Implementer and Tester
+// assignments follow the same <argo-objective> tagging convention as the Boss
+// task-start checkpoint's <argo-user-prompt> and the Planner's <argo-objective>.
+
+test('buildImplementerAssignment: wraps the objective in <argo-objective> tags, framed as "implement"', () => {
+  const text = buildImplementerAssignment('fix the off-by-one in nextId()')
+  assert.ok(text.startsWith('Your task is to implement the following objective:'))
+  assert.ok(text.includes('<argo-objective>\nfix the off-by-one in nextId()\n</argo-objective>'))
+})
+
+test('buildTesterAssignment: wraps the claim in <argo-objective> tags, framed as "verify"', () => {
+  const text = buildTesterAssignment('Original assignment: fix nextId(). Conclusion (success): done.')
+  assert.ok(text.startsWith('Your task is to verify the following claimed work:'))
+  assert.ok(text.includes('<argo-objective>\nOriginal assignment: fix nextId(). Conclusion (success): done.\n</argo-objective>'))
 })
 
 // ── Agent.seedPlan — the plan/act gate is bypassed for a SEEDED frame, unchanged for
@@ -433,6 +449,67 @@ test('system prompt: explains that calling conclude is the only way to end the s
     assert.ok(capturedSystemPrompt.includes(
       'A turn with no tool calls is treated as a thinking turn and your session continues, so you can reason freely without accidentally finishing.',
     ))
+  } finally {
+    await cleanupSeedPlanSession(sessionId)
+  }
+})
+
+// ── system prompt: describes ONLY the tools this role actually has (2026-09-06) ──
+// buildSystemPrompt (agent.ts) used to send every role the SAME tool list regardless
+// of Agent.setAllowedTools — the Planner's own prompt taught it about bash, write_file,
+// edit_file, and browser_fetch, none of which it holds (frames.ts's ROLE_TOOLS.planner),
+// and a real session had it try bash anyway. Proven here via ROLE_TOOLS.planner's own
+// restricted set (read_file, web_search, fetch_url, ledger, conclude) — the SAME
+// scripted-client technique as the test above, direct proof of what reaches the model.
+
+test('system prompt: a role-restricted frame (Planner\'s tool set) is not told about tools it does not have', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-system-prompt-role-gate-${Date.now()}`
+  let capturedSystemPrompt = ''
+  const ollama = {
+    chat: async (args: { messages: Array<{ role: string; content: string }> }) => {
+      capturedSystemPrompt = args.messages[0]?.content ?? ''
+      return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { answer: 'Final answer.' } } }] } }
+    },
+  } as unknown as Ollama
+  const agent = new Agent(e => events.push(e), 'test-model', ollama)
+  agent.setSessionId(sessionId)
+  agent.setAllowedTools(['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude']) // ROLE_TOOLS.planner
+  try {
+    await agent.chat('argo role-gated system prompt case')
+    assert.equal(capturedSystemPrompt.includes('- bash:'), false)
+    assert.equal(capturedSystemPrompt.includes('- write_file:'), false)
+    assert.equal(capturedSystemPrompt.includes('- edit_file:'), false)
+    assert.equal(capturedSystemPrompt.includes('- browser_fetch:'), false)
+    // What it DOES have is still described.
+    assert.ok(capturedSystemPrompt.includes('- read_file:'))
+    assert.ok(capturedSystemPrompt.includes('- web_search:'))
+    assert.ok(capturedSystemPrompt.includes('- fetch_url:'))
+    // The explicit read-only note is present since it has neither write_file nor edit_file.
+    assert.ok(capturedSystemPrompt.includes('You have no file-modification tools in this role'))
+  } finally {
+    await cleanupSeedPlanSession(sessionId)
+  }
+})
+
+test('system prompt: an unrestricted frame (allowedTools null, the baseline) still sees every tool', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-system-prompt-baseline-tools-${Date.now()}`
+  let capturedSystemPrompt = ''
+  const ollama = {
+    chat: async (args: { messages: Array<{ role: string; content: string }> }) => {
+      capturedSystemPrompt = args.messages[0]?.content ?? ''
+      return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { answer: 'Final answer.' } } }] } }
+    },
+  } as unknown as Ollama
+  const agent = new Agent(e => events.push(e), 'test-model', ollama)
+  agent.setSessionId(sessionId)
+  try {
+    await agent.chat('argo baseline system prompt case')
+    for (const bullet of ['- bash:', '- read_file:', '- write_file:', '- edit_file:', '- fetch_url:', '- browser_fetch:', '- web_search:']) {
+      assert.ok(capturedSystemPrompt.includes(bullet), `expected baseline prompt to include "${bullet}"`)
+    }
+    assert.equal(capturedSystemPrompt.includes('You have no file-modification tools in this role'), false)
   } finally {
     await cleanupSeedPlanSession(sessionId)
   }

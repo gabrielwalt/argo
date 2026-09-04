@@ -466,16 +466,16 @@ export function buildTaskStartAssignment(userMessage: string, verbatimRequestOn:
         'original is preserved separately for anyone who needs the exact wording.\n\n'
       : '') +
     'Return exactly one of these formats:\n' +
-    '- `ANSWER:\\n{complete final answer}` — Use only if you already know the answer with certainty and no ' +
+    '- `ANSWER: {complete final answer}` — Use only if you already know the answer with certainty and no ' +
     'project changes are required.\n' +
-    '- `TRIVIAL:\\n{concrete, verifiable objective}` — Use only for the most trivial changes when you are ' +
+    '- `TRIVIAL: {concrete, verifiable objective}` — Use only for the most trivial changes when you are ' +
     'certain no testing is needed, such as a one-character typo or a single obvious constant change. Do not ' +
     'implement it yourself; instead, formulate a clear objective for the Implementer agent, which has write ' +
     'access. Such tasks typically take 1\u20133 iterations.\n' +
-    '- `SIMPLE:\\n{concrete, verifiable objective}` — Use for a well-scoped change that will typically take ' +
+    '- `SIMPLE: {concrete, verifiable objective}` — Use for a well-scoped change that will typically take ' +
     '3\u201320 iterations to diagnose and implement, such as a bug confined to one file or a single function ' +
     'to fix. The objective will be handled by an Implementer and a Tester agent.\n' +
-    '- `OBJECTIVE:\\n{concrete, verifiable objective}` — Use if you expect the task to take more than 20 ' +
+    '- `OBJECTIVE: {concrete, verifiable objective}` — Use if you expect the task to take more than 20 ' +
     'iterations, require deeper upfront analysis, involve several distinct pieces of work, or contain genuine ' +
     'ambiguity about the approach. The objective will be given to a Planner agent to break down into an ' +
     'actionable plan.\n\n' +
@@ -648,10 +648,11 @@ async function runTesterRounds(frame: SpawnedFrame, combinedPrompt: string, emit
       role: 'tester',
       parentFrameId: frame.result.frameId,
       assignment:
-        `Verify this claim.\nOriginal assignment: ${combinedPrompt}\n` +
-        `Conclusion (${frame.result.status}): ${frame.result.summary}\n` +
-        `Files touched: ${frame.result.filesTouched.join(', ') || 'none (or made via bash, not tracked)'}` +
-        verdictNudge,
+        buildTesterAssignment(
+          `Original assignment: ${combinedPrompt}\n` +
+          `Conclusion (${frame.result.status}): ${frame.result.summary}\n` +
+          `Files touched: ${frame.result.filesTouched.join(', ') || 'none (or made via bash, not tracked)'}`,
+        ) + verdictNudge,
     }
     const { agent: testerAgent, result: testerResult } = await spawnFrame(testerReq, emit)
     const verdict = parseTesterVerdict(testerResult.summary)
@@ -901,6 +902,39 @@ export function buildReplanAssignment(objective: string, reason: string): string
   )
 }
 
+// Implementer/Tester assignments, wrapped the same way as the Boss task-start
+// checkpoint's `<argo-user-prompt>` tags and the Planner's `<argo-objective>` tags
+// (buildTaskStartAssignment / buildPlannerAssignment above) — one prompt shape
+// across every role instead of each spawn site below handing over a bare,
+// untagged string. Pure and exported so the exact text is directly testable
+// without spawning a real frame.
+export function buildImplementerAssignment(objective: string): string {
+  return (
+    'Your task is to implement the following objective:\n' +
+    `<argo-objective>\n${objective}\n</argo-objective>`
+  )
+}
+
+// Same tag, opposite framing: the Tester is told what to VERIFY, never what to
+// implement, matching ROLE_SYSTEM_SUFFIX.tester ("You verify another agent's
+// claimed work — you never fix anything yourself").
+export function buildTesterAssignment(claim: string): string {
+  return (
+    'Your task is to verify the following claimed work:\n' +
+    `<argo-objective>\n${claim}\n</argo-objective>`
+  )
+}
+
+// Wraps a step-execution spawn's assignment with the correct one of the two
+// builders above, keyed on the role about to receive it — the ONE place this
+// decision is made, so a spawn site never has to remember which wrapper matches
+// which role. Tester steps reached via a Planner-authored task-graph step
+// (as opposed to runTesterRounds' own explicit verification pass, which builds
+// its own richer claim text) still just want "verify this objective."
+function buildRoleAssignment(role: Role, content: string): string {
+  return role === 'tester' ? buildTesterAssignment(content) : buildImplementerAssignment(content)
+}
+
 export async function runDispatchLoop(
   userMessage: string,
   rawEmit: Emit,
@@ -1117,7 +1151,7 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
       const retryReq: FrameSpawnRequest = {
         role,
         parentFrameId: plannerFrame?.result.frameId ?? null,
-        assignment: `${combinedPrompt}\n\nA PREVIOUS ATTEMPT at this task got stuck. What it did and where: ${frame.result.summary}\nTry a different approach.`,
+        assignment: `${buildRoleAssignment(role, combinedPrompt)}\n\nA PREVIOUS ATTEMPT at this task got stuck. What it did and where: ${frame.result.summary}\nTry a different approach.`,
         dependsOn: depFrameIds,
       }
       const retry = await spawnFrame(retryReq, emit)
@@ -1157,7 +1191,7 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
       // already told. Tester never gets this — it holds no write_file/edit_file, so
       // the plan/act gate can never trip for it regardless.
       let frame = await spawnFrame(
-        { role, parentFrameId: plannerFrame?.result.frameId ?? null, assignment: combinedPrompt, dependsOn: depFrameIds },
+        { role, parentFrameId: plannerFrame?.result.frameId ?? null, assignment: buildRoleAssignment(role, combinedPrompt), dependsOn: depFrameIds },
         emit,
         undefined,
         role === 'implementer' ? combinedPrompt : undefined,
@@ -1226,7 +1260,7 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
         // verification escalation), so an Implementer here must not hit the plan/act
         // gate either.
         const frame = await spawnFrame(
-          { role, parentFrameId: plannerFrame?.result.frameId ?? null, assignment: combinedPrompt },
+          { role, parentFrameId: plannerFrame?.result.frameId ?? null, assignment: buildRoleAssignment(role, combinedPrompt) },
           emit,
           undefined,
           role === 'implementer' ? combinedPrompt : undefined,

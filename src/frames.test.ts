@@ -71,6 +71,29 @@ test('planner system prompt: still states it never writes or edits (matches the 
   assert.ok(text.includes('you never write or edit anything'))
 })
 
+// ── Planner read-only framing (2026-09-06) — the Planner's tool list has no bash,
+// write_file, or edit_file (ROLE_TOOLS.planner above), but nothing in its OWN system
+// prompt said so explicitly before this — a real session had it try to use bash
+// anyway. Mirrors the Boss task-start checkpoint's own explicit "READ-ONLY" framing.
+
+test('planner system prompt: explicitly states it is READ-ONLY and points at read_file for investigation', () => {
+  const text = systemPromptFor('planner')
+  assert.ok(/READ-ONLY/.test(text))
+  assert.ok(text.includes('Use read_file to inspect files'))
+})
+
+// ── Planner step prompts must carry AGENTS.md/MEMORY.md context forward (2026-09-06) —
+// a downstream Implementer/Tester step only sees its own assignment, never the
+// Planner's own investigation, so anything the Planner learned that matters for a
+// specific step must be restated in that step's own prompt.
+
+test('planner system prompt: instructs restating relevant AGENTS.md/MEMORY.md content in each step\'s own prompt', () => {
+  const text = systemPromptFor('planner')
+  assert.ok(text.includes('AGENTS.md'))
+  assert.ok(text.includes('MEMORY.md'))
+  assert.ok(text.includes('self-contained'))
+})
+
 // ── update_plan removed as a callable tool for every multi-agent role (2026-09-05) ──
 // dispatch.ts's spawnFrame now seeds every Implementer's plan (Agent.seedPlan) before
 // chat() runs, so no multi-agent role ever needs to set or refine its own plan.

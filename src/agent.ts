@@ -74,15 +74,42 @@ import { recordEpisode, markEpisodeEvicted, newId as newLedgerId } from './ledge
 // something that then gets rejected as "not available in this role" on its very
 // first attempt — the same class of contradiction fixed for the Boss task-start
 // checkpoint (frames.ts, dispatch.ts) earlier in this project.
-function buildSystemPrompt(hasUpdatePlan: boolean): string {
+//
+// buildSystemPrompt (2026-09-06): the SAME contradiction existed one level up — every
+// role got the identical TOOLS section, which describes bash/write_file/edit_file/
+// fetch_url/browser_fetch unconditionally, regardless of which tools this.allowedTools
+// (frames.ts's ROLE_TOOLS) actually grants that role. Measured consequence: the Planner
+// (no bash) tried to use it anyway, then went looking for another way to do what the
+// prompt implied it should be able to. Now takes the frame's REAL tool list (null for
+// the unrestricted baseline, matching canUpdatePlan()'s own convention) and builds the
+// TOOLS section from only what `has()` says is actually there — a role that lacks
+// write_file/edit_file is never told about them, and gets an explicit note instead
+// pointing at what it DOES have for reading/investigating.
+function buildSystemPrompt(tools: ToolName[] | null): string {
+  const has = (t: ToolName): boolean => tools === null || tools.includes(t)
+  const hasUpdatePlan = has('update_plan')
+  const canWrite = has('write_file') || has('edit_file')
+
+  const toolLines = [
+    has('bash') && '- bash: run shell commands. Pass the working directory via the cwd argument (e.g. /workspace); do not prefix with "cd /workspace &&".',
+    has('read_file') && '- read_file: whole-file read at any absolute path.',
+    has('write_file') && '- write_file: whole-file write at any absolute path.',
+    has('edit_file') && '- edit_file: replace an exact string in a file; it reports the changed lines and errors if the text is missing or matches more than once.',
+    hasUpdatePlan && '- update_plan: record or refine your plan (a concrete objective plus steps).',
+    has('fetch_url') && '- fetch_url: fetch a page\'s text content (no JavaScript execution).',
+    has('browser_fetch') && '- browser_fetch: fetch a page and run its JavaScript — for pages that need it to render.',
+    has('web_search') && '- web_search: look up things you do not already know.',
+    '- conclude: end your session with your final answer.',
+    // Read-only roles (Planner, Tester, Boss) get told explicitly what to use
+    // instead of write_file/edit_file, rather than left to infer it from the
+    // absence of a bullet.
+    !canWrite && '- You have no file-modification tools in this role: use the tools above (read_file, and bash/web_search/fetch_url where listed) to investigate — you cannot change the project.',
+  ].filter((line): line is string => typeof line === 'string').join('\n')
+
   return `You are the coding agent inside Argo, a local-first coding harness. Your project is mounted at /workspace in an isolated Ubuntu Docker container (the host is not accessible). Your thoughts, tool calls, and results stream live to the user, and changes under /workspace are committed to git when auto-commit is enabled.
 
 TOOLS — invoke them through the function-calling API; never write a tool call as text, JSON, or XML in your reply.
-- bash: run shell commands. Pass the working directory via the cwd argument (e.g. /workspace); do not prefix with "cd /workspace &&".
-- read_file / write_file: whole-file I/O at any absolute path.
-- edit_file: replace an exact string in a file; it reports the changed lines and errors if the text is missing or matches more than once.
-${hasUpdatePlan ? '- update_plan: record or refine your plan (a concrete objective plus steps).\n' : ''}- fetch_url / browser_fetch: fetch a page (browser_fetch runs JavaScript). web_search: look up things you do not already know.
-- conclude: end your session with your final answer.
+${toolLines}
 
 To finish, call \`conclude\` with your final answer — that is the ONLY way to end your session. A turn with no tool calls is treated as a thinking turn and your session continues, so you can reason freely without accidentally finishing.
 
@@ -104,13 +131,15 @@ PRECISION
 
 FILESYSTEM
 - /workspace is the git-tracked project — the only place that is committed. Keep scratch, experiments, and downloads elsewhere (/tmp, your home directory); none of that is committed or shown to the user.
-- Use absolute paths. For commands about the project itself (npm test, git, node <file>), set the bash cwd to /workspace.
+- Use absolute paths.${has('bash') ? ' For commands about the project itself (npm test, git, node <file>), set the bash cwd to /workspace.' : ''}
 
 MEMORY
-- /workspace/AGENTS.md (project instructions) and /workspace/MEMORY.md (durable memory), if present, are already appended below. Update MEMORY.md only for durable, reusable facts — tersely, in place — never one-off task state.
+- /workspace/AGENTS.md (project instructions) and /workspace/MEMORY.md (durable memory), if present, are already appended below.${canWrite ? ' Update MEMORY.md only for durable, reusable facts — tersely, in place — never one-off task state.' : ''}
 
 ENVIRONMENT
-- Ubuntu 24.04. CLI includes bash, git, jq, node, python3, rg, fd, sqlite3, curl. In Node use require() (NODE_PATH is set), not import; native fetch() is available; cheerio and playwright are preinstalled.`
+${has('bash')
+    ? '- Ubuntu 24.04. CLI includes bash, git, jq, node, python3, rg, fd, sqlite3, curl. In Node use require() (NODE_PATH is set), not import; native fetch() is available; cheerio and playwright are preinstalled.'
+    : '- Ubuntu 24.04 container. This role has no direct shell access — investigate using the tools listed above.'}`
 }
 
 // Parses tool calls that a model wrote as JSON code blocks in its text content
@@ -1647,7 +1676,11 @@ export class Agent {
     const projectContext = this.memory
       ? await this.buildProjectMemoryContext(userMessage)
       : await loadProjectContext()
-    const rolePrompt = buildSystemPrompt(this.canUpdatePlan())
+    // this.allowedTools (null for the unrestricted baseline) is the frame's REAL
+    // tool set — buildSystemPrompt derives hasUpdatePlan from it internally the
+    // same way canUpdatePlan() does, so passing it here (rather than the boolean)
+    // is also what lets the TOOLS section itself stay truthful per role.
+    const rolePrompt = buildSystemPrompt(this.allowedTools)
     const baseSystemPrompt = this.roleInstructions ? `${rolePrompt}\n\n${this.roleInstructions}` : rolePrompt
     const systemPrompt = projectContext ? `${baseSystemPrompt}\n\n${projectContext}` : baseSystemPrompt
 
