@@ -463,7 +463,21 @@ const originalPlaceholder = inputEl.placeholder
 // ── SSE connection ───────────────────────────────────────────────
 const es = new EventSource(`${API_BASE}/events`)
 
-es.onopen = () => { if (!busy) setStatus('ready', 'Ready') }  // don't clobber a running state on (re)connect
+es.onopen = () => {
+  if (!busy) setStatus('ready', 'Ready')  // don't clobber a running state on (re)connect
+  // A reconnect can straddle a run's end/start while the connection was down, and any
+  // `done`/run-start event that fired during the gap is simply lost (SSE replay only
+  // covers this session's own persisted events, not a state transition). Reconcile
+  // against the server's actual busy state — fire and forget so onopen stays synchronous.
+  fetch(`${API_BASE}/status`).then(r => r.json()).then(status => {
+    if (status.busy === false && busy) {
+      setBusy(false)
+      setStatus('ready', 'Ready')
+    } else if (status.busy === true && !busy) {
+      setBusy(true)
+    }
+  }).catch(() => { /* ignore — next onopen or the stop-poll safety net will retry */ })
+}
 es.onerror = () => setStatus('error', 'Disconnected — reload page')
 
 es.onmessage = (e) => {
@@ -964,6 +978,29 @@ async function stopAgent() {
   stopRequested = true
   setStatus('busy', 'Stopping…')
   try { await fetch(`${API_BASE}/stop`, { method: 'POST' }) } catch { /* ignore */ }
+
+  // Safety net: the normal path is the `done` SSE event calling setBusy(false). If it's
+  // delayed, dropped, or the stream hiccups right after a stop, the boat is stuck sailing
+  // forever with no recovery but a refresh. Poll /status a few times, giving `done` a head
+  // start each round before asking the server directly.
+  for (let attempt = 0; attempt < 3 && busy; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 2000))
+    if (!busy) return  // `done` arrived while we were waiting — nothing left to do
+    let status
+    try {
+      status = await fetch(`${API_BASE}/status`).then(r => r.json())
+    } catch {
+      continue  // network hiccup — just try again next round
+    }
+    if (status.busy === false) {
+      setBusy(false)
+      setStatus('ready', 'Ready')
+      return
+    }
+  }
+  // Still busy after 3 rounds (~6s) with the server agreeing it's busy: this isn't a lost
+  // event, something is actually stuck server-side. Surface it instead of spinning forever.
+  if (busy) setStatus('error', 'Stop failed — agent still busy')
 }
 
 // ── Combined indicator dropdown ───────────────────────────────────
