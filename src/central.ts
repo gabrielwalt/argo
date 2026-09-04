@@ -8,6 +8,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { promises as fs } from 'fs'
 import crypto from 'crypto'
+import os from 'os'
 import { config } from './config.js'
 import { checkOllama, checkDocker, logEnvironment } from './health.js'
 import { installAuth } from './auth.js'
@@ -29,6 +30,12 @@ const AGENT_IMAGE       = process.env.AGENT_IMAGE ?? 'argo:latest'
 const CONTAINER_PREFIX  = 'argo-'
 const PORT_START        = 3101
 const PORT_END          = 3199
+
+// The native folder dialog blocks on the user — generous so a real browsing
+// session isn't cut short, finite so a route call can never hang forever.
+// See the comment at POST /api/pick-folder for what happens to the dialog
+// process itself when this fires.
+const PICK_FOLDER_TIMEOUT_MS = 5 * 60 * 1000
 
 // Authorizes worker → central calls for tools that need secrets central holds
 // (see startWorker below). Not a user-facing secret — its only power is
@@ -270,6 +277,20 @@ function deriveUniqueName(absPath: string, taken: Set<string>): string {
   return sanitizeName(parts[parts.length - 1] + '-' + hash)
 }
 
+// ── Shell quoting ─────────────────────────────────────────────────
+
+// Mirrors the same-named helper in src/server.ts (not shared/exported — this
+// is the only other place in central that shells out with a value it didn't
+// choose itself). exec() always runs through a shell, so anything that isn't
+// a fixed literal must be single-quoted before it's spliced into a command
+// string; never interpolate it bare. Used by POST /api/pick-folder below for
+// the one user-influenced value that reaches that command line — the
+// starting directory. It is NOT used to build the AppleScript source itself;
+// see that route for why.
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`
+}
+
 // ── HTTP proxy ────────────────────────────────────────────────────
 
 // Hop-by-hop headers must not be forwarded by proxies (RFC 2616)
@@ -380,6 +401,169 @@ export function startCentral(): void {
       }
     }))
     res.json(result)
+  })
+
+  // Native folder picker for the "Attach workspace" button — the PRIMARY path
+  // on macOS, where the owner actually runs this. Shells out to the real
+  // Finder "choose folder" dialog via osascript rather than reimplementing
+  // any part of it — sidebar, favourites, recents, Cmd+Shift+G path entry,
+  // search all come for free and can't be matched by an in-page list.
+  //
+  // POST, not GET: this has a real side effect on the host (it pops a modal
+  // dialog), which is exactly what GET must never do.
+  //
+  // macOS-only. GET /api/browse below is what covers every other case —
+  // another OS, a missing osascript, a headless/no-GUI session, or any other
+  // way this route can fail — so the frontend always has a working fallback
+  // rather than a dead end.
+  app.post('/api/pick-folder', express.json(), async (req, res) => {
+    if (process.platform !== 'darwin') {
+      res.json({ available: false, reason: 'Native folder dialog is only available on macOS' })
+      return
+    }
+
+    // Optional starting directory — normally #attach-path's current value, so
+    // a second use of the button resumes near where the user last was. Same
+    // "must exist and be a real directory, else fall back" rule as
+    // GET /api/browse; an invalid value here should never surface as an error,
+    // it should just start from home instead.
+    const requested = typeof req.body?.path === 'string' ? req.body.path : ''
+    let startDir = os.homedir()
+    if (requested) {
+      try {
+        const resolved = path.resolve(requested)
+        if ((await fs.stat(resolved)).isDirectory()) startDir = resolved
+      } catch { /* keep the home-directory default */ }
+    }
+
+    // `choose folder` is a StandardAdditions command; the osascript process
+    // that runs it has no Dock presence or window of its own, so without
+    // giving some real, visible application focus first, the panel can open
+    // *behind* the browser window with no indication it's waiting — which
+    // reads as a hang. Activating Finder first is the standard fix for
+    // exactly this failure mode; do not remove it as dead code.
+    //
+    // The starting path travels as a script ARGUMENT (`argv`), never spliced
+    // into the AppleScript source text — that would mean stacking shell
+    // quoting on top of AppleScript string-quoting for a value we don't
+    // control, two escaping schemes at once for no benefit. `shQuote` still
+    // guards it at the one place it does enter the shell command line, same
+    // pattern src/server.ts already uses for git paths.
+    //
+    // Cancel is AppleScript error -128. The script catches that itself and
+    // returns a sentinel string, so a cancelled pick is an ordinary 200
+    // response, not a thrown error a caller could confuse with a real failure.
+    const scriptLines = [
+      'on run argv',
+      'tell application "Finder" to activate',
+      'set startPath to item 1 of argv',
+      'try',
+      'set chosenFolder to choose folder with prompt "Choose a workspace folder" default location (POSIX file startPath)',
+      'return POSIX path of chosenFolder',
+      'on error errText number errNum',
+      'if errNum is -128 then',
+      'return "CANCELLED"',
+      'else',
+      'error errText number errNum',
+      'end if',
+      'end try',
+      'end run',
+    ]
+    const cmd = `osascript ${scriptLines.map(l => `-e ${shQuote(l)}`).join(' ')} -- ${shQuote(startDir)}`
+
+    try {
+      const { stdout } = await execAsync(cmd, { timeout: PICK_FOLDER_TIMEOUT_MS })
+      const out = stdout.trim()
+      if (out === 'CANCELLED') { res.json({ cancelled: true }); return }
+      res.json({ path: out })
+    } catch (err: any) {
+      // Node's `timeout` sends SIGTERM to the process exec() itself spawned
+      // (the shell). This command has no pipe/redirection, so a POSIX shell
+      // execs osascript directly in the shell's own place rather than forking
+      // a child (the standard single-command optimization) — the signal
+      // reaches the real dialog process, not just its shell wrapper. If that
+      // assumption is ever wrong for some shell, the panel is left open,
+      // invisible to the request that already returned, until the user finds
+      // it or logs out — nothing server-side is still waiting on it either way.
+      if (err?.killed) {
+        res.status(504).json({ error: 'Folder dialog timed out waiting for a choice — it may still be open on the host; check for it, or try again.' })
+        return
+      }
+      // Missing osascript (exit 127 from the shell, or in principle ENOENT if
+      // spawning the shell itself failed) and any other AppleScript-level
+      // failure (no GUI session, Automation permission denied, etc.) are all
+      // treated the same way: the native path is unusable on this host, so
+      // hand the frontend a clear "fall back" signal instead of a raw error
+      // it would otherwise show on every single click.
+      const reason = (err?.stderr || err?.message || String(err)).toString().trim().slice(0, 300)
+        || 'osascript failed'
+      res.json({ available: false, reason })
+    }
+  })
+
+  // Folder browser fallback for the "Attach workspace" picker — used when
+  // POST /api/pick-folder reports the native dialog unavailable (non-macOS,
+  // osascript missing, no GUI session, etc.). Lists immediate subdirectories
+  // of a path so the in-page modal can let the user walk the filesystem and
+  // land on an absolute path — something a browser page can never produce on
+  // its own (webkitdirectory and showDirectoryPicker() both withhold the real
+  // path by design), so central, which runs on the host as the user, does
+  // the listing.
+  //
+  // Security: this lets any authenticated caller enumerate directory names
+  // anywhere on the host the process can read. That is not a new boundary —
+  // central is loopback-bound behind the same shared-password gate installed
+  // above, and /api/attach already accepts an arbitrary absolute path and
+  // bind-mounts it into a container. A root restriction (e.g. confining this
+  // to the user's home directory) is not added here: the owner may
+  // deliberately want to attach a project living outside $HOME (an external
+  // volume, /opt, a mounted drive), and a silent restriction would just turn
+  // that into a confusing dead end rather than adding real protection.
+  //
+  // Files are intentionally never listed — the user is picking a folder, and
+  // something like node_modules would swamp the list with entries that can
+  // never be a valid answer.
+  app.get('/api/browse', async (req, res) => {
+    const raw = typeof req.query.path === 'string' && req.query.path ? req.query.path : os.homedir()
+    const dir = path.resolve(raw)
+
+    let stat
+    try {
+      stat = await fs.stat(dir)
+    } catch {
+      res.status(400).json({ error: `Path not found: ${dir}` })
+      return
+    }
+    if (!stat.isDirectory()) {
+      res.status(400).json({ error: `Not a directory: ${dir}` })
+      return
+    }
+
+    let entries
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true })
+    } catch {
+      res.status(400).json({ error: `Cannot read directory: ${dir}` })
+      return
+    }
+
+    const showHidden = req.query.hidden === '1'
+    const dirs: { name: string; path: string }[] = []
+    for (const entry of entries) {
+      // One unreadable entry (permission error, broken symlink) must not fail
+      // the whole listing — skip it, don't throw.
+      try {
+        if (!entry.isDirectory()) continue
+        if (!showHidden && entry.name.startsWith('.')) continue
+        dirs.push({ name: entry.name, path: path.join(dir, entry.name) })
+      } catch {
+        continue
+      }
+    }
+    dirs.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+
+    const parent = path.dirname(dir) === dir ? null : path.dirname(dir)
+    res.json({ path: dir, parent, dirs })
   })
 
   // Attach workspace

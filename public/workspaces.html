@@ -101,6 +101,10 @@
     /* Stopped is still the card's main action (start the workspace) — same blue
        fill as running, not a muted/outlined treatment. */
     a.ws-open.stopped { cursor: pointer; }
+    /* Busy state (see setButtonBusy in <script>) — a.ws-open is an anchor,
+       so the native :disabled pseudo-class never matches it; this rule
+       covers the visual dimming that gives buttons for free via :disabled. */
+    a.ws-open[aria-disabled="true"], button.recent-attach:disabled { opacity: .6; cursor: default; }
 
     /* Secondary action (outlined, transparent) — shared look for Detach/Forget. */
     button.ws-detach, button.recent-forget {
@@ -152,6 +156,87 @@
     .attach-row button:hover:not(:disabled) { filter: brightness(1.15); }
     .attach-row button:disabled { opacity: .4; cursor: not-allowed; }
 
+    /* Browse button — DESIGN.md's Secondary archetype (indigo fill, white
+       text, opacity hover/disabled): visible next to the gold "+ Attach"
+       primary without competing with it for attention. Gold stays the
+       page's one primary/CTA color — the coin-shine shimmer sweep is
+       exclusive to "+ Attach"; this button gets the plain opacity treatment
+       DESIGN.md specifies for Secondary instead. */
+    .attach-row button.browse-btn {
+      background: var(--accent); color: #fff; font-weight: 500;
+      transition: opacity .15s;
+    }
+    .attach-row button.browse-btn::after { content: none; }
+    .attach-row button.browse-btn:hover:not(:disabled) { filter: none; opacity: .85; }
+
+    /* ── Folder browser modal (opened by the Browse button) ── */
+    #browse-modal {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,.75);
+      z-index: 300; align-items: center; justify-content: center; backdrop-filter: blur(3px);
+    }
+    #browse-modal.open { display: flex; }
+    #browse-box {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+      width: 480px; max-width: 90vw; max-height: 80vh; padding: 20px;
+      box-shadow: 0 24px 64px rgba(0,0,0,.7);
+      display: flex; flex-direction: column; gap: 12px;
+    }
+    #browse-box:focus { outline: none; }
+    .browse-header { display: flex; align-items: center; gap: 8px; }
+    .browse-up {
+      background: none; border: 1px solid var(--border); color: var(--muted);
+      border-radius: 6px; width: 32px; height: 32px; flex-shrink: 0; cursor: pointer;
+      font-size: 14px; transition: color .15s, border-color .15s;
+    }
+    .browse-up:hover:not(:disabled) { color: var(--text); border-color: var(--muted); }
+    .browse-up:disabled { opacity: .35; cursor: not-allowed; }
+    .browse-current {
+      flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 12px; color: var(--text);
+      background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+      padding: 8px 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .browse-list {
+      flex: 1; min-height: 180px; max-height: 320px; overflow-y: auto;
+      border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .browse-item {
+      display: block; width: 100%; text-align: left; background: none; border: none;
+      color: var(--text); font-size: 13px; padding: 8px 12px; border-radius: 6px;
+      cursor: pointer; transition: background .15s;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    /* Plain interactive-row hover per DESIGN.md's Interaction States table
+       (subtle white background tint) — NOT a gold tint: gold marks
+       active/selected state and CTAs, not an ordinary list row's hover. */
+    .browse-item:hover, .browse-item:focus { background: rgba(255, 255, 255, .05); outline: none; }
+    .browse-empty, .browse-spinner { color: var(--muted); font-size: 13px; padding: 20px 12px; text-align: center; }
+    .browse-error { color: var(--red); font-size: 12px; padding: 4px 0; display: none; }
+    .browse-hidden-toggle { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); cursor: pointer; }
+    .browse-footer { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .browse-footer-actions { display: flex; gap: 8px; }
+    .browse-footer-actions button {
+      padding: 8px 16px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer;
+      border: 1px solid var(--border); background: none; color: var(--muted);
+      transition: border-color .15s, color .15s, opacity .15s;
+    }
+    #browse-cancel-btn:hover { color: var(--text); border-color: var(--text); }
+    /* "Use this folder" is an affirmative confirm, but it is not the page's
+       primary action (it doesn't attach — it just fills the input), so it
+       gets the same Secondary archetype as the Browse button rather than a
+       second gold button competing with "+ Attach" for "look here first". */
+    #browse-confirm-btn { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 500; }
+    #browse-confirm-btn:hover:not(:disabled) { filter: none; opacity: .85; }
+    #browse-confirm-btn:disabled { opacity: .4; cursor: not-allowed; }
+    /* Shown only when this modal is opened as a fallback for the native
+       macOS dialog (see openBrowseModal/openPicker) — otherwise stays hidden.
+       Gold tint here is DESIGN.md's documented "gold tint for surfaces"
+       (0.05–0.12), used for an informational banner, not a hover/CTA. */
+    .browse-fallback-note {
+      font-size: 12px; color: var(--muted); background: rgba(201, 162, 39, .08);
+      border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px;
+    }
+
     .workspace-card:nth-child(2) { animation-delay: .04s; }
     .workspace-card:nth-child(3) { animation-delay: .08s; }
     .workspace-card:nth-child(4) { animation-delay: .12s; }
@@ -191,13 +276,64 @@
     }
     #confirm-message { font-size: 13px; color: var(--text); line-height: 1.5; margin-bottom: 20px; }
     #confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+    /* Shared geometry ONLY — no paint (background/color/border) here.
+       DESIGN.md's archetype model is "shared geometry, per-archetype paint";
+       putting background/color/border in this shared, id+type rule was the
+       actual bug that shipped: `#confirm-actions button` carries an id AND
+       a type selector (specificity 1,0,1), which outranks a bare id
+       selector like `#confirm-ok` (1,0,0) — see the two per-button rules
+       below, which now own every visual property they need instead of
+       trying to override this one. Do not add background/color/border back
+       here; a future archetype would silently lose to this rule again. */
     #confirm-actions button {
       padding: 8px 16px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer;
-      border: 1px solid var(--border); background: none; color: var(--muted);
       transition: border-color .15s, color .15s, filter .15s;
     }
+    /* Ghost archetype — dismissal, not a filled action. Unchanged in intent
+       from before the fix below; only moved here so it owns its own paint
+       instead of relying on the (bugged) shared rule for it. */
+    #confirm-cancel { background: none; border: 1px solid var(--border); color: var(--muted); }
     #confirm-cancel:hover { color: var(--text); border-color: var(--text); }
-    #confirm-ok { background: var(--red); border-color: var(--red); color: #fff; }
+    /* Confirm is the action this dialog exists to perform (e.g. "Detach") —
+       DESIGN.md's Primary archetype (gold fill, near-black text, coin-shine
+       hover), matching "+ Attach" exactly, including its shimmer sweep.
+       The CSS text here previously read `background: var(--red)`, which is
+       not one of DESIGN.md's three button archetypes at all: red is a
+       semantic status color there, and destructive emphasis is specified
+       only as a HOVER treatment on a Ghost button (color: var(--red) + red
+       border tint — see the Interaction States table), never as a fill.
+       (Whether that red text ever actually rendered is a separate question
+       from whether it belonged — the shared rule above, before this fix,
+       out-ranked ANY bare `#confirm-ok` background declaration by CSS
+       specificity, gold or red, so this button may have been silently
+       ghost-styled all along regardless of what its own rule said. Fixing
+       the specificity bug is what makes the archetype declared here — gold —
+       the one that actually renders.)
+       Detaching is not destructive regardless: it stops a container and
+       re-lists the workspace under "Recent" for one-click re-attach — no
+       files touched, nothing lost — so a red fill would overstate the risk
+       even if it had been rendering. No `.danger` variant is added here
+       either — nothing on this page currently needs one; add it the day a
+       genuinely destructive confirm exists, not speculatively now.
+       Cancel deliberately stays Ghost, not indigo Secondary, even though a
+       blue Cancel was floated: two filled buttons side by side compete for
+       the eye, and DESIGN.md's archetype table has room for exactly one
+       primary per context. Secondary (indigo) is for a secondary ACTION
+       beside a primary — like the Browse button next to "+ Attach" above —
+       not for a dismissal. Ghost-vs-gold is the least ambiguous pairing
+       available for "do it" vs "never mind". */
+    #confirm-ok {
+      background: var(--gold); color: var(--bg); border: none;
+      position: relative; overflow: hidden;
+    }
+    #confirm-ok::after {
+      content: '';
+      position: absolute; inset: 0;
+      background: linear-gradient(105deg, transparent 40%, rgba(255,255,255,.13) 50%, transparent 60%);
+      transform: translateX(-150%);
+      transition: transform .5s ease;
+    }
+    #confirm-ok:hover::after { transform: translateX(150%); }
     #confirm-ok:hover { filter: brightness(1.15); }
 
     /* ── Toast notifications (replaces native alert()) ── */
@@ -222,6 +358,7 @@
     <h2>Attach workspace</h2>
     <div class="attach-row">
       <input id="attach-path" type="text" placeholder="/absolute/path/to/project" autocomplete="off" spellcheck="false">
+      <button id="browse-btn" type="button" class="browse-btn">📁 Browse</button>
       <button id="attach-btn">+ Attach</button>
     </div>
     <div id="error-msg" class="error-msg"></div>
@@ -245,6 +382,26 @@
       <div id="confirm-actions">
         <button id="confirm-cancel" type="button">✕ Cancel</button>
         <button id="confirm-ok" type="button">✓ Confirm</button>
+      </div>
+    </div>
+  </div>
+  <div id="browse-modal">
+    <div id="browse-box" role="dialog" aria-modal="true" aria-label="Choose a folder" tabindex="-1">
+      <div id="browse-fallback-note" class="browse-fallback-note" style="display:none"></div>
+      <div class="browse-header">
+        <button id="browse-up" type="button" class="browse-up" title="Up one level">⬆</button>
+        <div id="browse-current" class="browse-current"></div>
+      </div>
+      <div id="browse-list" class="browse-list"><div class="browse-spinner">Loading…</div></div>
+      <div id="browse-error" class="browse-error"></div>
+      <div class="browse-footer">
+        <label class="browse-hidden-toggle">
+          <input id="browse-hidden-toggle" type="checkbox"> Show hidden folders
+        </label>
+        <div class="browse-footer-actions">
+          <button id="browse-cancel-btn" type="button">✕ Cancel</button>
+          <button id="browse-confirm-btn" type="button" disabled>✓ Use this folder</button>
+        </div>
       </div>
     </div>
   </div>
@@ -288,6 +445,227 @@
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     }
 
+    // ── Standard busy-button treatment for every async action on this page ──
+    // Spinner glyph + verb-plus-ellipsis label + disabled state + a preserved
+    // width so nothing reflows as the label's text metrics change. This is
+    // the pattern Detach already had; four other buttons had each grown a
+    // slightly different (and mostly spinner-less) variant of the same idea,
+    // which is exactly how the inconsistency happened — one helper instead of
+    // five copies.
+    //
+    // Works for both <button> (via the real `disabled` IDL property, which
+    // also drives each button's own `:disabled` CSS) and <a> (which has no
+    // such property at all — `el.disabled = true` on an anchor is a silent
+    // no-op — so `pointer-events: none` is what actually blocks clicks
+    // there, and `[aria-disabled="true"]` is what drives its own dimming;
+    // see `a.ws-open[aria-disabled="true"]` in <style>). Setting all of
+    // `disabled`/`pointer-events`/`aria-disabled` on every element regardless
+    // of type is redundant on one or the other but never wrong, which is
+    // simpler than branching on element type.
+    //
+    // `label` is always a fixed literal the caller chose ('Detaching…' etc.),
+    // never user-controlled data — if that ever changes, esc() it first.
+    function setButtonBusy(el, label) {
+      el.dataset.originalHtml = el.innerHTML
+      el.style.minWidth = el.offsetWidth + 'px'
+      el.innerHTML = '<span class="ui-spinner"></span>' + label
+      el.disabled = true
+      el.style.pointerEvents = 'none'
+      el.setAttribute('aria-disabled', 'true')
+    }
+
+    // Reverses setButtonBusy exactly — every failure path must restore the
+    // label, the enabled state, AND clear the inline minWidth, or a failed
+    // action leaves a permanently widened, permanently disabled button.
+    function restoreButton(el) {
+      if (el.dataset.originalHtml !== undefined) {
+        el.innerHTML = el.dataset.originalHtml
+        delete el.dataset.originalHtml
+      }
+      el.style.minWidth = ''
+      el.disabled = false
+      el.style.pointerEvents = ''
+      el.removeAttribute('aria-disabled')
+    }
+
+    // ── Folder picker (Browse button next to #attach-path) ──
+    // Fills #attach-path with an absolute path; never attaches by itself —
+    // that stays a separate, deliberate "+ Attach" click. Primary path is the
+    // native macOS Finder dialog (POST /api/pick-folder); the in-page modal
+    // below is only the fallback for when that reports itself unavailable.
+
+    // Wraps fetch for the picker's own two routes so a network failure, a
+    // non-2xx response, AND a non-JSON body (central's HTML catch-all when a
+    // route isn't live yet on the running server — see FOLDER-PICKER.md) all
+    // become one legible Error, never an uncaught "Unexpected token '<'"
+    // from response.json() on a page that isn't JSON.
+    async function safeJsonFetch(url, opts) {
+      let resp
+      try {
+        resp = await fetch(url, opts)
+      } catch {
+        throw new Error('Folder browser unavailable — the server may need a restart')
+      }
+      let data
+      try {
+        data = await resp.json()
+      } catch {
+        throw new Error('Folder browser unavailable — the server may need a restart')
+      }
+      if (!resp.ok) throw new Error(data.error || data.reason || 'Folder browser unavailable — the server may need a restart')
+      return data
+    }
+
+    let browseCurrentPath = null
+    let browseParentPath = null
+
+    function browseSetConfirmEnabled() {
+      document.getElementById('browse-confirm-btn').disabled = !browseCurrentPath
+    }
+
+    async function loadBrowseDir(requestedPath, opts = {}) {
+      const listEl = document.getElementById('browse-list')
+      const errEl = document.getElementById('browse-error')
+      const hidden = document.getElementById('browse-hidden-toggle').checked
+      listEl.innerHTML = '<div class="browse-spinner">Loading…</div>'
+      errEl.style.display = 'none'
+
+      const qs = new URLSearchParams()
+      if (requestedPath) qs.set('path', requestedPath)
+      if (hidden) qs.set('hidden', '1')
+
+      try {
+        const data = await safeJsonFetch('/api/browse' + (qs.toString() ? '?' + qs.toString() : ''))
+
+        browseCurrentPath = data.path
+        browseParentPath = data.parent
+        const curEl = document.getElementById('browse-current')
+        curEl.textContent = data.path
+        curEl.title = data.path
+        document.getElementById('browse-up').disabled = !data.parent
+        browseSetConfirmEnabled()
+
+        if (!data.dirs.length) {
+          listEl.innerHTML = '<div class="browse-empty">No subfolders</div>'
+        } else {
+          listEl.innerHTML = data.dirs.map(d => `
+            <button type="button" class="browse-item" data-path="${esc(d.path)}">📁 ${esc(d.name)}</button>
+          `).join('')
+          listEl.querySelectorAll('.browse-item').forEach(btn => {
+            btn.addEventListener('click', () => loadBrowseDir(btn.dataset.path))
+          })
+        }
+        return true
+      } catch (err) {
+        // Never leave the spinner running — show the failure inside the modal
+        // and keep whatever directory was last successfully loaded (state and
+        // list are left untouched so Confirm still targets a real folder).
+        if (!opts.silent) {
+          listEl.innerHTML = ''
+          errEl.textContent = err.message || 'Could not read that folder'
+          errEl.style.display = 'block'
+        }
+        return false
+      }
+    }
+
+    // opts.fallbackReason, when set, means this modal is standing in for the
+    // native dialog — shows why, so it doesn't look like the feature silently
+    // changed. Absent when the modal is opened any other way.
+    async function openBrowseModal(opts = {}) {
+      const modal = document.getElementById('browse-modal')
+      const box = document.getElementById('browse-box')
+      const noteEl = document.getElementById('browse-fallback-note')
+      if (opts.fallbackReason) {
+        noteEl.textContent = 'Native folder dialog unavailable — browse below'
+          + (typeof opts.fallbackReason === 'string' && opts.fallbackReason ? ` (${opts.fallbackReason})` : '')
+        noteEl.style.display = 'block'
+      } else {
+        noteEl.style.display = 'none'
+      }
+      browseCurrentPath = null
+      browseParentPath = null
+      browseSetConfirmEnabled()
+      modal.classList.add('open')
+      box.focus()
+      document.addEventListener('keydown', browseKeydown)
+
+      // Start at the path already typed into the attach input if it resolves
+      // to a real directory; fall back to the home directory silently.
+      const inputVal = document.getElementById('attach-path').value.trim()
+      const startedAtInput = inputVal && await loadBrowseDir(inputVal, { silent: true })
+      if (!startedAtInput) await loadBrowseDir(null)
+    }
+
+    function closeBrowseModal() {
+      document.getElementById('browse-modal').classList.remove('open')
+      document.removeEventListener('keydown', browseKeydown)
+      document.getElementById('attach-path').focus()
+    }
+
+    function browseKeydown(e) {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        closeBrowseModal()
+      } else if (e.key === 'Enter' && !e.target.closest('.browse-item')) {
+        // Enter confirms the current directory — unless focus is on a folder
+        // row, where Enter should descend into it (native button activation).
+        e.preventDefault()
+        document.getElementById('browse-confirm-btn').click()
+      }
+    }
+
+    // Browse button entry point: try the native dialog first, and only fall
+    // back to the in-page modal when the server says that dialog can't be
+    // used on this host at all — see FOLDER-PICKER.md for the full contract.
+    async function openPicker() {
+      const btn = document.getElementById('browse-btn')
+      if (btn.getAttribute('aria-disabled') === 'true') return
+      setButtonBusy(btn, 'Waiting for Finder…')
+      try {
+        const inputVal = document.getElementById('attach-path').value.trim()
+        const data = await safeJsonFetch('/api/pick-folder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(inputVal ? { path: inputVal } : {}),
+        })
+        if (data.path) {
+          document.getElementById('attach-path').value = data.path
+          return
+        }
+        if (data.cancelled) return // user changed their mind — input stays untouched, no error shown
+        if (data.available === false) {
+          await openBrowseModal({ fallbackReason: data.reason })
+          return
+        }
+        // Unexpected response shape — the working fallback beats a dead end.
+        await openBrowseModal({})
+      } catch (err) {
+        // safeJsonFetch throws for a network failure, a non-JSON body, and any
+        // non-2xx status — including the dialog-timeout 504. Shown as a toast,
+        // not the fallback modal: on a timeout the native dialog may still be
+        // open on the host, and popping a second picker on top would only
+        // add confusion, not fix anything.
+        showToast(err.message || 'Could not open the folder picker')
+      } finally {
+        restoreButton(btn)
+      }
+    }
+
+    document.getElementById('browse-btn').addEventListener('click', openPicker)
+    document.getElementById('browse-cancel-btn').addEventListener('click', closeBrowseModal)
+    document.getElementById('browse-up').addEventListener('click', () => {
+      if (browseParentPath) loadBrowseDir(browseParentPath)
+    })
+    document.getElementById('browse-hidden-toggle').addEventListener('change', () => {
+      if (browseCurrentPath) loadBrowseDir(browseCurrentPath)
+    })
+    document.getElementById('browse-confirm-btn').addEventListener('click', () => {
+      if (!browseCurrentPath) return
+      document.getElementById('attach-path').value = browseCurrentPath
+      closeBrowseModal()
+    })
+
     let lastWorkspacesSig = null
 
     async function loadWorkspaces() {
@@ -327,8 +705,8 @@
           grid.querySelectorAll('a.ws-open.stopped').forEach(link => {
             link.addEventListener('click', async (e) => {
               e.preventDefault()
-              const original = link.textContent
-              link.textContent = 'Starting…'
+              if (link.getAttribute('aria-disabled') === 'true') return
+              setButtonBusy(link, 'Starting…')
               try {
                 const resp = await fetch('/api/attach', {
                   method: 'POST',
@@ -339,7 +717,7 @@
                 if (!resp.ok) throw new Error(data.error)
                 window.location.href = data.url
               } catch (err) {
-                link.textContent = original
+                restoreButton(link)
                 showToast(err.message || 'Failed to start workspace')
               }
             })
@@ -347,19 +725,15 @@
 
           grid.querySelectorAll('.ws-detach').forEach(btn => {
             btn.addEventListener('click', async () => {
+              if (btn.getAttribute('aria-disabled') === 'true') return
               if (!(await confirmDialog(`Detach "${btn.dataset.name}"?`))) return
-              const original = btn.innerHTML
-              btn.style.minWidth = btn.offsetWidth + 'px'
-              btn.innerHTML = '<span class="ui-spinner"></span>Detaching…'
-              btn.disabled = true
+              setButtonBusy(btn, 'Detaching…')
               try {
                 const resp = await fetch(`/api/detach/${btn.dataset.name}`, { method: 'POST' })
                 if (!resp.ok) throw new Error('Detach failed')
                 loadWorkspaces()
               } catch (err) {
-                btn.innerHTML = original
-                btn.disabled = false
-                btn.style.minWidth = ''
+                restoreButton(btn)
                 showToast(err.message || 'Failed to detach workspace')
               }
             })
@@ -401,8 +775,8 @@
 
         grid.querySelectorAll('.recent-attach').forEach(btn => {
           btn.addEventListener('click', async () => {
-            btn.disabled = true
-            btn.textContent = '…'
+            if (btn.getAttribute('aria-disabled') === 'true') return
+            setButtonBusy(btn, 'Attaching…')
             try {
               const resp = await fetch('/api/attach', {
                 method: 'POST',
@@ -414,8 +788,7 @@
               window.location.href = data.url
               loadWorkspaces()
             } catch (err) {
-              btn.textContent = '↩ Attach'
-              btn.disabled = false
+              restoreButton(btn)
               showToast(err.message)
             }
           })
@@ -441,12 +814,12 @@
       const input = document.getElementById('attach-path')
       const btn = document.getElementById('attach-btn')
       const errEl = document.getElementById('error-msg')
+      if (btn.getAttribute('aria-disabled') === 'true') return
       const wsPath = input.value.trim()
       if (!wsPath) return
 
       errEl.style.display = 'none'
-      btn.textContent = 'Attaching…'
-      btn.disabled = true
+      setButtonBusy(btn, 'Attaching…')
 
       try {
         const resp = await fetch('/api/attach', {
@@ -463,8 +836,7 @@
         errEl.textContent = err.message
         errEl.style.display = 'block'
       } finally {
-        btn.textContent = '+ Attach'
-        btn.disabled = false
+        restoreButton(btn)
       }
     })
 
