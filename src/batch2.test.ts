@@ -58,7 +58,7 @@ function programmableOllama(): { ollama: Ollama; script: (responses: ScriptedRes
 function readCallTo(p: string): ScriptedResponse {
   return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: p } } }] } }
 }
-const finalAnswer: ScriptedResponse = { message: { role: 'assistant', content: 'Final answer.' } }
+const finalAnswer: ScriptedResponse = { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { answer: 'Final answer.' } } }] } }
 
 async function cleanupSession(sessionId: string, slug: string): Promise<void> {
   await Promise.all([

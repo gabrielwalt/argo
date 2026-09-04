@@ -81,10 +81,10 @@ TOOLS — invoke them through the function-calling API; never write a tool call 
 - bash: run shell commands. Pass the working directory via the cwd argument (e.g. /workspace); do not prefix with "cd /workspace &&".
 - read_file / write_file: whole-file I/O at any absolute path.
 - edit_file: replace an exact string in a file; it reports the changed lines and errors if the text is missing or matches more than once.
-${hasUpdatePlan ? '- update_plan: record or refine your plan (a concrete objective plus steps). It is a tool call, so it does not end your turn.\n' : ''}- fetch_url / browser_fetch: fetch a page (browser_fetch runs JavaScript). web_search: look up things you do not already know.
-When the task is complete, give your final answer and stop.
+${hasUpdatePlan ? '- update_plan: record or refine your plan (a concrete objective plus steps).\n' : ''}- fetch_url / browser_fetch: fetch a page (browser_fetch runs JavaScript). web_search: look up things you do not already know.
+- conclude: end your session with your final answer.
 
-A turn where you make no tool calls is how you signal completion — the harness treats your text as the final answer and ends the session. There is no "finish" or "done" tool to call.
+To finish, call \`conclude\` with your final answer — that is the ONLY way to end your session. A turn with no tool calls is treated as a thinking turn and your session continues, so you can reason freely without accidentally finishing.
 
 HOW TO WORK
 - A simple question or a one-line change: answer or do it directly — no plan needed.
@@ -96,7 +96,7 @@ ${hasUpdatePlan
     ? '- Stay on the plan. Call update_plan again only when the work contradicts one of its assumptions. Rewriting the same thing many different ways with nothing forcing it is drift — stop and return to the plan.'
     : '- Stay on this objective; do not drift to a different goal. If it cannot be met as scoped, say so explicitly in your final answer rather than grinding indefinitely — state what you tried, what failed, and why.'}
 - For repetitive work (many files or pages), write one script instead of repeating a tool call.
-- Before finishing, verify the objective against the original request — run the relevant command or test — then give your final answer.
+- Before finishing, verify the objective against the original request — run the relevant command or test — then call conclude with your final answer.
 
 PRECISION
 - Never reconstruct an exact identifier, path, URL, flag, or package name from memory — copy it verbatim from the tool result where it appeared, or re-read the source.
@@ -267,7 +267,12 @@ export function loopSteerMessage(name: string, priorRepeats: number, level: numb
 // answer — never more aimless inspecting, and never a broader/different goal (chasing a
 // new goal is exactly how a stuck run drifts). Kept terse — it is injected mid-run.
 export function regroundSteer(objective: string, detail: string): string {
-  return `You appear stuck — ${detail}. Re-anchor to the objective: "${objective}". Do ONE thing now: either make the single most important change (an edit) that advances that objective, or — if it is already met, or you are genuinely blocked — give your final answer, stating what you accomplished and (if blocked) exactly what is blocking you. Stop re-inspecting the same things, and do not broaden or switch the objective.`
+  // 2026-09-06: "give your final answer" alone no longer ends anything (a turn
+  // with no tool calls is now a thinking turn — only calling `conclude` finishes)
+  // — corrected here so this steer's own urgency ("you appear stuck... do ONE
+  // thing now") isn't quietly defeated by advice that used to work and now just
+  // produces another thinking-turn nudge instead of ending the run.
+  return `You appear stuck — ${detail}. Re-anchor to the objective: "${objective}". Do ONE thing now: either make the single most important change (an edit) that advances that objective, or — if it is already met, or you are genuinely blocked — call conclude with your final answer, stating what you accomplished and (if blocked) exactly what is blocking you. Stop re-inspecting the same things, and do not broaden or switch the objective.`
 }
 
 // Same cap as read_file's own truncation (file-ops.ts) — these are the same
@@ -304,8 +309,10 @@ export async function loadProjectContext(workspaceRoot = '/workspace'): Promise<
 }
 
 // HOW A chat() TURN ENDED, as a fact rather than an inference (H13, 2026-09-04):
-//   'ok'      — the model produced a final answer (no tool call) and every pre-done gate
-//               (task ledger, grounding, layout, re-ground) let it through.
+//   'ok'      — the model called `conclude` with a final answer (2026-09-06: no longer
+//               a bare no-tool-call turn — see the thinking-turn/conclude comments in
+//               chat() itself) and every pre-done gate (task ledger, grounding, layout,
+//               re-ground) let it through.
 //   'cap'     — the iteration budget ran out first. chat() still RETURNS a string (the
 //               "Reached maximum iterations (N) without a final answer." notice) and
 //               emits a terminal `error` event; that string is NOT a final answer and a
@@ -1264,10 +1271,12 @@ export class Agent {
 
   // Harness handler for the update_plan tool. Sets the run's plan, surfaces it as
   // a 'plan' event (rendered in the UI like a message and logged for replay), and
-  // returns the confirmation that becomes the tool result in history. Because the
-  // model reaches this via a tool call, recording a plan never trips the
-  // "no tool call = done" terminal condition — the failure that made a plan-as-prose
-  // turn end the run.
+  // returns the confirmation that becomes the tool result in history. Originally
+  // written (pre-2026-09-06) because a tool call could never trip the OLD
+  // "no tool call = done" terminal condition — the failure that made a plan-as-
+  // prose turn end the run. That condition is gone now (only `conclude` ends a
+  // session), but recording a plan is still, correctly, a tool call rather than
+  // prose — it mutates state and needs a real return value, same as any other tool.
   private handleUpdatePlan(args: Record<string, unknown>, emitAndLog: (e: AgentEvent) => void): string {
     const objective = typeof args.objective === 'string' ? args.objective.trim() : ''
     // Raw steps as the model supplied them — each entry may be plain text OR
@@ -1668,7 +1677,13 @@ export class Agent {
     const maxForRun = this.iterationBase + this.maxIterations
 
     try {
-      for (let i = 0; i < this.maxIterations; i++) {
+      // Labeled so the `conclude` handler (deep inside the per-tool-call loop below)
+      // can jump straight to the NEXT Ollama call when a gate blocks concluding —
+      // 2026-09-06, part of removing "no tool call = done": that handler lives one
+      // loop level deeper than the old code it replaces did, so a bare `continue`
+      // there would only skip to the next tool call in THIS turn's batch, not to a
+      // fresh model turn with the steer actually in context.
+      iterations: for (let i = 0; i < this.maxIterations; i++) {
         if (this.aborted) {
           this.aborted = false
           const msg = 'Stopped.'
@@ -1718,10 +1733,10 @@ export class Agent {
             const stall = isLastCheckpoint
               ? (hasUpdatePlan
                 ? `STALL: ${iterNum} iterations without finishing — your approach is not converging. Call update_plan now with a revised plan that lists ONLY the remaining work as concrete steps, then carry it out. Do not repeat what has not worked.`
-                : `STALL: ${iterNum} iterations without finishing — your approach is not converging. Conclude NOW with your best verdict/answer given what you have found so far, or take one genuinely different action — do not repeat what has not worked.`)
+                : `STALL: ${iterNum} iterations without finishing — your approach is not converging. Call conclude NOW with your best verdict/answer given what you have found so far, or take one genuinely different action — do not repeat what has not worked.`)
               : (hasUpdatePlan
                 ? `PROGRESS CHECK: ${iterNum} iterations in and not finished. Objective: "${objective}". State which steps are DONE and which REMAIN, then make the single most important remaining change now — if you have been searching or re-reading without editing, stop and implement the next concrete step; if the approach is wrong, call update_plan to revise.`
-                : `PROGRESS CHECK: ${iterNum} iterations in and not finished. Objective: "${objective}". State what you have confirmed so far, then either conclude with your verdict/answer or take the single most important remaining action — do not keep re-checking the same thing.`)
+                : `PROGRESS CHECK: ${iterNum} iterations in and not finished. Objective: "${objective}". State what you have confirmed so far, then either call conclude with your verdict/answer or take the single most important remaining action — do not keep re-checking the same thing.`)
             emitAndLog({ type: 'warning', message: stall })
             this.pushCtx({ role: 'tool', content: stall })
             // ON-STALL critic checkpoint: reuse the existing stall/progress trigger
@@ -1802,184 +1817,23 @@ export class Agent {
           : []
         const hasCalls = nativeCalls.length > 0 || fallbackCalls.length > 0
 
+        // THINKING TURN (2026-09-06): a turn with no tool calls no longer ends the
+        // session — the owner's own diagnosis was that the old "no tool call = done"
+        // convention didn't let the model reason or plan across multiple turns
+        // without accidentally finishing. The ONLY way to end the session now is
+        // calling `conclude` (see its handler in the per-call loop below); an
+        // iteration cap hit is the one other terminal path, and it is unchanged.
+        // Every gate that used to live in THIS branch (task-ledger verify/summary/
+        // advance, final reconciliation, critic, grounding, layout, re-ground) has
+        // moved into the `conclude` handler — they gate the FINISH action now, not
+        // an ordinary thinking turn, so this branch is deliberately just "keep the
+        // model's reasoning in context and nudge it toward an explicit next move."
         if (!hasCalls) {
           this.pushCtx(msg)
-          // ── HARNESS TASK LEDGER: per-task verify → SUMMARY → advance (this.tasks). A
-          // no-tool call while tasks REMAIN means the model believes the CURRENT task
-          // is done.
-          //
-          // Step 1 — EXECUTABLE VERIFY (Change 3, unchanged): if the current task
-          // carries a `verify` command and it hasn't already passed this run, the
-          // harness does NOT take the self-report at face value: it RUNS the command
-          // itself (via tracedBash, same trace/log path as any other tool call). A
-          // failing command blocks — taskVerifyFails increments, the real output is
-          // fed back (escalating past VERIFY_FAIL_ESCALATE), and the model stays on
-          // THIS task; no summary is asked for. A passing command is recorded
-          // (taskVerifyPassed) and FALLS THROUGH to step 2 — it does NOT advance yet.
-          //
-          // Step 2 — SUMMARY (NEW): the executable oracle (or its absence) is
-          // necessary but not sufficient — the harness also wants the model's own
-          // brief account of WHAT it did and HOW, for the final reconciliation pass.
-          // First no-tool-call turn for this task id (taskSummaryAsked) asks for that
-          // summary once and CONTINUEs; the NEXT no-tool-call turn for the SAME task
-          // is treated as the summary itself — it is recorded onto the active task
-          // (recordActiveTaskSummary) and the ledger advances (completeActiveTask). A
-          // task with no verify lands here directly; a task with a verify lands here
-          // only once its verify has passed. Net shape is unchanged from before for a
-          // no-verify task (ask once, advance on the next turn) — the summary now
-          // fills the role the old bare "confirm you're done" nudge used to.
-          //
-          // Either way, once advanced, emit a 'tasks' advance event, recite the next
-          // task, CONTINUE. Only when the ledger is exhausted (allDone) — or when
-          // this.tasks is off / there is no ledger — do we fall through to the existing
-          // run-level done-gate below (final reconciliation → critic → grounding →
-          // layout → re-ground → finish). Read the ledger via a cast (the narrowing
-          // gotcha: handleUpdatePlan sets it where TS can't see).
-          const tlGate = this.taskList as TaskList | null
-          if (this.tasks && tlGate && !tasksAllDone(tlGate)) {
-            const cur = activeTask(tlGate)
-            if (cur && cur.verify && !this.taskVerifyPassed.has(cur.id)) {
-              const verifyResult = await this.tracedBash(cur.verify, emitAndLog)
-              if (verifyResult.error) {
-                // VERIFY FAILED — do not advance, do not ask for a summary. Feed the
-                // failure straight back, output intact (never hidden), and keep the
-                // model on this one task.
-                const fails = (this.taskVerifyFails.get(cur.id) ?? 0) + 1
-                this.taskVerifyFails.set(cur.id, fails)
-                const failOutput = truncateOutput(
-                  [verifyResult.output, verifyResult.error].filter(Boolean).join('\n') || '(no output)',
-                  1500,
-                )
-                const steer = fails < VERIFY_FAIL_ESCALATE
-                  ? `Verification for the current task "${cur.title}" FAILED — command \`${cur.verify}\` did not pass:\n${failOutput}\nFix this before finishing the task.`
-                  // Persistent failure (VERIFY_FAIL_ESCALATE+ in a row): stop repeating
-                  // the identical "fix this" steer and push toward a different move —
-                  // either the actual fix or a re-plan — while still not advancing.
-                  : `Verification for "${cur.title}" has now FAILED ${fails} times in a row (\`${cur.verify}\`):\n${failOutput}\nStop repeating the same fix if it hasn't worked. Either resolve the real underlying problem, or call update_plan to revise this task (or its verify command) if it no longer makes sense as written.`
-                emitAndLog({ type: 'warning', message: steer })
-                this.pushCtx({ role: 'tool', content: steer })
-                continue
-              }
-              // VERIFY PASSED — the task is genuinely done by the executable oracle;
-              // record it and fall through to the summary step below (do NOT advance
-              // yet — the summary is still captured for the final reconciliation).
-              this.taskVerifyFails.delete(cur.id)
-              this.taskVerifyPassed.add(cur.id)
-              emitAndLog({ type: 'warning', message: `VERIFY PASSED for task "${cur.title}" (\`${cur.verify}\`) — capturing a summary before advancing.` })
-            }
-            if (cur && !this.taskSummaryAsked.has(cur.id)) {
-              // First no-tool-call turn for this task (post-verify, if any) — ask for
-              // the summary once and wait for the next turn.
-              this.taskSummaryAsked.add(cur.id)
-              const ask = `CURRENT TASK "${cur.title}" — if it is genuinely complete, reply with a brief 2-4 sentence summary of WHAT you did and HOW you solved it (this becomes the record used for the final check). If it is NOT actually done, keep working on THIS task only.`
-              emitAndLog({ type: 'warning', message: ask })
-              this.pushCtx({ role: 'tool', content: ask })
-              continue
-            } else if (cur) {
-              // Already asked for this task → THIS no-tool-call turn IS the summary.
-              // Record it, then advance the ledger.
-              const summarized = recordActiveTaskSummary(tlGate, msg.content.trim() || '(no summary provided)')
-              const advanced = completeActiveTask(summarized)
-              this.taskList = advanced
-              const done = advanced.tasks.filter(t => t.status === 'done').length
-              const nextActive = activeTask(advanced)
-              emitAndLog({
-                type: 'tasks',
-                action: 'advanced',
-                revision: advanced.revision,
-                done,
-                total: advanced.tasks.length,
-                current: nextActive?.title ?? null,
-              })
-              if (!tasksAllDone(advanced) && nextActive) {
-                // Recite the next task and keep the loop going — the full ledger is in
-                // the recited tail (chatCall).
-                const adv = `Task complete. NEXT TASK "${nextActive.title}". Work only on this task now; the full plan is in the recited ledger. Refine via update_plan only if the work contradicts it.`
-                emitAndLog({ type: 'warning', message: adv })
-                this.pushCtx({ role: 'tool', content: adv })
-                continue
-              }
-              // allDone after advancing → do NOT continue; fall through to the existing
-              // run-level done-gate below (final reconciliation → critic → grounding →
-              // layout → re-ground → finish).
-            }
-          }
-          // Read through a cast: this.currentPlan is set only inside handleUpdatePlan
-          // (the update_plan intercept), which TS's control-flow analysis can't see
-          // from here — after the run-start `this.currentPlan = null` it still believes
-          // the field is null and narrows this truthy branch to `never`. The cast
-          // restores the real plan type.
-          const activePlan = this.currentPlan as { objective: string; steps: string[]; revision: number } | null
-          // FINAL RECONCILIATION (NEW): once every planned task is done, before any of
-          // the existing critic/grounding/layout/re-ground checks run, feed the model
-          // ALL the per-task summaries plus the objective and make it double-check
-          // nothing is missing — it can re-open work via update_plan (which resets
-          // finalReconciled, so a later allDone re-arms exactly one more pass) or give
-          // its genuine final answer. At most once per run (finalReconciled) so this
-          // cannot loop.
-          if (this.tasks && tlGate && tasksAllDone(tlGate) && !this.finalReconciled) {
-            this.finalReconciled = true
-            const objective = activePlan?.objective || tlGate.objective
-            const reconcileMsg = `ALL PLANNED TASKS ARE DONE — final check before finishing. Objective: "${objective}". What was done per task:\n${renderTaskSummaries(tlGate)}\nVerify this FULLY addresses the objective. If ANYTHING is missing, incomplete, or inconsistent, call update_plan to add/adjust the remaining work and keep going. If it is genuinely complete, give your FINAL ANSWER now: a clear summary for the user of what was accomplished, and suggest a sensible next step.`
-            emitAndLog({ type: 'warning', message: reconcileMsg })
-            this.pushCtx({ role: 'tool', content: reconcileMsg })
-            continue
-          }
-          // PRE-DONE critic checkpoint: reuse the existing done-gate. Before taking
-          // "I'm done" at face value, the critic reviews the files edited (with
-          // test/spec flags), the latest test output, and the recent trace, and
-          // answers: did it REALLY satisfy the objective, and did it tamper with any
-          // test/spec file (ORACLE TAMPER)? On tamper or objective-unmet it injects
-          // the critique (+ a hard "do NOT edit test/spec files" reminder when
-          // gamed_oracle) and BLOCKS completion — the loop continues. Fails OPEN:
-          // if the critic errors/won't parse, completion proceeds as in baseline.
-          if (config.critic && activePlan) {
-            const critique = await this.runCriticCheckpoint('pre-done', activePlan.objective, activePlan.steps, emitAndLog)
-            if (critique && (critique.gamed_oracle || critique.verdict === 'revise')) {
-              continue
-            }
-          }
-          // GROUNDING & self-consistency checkpoint (writing/research tasks). At most
-          // once per run. If it flags fabricated specifics or internal contradictions,
-          // block completion so the agent revises. Only active when config.grounding is
-          // on; runGroundingCheckpoint returns null (no block) for non-writing runs.
-          if (this.grounding && activePlan && !groundingChecked) {
-            groundingChecked = true
-            const g = await this.runGroundingCheckpoint(activePlan.objective, emitAndLog)
-            if (g && g.verdict === 'revise') continue
-          }
-          // LAYOUT JUDGE checkpoint (visual-layout guard, config.layout / this.layout —
-          // default OFF, unproven). At most once per run (layoutChecked), mirroring
-          // groundingChecked's cap so this can never block indefinitely. Only runs the
-          // (render + vision-model) check at all when selectLayoutArtifact finds an
-          // HTML artifact this run edited — a no-op for non-HTML tasks or when the flag
-          // is off, so baseline behavior is untouched either way.
-          if (this.layout && !layoutChecked) {
-            const artifact = selectLayoutArtifact(this.editedPaths)
-            if (artifact) {
-              layoutChecked = true
-              const lv = await this.runLayoutCheckpoint(artifact, emitAndLog)
-              if (!lv.ok) continue
-            }
-          }
-          // Re-grounding done-gate: if a plan is active for THIS run, don't take the
-          // first "I'm done" at face value — nudge once to verify the recorded
-          // objective is actually met (checking a fix against the reported symptom is
-          // the exact step the 90-iteration drift run skipped). A run with no plan
-          // (simple task / question) finishes immediately, so versatility is
-          // untouched. At most once per run (regrounded), so it cannot loop.
-          if (activePlan && !regrounded) {
-            regrounded = true
-            const nudge = `Before finishing, re-ground against your plan. Objective: "${activePlan.objective}". Think critically: is the objective TRULY met — not just that a command exited 0, with no corner cut and the real request satisfied? State how you verified it (the check you ran and its result). If it is not genuinely met, keep working toward THIS objective (do not drift to a different one). If it is met, give your final answer as: (1) a brief summary of what you did to achieve the objective, and (2) only if there is a clear, sensible next step for this project, one short suggestion of what to do next.`
-            emitAndLog({ type: 'warning', message: nudge })
-            this.pushCtx({ role: 'tool', content: nudge })
-            continue
-          }
-          emitAndLog({ type: 'message', role: 'assistant', content: msg.content })
-          emitAndLog({ type: 'done', content: msg.content })
-          if (this.autoCommitEnabled) await this.autoCommit(emitAndLog)
-          this.phase = 'idle'
-          return msg.content
+          const nudge = 'Your turn produced no tool calls. To finish, call conclude with your final answer. To keep working, make your next tool call.'
+          emitAndLog({ type: 'warning', message: nudge })
+          this.pushCtx({ role: 'tool', content: nudge })
+          continue
         }
 
         this.pushCtx(msg)
@@ -2030,6 +1884,185 @@ export class Agent {
               if (newPlan) await this.runCriticCheckpoint('post-plan', newPlan.objective, newPlan.steps, emitAndLog)
             }
             continue
+          }
+          // CONCLUDE (2026-09-06): the ONLY way a turn ends the session now — see
+          // the thinking-turn comment above this inner loop's caller. Intercepted
+          // here exactly like update_plan just above (a harness action, not a
+          // sandbox tool — skips the repetition guard and the normal execution
+          // path), and gated the same defensive way: a role without `conclude` in
+          // its allowedTools (none currently — frames.ts gives every role the tool,
+          // since every agent needs a way to finish) falls through to the standard
+          // "not available in this role" rejection instead of being silently
+          // intercepted here regardless of role.
+          if (name === 'conclude' && (this.allowedTools === null || this.allowedTools.includes('conclude'))) {
+            emitAndLog({ type: 'tool_call', tool: name, args })
+            const answer = typeof args.answer === 'string' ? args.answer.trim() : ''
+            if (!answer) {
+              const err = 'conclude needs a non-empty "answer" string — nothing was concluded. Call it again with your final answer.'
+              emitAndLog({ type: 'tool_result', tool: name, output: '', error: err, duration_ms: 0 })
+              this.pushCtx({ role: 'tool', content: `Error: ${err}` })
+              continue
+            }
+
+            // Everything below used to gate the OLD "no tool call = done" terminal
+            // condition (the thinking-turn branch above is now clean of all of it) —
+            // moved here so these checks fire on the FINISH action itself, not on
+            // every ordinary thinking turn. Logic and order are UNCHANGED from
+            // before this move; only the trigger (calling conclude, not the absence
+            // of a tool call) and the source of the model's "final" text (the
+            // `answer` argument, not the old no-tool-call turn's message content)
+            // are different. The next architectural pass removes most of these
+            // gates outright — for THIS change they only had to move, not go away.
+
+            // HARNESS TASK LEDGER: per-task verify → SUMMARY → advance (this.tasks).
+            // Calling conclude while tasks REMAIN means the model believes the
+            // CURRENT task is done.
+            const tlGate = this.taskList as TaskList | null
+            if (this.tasks && tlGate && !tasksAllDone(tlGate)) {
+              const cur = activeTask(tlGate)
+              if (cur && cur.verify && !this.taskVerifyPassed.has(cur.id)) {
+                const verifyResult = await this.tracedBash(cur.verify, emitAndLog)
+                if (verifyResult.error) {
+                  // VERIFY FAILED — do not advance, do not ask for a summary. Feed
+                  // the failure straight back, output intact, and keep the model on
+                  // THIS task.
+                  const fails = (this.taskVerifyFails.get(cur.id) ?? 0) + 1
+                  this.taskVerifyFails.set(cur.id, fails)
+                  const failOutput = truncateOutput(
+                    [verifyResult.output, verifyResult.error].filter(Boolean).join('\n') || '(no output)',
+                    1500,
+                  )
+                  const steer = fails < VERIFY_FAIL_ESCALATE
+                    ? `Verification for the current task "${cur.title}" FAILED — command \`${cur.verify}\` did not pass:\n${failOutput}\nFix this before concluding.`
+                    : `Verification for "${cur.title}" has now FAILED ${fails} times in a row (\`${cur.verify}\`):\n${failOutput}\nStop repeating the same fix if it hasn't worked. Either resolve the real underlying problem, or call update_plan to revise this task (or its verify command) if it no longer makes sense as written.`
+                  emitAndLog({ type: 'tool_result', tool: name, output: steer, duration_ms: 0 })
+                  this.pushCtx({ role: 'tool', content: steer })
+                  continue iterations
+                }
+                // VERIFY PASSED — the task is genuinely done by the executable
+                // oracle; record it and fall through to the summary step below (do
+                // NOT conclude yet — the summary is still captured for the final
+                // reconciliation).
+                this.taskVerifyFails.delete(cur.id)
+                this.taskVerifyPassed.add(cur.id)
+                emitAndLog({ type: 'warning', message: `VERIFY PASSED for task "${cur.title}" (\`${cur.verify}\`) — capturing a summary before concluding this task.` })
+              }
+              if (cur && !this.taskSummaryAsked.has(cur.id)) {
+                // First conclude call for this task (post-verify, if any) — ask for
+                // the summary once and wait for the next turn.
+                this.taskSummaryAsked.add(cur.id)
+                const ask = `CURRENT TASK "${cur.title}" — if it is genuinely complete, call conclude again with a brief 2-4 sentence summary of WHAT you did and HOW you solved it as your answer (this becomes the record used for the final check). If it is NOT actually done, keep working on THIS task only.`
+                emitAndLog({ type: 'tool_result', tool: name, output: ask, duration_ms: 0 })
+                this.pushCtx({ role: 'tool', content: ask })
+                continue iterations
+              } else if (cur) {
+                // Already asked for this task → THIS conclude call's answer IS the
+                // summary. Record it, then advance the ledger.
+                const summarized = recordActiveTaskSummary(tlGate, answer || '(no summary provided)')
+                const advanced = completeActiveTask(summarized)
+                this.taskList = advanced
+                const done = advanced.tasks.filter(t => t.status === 'done').length
+                const nextActive = activeTask(advanced)
+                emitAndLog({
+                  type: 'tasks',
+                  action: 'advanced',
+                  revision: advanced.revision,
+                  done,
+                  total: advanced.tasks.length,
+                  current: nextActive?.title ?? null,
+                })
+                if (!tasksAllDone(advanced) && nextActive) {
+                  const adv = `Task complete. NEXT TASK "${nextActive.title}". Work only on this task now; the full plan is in the recited ledger. Refine via update_plan only if the work contradicts it. Call conclude again once this next task is genuinely done.`
+                  emitAndLog({ type: 'tool_result', tool: name, output: adv, duration_ms: 0 })
+                  this.pushCtx({ role: 'tool', content: adv })
+                  continue iterations
+                }
+                // allDone after advancing → do NOT continue; fall through to the
+                // reconciliation checks below.
+              }
+            }
+            // Read through a cast: this.currentPlan is set only inside
+            // handleUpdatePlan/seedPlan, which TS's control-flow analysis can't see
+            // from here — after the run-start reset it still believes the field is
+            // null and narrows this truthy branch to `never`. The cast restores the
+            // real plan type.
+            const activePlan = this.currentPlan as { objective: string; steps: string[]; revision: number } | null
+            // FINAL RECONCILIATION: once every planned task is done, before any of
+            // the critic/grounding/layout/re-ground checks below run, feed the model
+            // ALL the per-task summaries plus the objective and make it double-check
+            // nothing is missing — it can re-open work via update_plan (which resets
+            // finalReconciled, so a later allDone re-arms exactly one more pass) or
+            // truly conclude. At most once per run (finalReconciled) so this cannot
+            // loop.
+            if (this.tasks && tlGate && tasksAllDone(tlGate) && !this.finalReconciled) {
+              this.finalReconciled = true
+              const objective = activePlan?.objective || tlGate.objective
+              const reconcileMsg = `ALL PLANNED TASKS ARE DONE — final check before concluding. Objective: "${objective}". What was done per task:\n${renderTaskSummaries(tlGate)}\nVerify this FULLY addresses the objective. If ANYTHING is missing, incomplete, or inconsistent, call update_plan to add/adjust the remaining work and keep going. If it is genuinely complete, call conclude again with your FINAL ANSWER: a clear summary for the user of what was accomplished, and suggest a sensible next step.`
+              emitAndLog({ type: 'tool_result', tool: name, output: reconcileMsg, duration_ms: 0 })
+              this.pushCtx({ role: 'tool', content: reconcileMsg })
+              continue iterations
+            }
+            // PRE-DONE critic checkpoint: before taking "I'm done" at face value,
+            // the critic reviews the files edited (with test/spec flags), the latest
+            // test output, and the recent trace, and answers: did it REALLY satisfy
+            // the objective, and did it tamper with any test/spec file (ORACLE
+            // TAMPER)? On tamper or objective-unmet it injects the critique and
+            // blocks concluding. Fails OPEN: if the critic errors/won't parse,
+            // concluding proceeds.
+            if (config.critic && activePlan) {
+              const critique = await this.runCriticCheckpoint('pre-done', activePlan.objective, activePlan.steps, emitAndLog)
+              if (critique && (critique.gamed_oracle || critique.verdict === 'revise')) {
+                emitAndLog({ type: 'tool_result', tool: name, output: 'Not concluded — the critic requested a revision; see its feedback above.', duration_ms: 0 })
+                continue iterations
+              }
+            }
+            // GROUNDING & self-consistency checkpoint (writing/research tasks). At
+            // most once per run. If it flags fabricated specifics or internal
+            // contradictions, block concluding. Only active when config.grounding is
+            // on; runGroundingCheckpoint returns null (no block) for non-writing runs.
+            if (this.grounding && activePlan && !groundingChecked) {
+              groundingChecked = true
+              const g = await this.runGroundingCheckpoint(activePlan.objective, emitAndLog)
+              if (g && g.verdict === 'revise') {
+                emitAndLog({ type: 'tool_result', tool: name, output: 'Not concluded — the grounding check requested a revision; see its feedback above.', duration_ms: 0 })
+                continue iterations
+              }
+            }
+            // LAYOUT JUDGE checkpoint (visual-layout guard, config.layout / this.layout
+            // — default OFF, unproven). At most once per run (layoutChecked). Only
+            // runs the (render + vision-model) check at all when
+            // selectLayoutArtifact finds an HTML artifact this run edited.
+            if (this.layout && !layoutChecked) {
+              const artifact = selectLayoutArtifact(this.editedPaths)
+              if (artifact) {
+                layoutChecked = true
+                const lv = await this.runLayoutCheckpoint(artifact, emitAndLog)
+                if (!lv.ok) {
+                  emitAndLog({ type: 'tool_result', tool: name, output: 'Not concluded — the layout check requested a revision; see its feedback above.', duration_ms: 0 })
+                  continue iterations
+                }
+              }
+            }
+            // Re-grounding done-gate: if a plan is active for THIS run, don't take
+            // the first conclude call at face value — nudge once to verify the
+            // recorded objective is actually met. A run with no plan (simple task /
+            // question) concludes immediately, so versatility is untouched. At most
+            // once per run (regrounded), so it cannot loop.
+            if (activePlan && !regrounded) {
+              regrounded = true
+              const nudge = `Before concluding, re-ground against your plan. Objective: "${activePlan.objective}". Think critically: is the objective TRULY met — not just that a command exited 0, with no corner cut and the real request satisfied? State how you verified it (the check you ran and its result). If it is not genuinely met, keep working toward THIS objective (do not drift to a different one) and call conclude again once it is. If it is met, call conclude again with your final answer: (1) a brief summary of what you did to achieve the objective, and (2) only if there is a clear, sensible next step for this project, one short suggestion of what to do next.`
+              emitAndLog({ type: 'tool_result', tool: name, output: nudge, duration_ms: 0 })
+              this.pushCtx({ role: 'tool', content: nudge })
+              continue iterations
+            }
+            // All gates passed — genuinely done.
+            emitAndLog({ type: 'tool_result', tool: name, output: 'Concluded.', duration_ms: 0 })
+            this.pushCtx({ role: 'tool', content: 'Concluded.' })
+            emitAndLog({ type: 'message', role: 'assistant', content: answer })
+            emitAndLog({ type: 'done', content: answer })
+            if (this.autoCommitEnabled) await this.autoCommit(emitAndLog)
+            this.phase = 'idle'
+            return answer
           }
           // H21: the normalised identity of this call, computed ONCE and shared by
           // both gates below plus the ladder's own loopKey further down (all three

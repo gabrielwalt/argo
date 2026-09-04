@@ -33,8 +33,8 @@ test('TASK_START_TOOLS keeps ledger — the tool itself exposes no write action'
   assert.equal(TASK_START_TOOLS.includes('ledger'), true)
 })
 
-test('TASK_START_TOOLS is exactly four tools, not a filtered copy of ROLE_TOOLS.boss', () => {
-  assert.deepEqual([...TASK_START_TOOLS].sort(), ['fetch_url', 'ledger', 'read_file', 'web_search'])
+test('TASK_START_TOOLS is exactly five tools (read-only + conclude), not a filtered copy of ROLE_TOOLS.boss', () => {
+  assert.deepEqual([...TASK_START_TOOLS].sort(), ['conclude', 'fetch_url', 'ledger', 'read_file', 'web_search'])
 })
 
 test('ROLE_TOOLS.boss (the Boss\'s OTHER checkpoints — standup, final) still has bash', () => {
@@ -86,4 +86,20 @@ test('no role in ROLE_TOOLS holds update_plan — it is a harness-internal mecha
   for (const role of ['planner', 'implementer', 'tester', 'boss'] as const) {
     assert.equal(ROLE_TOOLS[role].includes('update_plan'), false, `${role} must not have update_plan`)
   }
+})
+
+// ── conclude: every role gets it (2026-09-06) — "no tool call = done" is gone,
+// so every agent needs an explicit way to finish, unlike update_plan which was
+// always role-specific.
+
+test('every role in ROLE_TOOLS holds conclude', () => {
+  for (const role of ['planner', 'implementer', 'tester', 'boss'] as const) {
+    assert.equal(ROLE_TOOLS[role].includes('conclude'), true, `${role} must have conclude`)
+  }
+})
+
+test('TASK_START_TOOLS (the read-only classification checkpoint) also holds conclude', () => {
+  // Without it the checkpoint could investigate forever but never actually
+  // classify — a turn with no tool calls no longer ends anything either.
+  assert.equal(TASK_START_TOOLS.includes('conclude'), true)
 })

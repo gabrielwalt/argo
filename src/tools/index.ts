@@ -217,6 +217,20 @@ export const toolDefinitions = [
   {
     type: 'function' as const,
     function: {
+      name: 'conclude',
+      description: 'End your session and deliver your final answer to the user. This is the ONLY way to finish — a turn with no tool calls is a thinking turn, not a termination signal.',
+      parameters: {
+        type: 'object',
+        properties: {
+          answer: { type: 'string', description: 'Your final answer or summary for the user.' },
+        },
+        required: ['answer'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
       name: 'ledger',
       description: 'Query the multi-agent ledger — the persistent record under /workspace/.argo/ of every delegation, conclusion, standup, and injection across this task. Use it to look up prior work instead of assuming, e.g. what a dependency actually found/touched, or to recover content that was evicted from your own context.',
       parameters: {
@@ -261,6 +275,9 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
     case 'update_plan':
       // Handled in the agent loop (needs agent state); never dispatched here.
       return { output: '', error: 'update_plan is handled by the agent loop' }
+    case 'conclude':
+      // Handled in the agent loop (terminates the session); never dispatched here.
+      return { output: '', error: 'conclude is handled by the agent loop' }
     case 'ledger':
       return runLedgerTool(args)
     default:

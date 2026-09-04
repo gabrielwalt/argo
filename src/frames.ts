@@ -17,17 +17,27 @@
 import type { Role, ToolName, FrameSpawnRequest, FramePolicy } from './types.js'
 import { getConclusion } from './ledger.js'
 
+// `conclude` (2026-09-06) is in EVERY role's tool set below — it is not role-
+// specific, it is how any frame ends its turn now (agent.ts's chat() loop: a turn
+// with no tool calls is a thinking turn, only calling `conclude` finishes). The
+// Planner's task graph, the Tester's RELEASE/REDO verdict, and the Boss's
+// checkpoint markers are now delivered as `conclude`'s `answer` argument instead of
+// a bare no-tool-call final message — dispatch.ts/frames.ts's parsing functions
+// (parseTaskGraph, parseTesterVerdict, parseBossVerdict, parseTaskStartVerdict) are
+// unaffected: they only ever read the STRING chat() returns, and that string is
+// still exactly the model's own text either way.
 export const ROLE_TOOLS: Record<Role, ToolName[]> = {
-  // Deliberately NO update_plan (removed 2026-09-04). The Planner's deliverable is the
-  // task graph it returns as its FRAME'S FINAL ANSWER (a no-tool-call turn — see
-  // dispatch.ts's parseTaskGraph), not a harness plan ledger: dispatch.ts owns the
-  // graph, ledger.setPlan persists it, and nothing ever read a Planner's own
-  // this.currentPlan. Holding the tool was actively harmful, not merely redundant —
-  // combined with harness task sequencing (which spawnFrame never disabled, see
-  // types.ts FramePolicy) an update_plan call built a task ledger whose per-task verify
-  // gate then refused to let the frame conclude, so the graph was never delivered. The
-  // 6 Planner frames that never called it concluded in two messages.
-  planner: ['read_file', 'web_search', 'fetch_url', 'ledger'],
+  // Deliberately NO update_plan (removed 2026-09-04). The Planner's deliverable is
+  // the task graph it returns as its FRAME'S FINAL ANSWER (delivered via
+  // `conclude`'s `answer` — see dispatch.ts's parseTaskGraph), not a harness plan
+  // ledger: dispatch.ts owns the graph, ledger.setPlan persists it, and nothing
+  // ever read a Planner's own this.currentPlan. Holding the tool was actively
+  // harmful, not merely redundant — combined with harness task sequencing (which
+  // spawnFrame never disabled, see types.ts FramePolicy) an update_plan call built
+  // a task ledger whose per-task verify gate then refused to let the frame
+  // conclude, so the graph was never delivered. The 6 Planner frames that never
+  // called it concluded in two messages.
+  planner: ['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude'],
   // Deliberately NO update_plan (removed 2026-09-05, alongside the Planner's own
   // removal above). dispatch.ts's spawnFrame now calls Agent.seedPlan with this
   // frame's own assignment (the TRIVIAL/SIMPLE objective, or a Planner step's own
@@ -36,11 +46,11 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
   // update_plan 8 times with byte-identical content, 7 no-op revisions that read as
   // pure log noise. The harness owns the plan; the Implementer's job is to execute
   // it, not define or refine it (see agent.ts's canUpdatePlan/buildSystemPrompt).
-  implementer: ['read_file', 'write_file', 'edit_file', 'bash', 'fetch_url', 'web_search', 'browser_fetch', 'ledger'],
+  implementer: ['read_file', 'write_file', 'edit_file', 'bash', 'fetch_url', 'web_search', 'browser_fetch', 'ledger', 'conclude'],
   // Deliberately no write_file/edit_file — Tester directs fixes, never makes them.
-  tester: ['read_file', 'bash', 'ledger'],
+  tester: ['read_file', 'bash', 'ledger', 'conclude'],
   // Deliberately no write_file/edit_file — the Boss verifies, it never fixes.
-  boss: ['read_file', 'bash', 'web_search', 'fetch_url', 'ledger'],
+  boss: ['read_file', 'bash', 'web_search', 'fetch_url', 'ledger', 'conclude'],
 }
 
 // The task-start checkpoint's tool set (dispatch.ts's runBossTaskStart) — deliberately
@@ -64,8 +74,11 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
 // reopen a write path. `read_file` covers investigation (it gained a `pattern` search
 // param plus offset/limit line paging — 8656de9, fa5b497 — specifically so a role
 // without bash can still find a symbol); `web_search`/`fetch_url` cover the
-// checkpoint's own "ground it" instruction.
-export const TASK_START_TOOLS: ToolName[] = ['read_file', 'web_search', 'fetch_url', 'ledger']
+// checkpoint's own "ground it" instruction. `conclude` (2026-09-06) is how this
+// checkpoint now delivers its ANSWER/TRIVIAL/SIMPLE/OBJECTIVE marker line — a turn
+// with no tool calls no longer ends anything (agent.ts's chat() loop), so without
+// it this checkpoint could investigate forever but never actually classify.
+export const TASK_START_TOOLS: ToolName[] = ['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude']
 
 // Per-role iteration budgets. Implementer keeps the most headroom (real work happens
 // there); Planner/Tester/Boss are short bounded loops, not open-ended. Planner raised

@@ -1,4 +1,4 @@
-export type ToolName = 'bash' | 'web_search' | 'read_file' | 'write_file' | 'edit_file' | 'fetch_url' | 'browser_fetch' | 'update_plan' | 'ledger'
+export type ToolName = 'bash' | 'web_search' | 'read_file' | 'write_file' | 'edit_file' | 'fetch_url' | 'browser_fetch' | 'update_plan' | 'ledger' | 'conclude'
 
 export interface ToolResult {
   output: string
