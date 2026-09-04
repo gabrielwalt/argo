@@ -361,7 +361,7 @@ export function deriveFrameResult(frameId: string, finalAnswer: string, agent: A
   const editedPaths = agent.getEditedPaths()
   const outcome = agent.getLastRunOutcome()
   const lower = finalAnswer.toLowerCase()
-  const gaveUp = /\b(giving up|give up|cannot complete|unable to complete)\b/.test(lower)
+  const gaveUp = /\b(giv(?:e|es|en|ing) up|cannot complete|can['\u2019]t complete|unable to complete)\b/.test(lower)
   const status: FrameStatus = outcome === 'cap'
     ? 'partial'
     : outcome === 'error'
@@ -861,9 +861,9 @@ export function isPlannerDone(concludeText: string): boolean {
 // marker.
 const PLANNER_GIVE_UP_PHRASES: RegExp[] = [
   /^\s*GIVE_UP\s*:/i,
-  /\bgive(?:s|n)? up\b/i,
+  /\bgiv(?:e|es|en|ing) up\b/i,
   /\bcannot complete\b/i,
-  /\bcan\u2019t complete\b/i,
+  /\bcan['\u2019]t complete\b/i,
   /\bunable to complete (?:the|this) objective\b/i,
 ]
 
@@ -906,12 +906,21 @@ export async function runDispatchLoop(
   // moment the run ended, and every individual FRAME (each its own real
   // Agent.chat() call) already gets its own separate JSONL+MD, so "every session is
   // logged" was silently false for the one file that would show the overall shape
-  // of the run. Only UNTAGGED events (no __frameId) are logged HERE — a tagged
-  // event already has its own home in its frame's own log; logging it again here
-  // would just duplicate it.
+  // of the run. REVERSED (2026-09-04, see /shared/argo-ui/REPLAY-ARCHITECTURE.md):
+  // the old comment above argued that a tagged event "already has its own home in
+  // its frame's own log; logging it again here would just duplicate it" — true of
+  // the bytes, false of the ORDER. Skipping tagged events here meant the run's log
+  // stopped being a record of what the UI actually showed: every thought, tool call,
+  // tool result and role card lived ONLY in the SSE stream and died with the page.
+  // The UI is a pure function of one durable, ordered event stream per run — so
+  // EVERY event, tagged or not, gets logged here, and every event's seq now comes
+  // from this ONE top-level logger (the frame's own `seq` argument is ignored for
+  // ordering purposes; the frame log keeps its own independent counter for its own
+  // file). Per-frame JSONL logs stay — they remain the per-agent analytical copy
+  // used by GET /context?frame=, and the run log now duplicating their contents is
+  // an accepted, quantified cost, not an oversight.
   const logger = new SessionLogger(userMessage, model, currentOptions ?? {}, overrides?.sessionId)
-  const emit: Emit = (event, seq) => {
-    if ('__frameId' in event) { rawEmit(event, seq); return }
+  const emit: Emit = (event) => {
     logger.log(event)
     rawEmit(event, logger.getSeq())
   }

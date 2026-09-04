@@ -30,6 +30,7 @@ import {
   buildNextTaskPrompt,
   buildImplementerCapFollowUp,
   isPlannerDone,
+  isPlannerGiveUp,
   TASK_START_MAX_ITERATIONS,
   TASK_START_HARD_CAP,
   TASK_START_CAP_FAILURE_MESSAGE,
@@ -957,4 +958,32 @@ test('UI-CLEAN-END: only runDispatchLoop itself emits an untagged done/error eve
   assert.equal(bareEmit.test(outsideBody), false,
     'found an untagged done/error emit outside runDispatchLoop — every other function must ' +
     'return its result string and let runDispatchLoop emit done/error, never emit them itself')
+})
+
+// ── isPlannerGiveUp — BUG-2/BUG-3 regressions (this task) ──────────────────────────
+// BUG-2: the give-up phrase list used the Unicode right single quote (U+2019) only,
+// so the ASCII apostrophe (U+0027) models actually emit for "can't complete" never
+// matched. BUG-3: the "give up" alternation covered give/gives/given but not the
+// gerund "giving up", a natural phrasing ("I'm giving up on this task.").
+
+test('isPlannerGiveUp: matches "can\'t complete" with the ASCII apostrophe (BUG-2)', () => {
+  assert.equal(isPlannerGiveUp("I can't complete this objective."), true)
+})
+
+test('isPlannerGiveUp: still matches "can\u2019t complete" with the Unicode apostrophe', () => {
+  assert.equal(isPlannerGiveUp('I can\u2019t complete this objective.'), true)
+})
+
+test('isPlannerGiveUp: matches the gerund "giving up" (BUG-3)', () => {
+  assert.equal(isPlannerGiveUp("I'm giving up on this task."), true)
+})
+
+test('isPlannerGiveUp: still matches "give up" / "gives up" / "given up"', () => {
+  assert.equal(isPlannerGiveUp('I give up.'), true)
+  assert.equal(isPlannerGiveUp('The planner gives up here.'), true)
+  assert.equal(isPlannerGiveUp('I have given up on this approach.'), true)
+})
+
+test('isPlannerGiveUp: unrelated success text does not match', () => {
+  assert.equal(isPlannerGiveUp('The objective is complete and all tests pass.'), false)
 })
