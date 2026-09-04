@@ -17,6 +17,7 @@ export type AgentEvent =
   | { type: 'iteration'; current: number; max: number }
   | { type: 'ollama_request'; iteration: number; message_count: number; model: string }
   | { type: 'thought'; content: string }
+  | { type: 'system_prompt'; content: string }
   | { type: 'tool_call'; tool: ToolName; args: Record<string, unknown> }
   // rejected: true marks a HARNESS-level block (plan/act gate, role restriction, loop
   // steer/replay) — deliberately still shaped exactly like a real tool_result (see

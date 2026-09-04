@@ -1683,6 +1683,11 @@ export class Agent {
     const rolePrompt = buildSystemPrompt(this.allowedTools)
     const baseSystemPrompt = this.roleInstructions ? `${rolePrompt}\n\n${this.roleInstructions}` : rolePrompt
     const systemPrompt = projectContext ? `${baseSystemPrompt}\n\n${projectContext}` : baseSystemPrompt
+    // Logging-only: makes the full prompt (tool list + role suffix + AGENTS.md/
+    // MEMORY.md context) visible in the run log. Emitted before the first
+    // iteration/tool_call so a reader sees it ahead of anything it produced.
+    // Does not affect what is sent to the model.
+    emitAndLog({ type: 'system_prompt', content: systemPrompt })
 
     // Stall/progress-check iteration numbers for THIS run, scaled to THIS run's own
     // budget (2026-09-03: multi-agent roles run short, fixed budgets — Boss/Planner
