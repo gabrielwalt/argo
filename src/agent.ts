@@ -1600,6 +1600,12 @@ export class Agent {
     // Reassigned (not recomputed) after each compaction, since compaction replaces
     // `this.history` wholesale and returns the prompt's new position in it.
     let currentRunStart = this.history.length - 1
+    // Consecutive no-tool-call ("thinking") turns, local to this chat() call (not a
+    // class field — a class field would carry across a resumed frame's later chat()
+    // call and could suppress or misfire the nudge for state it never actually saw).
+    // Reset to 0 on any turn that DOES produce a tool call, so the count always
+    // means "since the last real action," not "since the run started."
+    let consecutiveThinkingTurns = 0
     // How this turn ends is decided by whichever exit path below runs; assume the good
     // case so a normal final answer needs no bookkeeping, and overwrite on the cap /
     // error / abort paths. Reset for a resumed turn too: it describes the LAST turn.
@@ -1703,7 +1709,15 @@ export class Agent {
     // the same positions WITHIN this turn — the alternative (absolute numbering) would
     // put every checkpoint in the past for a resumed frame and silently give it no
     // mid-run steering at all, which is the same class of bug the scaling above fixed.
-    const stallCheckpoints = [0.4, 0.65, 0.85].map((frac, idx) =>
+    // The Boss task-start classification checkpoint (dispatch.ts's
+    // buildTaskStartAssignment, marked 'CHECKPOINT: task-start') gets its first
+    // check pushed all the way to its own 10-iteration cap instead of 0.4 of it
+    // (=4) — classification is expected to finish fast, and a mid-run steer at 4
+    // was firing well before the model had a real chance to converge. Scoped to
+    // this checkpoint only (via the assignment marker) so every other role's
+    // 0.4/0.65/0.85 scaling is untouched.
+    const isBossTaskStartCheckpoint = userMessage.startsWith('CHECKPOINT: task-start')
+    const stallCheckpoints = [isBossTaskStartCheckpoint ? 1 : 0.4, 0.65, 0.85].map((frac, idx) =>
       this.iterationBase + Math.min([20, 35, 45][idx], Math.max(1, Math.round(frac * this.maxIterations))),
     )
     // A resumed turn gets its own full iteration allowance; what carries over is the
@@ -1768,7 +1782,17 @@ export class Agent {
             // so the extra check is no longer needed.
             const hasUpdatePlan = this.canUpdatePlan()
             const isLastCheckpoint = iterNum === stallCheckpoints[stallCheckpoints.length - 1]
-            const stall = isLastCheckpoint
+            // The Boss task-start checkpoint gets its own short one-liner instead of
+            // the generic PROGRESS CHECK below — that one restates the full objective/
+            // userMessage, which for this checkpoint is the ENTIRE original user
+            // request (often long, sometimes multi-paragraph); classification only
+            // needs a reminder of the four-way mode split, not its own input echoed
+            // back at it.
+            const stall = isBossTaskStartCheckpoint
+              ? `PROGRESS CHECK: ${iterNum} iterations in and not finished. Your task is not to dig deep into ` +
+                'the project, but to classify the original user request into one of the four modes: ANSWER, ' +
+                'TRIVIAL, SIMPLE or OBJECTIVE, followed by the answer or the objective.'
+              : isLastCheckpoint
               ? (hasUpdatePlan
                 ? `STALL: ${iterNum} iterations without finishing — your approach is not converging. Call update_plan now with a revised plan that lists ONLY the remaining work as concrete steps, then carry it out. Do not repeat what has not worked.`
                 : `STALL: ${iterNum} iterations without finishing — your approach is not converging. Call conclude NOW with your best verdict/answer given what you have found so far, or take one genuinely different action — do not repeat what has not worked.`)
@@ -1868,12 +1892,19 @@ export class Agent {
         // model's reasoning in context and nudge it toward an explicit next move."
         if (!hasCalls) {
           this.pushCtx(msg)
-          const nudge = 'Your turn produced no tool calls. To finish, call conclude with your final answer. To keep working, make your next tool call.'
-          emitAndLog({ type: 'warning', message: nudge })
-          this.pushCtx({ role: 'tool', content: nudge })
+          consecutiveThinkingTurns++
+          // Only nudge from the 2nd consecutive thinking turn on — the model gets one
+          // free turn to reason/plan without being told to hurry up; a SECOND turn in
+          // a row with no tool call is when a reminder actually earns its place.
+          if (consecutiveThinkingTurns >= 2) {
+            const nudge = 'Your turn produced no tool calls. To finish, call conclude with your final answer. To keep working, make your next tool call.'
+            emitAndLog({ type: 'warning', message: nudge })
+            this.pushCtx({ role: 'tool', content: nudge })
+          }
           continue
         }
 
+        consecutiveThinkingTurns = 0
         this.pushCtx(msg)
 
         const callsToRun = nativeCalls.length > 0

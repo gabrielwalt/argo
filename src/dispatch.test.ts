@@ -587,11 +587,12 @@ test('conclude with an empty answer is rejected (validation, not a gate) and doe
   }
 })
 
-test('a no-tool-call turn gets the exact nudge, injected so the model sees it on its next turn', async () => {
+test('a no-tool-call turn gets the nudge on the 2nd consecutive thinking turn, not the 1st', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-thinking-nudge-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
-    { message: { role: 'assistant', content: 'thinking...' } },
+    { message: { role: 'assistant', content: 'thinking...' } },       // 1st no-tool-call: silent
+    { message: { role: 'assistant', content: 'still thinking...' } }, // 2nd consecutive: nudge
     concludeCall('done'),
   ]))
   agent.setSessionId(sessionId)
@@ -600,6 +601,7 @@ test('a no-tool-call turn gets the exact nudge, injected so the model sees it on
     const nudges = events.filter(
       (e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning' && e.message.includes('produced no tool calls'),
     )
+    // Only ONE nudge — the 2nd consecutive no-tool-call turn, not the 1st
     assert.equal(nudges.length, 1)
     assert.equal(
       nudges[0].message,
@@ -622,9 +624,9 @@ test('the iteration cap is still a hard stop when the model never calls conclude
     const answer = await agent.chat('argo cap thinking case')
     assert.match(answer, /Reached maximum iterations \(10\) without a final answer\./)
     assert.equal(agent.getLastRunOutcome(), 'cap')
-    // Ran the cap out entirely on thinking-turn nudges, never on anything else —
-    // confirms the cap is genuinely what stopped it, not some other path.
-    assert.equal(events.filter(e => e.type === 'warning' && e.message.includes('produced no tool calls')).length, 10)
+    // Nudge fires from the 2nd consecutive no-tool-call turn onward (the 1st is
+    // silent), so with 10 pure thinking turns: turn 1 silent, turns 2-10 nudged = 9.
+    assert.equal(events.filter(e => e.type === 'warning' && e.message.includes('produced no tool calls')).length, 9)
   } finally {
     await cleanupSeedPlanSession(sessionId)
   }
