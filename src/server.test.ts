@@ -1,8 +1,9 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import type { Server } from 'http'
-import { app } from './server.js'
+import { app, parseFrameRole, frameIdFromHistoryFilename, buildDiskContextMessages, compactionHasContent, mergeFrameSummaries, chooseActiveFrame, type FrameSummary } from './server.js'
 import { config } from './config.js'
+import { emptyCompactionState } from './compaction.js'
 
 // server.ts's Express app, listening on an ephemeral port — no startServer()
 // (no history loading, no session bookkeeping needed for these route-level
@@ -70,4 +71,163 @@ test('GET /git-diff/:hash accepts a well-formed short hash (passes the format gu
   // Not necessarily 200 — this hash may not exist in the repo at test time —
   // just confirms it wasn't rejected by the format guard itself.
   assert.notEqual(resp.status, 400)
+})
+
+// ── Frame context backend (CONTEXT-VIEWER-CONTRACT.md) — pure functions ──
+// No fs, no Ollama: these are the "id resolution, disk-recovery mapping, ordering,
+// active-frame choice" pieces called out as the testable logic in the task brief.
+// Real disk state in this dev environment's LOGS_DIR (leftover history-*.json from
+// unrelated past runs) makes exact-count assertions against the real /frames route
+// unreliable, which is exactly why this logic is exercised here in isolation instead.
+
+test('parseFrameRole: recognises all four frame roles from a real frameId shape', () => {
+  assert.equal(parseFrameRole('boss-mtmm1gcc-1'), 'boss')
+  assert.equal(parseFrameRole('planner-mtmm1gcc-2'), 'planner')
+  assert.equal(parseFrameRole('implementer-mtmm1gcc-3'), 'implementer')
+  assert.equal(parseFrameRole('tester-mtmm1gcc-4'), 'tester')
+})
+
+test('parseFrameRole: the baseline agent\'s own session id (ISO-derived, hyphenated) is not a frame', () => {
+  assert.equal(parseFrameRole('2026-09-04T07-03-37'), null)
+})
+
+test('parseFrameRole: a prefix that is not one of the four known roles is not a frame', () => {
+  assert.equal(parseFrameRole('orchestrator-mtmm1gcc-1'), null)
+})
+
+test('frameIdFromHistoryFilename: extracts the id from history-<id>.json', () => {
+  assert.equal(frameIdFromHistoryFilename('history-implementer-mtmm1gcc-3.json'), 'implementer-mtmm1gcc-3')
+})
+
+test('frameIdFromHistoryFilename: null for the baseline\'s bare history.json', () => {
+  assert.equal(frameIdFromHistoryFilename('history.json'), null)
+})
+
+test('frameIdFromHistoryFilename: null for unrelated LOGS_DIR files', () => {
+  assert.equal(frameIdFromHistoryFilename('current-session.txt'), null)
+  assert.equal(frameIdFromHistoryFilename('compaction-implementer-mtmm1gcc-3.json'), null)
+  assert.equal(frameIdFromHistoryFilename('2026-09-04T07-03-37_some-query.jsonl'), null)
+})
+
+test('buildDiskContextMessages: reconstructs role/content/chars from a raw history array', () => {
+  const result = buildDiskContextMessages([
+    { role: 'system', content: 'you are helpful' },
+    { role: 'user', content: 'hello' },
+  ])
+  assert.equal(result.messageCount, 2)
+  assert.equal(result.totalChars, 'you are helpful'.length + 'hello'.length)
+  assert.deepEqual(result.messages[0], { role: 'system', content: 'you are helpful', chars: 15, ts: null })
+  assert.equal(result.messages.every(m => m.ts === null), true, 'disk-recovered messages never fabricate a timestamp')
+})
+
+test('buildDiskContextMessages: applies the same 4000-char truncation as agent.ts getContext()', () => {
+  const long = 'x'.repeat(4500)
+  const result = buildDiskContextMessages([{ role: 'assistant', content: long }])
+  assert.equal(result.messages[0].chars, 4500)
+  assert.equal(result.messages[0].content, `${'x'.repeat(4000)}…(+500 more chars)`)
+})
+
+test('buildDiskContextMessages: non-array input yields an empty context, not a throw', () => {
+  assert.deepEqual(buildDiskContextMessages(null), { messages: [], messageCount: 0, totalChars: 0 })
+  assert.deepEqual(buildDiskContextMessages('not an array'), { messages: [], messageCount: 0, totalChars: 0 })
+})
+
+test('compactionHasContent: false for a freshly-initialised state', () => {
+  assert.equal(compactionHasContent(emptyCompactionState()), false)
+})
+
+test('compactionHasContent: true when any tracked list has an entry', () => {
+  assert.equal(compactionHasContent({ ...emptyCompactionState(), verifiedFacts: ['x uses Postgres'] }), true)
+})
+
+test('compactionHasContent: true when only projectCapsule is set', () => {
+  assert.equal(compactionHasContent({ ...emptyCompactionState(), projectCapsule: 'a small CLI tool' }), true)
+})
+
+function frame(overrides: Partial<FrameSummary>): FrameSummary {
+  return {
+    frameId: 'implementer-a-1',
+    role: 'implementer',
+    parentFrameId: null,
+    live: true,
+    startedAt: 1000,
+    messageCount: 1,
+    totalChars: 10,
+    promptTokens: null,
+    numCtx: null,
+    ...overrides,
+  }
+}
+
+test('mergeFrameSummaries: orders oldest-first by startedAt', () => {
+  const a = frame({ frameId: 'a', startedAt: 2000 })
+  const b = frame({ frameId: 'b', startedAt: 1000 })
+  assert.deepEqual(mergeFrameSummaries([a, b], []).map(f => f.frameId), ['b', 'a'])
+})
+
+test('mergeFrameSummaries: disk-recovered frames (startedAt: null) sort before any known timestamp', () => {
+  const live = frame({ frameId: 'live', startedAt: 1000 })
+  const disk = frame({ frameId: 'disk', live: false, startedAt: null })
+  assert.deepEqual(mergeFrameSummaries([live], [disk]).map(f => f.frameId), ['disk', 'live'])
+})
+
+test('mergeFrameSummaries: a frameId present in both groups keeps the LIVE entry', () => {
+  const live = frame({ frameId: 'dup', startedAt: 1000, promptTokens: 42 })
+  const disk = frame({ frameId: 'dup', live: false, startedAt: null, promptTokens: null })
+  const merged = mergeFrameSummaries([live], [disk])
+  assert.equal(merged.length, 1)
+  assert.equal(merged[0].live, true)
+  assert.equal(merged[0].promptTokens, 42)
+})
+
+test('chooseActiveFrame: an explicit active id wins outright', () => {
+  assert.equal(chooseActiveFrame('boss-a-1', [frame({ frameId: 'boss-a-1' })]), 'boss-a-1')
+})
+
+test('chooseActiveFrame: null with nothing live', () => {
+  assert.equal(chooseActiveFrame(null, []), null)
+  assert.equal(chooseActiveFrame(null, [frame({ live: false })]), null)
+})
+
+test('chooseActiveFrame: falls back to the most recently started live frame when no id is set', () => {
+  const older = frame({ frameId: 'older', startedAt: 1000 })
+  const newer = frame({ frameId: 'newer', startedAt: 2000 })
+  assert.equal(chooseActiveFrame(null, [older, newer]), 'newer')
+})
+
+// ── /frames, /context?frame= — structural checks only (see the header comment
+// above: real leftover frame history files in this dev LOGS_DIR make exact-count
+// assertions unreliable, so these check SHAPE/invariants, not specific contents).
+
+test('GET /frames reflects config.agents as baselineBypassed and returns a well-shaped list', async () => {
+  const resp = await fetch(`${baseUrl}/frames`, { headers: authHeaders() })
+  assert.equal(resp.status, 200)
+  const body = await resp.json() as { baselineBypassed: boolean; active: string | null; frames: FrameSummary[] }
+  assert.equal(body.baselineBypassed, config.agents)
+  assert.ok(Array.isArray(body.frames))
+  for (const f of body.frames) {
+    assert.ok(['planner', 'implementer', 'tester', 'boss'].includes(f.role))
+    assert.equal(typeof f.live, 'boolean')
+  }
+})
+
+test('GET /context with no frame param keeps the pre-existing shape plus the additive fields', async () => {
+  const resp = await fetch(`${baseUrl}/context`, { headers: authHeaders() })
+  assert.equal(resp.status, 200)
+  const body = await resp.json() as Record<string, unknown>
+  // Pre-existing fields (backward compatibility — an old frontend must keep working).
+  for (const key of ['messages', 'messageCount', 'totalChars', 'numCtx', 'compaction', 'compactionTs']) {
+    assert.ok(key in body, `missing pre-existing field: ${key}`)
+  }
+  assert.equal(body.frameId, null)
+  assert.equal(body.role, null)
+  assert.equal(body.live, false)
+  assert.equal(body.baselineBypassed, config.agents)
+})
+
+test('GET /context?frame=<unknown> is a 404 with an error body', async () => {
+  const resp = await fetch(`${baseUrl}/context?frame=implementer-doesnotexist-999999`, { headers: authHeaders() })
+  assert.equal(resp.status, 404)
+  const body = await resp.json() as { error: string }
+  assert.ok(typeof body.error === 'string' && body.error.length > 0)
 })

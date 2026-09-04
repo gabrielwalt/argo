@@ -10,11 +10,12 @@ import type { Dirent } from 'fs'
 import { config } from './config.js'
 import { Agent } from './agent.js'
 import { listLogs, readLog, readLogEvents, listSessions, deleteAllLogs, deleteSession, getSessionMessages, registerSession, LOGS_DIR } from './logger.js'
-import type { AgentEvent, ModelOptions } from './types.js'
+import type { AgentEvent, ModelOptions, Role } from './types.js'
 import { checkEnvironment, logEnvironment, type EnvCheck } from './health.js'
 import { installAuth } from './auth.js'
-import { runDispatchLoop, abortDispatch } from './dispatch.js'
+import { runDispatchLoop, abortDispatch, listLiveFrames, getLiveFrame, getActiveFrameId, type LiveFrame } from './dispatch.js'
 import { ensureWorkspaceId, workspaceHasContent, parseSessionPointer, formatSessionPointer, decideSessionResume, type SessionResumeReason } from './workspace-identity.js'
+import { coerceCompactionState, emptyCompactionState, renderCompactionState, type CompactionState } from './compaction.js'
 
 const execAsync = promisify(exec)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -158,8 +159,251 @@ app.get('/history', (req, res) => {
   res.json(agent.getChatHistory())
 })
 
-app.get('/context', (req, res) => {
-  res.json(agent.getContext())
+// ── Frame context (context viewer backend) ─────────────────────────
+// /shared/argo-ui/CONTEXT-VIEWER-CONTRACT.md is the authoritative shape for GET
+// /frames and GET /context?frame=<id>. The root cause this exists for: GET /context
+// below always read the baseline single-loop `agent`, which /chat bypasses entirely
+// whenever config.agents is on (dispatch.ts's runDispatchLoop drives scoped Agent
+// instances of its own instead) — so the real per-frame contexts were simply never
+// reachable from the API. GET /context with no `frame` param keeps its pre-existing
+// shape/meaning for backward compatibility — a deployed frontend against a new
+// backend must keep working, since the two halves of this feature land separately.
+
+const FRAME_ROLES: readonly Role[] = ['planner', 'implementer', 'tester', 'boss']
+
+// frameId format is `${role}-${base36 timestamp}-${counter}` (ledger.ts's newId) —
+// none of the four role names contain a hyphen, so the segment before the first
+// hyphen is reliable. Returns null for anything else, in particular the baseline
+// agent's own session ids (ISO-derived timestamps like `2026-09-04T07-03-37`, whose
+// first segment is never one of these four words) — this is what lets the disk scan
+// below tell a frame's history file apart from the baseline's own history-<id>.json.
+export function parseFrameRole(frameId: string): Role | null {
+  const cut = frameId.indexOf('-')
+  const prefix = cut === -1 ? frameId : frameId.slice(0, cut)
+  return (FRAME_ROLES as readonly string[]).includes(prefix) ? (prefix as Role) : null
+}
+
+const HISTORY_FILENAME_RE = /^history-(.+)\.json$/
+
+// Extracts the id portion of a `history-<id>.json` filename, or null for anything
+// else LOGS_DIR holds (the baseline's bare `history.json`, `.jsonl`/`.md` run logs,
+// `sessions-registry.json`, `current-session.txt`, `compaction-*.json`, ...).
+export function frameIdFromHistoryFilename(filename: string): string | null {
+  const m = HISTORY_FILENAME_RE.exec(filename)
+  return m ? m[1] : null
+}
+
+// Mirrors agent.ts's getContext() MAX=4000 truncation exactly (contract: "the
+// identical 4000-char message truncation on both paths"). Duplicated rather than
+// imported/shared because agent.ts is out of scope for this change (dispatch.ts and
+// server.ts only) — if that constant ever moves, this one needs updating alongside it.
+const CONTEXT_MESSAGE_CHAR_CAP = 4000
+
+function truncateContextMessage(full: string): { content: string; chars: number } {
+  const chars = full.length
+  const content = chars > CONTEXT_MESSAGE_CHAR_CAP
+    ? `${full.slice(0, CONTEXT_MESSAGE_CHAR_CAP)}…(+${chars - CONTEXT_MESSAGE_CHAR_CAP} more chars)`
+    : full
+  return { content, chars }
+}
+
+export interface DiskContextMessage {
+  role: string
+  content: string
+  chars: number
+  ts: null
+}
+
+// Pure reconstruction of getContext()'s `messages`/`messageCount`/`totalChars` from
+// an already-parsed history-<frameId>.json array — no fs here, so this is
+// unit-testable without touching disk. `ts` is always null: per-message timestamps
+// live in agent.ts's historyTs WeakMap, which does not survive the process
+// (contract: "Do not fabricate timestamps").
+export function buildDiskContextMessages(rawMessages: unknown): { messages: DiskContextMessage[]; messageCount: number; totalChars: number } {
+  const arr = Array.isArray(rawMessages) ? rawMessages : []
+  let totalChars = 0
+  const messages = arr.map(m => {
+    const rec = (m ?? {}) as { role?: unknown; content?: unknown }
+    const full = typeof rec.content === 'string' ? rec.content : String(rec.content ?? '')
+    totalChars += full.length
+    const { content, chars } = truncateContextMessage(full)
+    return { role: typeof rec.role === 'string' ? rec.role : 'unknown', content, chars, ts: null }
+  })
+  return { messages, messageCount: messages.length, totalChars }
+}
+
+// Mirrors agent.ts getContext()'s own "does this compaction state actually have
+// anything to show" check exactly, so the disk-recovery path renders compaction
+// identically to the live path instead of showing an empty-but-present state as if
+// it were real content.
+export function compactionHasContent(state: CompactionState): boolean {
+  return !!state.projectCapsule || [
+    state.userRequirements,
+    state.verifiedFacts,
+    state.decisionsMade,
+    state.changesMade,
+    state.testsAndVerification,
+    state.openQuestions,
+    state.hypotheses,
+    state.failedAttempts,
+    state.invalidatedConclusions,
+  ].some(arr => Array.isArray(arr) && arr.length > 0)
+}
+
+export interface FrameSummary {
+  frameId: string
+  role: Role
+  parentFrameId: string | null
+  live: boolean
+  startedAt: number | null
+  messageCount: number
+  totalChars: number
+  promptTokens: number | null
+  numCtx: number | null
+}
+
+// Oldest-first merge of the live registry's summaries with disk-recovered ones —
+// pure so ordering/dedup is testable without a filesystem. A frameId present in
+// both groups (should not happen in practice: a live frame's history file also
+// exists on disk, but scanDiskFrames is told to exclude live ids) keeps the LIVE
+// entry, which carries a real startedAt/promptTokens instead of the disk fallback's
+// nulls. Disk-recovered frames have startedAt: null (contract-sanctioned
+// "unknown") and sort as older than anything with a known timestamp — a frame only
+// reachable via disk recovery is, in every case this backend can build, from
+// further back than anything still live in this run's own registry.
+export function mergeFrameSummaries(live: FrameSummary[], diskOnly: FrameSummary[]): FrameSummary[] {
+  const liveIds = new Set(live.map(f => f.frameId))
+  const merged = [...live, ...diskOnly.filter(f => !liveIds.has(f.frameId))]
+  return merged.sort((a, b) => (a.startedAt ?? -Infinity) - (b.startedAt ?? -Infinity))
+}
+
+// dispatch.ts's own hard "no two LLM calls ever run concurrently" rule means at
+// most one frame is ever actually executing, so this is normally just
+// `liveActiveFrameId` verbatim. The contract's own wording ("when several are
+// live... it is the most recently spawned live one") is honoured as a defensive
+// fallback: if that id is unset for any reason, pick the most recently started
+// frame still marked live rather than reporting nothing while frames demonstrably
+// exist.
+export function chooseActiveFrame(liveActiveFrameId: string | null, liveFrames: FrameSummary[]): string | null {
+  if (liveActiveFrameId) return liveActiveFrameId
+  const live = liveFrames.filter(f => f.live)
+  if (live.length === 0) return null
+  return live.reduce((latest, f) => (f.startedAt ?? -Infinity) > (latest.startedAt ?? -Infinity) ? f : latest).frameId
+}
+
+// Disk-only candidates for GET /frames: every `history-<frameId>.json` in LOGS_DIR
+// not already covered by the live registry. NOT scoped to the current session
+// specifically — there is no persisted session→frameId index anywhere in this
+// codebase (frameId encodes no session, and the workspace-side ledger has no
+// sessionId field either), so this necessarily surfaces this WORKSPACE's frame
+// history broadly rather than one session's. Accepted limitation, documented in
+// FRAME-CONTEXT-BACKEND.md — the alternative (showing nothing for a resumed
+// session after a restart) is worse for the "post-run inspection" this exists for.
+async function scanDiskFrames(excludeIds: Set<string>): Promise<FrameSummary[]> {
+  let files: string[]
+  try {
+    files = await fs.readdir(LOGS_DIR)
+  } catch {
+    return []
+  }
+  const out: FrameSummary[] = []
+  for (const f of files) {
+    const frameId = frameIdFromHistoryFilename(f)
+    if (!frameId || excludeIds.has(frameId)) continue
+    const role = parseFrameRole(frameId)
+    if (!role) continue // not a frame history file (e.g. the baseline's own history-<sessionId>.json)
+    try {
+      const raw = JSON.parse(await fs.readFile(path.join(LOGS_DIR, f), 'utf-8'))
+      const { messageCount, totalChars } = buildDiskContextMessages(raw)
+      out.push({ frameId, role, parentFrameId: null, live: false, startedAt: null, messageCount, totalChars, promptTokens: null, numCtx: null })
+    } catch {
+      // Unreadable/corrupt history file — skip it, don't fail the whole listing.
+    }
+  }
+  return out
+}
+
+function liveFrameSummary(f: LiveFrame): FrameSummary {
+  const ctx = f.agent.getContext()
+  return {
+    frameId: f.frameId,
+    role: f.role,
+    parentFrameId: f.parentFrameId,
+    live: true,
+    startedAt: f.startedAt,
+    messageCount: ctx.messageCount,
+    totalChars: ctx.totalChars,
+    // Prefer the last real `token_usage` event over the Agent's configured
+    // options.num_ctx (usually unset — see dispatch.ts's LiveFrame comment): this is
+    // what "last known values... lets the donut follow a frame" means, and it is
+    // deliberately NOT what GET /context's own (unchanged) numCtx field does below.
+    promptTokens: f.lastTokenUsage?.promptTokens ?? null,
+    numCtx: f.lastTokenUsage?.numCtx ?? ctx.numCtx,
+  }
+}
+
+// Frames of the current process's most recent dispatch run, oldest first — see
+// dispatch.ts's liveFrames registry comment for the retention policy (cleared at
+// the START of the next run, not the end, so the last run stays inspectable).
+app.get('/frames', async (req, res) => {
+  const liveSummaries = listLiveFrames().map(liveFrameSummary)
+  const diskOnly = await scanDiskFrames(new Set(liveSummaries.map(f => f.frameId)))
+  res.json({
+    baselineBypassed: config.agents,
+    active: chooseActiveFrame(getActiveFrameId(), liveSummaries),
+    frames: mergeFrameSummaries(liveSummaries, diskOnly),
+  })
+})
+
+// GET /context — baseline agent by default; ?frame=<frameId> for a specific
+// dispatch frame (live from its Agent instance, or reconstructed from disk).
+app.get('/context', async (req, res) => {
+  const frameId = typeof req.query.frame === 'string' ? req.query.frame : null
+  if (frameId === null) {
+    // Unchanged shape/meaning (backward compat: an old frontend against a new
+    // backend keeps working) plus the three additive fields plus baselineBypassed.
+    res.json({ ...agent.getContext(), frameId: null, role: null, live: false, baselineBypassed: config.agents })
+    return
+  }
+
+  const live = getLiveFrame(frameId)
+  if (live) {
+    res.json({ ...live.agent.getContext(), frameId: live.frameId, role: live.role, live: true })
+    return
+  }
+
+  // Disk recovery: the frame's Agent is gone (a prior run, or a process restart),
+  // but LOGS_DIR/history-<frameId>.json survives exactly like a baseline session's
+  // history does — reconstruct the same shape from it rather than 404ing just
+  // because nothing is currently held in memory. Post-run inspection is the
+  // primary use of this whole feature.
+  let rawMessages: unknown
+  try {
+    rawMessages = JSON.parse(await fs.readFile(path.join(LOGS_DIR, `history-${frameId}.json`), 'utf-8'))
+  } catch {
+    res.status(404).json({ error: `Unknown frame: ${frameId}` })
+    return
+  }
+  const { messages, messageCount, totalChars } = buildDiskContextMessages(rawMessages)
+  let compaction: string | null = null
+  try {
+    const raw = JSON.parse(await fs.readFile(path.join(LOGS_DIR, `compaction-${frameId}.json`), 'utf-8'))
+    const state = coerceCompactionState(raw, emptyCompactionState())
+    if (compactionHasContent(state)) compaction = renderCompactionState(state)
+  } catch {
+    // No persisted compaction state for this frame — compaction stays null, not an error.
+  }
+  res.json({
+    frameId,
+    role: parseFrameRole(frameId),
+    live: false,
+    messages,
+    messageCount,
+    totalChars,
+    numCtx: null,       // not persisted anywhere once the Agent instance is gone — never fabricated
+    compaction,
+    compactionTs: null, // same reason — lastCompactedAt is in-memory only on Agent, never persisted
+  })
 })
 
 app.post('/stop', (_req, res) => {

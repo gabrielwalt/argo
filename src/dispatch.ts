@@ -151,6 +151,64 @@ function checkAborted(): void {
   if (stopRequested) throw new DispatchAborted()
 }
 
+// LIVE FRAME REGISTRY (context viewer backend, see /shared/argo-ui/CONTEXT-VIEWER-
+// CONTRACT.md). GET /context always read the baseline single-loop Agent, which /chat
+// bypasses entirely whenever config.agents is on — so the real per-frame contexts
+// this Map records were never reachable from the API. A module-level Map, same
+// pattern as stopRequested/activeFrameAgent above — deliberately not a class, this
+// module already holds its run state as plain module-level bindings.
+//
+// Retention: cleared at the START of runDispatchLoop, not the end, so the LAST run's
+// frames stay fully inspectable (server.ts's GET /frames, GET /context?frame=) right
+// up until the next run begins — post-run inspection is the primary use of this
+// feature, a user reading trace output while nothing is executing. Bound: every
+// Agent instance this run has spawned stays resident (its full this.history +
+// compaction state) until the next run's clear() — for a long multi-frame task this
+// is real but small: the largest single frame history observed in this project's own
+// logs is ~278KB, and a big multi-step task graph (2-5 steps is typical per
+// docs/subagents-plan.md) spawning a few dozen frames this way tops out on the order
+// of a few MB resident — negligible next to the Ollama client/model process itself,
+// and fully released the moment the next run clears the Map. Worst case: an unusually
+// long-running single task with many large Implementer frames holds all of them
+// simultaneously until it (or the next run) starts; there is no cross-run cap because
+// the whole point is "the last run", not "the last N runs".
+export interface LiveFrame {
+  frameId: string
+  role: Role
+  parentFrameId: string | null
+  agent: Agent
+  startedAt: number
+  // Last `token_usage` event this frame emitted, cached here because Agent.getContext()
+  // does not carry it (see agent.ts) — this is what lets GET /frames' promptTokens/
+  // numCtx follow a running frame for the context donut. null until the frame's first
+  // completed Ollama call.
+  lastTokenUsage: { promptTokens: number; numCtx: number } | null
+}
+
+const liveFrames = new Map<string, LiveFrame>()
+
+// The frame currently executing (mid agent.chat()), mirroring activeFrameAgent above
+// one level up (by frameId instead of Agent instance) — see GET /frames' `active`
+// field. Sequential by construction (this module's own "no two LLM calls ever run
+// concurrently" hard rule, stated at the top of this file), so exactly one frame is
+// ever active at a time; there is no queue or stack to maintain.
+let activeFrameId: string | null = null
+
+// Read accessors for server.ts — the registry itself stays a private module-level
+// Map, matching how stopRequested/activeFrameAgent are exposed only through
+// abortDispatch() rather than as raw bindings.
+export function listLiveFrames(): LiveFrame[] {
+  return Array.from(liveFrames.values())
+}
+
+export function getLiveFrame(frameId: string): LiveFrame | undefined {
+  return liveFrames.get(frameId)
+}
+
+export function getActiveFrameId(): string | null {
+  return activeFrameId
+}
+
 // Exported so ctrlplane.test.ts can build a fixture (a fake Agent + a FrameResult) without
 // re-declaring the shape.
 export interface SpawnedFrame {
@@ -165,8 +223,16 @@ export interface SpawnedFrame {
 // re-wrapping needed. An UNTAGGED event (the objective/task_graph/boss_verdict/replan
 // narrative events below, emitted via the raw `emit` param) is the harness's own
 // top-level narrative, not any one frame's turn.
+//
+// Also the one hook point for the live registry's lastTokenUsage cache (read-only
+// observability only — this does not change what's emitted or sent to Ollama, it
+// just also stashes a copy of `token_usage` events already flowing through here).
 function tagEmit(emit: Emit, frameId: string, role: Role, parentFrameId: string | null) {
   return (event: AgentEvent, seq?: number) => {
+    if (event.type === 'token_usage') {
+      const entry = liveFrames.get(frameId)
+      if (entry) entry.lastTokenUsage = { promptTokens: event.prompt_tokens, numCtx: event.num_ctx }
+    }
     emit({ ...event, __frameId: frameId, __role: role, __parentFrameId: parentFrameId } as unknown as AgentEvent, seq)
   }
 }
@@ -208,9 +274,15 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit): Promise<SpawnedFr
   applyFramePolicy(agent, req.role) // H17 — never inherit the single-loop baseline's mechanisms
 
   const assignment = await buildAssignment(root(), req, currentVerbatimRequest)
+  const startedAt = Date.now()
+  // Registered BEFORE chat() runs (not after) — GET /frames/GET /context?frame= must
+  // be able to see a frame while it is still executing, not just once it concludes.
+  liveFrames.set(frameId, { frameId, role: req.role, parentFrameId: req.parentFrameId, agent, startedAt, lastTokenUsage: null })
   activeFrameAgent = agent
+  activeFrameId = frameId
   const finalAnswer = await agent.chat(assignment)
   activeFrameAgent = null
+  activeFrameId = null
   checkAborted()
   const result = deriveFrameResult(frameId, finalAnswer, agent)
   await ledger.recordConclusion(root(), result)
@@ -228,11 +300,28 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit): Promise<SpawnedFr
 // history" was true of the transcript and false of every piece of run state derived from
 // it — a resumed frame restarted at ITER 1 with no plan and no memory of what it had
 // edited. Latent while REDO/replan never fired; live the moment H13 makes REDO reachable.
+// LIVE REGISTRY + resumeFrame: no registry update needed here beyond activeFrameId.
+// The frameId's entry already exists (spawnFrame put it there, and it is never
+// deleted until the NEXT run's clear()), and it holds this exact same Agent
+// instance by construction ("Resumes an EXISTING frame (same Agent instance...)"
+// above) — so `live` (computed from map membership) and the entry's role/
+// parentFrameId/startedAt all stay correct with no changes on this path. What DOES
+// need updating is which frame counts as "currently executing" for GET /frames'
+// `active` field, exactly like activeFrameAgent just below.
+//
+// The H14 bug noted above (chat() wipes currentPlan/taskList/loopState/
+// editedPaths/episodes/reconciliation-state/iteration-counter on resume) does NOT
+// affect what GET /context or GET /frames report: both read only
+// agent.getContext(), which reads this.history and this.compactionState — neither
+// is in that list, so message counts/content stay accurate across a resume
+// regardless of that separate, not-fixed-here bug.
 async function resumeFrame(frameId: string, agent: Agent, followUp: string): Promise<FrameResult> {
   checkAborted()
   activeFrameAgent = agent
+  activeFrameId = frameId
   const finalAnswer = await agent.chat(followUp, { resume: true })
   activeFrameAgent = null
+  activeFrameId = null
   checkAborted()
   const result = deriveFrameResult(frameId, finalAnswer, agent)
   await ledger.recordConclusion(root(), result)
@@ -791,6 +880,13 @@ export async function runDispatchLoop(
   currentOptions = overrides?.options
   stopRequested = false
   activeFrameAgent = null
+  // LIVE REGISTRY (server.ts's GET /frames, GET /context?frame=): cleared at the
+  // START of a run, not the end — the whole retention policy is "one run's frames
+  // replace the previous run's", so the run that just finished stays fully
+  // inspectable right up until this line runs for the NEXT one. See the registry's
+  // own declaration above for the memory bound this implies.
+  liveFrames.clear()
+  activeFrameId = null
   // See the module-level currentVerbatimRequest declaration above. Deliberately the
   // SAME raw userMessage runBossTaskStart is about to paraphrase, captured before that
   // paraphrase happens — there is no other candidate text this could be, and capturing
