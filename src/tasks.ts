@@ -276,79 +276,31 @@ export function renderTaskSummaries(list: TaskList): string {
     .join('\n')
 }
 
-// ── TASK GRAPH (docs/subagents-plan.md, config.agents / ARGO_AGENTS) ──────────────
-// The Planner's output in the multi-agent architecture: a DAG of steps, each naming
-// which role executes it, its own prompt, and dependencies on other steps in this
-// same graph. Deliberately a SEPARATE type from TaskList/StepInput above (the
-// single-loop baseline's plan shape) rather than an extension of it — the two plans
-// serve different loops and mixing their fields would make the baseline's
-// createTaskList/reconcile ambiguous about which fields apply. Pure: no LLM, no fs,
-// no Date — same discipline as the rest of this module.
-
-export interface TaskStep {
-  id: string // stable within the graph, e.g. "s1" — dependsOn references these, not frameIds
-  role: Role
-  prompt: string
-  dependsOn: string[]
-  // Steps sharing a frameGroup run in ONE frame, fed as sequential assignments,
-  // instead of each getting its own frame + Tester pass — the unified mechanism for
-  // both "too cheap to warrant its own frame" and "touches the same files/logic as
-  // another step, must not be isolated" (see docs/subagents-plan.md).
-  frameGroup?: string
-  // the Planner marks a step trivial when it's small/unambiguous enough
-  // that the Tester's separate verification pass wouldn't earn its
-  // extra iterations — the Boss's own periodic/final checks remain the safety net
-  // either way. Default false (unchanged behavior) when omitted.
-  skipTest?: boolean
-}
-
+// ── TASK GRAPH — REMOVED (2026-09, "iterative planner" supersedes both the original
+// task-graph design AND the interim "flatten it to a task list" pass). The Planner no
+// longer produces ANY harness-owned plan object at all — TaskStep, createTaskGraph,
+// readyGroups/nextStep, allStepsDone are gone entirely. dispatch.ts now calls the
+// Planner iteratively: one initial call for a rough plan (plain text, never parsed
+// into a structure), then repeated resumeFrame calls that each detail exactly one
+// Implementer task via a simple TASK:/TEST:/DONE text convention
+// (dispatch.ts's parseNextTask). See dispatch.ts's module header for the full flow.
+//
+// TaskGraph itself (below) is NOT fully deleted — kept to the minimal shape two
+// off-limits files still need to type-check against: ledger.ts's PinnedState.plan
+// (getPlan/setPlan) and eviction.ts's renderPinnedAnchor (which calls
+// renderTaskGraph). Neither is on this task's write list. dispatch.ts's new flow
+// never calls setPlan any more, so getPlan will simply return null for every future
+// run — this type+function pair is inert legacy weight, not active machinery. Safe
+// to delete outright once ledger.ts/eviction.ts are migrated off the graph concept;
+// flagged for the cone in the report rather than done here.
 export interface TaskGraph {
   objective: string
-  steps: TaskStep[]
+  steps: Array<{ id: string; role: Role; prompt: string; skipTest?: boolean }>
   revision: number
 }
 
-// Builds a fresh graph (revision 1), assigning stable ids by position.
-export function createTaskGraph(objective: string, steps: Array<Omit<TaskStep, 'id'>>): TaskGraph {
-  return {
-    objective: objective.trim(),
-    steps: steps.map((s, i) => ({ id: `s${i + 1}`, ...s })),
-    revision: 1,
-  }
-}
-
-// Steps whose dependsOn are ALL satisfied and that aren't already done or in flight,
-// grouped by frameGroup (a step with no frameGroup is its own singleton group, keyed
-// by its own id) — what the dispatch loop dequeues next.
-export function readyGroups(
-  graph: TaskGraph,
-  doneStepIds: ReadonlySet<string>,
-  inFlightStepIds: ReadonlySet<string>,
-): Map<string, TaskStep[]> {
-  const groups = new Map<string, TaskStep[]>()
-  for (const step of graph.steps) {
-    if (doneStepIds.has(step.id) || inFlightStepIds.has(step.id)) continue
-    if (!step.dependsOn.every(d => doneStepIds.has(d))) continue
-    const key = step.frameGroup ?? step.id
-    const arr = groups.get(key) ?? []
-    arr.push(step)
-    groups.set(key, arr)
-  }
-  return groups
-}
-
-export function allStepsDone(graph: TaskGraph, doneStepIds: ReadonlySet<string>): boolean {
-  return graph.steps.every(s => doneStepIds.has(s.id))
-}
-
-// Renders the task graph as a compact recited block — the TaskGraph analogue of
-// renderTaskLedger above, used by eviction.ts's pinned-anchor renderer.
 export function renderTaskGraph(graph: TaskGraph): string {
   if (graph.steps.length === 0) return ''
-  const lines = graph.steps.map(s => {
-    const deps = s.dependsOn.length ? ` (after ${s.dependsOn.join(', ')})` : ''
-    const group = s.frameGroup ? ` [group: ${s.frameGroup}]` : ''
-    return `${s.id}. [${s.role}] ${s.prompt}${deps}${group}`
-  })
-  return `[PLAN — task graph, revision ${graph.revision}]\n${lines.join('\n')}`
+  const lines = graph.steps.map(s => `${s.id}. [${s.role}] ${s.prompt}`)
+  return `[PLAN — task list, revision ${graph.revision}]\n${lines.join('\n')}`
 }

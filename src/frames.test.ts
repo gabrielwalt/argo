@@ -1,9 +1,11 @@
 // TASK-START READ-ONLY CHECKPOINT (2026-09-05) — frames.ts half. dispatch.ts's
 // runBossTaskStart now spawns its classification frame with TASK_START_TOOLS instead
 // of ROLE_TOOLS.boss; these tests pin the composition of both so a future edit can't
-// silently reintroduce a write path into classification, or silently strip `bash` from
-// the Boss's OTHER checkpoints (standup/final), which still legitimately need it to
-// run tests. No Ollama, no ledger, no fs — plain array membership checks.
+// silently reintroduce a write path into classification. ROLE_TOOLS.boss itself has
+// no live call site any more (2026-09, "iterative planner" removed the Boss standup/
+// final-verification checkpoints it used to serve — see dispatch.ts's module header
+// and the test below) but is still asserted on as the Record<Role,...> default. No
+// Ollama, no ledger, no fs — plain array membership checks.
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -39,31 +41,51 @@ test('TASK_START_TOOLS includes bash for investigation plus read-only tools and 
   assert.deepEqual([...TASK_START_TOOLS].sort(), ['bash', 'conclude', 'fetch_url', 'ledger', 'read_file', 'web_search'])
 })
 
-test('ROLE_TOOLS.boss (the Boss\'s OTHER checkpoints — standup, final) still has bash', () => {
+test('ROLE_TOOLS.boss still has bash (the Record<Role,...> default, currently unused in practice)', () => {
   // The classification-only restriction applies to task-start ALONE (dispatch.ts
-  // passes TASK_START_TOOLS as a one-off override to spawnFrame there) — every other
-  // Boss checkpoint still spawns with ROLE_TOOLS.boss and legitimately needs bash to
-  // run tests during standup/final verification. This guards against "fixing"
-  // ROLE_TOOLS.boss directly instead of using the override, which would silently take
-  // bash away from checkpoints that still need it.
+  // passes TASK_START_TOOLS as a one-off override to spawnFrame there). NOTE
+  // (2026-09, "iterative planner"): the Boss standup/final checkpoints that used to
+  // be ROLE_TOOLS.boss's other real call site were removed along with the task-graph
+  // execution loop they reviewed (dispatch.ts's module header) — runBossTaskStart is
+  // now the ONLY place a 'boss' frame ever spawns, and it always passes
+  // TASK_START_TOOLS as an override. ROLE_TOOLS.boss therefore has no live call site
+  // today; it still exists only because ROLE_TOOLS: Record<Role, ToolName[]> requires
+  // an entry for every role, and is a reasonable, capable default should a future
+  // Boss checkpoint be added without its own override. This test still guards its
+  // CONTENTS (bash present, write_file absent) so that default stays sane whenever
+  // it does get used.
   assert.equal(ROLE_TOOLS.boss.includes('bash'), true)
   assert.equal(ROLE_TOOLS.boss.includes('write_file'), false, 'unchanged pre-existing guarantee — the Boss verifies, never fixes directly')
 })
 
-// ── Planner system prompt consistency with dispatch.ts's assignment prompts
-// (buildPlannerAssignment/buildReplanAssignment, 2026-09-05) — the system prompt
-// used to say a too-large-to-predict plan should "say so explicitly" and expect to
-// be "resumed later with what happened so far", while the new assignment prompt
-// instructs a structural mechanism instead: "include a final step that requests a
-// re-planning round... resumed with what each agent produced." A model reading both
-// would get two different instructions for the same situation — fixed here.
+// ── Planner system prompt: the ITERATIVE two-phase design (2026-09) — replaces the
+// earlier task-graph and flattened-task-list designs entirely. The Planner is called
+// once for a rough overall plan (plain text), then resumed repeatedly to detail one
+// task at a time via TASK:/TEST:/DONE, with no separate "re-planning round" request
+// any more — adaptation is just what happens on the next detail call.
 
-test('planner system prompt: the too-large-to-predict guidance matches the replanning mechanic (no contradiction)', () => {
+test('planner system prompt: describes the two-phase flow — rough plan first, then resumed to detail one task at a time', () => {
   const text = systemPromptFor('planner')
-  assert.ok(text.includes('include a final step that requests a re-planning round'))
-  assert.ok(text.includes('resumed later with what each agent produced'))
-  // The old, now-inconsistent wording must not linger alongside the new mechanic.
-  assert.equal(text.includes('say so explicitly'), false)
+  assert.ok(text.includes('ROUGH OVERALL PLAN'))
+  assert.ok(text.includes('resumed repeatedly'))
+  assert.ok(text.includes('detail exactly ONE task'))
+  // No dangling reference to the old, now-removed graph/list mechanics.
+  assert.equal(text.includes('dependsOn'), false)
+  assert.equal(text.includes('frameGroup'), false)
+  assert.equal(text.includes('task graph'), false)
+})
+
+test('planner system prompt: states the TASK:/TEST:/DONE ending convention', () => {
+  const text = systemPromptFor('planner')
+  assert.ok(text.includes('TASK:'))
+  assert.ok(text.includes('TEST: yes'))
+  assert.ok(text.includes('TEST: no'))
+  assert.ok(text.includes('DONE'))
+})
+
+test('planner system prompt: adaptation is natural, not a separate re-planning request', () => {
+  const text = systemPromptFor('planner')
+  assert.ok(text.includes('no separate re-planning step'))
 })
 
 test('planner system prompt: still states it never writes or edits (matches the assignment prompt\'s READ-ONLY statement)', () => {
@@ -82,16 +104,21 @@ test('planner system prompt: explicitly states it is READ-ONLY and points at rea
   assert.ok(text.includes('Use read_file to inspect files'))
 })
 
-// ── Planner step prompts must carry AGENTS.md/MEMORY.md context forward (2026-09-06) —
-// a downstream Implementer/Tester step only sees its own assignment, never the
-// Planner's own investigation, so anything the Planner learned that matters for a
-// specific step must be restated in that step's own prompt.
+// ── Planner task prompts must carry AGENTS.md/MEMORY.md context forward (2026-09-06,
+// still true under the iterative design) — the Implementer only sees its own task
+// prompt, never the Planner's own investigation, so anything the Planner learned that
+// matters for a specific task must be restated directly in that task's own prompt.
 
-test('planner system prompt: instructs restating relevant AGENTS.md/MEMORY.md content in each step\'s own prompt', () => {
+test('planner system prompt: instructs restating relevant AGENTS.md/MEMORY.md content in each task\'s own prompt', () => {
   const text = systemPromptFor('planner')
   assert.ok(text.includes('AGENTS.md'))
   assert.ok(text.includes('MEMORY.md'))
   assert.ok(text.includes('self-contained'))
+})
+
+test('planner system prompt: TEST: no is for tasks too small to warrant a separate Tester pass', () => {
+  const text = systemPromptFor('planner')
+  assert.ok(text.includes('Answer TEST: no only when the task is small'))
 })
 
 // ── update_plan removed as a callable tool for every multi-agent role (2026-09-05) ──

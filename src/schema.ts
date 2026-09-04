@@ -12,8 +12,8 @@
 // This module is the EXTRACTION step, not a replacement for the frames themselves. A
 // Boss/Planner/Tester frame runs exactly as it does today — its own ReAct loop, its own
 // tools, its own free-text final answer — and the harness's existing regex parsers
-// (frames.ts's parseTesterVerdict/parseTaskStartVerdict/parseBossVerdict, dispatch.ts's
-// parseTaskGraph) remain the cheap first attempt, tried first, at zero extra cost. Only
+// (frames.ts's parseTesterVerdict/parseTaskStartVerdict/parseBossVerdict) remain the
+// cheap first attempt, tried first, at zero extra cost. Only
 // when that cheap parse fails does dispatch.ts hand this module the frame's own final
 // answer, and this module makes exactly one bounded, schema-constrained, NO-TOOLS call
 // that RESTATES the decision the frame already reached in the shape the harness needs —
@@ -25,9 +25,9 @@
 // mistake available here" (§1, "Cost").
 //
 // NEVER FAILS OPEN. Every parse function below returns null on ANY structural doubt —
-// wrong enum, empty/missing required field, an empty task-graph, a REDO/INJECT/RESTART/
-// ESCALATE with nothing to act on, or the model's own explicit "nothing was decided"
-// sentinel (see the *_EXTRACTION_PROMPT strings) — rather than coercing to a default.
+// wrong enum, empty/missing required field, a REDO/INJECT/RESTART/ESCALATE with nothing
+// to act on, or the model's own explicit "nothing was decided" sentinel (see the
+// *_EXTRACTION_PROMPT strings) — rather than coercing to a default.
 // Unlike layout.ts's OK_VERDICT fallback, there is no safe default for "the Planner's
 // graph" or "the Tester's verdict": inventing one here would recreate the exact defect
 // BATCH 2 (H13) just removed — a fail-open default indistinguishable from a real decision
@@ -65,27 +65,15 @@ function ollamaHost(): string {
 
 type JsonSchema = Record<string, unknown>
 
-const TASK_GRAPH_STEP_SCHEMA: JsonSchema = {
-  type: 'object',
-  properties: {
-    role: { type: 'string', enum: ['implementer', 'tester'] },
-    prompt: { type: 'string', minLength: 1 },
-    dependsOn: { type: 'array', items: { type: 'string' } },
-    frameGroup: { type: 'string' },
-    skipTest: { type: 'boolean' },
-  },
-  required: ['role', 'prompt'],
-  additionalProperties: false,
-}
-
-export const TASK_GRAPH_SCHEMA: JsonSchema = {
-  type: 'object',
-  properties: {
-    steps: { type: 'array', minItems: 1, items: TASK_GRAPH_STEP_SCHEMA },
-  },
-  required: ['steps'],
-  additionalProperties: false,
-}
+// TASK_GRAPH_STEP_SCHEMA/TASK_GRAPH_SCHEMA (the Planner's JSON task-graph shape) and
+// their extraction plumbing (ExtractedTaskStep/ExtractedTaskGraph, extractTaskGraph,
+// parseExtractedTaskGraph, the 'task_graph' ExtractionKind) were REMOVED (2026-09,
+// "iterative planner" — see dispatch.ts's module header). The Planner no longer
+// produces a JSON graph at all: it returns a rough plan as plain text, then is
+// resumed repeatedly to detail one task at a time via a simple TASK:/TEST:/DONE text
+// convention (dispatch.ts's parseNextTask) — there is nothing graph-shaped left to
+// restate here. task_start/tester_verdict/boss_verdict extraction (below) are
+// unaffected; they concern separate checkpoints untouched by this change.
 
 export const TASK_START_SCHEMA: JsonSchema = {
   type: 'object',
@@ -118,22 +106,11 @@ export const BOSS_VERDICT_SCHEMA: JsonSchema = {
 }
 
 // ---------------------------------------------------------------------------------------
-// Extracted shapes. Deliberately separate from tasks.ts's TaskStep (which carries a
-// harness-assigned `id`) and frames.ts's *Verdict types (which carry a `parsed` flag this
-// module has no business producing — extraction either succeeds structurally or returns
-// null, there is no partial state to report). The dispatch.ts/frames.ts call sites do the
-// mapping into those shapes.
+// Extracted shapes. Deliberately separate from frames.ts's *Verdict types (which carry a
+// `parsed` flag this module has no business producing — extraction either succeeds
+// structurally or returns null, there is no partial state to report). The dispatch.ts/
+// frames.ts call sites do the mapping into those shapes.
 
-export interface ExtractedTaskStep {
-  role: 'implementer' | 'tester'
-  prompt: string
-  dependsOn?: string[]
-  frameGroup?: string
-  skipTest?: boolean
-}
-export interface ExtractedTaskGraph {
-  steps: ExtractedTaskStep[]
-}
 export interface ExtractedTaskStart {
   mode: 'answer' | 'trivial' | 'simple' | 'objective'
   text: string
@@ -147,7 +124,7 @@ export interface ExtractedBossVerdict {
   reason?: string
 }
 
-export type ExtractionKind = 'task_graph' | 'task_start' | 'tester_verdict' | 'boss_verdict'
+export type ExtractionKind = 'task_start' | 'tester_verdict' | 'boss_verdict'
 
 // ---------------------------------------------------------------------------------------
 // System prompts. Each one is explicit that the model RESTATES an existing decision — it
@@ -158,18 +135,6 @@ export type ExtractionKind = 'task_graph' | 'task_start' | 'tester_verdict' | 'b
 
 export const NO_DECISION_SENTINEL = 'NO_DECISION_IN_INPUT'
 export const NO_VERDICT_SENTINEL = 'NO_VERDICT_IN_INPUT'
-
-const TASK_GRAPH_EXTRACTION_PROMPT =
-  'You restate an ALREADY-DECIDED task graph as JSON — you do not plan, decide, or add anything new. You are ' +
-  "given the PLANNER's own final answer, which already describes a task graph in prose and/or contains a " +
-  'missing or malformed JSON block. Read ONLY what it already says and re-express it exactly: one entry per ' +
-  'step it describes, each with the role it names (implementer or tester) and the exact instruction/prompt it ' +
-  'gives that step, in the same order. Only include a dependsOn entry when the text explicitly says one step ' +
-  'must wait for another — reference earlier steps by their 1-based position as "s1", "s2", etc.; if the text ' +
-  'names no explicit dependency for a step, omit dependsOn for it rather than inferring an ordering that was ' +
-  'not stated. Never invent a step, never merge two distinct steps into one, never drop a step that is ' +
-  `described. If the text genuinely commits to no task graph at all (it asks a question, explains it could not ` +
-  `decide, or is otherwise not a plan), respond with exactly: {"steps":[{"role":"implementer","prompt":"${NO_DECISION_SENTINEL}"}]}`
 
 const TASK_START_EXTRACTION_PROMPT =
   'You restate an ALREADY-MADE classification as JSON — you do not classify anything yourself. You are given ' +
@@ -201,14 +166,12 @@ const BOSS_VERDICT_EXTRACTION_PROMPT =
   `no verdict at all, respond with exactly: {"verdict":"escalate","reason":"${NO_VERDICT_SENTINEL}"}`
 
 const SYSTEM_PROMPTS: Record<ExtractionKind, string> = {
-  task_graph: TASK_GRAPH_EXTRACTION_PROMPT,
   task_start: TASK_START_EXTRACTION_PROMPT,
   tester_verdict: TESTER_VERDICT_EXTRACTION_PROMPT,
   boss_verdict: BOSS_VERDICT_EXTRACTION_PROMPT,
 }
 
 const SCHEMAS: Record<ExtractionKind, JsonSchema> = {
-  task_graph: TASK_GRAPH_SCHEMA,
   task_start: TASK_START_SCHEMA,
   tester_verdict: TESTER_VERDICT_SCHEMA,
   boss_verdict: BOSS_VERDICT_SCHEMA,
@@ -315,38 +278,6 @@ function parseJsonObject(raw: string): Record<string, unknown> | null {
 // Parse + structural validation, one per kind. Each returns null on ANY doubt — see the
 // module header. These are pure and unit-tested directly (no network).
 
-export function parseExtractedTaskGraph(raw: string): ExtractedTaskGraph | null {
-  const obj = parseJsonObject(raw)
-  if (!obj) return null
-  const rawSteps = obj.steps
-  if (!Array.isArray(rawSteps) || rawSteps.length === 0) return null
-  const steps: ExtractedTaskStep[] = []
-  for (const s of rawSteps) {
-    if (!s || typeof s !== 'object' || Array.isArray(s)) return null
-    const rec = s as Record<string, unknown>
-    const role = rec.role
-    const prompt = rec.prompt
-    if (role !== 'implementer' && role !== 'tester') return null
-    if (typeof prompt !== 'string' || prompt.trim().length === 0) return null
-    const trimmedPrompt = prompt.trim()
-    // The model's own explicit "nothing to restate" escape hatch — see
-    // TASK_GRAPH_EXTRACTION_PROMPT. Bail on the WHOLE graph, not just this step: a
-    // sentinel step is a statement that no graph exists, not that this one step is blank.
-    if (trimmedPrompt === NO_DECISION_SENTINEL) return null
-    // Explicit cast (not relied-on narrowing) mirrors dispatch.ts's own parseTaskGraph
-    // (`role: s.role as Role`) — belt and suspenders since `role` originated as `unknown`.
-    const step: ExtractedTaskStep = { role: role as 'implementer' | 'tester', prompt: trimmedPrompt }
-    if (Array.isArray(rec.dependsOn)) {
-      const deps = rec.dependsOn.filter((d): d is string => typeof d === 'string' && d.trim().length > 0)
-      if (deps.length > 0) step.dependsOn = deps
-    }
-    if (typeof rec.frameGroup === 'string' && rec.frameGroup.trim()) step.frameGroup = rec.frameGroup.trim()
-    if (rec.skipTest === true) step.skipTest = true
-    steps.push(step)
-  }
-  return steps.length > 0 ? { steps } : null
-}
-
 export function parseExtractedTaskStart(raw: string): ExtractedTaskStart | null {
   const obj = parseJsonObject(raw)
   if (!obj) return null
@@ -416,19 +347,12 @@ async function callExtraction(kind: ExtractionKind, model: string, proseAnswer: 
   }
 }
 
-// Each entry point pre-checks with looksLikeNoDecision (task_graph/task_start only — a
-// Tester/Boss verdict frame's prose is reviewing something else's work, not reporting its
-// own progress, so "unable to complete" language in it describes the REVIEWED work, not
-// the verdict itself, and must not short-circuit the verdict extraction), then calls the
-// model, then validates structurally. Returns null on ANY failure — network, HTTP, parse,
-// or structural — never a default.
-
-export async function extractTaskGraph(model: string, proseAnswer: string): Promise<ExtractedTaskGraph | null> {
-  if (!proseAnswer?.trim() || looksLikeNoDecision(proseAnswer)) return null
-  const raw = await callExtraction('task_graph', model, proseAnswer)
-  if (raw === null) return null
-  return parseExtractedTaskGraph(raw)
-}
+// Each entry point pre-checks with looksLikeNoDecision (task_start only, of the three
+// remaining kinds — a Tester/Boss verdict frame's prose is reviewing something else's
+// work, not reporting its own progress, so "unable to complete" language in it describes
+// the REVIEWED work, not the verdict itself, and must not short-circuit the verdict
+// extraction), then calls the model, then validates structurally. Returns null on ANY
+// failure — network, HTTP, parse, or structural — never a default.
 
 export async function extractTaskStart(model: string, proseAnswer: string): Promise<ExtractedTaskStart | null> {
   if (!proseAnswer?.trim() || looksLikeNoDecision(proseAnswer)) return null

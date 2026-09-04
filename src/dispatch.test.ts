@@ -1,13 +1,17 @@
 // TASK-START READ-ONLY CHECKPOINT (2026-09-05) — dispatch.ts half. No Ollama, no
-// ledger, no git, no fs: buildTaskStartAssignment/buildTaskStartGraph are pure
-// functions extracted specifically so this prompt/routing change is testable without
-// spawning a real frame (spawnFrame/runBossTaskStart themselves still can't be, for
-// the same reason noted throughout this file: they write a ledger entry and run a
-// real model turn).
+// ledger, no git, no fs: buildTaskStartAssignment is a pure function extracted
+// specifically so this prompt/routing change is testable without spawning a real
+// frame (spawnFrame/runBossTaskStart themselves still can't be, for the same reason
+// noted throughout this file: they write a ledger entry and run a real model turn).
 //
-// PLAN/ACT GATE SEEDING (2026-09-05) — buildPlannerAssignment/buildReplanAssignment
-// are pure, tested the same way. Agent.seedPlan's actual gate-bypass effect DOES need
-// a live chat() loop, so those two tests use the SAME scripted-Ollama-client
+// ITERATIVE PLANNER (2026-09) — buildInitialPlannerPrompt/buildNextTaskPrompt/
+// buildTesterPromptFromImpl/parseNextTask are pure, tested the same way; they
+// replace the earlier task-graph design (buildPlannerAssignment/
+// buildReplanAssignment/parseTaskGraph, all removed) and the interim flattened-
+// task-list pass entirely — see dispatch.ts's module header for the full flow.
+//
+// PLAN/ACT GATE SEEDING (2026-09-05) — Agent.seedPlan's actual gate-bypass effect
+// DOES need a live chat() loop, so those tests use the SAME scripted-Ollama-client
 // technique agent.test.ts's own plan/act gate tests use (Agent's injectable
 // constructor seam) — no real model, no network, no Docker.
 
@@ -18,7 +22,18 @@ import type { Ollama } from 'ollama'
 import { Agent } from './agent.js'
 import { LOGS_DIR } from './logger.js'
 import type { AgentEvent } from './types.js'
-import { buildTaskStartAssignment, buildTaskStartGraph, buildPlannerAssignment, buildReplanAssignment, buildImplementerAssignment, buildTesterAssignment } from './dispatch.js'
+import {
+  buildTaskStartAssignment,
+  buildImplementerAssignment,
+  buildTesterAssignment,
+  buildTesterPromptFromImpl,
+  buildInitialPlannerPrompt,
+  buildNextTaskPrompt,
+  parseNextTask,
+  TASK_START_MAX_ITERATIONS,
+  TASK_START_HARD_CAP,
+  TASK_START_CAP_FAILURE_MESSAGE,
+} from './dispatch.js'
 import { parseTaskStartVerdict } from './frames.js'
 
 // ── buildTaskStartAssignment — the exact prompt text ────────────────────────
@@ -32,7 +47,6 @@ test('buildTaskStartAssignment: wraps the user message in <argo-user-prompt> tag
 test('buildTaskStartAssignment: states the project is read-only', () => {
   const text = buildTaskStartAssignment('fix the bug', false)
   assert.ok(/READ-ONLY/.test(text))
-  assert.ok(/nothing may be modified/.test(text))
 })
 
 test('buildTaskStartAssignment: all four mode markers are present', () => {
@@ -107,83 +121,36 @@ test('a reply following the prompt\'s OBJECTIVE format parses as objective', () 
   assert.equal(verdict.parsed, true)
 })
 
-// ── buildTaskStartGraph — mode routing (item 4: TRIVIAL skips the Tester) ───
+// ── Boss classification: soft budget 10, hard cap 20 (2026-09) ─────────────
+// The prompt still STATES 10 iterations (buildTaskStartAssignment already asserts
+// this above); the actual enforced cap given to spawnFrame is a separate, larger
+// constant so a classification a few turns over its stated budget still gets to
+// conclude instead of being force-ended exactly on the model's own deadline.
 
-test('buildTaskStartGraph: trivial mode sets skipTest on its one step', () => {
-  const graph = buildTaskStartGraph('fix the typo', 'trivial')
-  assert.equal(graph.steps.length, 1)
-  assert.equal(graph.steps[0].role, 'implementer')
-  assert.equal(graph.steps[0].prompt, 'fix the typo')
-  assert.equal(graph.steps[0].skipTest, true)
+test('TASK_START_HARD_CAP is strictly greater than the prompt\'s stated TASK_START_MAX_ITERATIONS', () => {
+  assert.equal(TASK_START_MAX_ITERATIONS, 10)
+  assert.equal(TASK_START_HARD_CAP, 20)
+  assert.ok(TASK_START_HARD_CAP > TASK_START_MAX_ITERATIONS)
 })
 
-test('buildTaskStartGraph: simple mode does NOT set skipTest — still gets a Tester pass', () => {
-  const graph = buildTaskStartGraph('fix the pagination bug', 'simple')
-  assert.equal(graph.steps.length, 1)
-  assert.equal(graph.steps[0].role, 'implementer')
-  assert.equal(graph.steps[0].skipTest, undefined)
+test('the prompt itself still states the soft budget (10), not the hard cap (20)', () => {
+  const text = buildTaskStartAssignment('fix the bug', false)
+  assert.ok(text.includes(`hard budget of ${TASK_START_MAX_ITERATIONS} iterations`))
+  // Note: the OBJECTIVE mode's own "more than 20 iterations" threshold is unrelated
+  // prose that happens to share TASK_START_HARD_CAP's value — checking the specific
+  // "hard budget of 20" phrase (not a bare "20 iterations" substring) avoids a false
+  // positive against that unrelated line.
+  assert.equal(text.includes(`hard budget of ${TASK_START_HARD_CAP} iterations`), false)
 })
 
-test('buildTaskStartGraph: the objective text is preserved on the graph itself', () => {
-  const graph = buildTaskStartGraph('  fix the pagination bug  ', 'simple')
-  assert.equal(graph.objective, 'fix the pagination bug')
-})
-
-// ── buildPlannerAssignment / buildReplanAssignment — the restructured Planner prompts ──
-
-test('buildPlannerAssignment: wraps the objective in <argo-objective> tags verbatim', () => {
-  const text = buildPlannerAssignment('add pagination across three endpoints')
-  assert.ok(text.includes('<argo-objective>\nadd pagination across three endpoints\n</argo-objective>'))
-})
-
-test('buildPlannerAssignment: states the project is read-only for planning', () => {
-  const text = buildPlannerAssignment('do the thing')
-  assert.ok(/READ-ONLY/.test(text))
-  assert.ok(/nothing can be modified/.test(text))
-})
-
-test('buildPlannerAssignment: steps must be self-contained — the agent won\'t see the full plan', () => {
-  const text = buildPlannerAssignment('do the thing')
-  assert.ok(/self-contained/.test(text))
-  assert.ok(text.includes('will not see the full plan'))
-})
-
-test('buildPlannerAssignment: covers the too-large-to-predict / re-planning-round case', () => {
-  const text = buildPlannerAssignment('do the thing')
-  assert.ok(text.includes('too large to fully predict'))
-  assert.ok(text.includes('re-planning round'))
-})
-
-test('buildPlannerAssignment: ends with the JSON task-graph format instruction', () => {
-  const text = buildPlannerAssignment('do the thing')
-  assert.ok(text.includes('```json'))
-  assert.ok(text.includes('Reference earlier steps in dependsOn'))
-})
-
-test('buildReplanAssignment: carries the objective, what happened since, and REMAINING-work framing', () => {
-  const text = buildReplanAssignment('add pagination', 'step s1 failed: timeout')
-  assert.ok(text.includes('<argo-objective>\nadd pagination\n</argo-objective>'))
-  assert.ok(text.includes('REPLANNING ROUND. What happened since the last plan: step s1 failed: timeout'))
-  assert.ok(text.includes('REMAINING work only'))
-  assert.ok(text.includes('do not redo what already succeeded'))
-})
-
-test('buildReplanAssignment: also ends with the JSON format instruction', () => {
-  const text = buildReplanAssignment('do the thing', 'some reason')
-  assert.ok(text.includes('```json'))
-})
-
-test('buildReplanAssignment: fully self-contained — a fresh Planner spawn needs no separate objective prefix', () => {
-  // dispatch.ts's replan() sends this SAME text whether resuming an existing Planner
-  // frame or spawning a fresh one (a TRIVIAL/SIMPLE start that never spawned one) —
-  // it must never depend on prior context existing.
-  const text = buildReplanAssignment('add pagination', 'some reason')
-  assert.ok(text.startsWith('<argo-objective>'))
+test('TASK_START_CAP_FAILURE_MESSAGE is a plain user-facing failure, not the raw agent.ts cap-hit string', () => {
+  assert.equal(/^Could not classify/.test(TASK_START_CAP_FAILURE_MESSAGE), true)
+  assert.equal(/Reached maximum iterations/.test(TASK_START_CAP_FAILURE_MESSAGE), false)
 })
 
 // ── buildImplementerAssignment / buildTesterAssignment — Implementer and Tester
 // assignments follow the same <argo-objective> tagging convention as the Boss
-// task-start checkpoint's <argo-user-prompt> and the Planner's <argo-objective>.
+// task-start checkpoint's <argo-user-prompt>.
 
 test('buildImplementerAssignment: wraps the objective in <argo-objective> tags, framed as "implement"', () => {
   const text = buildImplementerAssignment('fix the off-by-one in nextId()')
@@ -195,6 +162,81 @@ test('buildTesterAssignment: wraps the claim in <argo-objective> tags, framed as
   const text = buildTesterAssignment('Original assignment: fix nextId(). Conclusion (success): done.')
   assert.ok(text.startsWith('Your task is to verify the following claimed work:'))
   assert.ok(text.includes('<argo-objective>\nOriginal assignment: fix nextId(). Conclusion (success): done.\n</argo-objective>'))
+})
+
+// ── ITERATIVE PLANNER (2026-09) — buildInitialPlannerPrompt / buildNextTaskPrompt /
+// buildTesterPromptFromImpl / parseNextTask. Replaces buildPlannerAssignment/
+// buildReplanAssignment/parseTaskGraph (task-graph design) and the interim
+// flattened-task-list pass entirely — see dispatch.ts's module header.
+
+test('buildInitialPlannerPrompt: wraps the objective in <argo-objective> tags verbatim', () => {
+  const text = buildInitialPlannerPrompt('add pagination across three endpoints')
+  assert.ok(text.includes('<argo-objective>\nadd pagination across three endpoints\n</argo-objective>'))
+})
+
+test('buildInitialPlannerPrompt: states the project is read-only and asks for a ROUGH plan, not a formal structure', () => {
+  const text = buildInitialPlannerPrompt('do the thing')
+  assert.ok(/READ-ONLY/.test(text))
+  assert.ok(text.includes('rough overall plan'))
+  assert.equal(text.includes('```json'), false)
+})
+
+test('buildInitialPlannerPrompt: tells the Planner it will be asked to detail tasks one at a time afterward', () => {
+  const text = buildInitialPlannerPrompt('do the thing')
+  assert.ok(text.includes('detail each task one at a time afterward'))
+})
+
+test('buildNextTaskPrompt: with no completed tasks, carries the overall plan and the TASK:/TEST:/DONE format', () => {
+  const text = buildNextTaskPrompt('Step 1: read the config. Step 2: add the flag.', [])
+  assert.ok(text.includes('Your overall plan:\nStep 1: read the config. Step 2: add the flag.'))
+  assert.equal(text.includes('Work completed so far'), false)
+  assert.ok(text.includes('TASK: <the implementer prompt>'))
+  assert.ok(text.includes('TEST: yes|no'))
+  assert.ok(text.includes('DONE'))
+})
+
+test('buildNextTaskPrompt: with completed tasks, lists each one with its result and tested flag', () => {
+  const text = buildNextTaskPrompt('the plan', [
+    { prompt: 'add the flag', conclusion: 'flag added to config.js', tested: true },
+    { prompt: 'wire it up', conclusion: 'wired into main.js', tested: false },
+  ])
+  assert.ok(text.includes('Work completed so far:'))
+  assert.ok(text.includes('- Task: add the flag\n  Result: flag added to config.js\n  Tested: yes'))
+  assert.ok(text.includes('- Task: wire it up\n  Result: wired into main.js\n  Tested: no'))
+})
+
+test('buildTesterPromptFromImpl: harness-authored, states what the Implementer was asked and what it reported', () => {
+  const text = buildTesterPromptFromImpl('add the --count flag', 'Added the flag; all existing tests pass.')
+  assert.ok(text.startsWith('Your task is to verify the following claimed work:'))
+  assert.ok(text.includes('<argo-objective>\nThe Implementer was asked to: add the --count flag\n'
+    + 'It reported: Added the flag; all existing tests pass.\n</argo-objective>'))
+})
+
+test('parseNextTask: TASK:/TEST: yes parses as a task that needs testing', () => {
+  const result = parseNextTask('TASK: add input validation to parseArgs\nTEST: yes')
+  assert.deepEqual(result, { done: false, prompt: 'add input validation to parseArgs', needsTesting: true, parsed: true })
+})
+
+test('parseNextTask: TASK:/TEST: no parses as a task that skips testing', () => {
+  const result = parseNextTask('TASK: fix the typo on line 12\nTEST: no')
+  assert.equal(result.needsTesting, false)
+  assert.equal(result.parsed, true)
+})
+
+test('parseNextTask: bare DONE parses as done', () => {
+  const result = parseNextTask('All planned work is complete.\nDONE')
+  assert.deepEqual(result, { done: true, prompt: '', needsTesting: false, parsed: true })
+})
+
+test('parseNextTask: TASK: is checked before DONE — a stray "done" elsewhere in a TASK-bearing reply does not misfire', () => {
+  const result = parseNextTask('Once this task is done, the next one follows.\nTASK: run the migration\nTEST: no')
+  assert.equal(result.done, false)
+  assert.equal(result.prompt, 'run the migration')
+})
+
+test('parseNextTask: unparseable input (neither marker) reports parsed:false, never invents a decision', () => {
+  const result = parseNextTask('I think the work is progressing well.')
+  assert.deepEqual(result, { done: false, prompt: '', needsTesting: false, parsed: false })
 })
 
 // ── Agent.seedPlan — the plan/act gate is bypassed for a SEEDED frame, unchanged for

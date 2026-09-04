@@ -11,7 +11,9 @@ import {
   renderTaskSummaries,
   progress,
   normalizeTitle,
+  renderTaskGraph,
   type TaskList,
+  type TaskGraph,
 } from './tasks.js'
 
 // ── normalizeTitle ────────────────────────────────────────────────
@@ -395,4 +397,30 @@ test('renderTaskSummaries: a task with no recorded summary shows the placeholder
   const out = renderTaskSummaries(list)
   assert.ok(out.includes('1. only step [active]'))
   assert.ok(out.includes('(no summary recorded)'))
+})
+
+// ── TASK GRAPH — mostly REMOVED (2026-09, "iterative planner"). TaskStep,
+// createTaskGraph, nextStep, allStepsDone are gone — the Planner no longer produces
+// any harness-owned plan object (see dispatch.ts's module header). TaskGraph +
+// renderTaskGraph survive only as an inert legacy shape kept for two off-limits
+// files (ledger.ts, eviction.ts) that still reference them — dispatch.ts's new flow
+// never constructs one. Testing the shape directly (no createTaskGraph helper to
+// build one) since that helper is gone too.
+
+test('renderTaskGraph: lists steps in order with role and prompt (legacy shape, no longer constructed by dispatch.ts)', () => {
+  const graph: TaskGraph = {
+    objective: 'ship it',
+    revision: 1,
+    steps: [
+      { id: 's1', role: 'implementer', prompt: 'do the first thing' },
+      { id: 's2', role: 'tester', prompt: 'verify the first thing' },
+    ],
+  }
+  const out = renderTaskGraph(graph)
+  assert.ok(out.includes('s1. [implementer] do the first thing'))
+  assert.ok(out.includes('s2. [tester] verify the first thing'))
+})
+
+test('renderTaskGraph: empty graph renders empty string', () => {
+  assert.equal(renderTaskGraph({ objective: 'obj', revision: 1, steps: [] }), '')
 })

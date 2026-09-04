@@ -8,17 +8,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  TASK_GRAPH_SCHEMA,
   TASK_START_SCHEMA,
   TESTER_VERDICT_SCHEMA,
   BOSS_VERDICT_SCHEMA,
   buildExtractionRequest,
   looksLikeNoDecision,
-  parseExtractedTaskGraph,
   parseExtractedTaskStart,
   parseExtractedTesterVerdict,
   parseExtractedBossVerdict,
-  extractTaskGraph,
   extractTaskStart,
   extractTesterVerdict,
   extractBossVerdict,
@@ -36,11 +33,11 @@ test('schemaControlPlane is OFF by default — the baseline pipeline stays byte-
 // ── request builder (pure) ──────────────────────────────────────────────────────────
 
 test('buildExtractionRequest shapes the Ollama /api/chat request: think:false, no tools, schema in format', () => {
-  const req = buildExtractionRequest('task_graph', 'qwen3.6:latest', 'do step one then step two')
+  const req = buildExtractionRequest('task_start', 'qwen3.6:latest', 'do step one then step two')
   assert.equal(req.model, 'qwen3.6:latest')
   assert.equal(req.think, false)
   assert.equal(req.stream, false)
-  assert.equal(req.format, TASK_GRAPH_SCHEMA)
+  assert.equal(req.format, TASK_START_SCHEMA)
   assert.equal(req.messages.length, 2)
   assert.equal(req.messages[0].role, 'system')
   assert.equal(req.messages[1].role, 'user')
@@ -78,52 +75,13 @@ test('looksLikeNoDecision does not flag ordinary decision prose', () => {
   }
 })
 
-// ── parseExtractedTaskGraph ─────────────────────────────────────────────────────────
-
-test('parseExtractedTaskGraph accepts a clean, schema-shaped graph', () => {
-  const g = parseExtractedTaskGraph('{"steps":[{"role":"implementer","prompt":"add the endpoint"},{"role":"tester","prompt":"verify it","dependsOn":["s1"]}]}')
-  assert.ok(g)
-  assert.equal(g.steps.length, 2)
-  assert.equal(g.steps[0].role, 'implementer')
-  assert.deepEqual(g.steps[1].dependsOn, ['s1'])
-})
-
-test('parseExtractedTaskGraph strips <think> blocks and code fences before parsing', () => {
-  const raw = '<think>restating the plan</think>\n```json\n{"steps":[{"role":"implementer","prompt":"do it"}]}\n```'
-  const g = parseExtractedTaskGraph(raw)
-  assert.ok(g)
-  assert.equal(g.steps.length, 1)
-})
-
-test('parseExtractedTaskGraph rejects an empty steps array — never a fabricated fallback', () => {
-  assert.equal(parseExtractedTaskGraph('{"steps":[]}'), null)
-})
-
-test('parseExtractedTaskGraph rejects a step with an invalid role', () => {
-  assert.equal(parseExtractedTaskGraph('{"steps":[{"role":"planner","prompt":"do it"}]}'), null)
-})
-
-test('parseExtractedTaskGraph rejects a step with a blank prompt', () => {
-  assert.equal(parseExtractedTaskGraph('{"steps":[{"role":"implementer","prompt":"   "}]}'), null)
-})
-
-test('parseExtractedTaskGraph rejects the "nothing decided" sentinel — never silently a one-step plan', () => {
-  assert.equal(parseExtractedTaskGraph(`{"steps":[{"role":"implementer","prompt":"${NO_DECISION_SENTINEL}"}]}`), null)
-})
-
-test('parseExtractedTaskGraph rejects malformed JSON and non-conformant shapes', () => {
-  assert.equal(parseExtractedTaskGraph('not json at all'), null)
-  assert.equal(parseExtractedTaskGraph(''), null)
-  assert.equal(parseExtractedTaskGraph('{"steps": "not an array"}'), null)
-  assert.equal(parseExtractedTaskGraph('{"other": 1}'), null)
-  assert.equal(parseExtractedTaskGraph('[1,2,3]'), null)
-})
-
-test('parseExtractedTaskGraph drops empty/whitespace-only dependsOn entries but keeps real ones', () => {
-  const g = parseExtractedTaskGraph('{"steps":[{"role":"implementer","prompt":"a"},{"role":"tester","prompt":"b","dependsOn":["s1","","  "]}]}')
-  assert.ok(g)
-  assert.deepEqual(g.steps[1].dependsOn, ['s1'])
-})
+// ── parseExtractedTaskGraph / extractTaskGraph — REMOVED (2026-09, "iterative
+// planner"). The Planner no longer produces a JSON task graph at all (dispatch.ts's
+// module header) — it returns a rough plan as plain text, then is resumed repeatedly
+// to detail one task at a time via a TASK:/TEST:/DONE text convention
+// (dispatch.ts's parseNextTask, not schema-constrained). schema.ts dropped
+// TASK_GRAPH_SCHEMA/ExtractedTaskStep/ExtractedTaskGraph/parseExtractedTaskGraph/
+// extractTaskGraph entirely; there is nothing graph-shaped left to test here.
 
 // ── parseExtractedTaskStart ─────────────────────────────────────────────────────────
 
@@ -195,81 +153,6 @@ function withStubbedFetch<T>(impl: typeof fetch, fn: () => Promise<T>): Promise<
     global.fetch = original
   })
 }
-
-test('extractTaskGraph returns null on a network error (fetch throws)', async () => {
-  await withStubbedFetch(
-    (() => { throw new Error('ECONNREFUSED') }) as unknown as typeof fetch,
-    async () => {
-      const result = await extractTaskGraph('qwen3.6:latest', 'Step 1: implement. Step 2: test.')
-      assert.equal(result, null)
-    },
-  )
-})
-
-test('extractTaskGraph returns null on a non-OK HTTP response', async () => {
-  await withStubbedFetch(
-    (async () => ({ ok: false, status: 500, statusText: 'Internal Server Error' })) as unknown as typeof fetch,
-    async () => {
-      const result = await extractTaskGraph('qwen3.6:latest', 'Step 1: implement. Step 2: test.')
-      assert.equal(result, null)
-    },
-  )
-})
-
-test('extractTaskGraph returns null when the (supposedly schema-constrained) reply is non-conformant', async () => {
-  await withStubbedFetch(
-    (async () => ({ ok: true, json: async () => ({ message: { content: 'Sure, here is a plan in prose, no JSON at all.' } }) })) as unknown as typeof fetch,
-    async () => {
-      const result = await extractTaskGraph('qwen3.6:latest', 'Step 1: implement. Step 2: test.')
-      assert.equal(result, null)
-    },
-  )
-})
-
-test('extractTaskGraph returns null when the reply structurally conforms but steps is empty', async () => {
-  await withStubbedFetch(
-    (async () => ({ ok: true, json: async () => ({ message: { content: '{"steps":[]}' } }) })) as unknown as typeof fetch,
-    async () => {
-      const result = await extractTaskGraph('qwen3.6:latest', 'Step 1: implement. Step 2: test.')
-      assert.equal(result, null)
-    },
-  )
-})
-
-test('extractTaskGraph recovers a real graph on a clean conformant reply', async () => {
-  await withStubbedFetch(
-    (async () => ({ ok: true, json: async () => ({ message: { content: '{"steps":[{"role":"implementer","prompt":"do it"}]}' } }) })) as unknown as typeof fetch,
-    async () => {
-      const result = await extractTaskGraph('qwen3.6:latest', 'Step 1: implement it.')
-      assert.ok(result)
-      assert.equal(result.steps.length, 1)
-    },
-  )
-})
-
-test('extractTaskGraph short-circuits (no fetch at all) when the input already reads as "nothing decided"', async () => {
-  let called = false
-  await withStubbedFetch(
-    (async () => { called = true; return { ok: true, json: async () => ({}) } }) as unknown as typeof fetch,
-    async () => {
-      const result = await extractTaskGraph('qwen3.6:latest', 'I am giving up, this objective is too ambiguous to plan.')
-      assert.equal(result, null)
-    },
-  )
-  assert.equal(called, false, 'must not spend a network round-trip on input that already reads as undecided')
-})
-
-test('extractTaskGraph returns null on empty/whitespace input without calling the network', async () => {
-  let called = false
-  await withStubbedFetch(
-    (async () => { called = true; return { ok: true, json: async () => ({}) } }) as unknown as typeof fetch,
-    async () => {
-      assert.equal(await extractTaskGraph('qwen3.6:latest', ''), null)
-      assert.equal(await extractTaskGraph('qwen3.6:latest', '   '), null)
-    },
-  )
-  assert.equal(called, false)
-})
 
 test('extractTaskStart returns null on non-conformant output and recovers a clean one', async () => {
   await withStubbedFetch(

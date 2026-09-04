@@ -20,23 +20,23 @@ import { getConclusion } from './ledger.js'
 // `conclude` (2026-09-06) is in EVERY role's tool set below — it is not role-
 // specific, it is how any frame ends its turn now (agent.ts's chat() loop: a turn
 // with no tool calls is a thinking turn, only calling `conclude` finishes). The
-// Planner's task graph, the Tester's RELEASE/REDO verdict, and the Boss's
-// checkpoint markers are now delivered as `conclude`'s `answer` argument instead of
-// a bare no-tool-call final message — dispatch.ts/frames.ts's parsing functions
-// (parseTaskGraph, parseTesterVerdict, parseBossVerdict, parseTaskStartVerdict) are
+// Planner's plan text (both its initial rough plan and each per-task TASK:/TEST:/
+// DONE detail reply), the Tester's RELEASE/REDO verdict, and the Boss's checkpoint
+// markers are all delivered as `conclude`'s `answer` argument instead of a bare
+// no-tool-call final message — dispatch.ts/frames.ts's parsing functions
+// (parseNextTask, parseTesterVerdict, parseBossVerdict, parseTaskStartVerdict) are
 // unaffected: they only ever read the STRING chat() returns, and that string is
 // still exactly the model's own text either way.
 export const ROLE_TOOLS: Record<Role, ToolName[]> = {
   // Deliberately NO update_plan (removed 2026-09-04). The Planner's deliverable is
-  // the task graph it returns as its FRAME'S FINAL ANSWER (delivered via
-  // `conclude`'s `answer` — see dispatch.ts's parseTaskGraph), not a harness plan
-  // ledger: dispatch.ts owns the graph, ledger.setPlan persists it, and nothing
-  // ever read a Planner's own this.currentPlan. Holding the tool was actively
-  // harmful, not merely redundant — combined with harness task sequencing (which
-  // spawnFrame never disabled, see types.ts FramePolicy) an update_plan call built
-  // a task ledger whose per-task verify gate then refused to let the frame
-  // conclude, so the graph was never delivered. The 6 Planner frames that never
-  // called it concluded in two messages.
+  // its own FRAME'S FINAL ANSWER on each call (delivered via `conclude`'s `answer`
+  // — see dispatch.ts's buildInitialPlannerPrompt/buildNextTaskPrompt/
+  // parseNextTask), not a harness plan ledger: nothing ever read a Planner's own
+  // this.currentPlan. Holding the tool was actively harmful, not merely redundant —
+  // combined with harness task sequencing (which spawnFrame never disabled, see
+  // types.ts FramePolicy) an update_plan call built a task ledger whose per-task
+  // verify gate then refused to let the frame conclude, so its plan text was never
+  // delivered. The 6 Planner frames that never called it concluded in two messages.
   planner: ['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude'],
   // Deliberately NO update_plan (removed 2026-09-05, alongside the Planner's own
   // removal above). dispatch.ts's spawnFrame now calls Agent.seedPlan with this
@@ -132,10 +132,10 @@ export const ROLE_MAX_ITERATIONS: Record<Role, number> = {
 //     that does multi-step work, holds update_plan, and produces the file mutations the
 //     per-task verify gate exists to check. For every other role the mechanism cannot
 //     help and can only trap: the deliverable of a Planner/Tester/Boss frame IS its
-//     no-tool-call final answer (a task graph, a RELEASE/REDO verdict, a NONE/INJECT/
-//     RESTART/ESCALATE verdict), and task sequencing reinterprets that exact signal as
-//     "current task might be done — run its verify, then ask for a summary", which
-//     costs iterations at best and blocks the verdict at worst.
+//     no-tool-call final answer (a plan or a TASK:/TEST:/DONE detail, a RELEASE/REDO
+//     verdict, a NONE/INJECT/RESTART/ESCALATE verdict), and task sequencing reinterprets
+//     that exact signal as "current task might be done — run its verify, then ask for
+//     a summary", which costs iterations at best and blocks the verdict at worst.
 //   memory — ON only for the Implementer: MEMORY.md persistence at compaction (memory.ts
 //     persistToMemory) is a WRITE to the workspace, and the read-only roles must not
 //     write. Turning it off does not blind them: agent.ts falls back to the baseline
@@ -170,27 +170,29 @@ export const ROLE_NAME: Record<Role, string> = {
 }
 
 const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
+  // ITERATIVE PLANNER (2026-09) — replaces the earlier task-graph and flattened-
+  // task-list designs entirely. The Planner is called in two phases now: ONCE for a
+  // rough overall plan (plain text, no formal structure), then RESUMED repeatedly,
+  // each time detailing exactly one task for the Implementer, informed by what has
+  // been completed so far. There is no separate re-planning step — adaptation is
+  // just what happens naturally on the next detail call (see dispatch.ts's module
+  // header for the full flow).
   planner:
-    'You are the PLANNER inside Argo\'s multi-agent harness. ' +
-    'Turn the given (immutable) objective into a task graph: ' +
-    'an ordered list of steps, each naming which role should execute it (implementer or tester), its own concrete ' +
-    'prompt, and any dependsOn relationships on earlier steps. The project is READ-ONLY for you: you create the ' +
+    'You are the PLANNER inside Argo\'s multi-agent harness. Your job happens in two phases. First, given the ' +
+    '(immutable) objective, produce a ROUGH OVERALL PLAN in plain text: describe the pieces of work you see and ' +
+    'the order you would tackle them in, plus any considerations — a high-level plan, not a formal step list. ' +
+    'You will then be resumed repeatedly, each time asked to detail exactly ONE task for the Implementer, ' +
+    'informed by what has been completed so far (including any failures) — adjust your plan naturally as you ' +
+    'go; there is no separate re-planning step to request. End each detail reply with exactly one of: ' +
+    'TASK: <a concrete, self-contained Implementer prompt> followed by TEST: yes or TEST: no on the next line, ' +
+    'or the single word DONE once the objective is fully met. The project is READ-ONLY for you: you create the ' +
     'plan, you do not implement anything yourself. Use read_file to inspect files as needed. You may read files ' +
     'and search the web, but you never ' +
-    'write or edit anything — you reason about the plan, you don\'t produce artifacts. If several steps would ' +
-    'otherwise duplicate the same investigation, schedule a dedicated early step to produce that shared context ' +
-    'instead of investigating it yourself. Each step\'s prompt must be self-contained: restate any AGENTS.md/ ' +
-    'MEMORY.md content relevant to that specific step directly in its prompt — the agent executing a step sees ' +
-    'only its own assignment and its dependencies\' conclusions, never the full plan or your own investigation. ' +
-    'If the task is too large to fully predict, plan only the part you can ' +
-    'and include a final step that requests a re-planning round — you will be resumed later with what each agent ' +
-    'produced. You never redefine the objective itself — only the Boss does that. ' +
-    'Isolating a step into its own frame costs a fresh context and its own overhead — only worth paying when that ' +
-    'step\'s work would otherwise run many iterations, or when it must not share context/mutations with ' +
-    'unrelated work. Small or tightly-related steps (quick edits, steps that touch the same files or the same piece ' +
-    'of logic) belong in the SAME frame: give them the same frameGroup so they run sequentially in one Implementer ' +
-    'frame instead of each paying for isolation it doesn\'t need. Mark a step skipTest:true when it is small and ' +
-    'unambiguous enough that a separate Tester verification pass would not be worth the extra iterations.',
+    'write or edit anything — you reason about the plan, you don\'t produce artifacts. Each task prompt must be ' +
+    'self-contained: restate any AGENTS.md/MEMORY.md content relevant to that specific task directly in its ' +
+    'prompt — the Implementer executing it sees only its own assignment, never your plan or investigation. You ' +
+    'never redefine the objective itself — only the Boss does that. Answer TEST: no only when the task is small ' +
+    'and unambiguous enough that a separate Tester verification pass would not be worth the extra iterations.',
   implementer:
     'You are the IMPLEMENTER inside Argo\'s multi-agent harness, working one ' +
     'well-scoped task handed to you. If you ' +
@@ -203,17 +205,22 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'it fully; if partial, check both the claimed-successful and claimed-failed parts, and whether real effort was ' +
     'put into the failed parts. End your answer with either RELEASE (accept the conclusion, success or failure) or ' +
     'REDO: <specific follow-up> (resume the implementer with a targeted instruction, not a vague "try again").',
+  // 2026-09 ("iterative planner"): the standup/final checkpoints this suffix used to
+  // also describe an ending convention for (NONE/INJECT/RESTART/ESCALATE) were
+  // removed along with the task-graph execution loop they reviewed — see
+  // dispatch.ts's module header. task-start is now the ONLY Boss checkpoint that
+  // ever spawns (runBossTaskStart), and its own ANSWER/TRIVIAL/SIMPLE/OBJECTIVE
+  // convention is stated entirely in its own assignment text
+  // (dispatch.ts's buildTaskStartAssignment), not here. The generic
+  // "follow the assignment below" framing is kept deliberately future-proof: it
+  // remains true regardless of how many checkpoint types exist.
   boss:
     'You are the BOSS inside Argo\'s multi-agent harness, accountable for the whole ' +
     'run. Verify independently (read files, run checks, search the web) rather than trusting ' +
     'self-reports. Verify each specific claim ONCE — one clean check that confirms or refutes it — then ' +
     'conclude immediately with your verdict for THIS checkpoint. ' +
-    'Different checkpoints expect different one-line endings — the specific CHECKPOINT assignment ' +
-    'below always tells you which convention to end with; follow that one, not a checkpoint you handled earlier in ' +
-    'this same conversation. At standup/final checkpoints, end with exactly one of: NONE (healthy, continue), ' +
-    'INJECT: <message> (a targeted correction, the frame continues), RESTART: <context for the retry> (end this ' +
-    'frame, start a fresh one on the same task informed by what went wrong), or ESCALATE: <diagnosis> (return to the ' +
-    'Planner for a real replan).',
+    'The specific CHECKPOINT assignment below tells you exactly which one-line convention to end with; follow ' +
+    'that one, not a checkpoint you handled earlier in this same conversation.',
 }
 
 export function systemPromptFor(role: Role): string {
@@ -317,6 +324,13 @@ export function capSummary(s: string): string {
 // own prefix is byte-identical across sibling frames of one run, rather than burying an
 // immutable block after content that already varies frame to frame, where it could never
 // anchor a cache hit at all.
+// FLATTENED TASK LIST (2026-09): req.dependsOn is a list of frameIds (FrameSpawnRequest,
+// types.ts) — always distinct from tasks.ts's now-removed TaskStep.dependsOn (step ids in
+// a dependency graph). It never needed to change here: dispatch.ts's step-execution loop
+// now passes at most ONE entry, the immediately preceding step's frameId, so what this
+// renders as "PRIOR WORK" is simply the previous step's conclusion carried forward
+// linearly — still the right mechanism for "the next Implementer should know what the
+// last one did," just fed a single-item list instead of a graph edge.
 export async function buildAssignment(root: string, req: FrameSpawnRequest, verbatimRequest?: string): Promise<string> {
   const deps = await Promise.all(
     (req.dependsOn ?? []).map(async id => {
