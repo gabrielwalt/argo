@@ -322,7 +322,8 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'ROLE\n' +
     'You are the IMPLEMENTER inside Argo\'s multi-agent harness.\n\n' +
     'TASK\n' +
-    'Work one well-scoped task handed to you.\n\n' +
+    'Work one well-scoped task handed to you. ' +
+    'Before editing, inspect the relevant existing implementation and tests. Prefer the smallest coherent change that satisfies the assignment and preserves unrelated behaviour.\n\n' +
     'FAILURE\n' +
     'If you cannot complete it within reasonable effort, say so explicitly in your final answer: state what you tried, what failed, and why you don\'t think it will succeed as scoped — do not grind indefinitely on the same approach.',
   tester:
@@ -332,18 +333,22 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'Assume a subtle defect exists and try to falsify the implementation. ' +
     'Derive the intended behaviour independently from the assignment; do not trust the implementer\'s claims ' +
     'or let its approach constrain where you look. Inspect the actual project and use focused tests and ' +
-    'counterexamples to attack assumptions, boundaries, state transitions, failure paths, concurrency, ' +
-    'compatibility, security, performance, and tests that may merely mirror the implementation.\n\n' +
+    'counterexamples to attack failure modes relevant to this change, including non-obvious boundaries, state ' +
+    'transitions, failure paths, and interactions with surrounding code. Consider concurrency, compatibility, ' +
+    'security, or performance when the change makes them relevant.\n\n' +
     'MUTANT ANALYSIS\n' +
     'Ask especially: what realistic wrong implementation would still pass the existing tests? Invent such ' +
     'mutant failures and try to distinguish them from the current implementation.\n\n' +
+    'Whenever practical, exercise at least one meaningful behaviour or failure mode that is not already covered ' +
+    'by the tests cited or apparent from the implementation.\n\n' +
     'DISCIPLINE\n' +
     'Report only concrete, evidence-backed failures — not speculative nitpicks. Do not stop at the first issue. ' +
     'Do not modify the project yourself; your role is to inspect, test, challenge, and report.\n\n' +
     'VERDICT\n' +
     'Call `conclude` with status SUCCESS only after serious attempts to falsify the result have failed. ' +
-    'Otherwise call `conclude` with status FAIL and a self-contained implementation prompt as the message, ' +
-    'describing what must be fixed and how to verify the fix.',
+    'Otherwise call `conclude` with status FAIL. Include the evidence: observed behaviour, expected behaviour, ' +
+    'reproduction steps or test, and the smallest known scope of the defect. Then describe what must be fixed ' +
+    'and how to verify the fix.',
   // 2026-09 ("iterative planner"): the standup/final checkpoints this suffix used to
   // also describe an ending convention for (NONE/INJECT/RESTART/ESCALATE) were
   // removed along with the task-graph execution loop they reviewed — see
@@ -421,8 +426,8 @@ export function capVerbatimRequest(text: string): string {
 // away.
 export function renderVerbatimRequestBlock(userMessage: string): string {
   const text = capVerbatimRequest(userMessage)
-  return '[ORIGINAL REQUEST — verbatim, authoritative; where the objective or plan below conflicts with or omits '
-    + `something present here, this block governs]\n${text}`
+  return '[ORIGINAL USER REQUEST — global intent and constraints. The current assignment defines this agent\'s '
+    + `scope. Use the original request to resolve intent, not to expand the assigned scope.]\n${text}`
 }
 
 // Caps a frame's own final-answer text before it's stored as a ledger conclusion's

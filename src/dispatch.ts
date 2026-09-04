@@ -624,11 +624,13 @@ export function buildTaskStartAssignment(userMessage: string, verbatimRequestOn:
     '- Status SIMPLE, message: a concrete, verifiable objective — Use for a well-scoped change that can be ' +
     'handled by a single Implementer and verified by a Tester agent. This covers everything from trivial ' +
     'fixes to single-function changes.\n' +
+    'SIMPLE should be the default unless decomposition into independently verifiable sub-tasks materially improves correctness.\n' +
     '- Status OBJECTIVE, message: a concrete, verifiable objective — Use if the task requires deeper upfront ' +
     'analysis, involves several distinct pieces of work, or contains genuine ambiguity about the approach. A ' +
     'Planner agent will break it down.\n\n' +
     'Do not implement anything. The project is READ-ONLY: you may inspect files to understand the codebase, but you must not modify anything.\n' +
     'Ground your answer or objective whenever it depends on project-specific details, current facts, or anything you cannot know with certainty. Inspect the relevant files or use the web when necessary rather than relying on assumptions.\n' +
+    'When reformulating the request as an objective, preserve every material requirement and constraint. Clarify wording, but do not silently narrow, broaden, or reinterpret the requested outcome.\n' +
     `You have a hard budget of ${TASK_START_MAX_ITERATIONS} iterations to call \`conclude\` with the classified status and message.`
   )
 }
@@ -762,8 +764,9 @@ export function buildInitialPlannerPrompt(objective: string): string {
     'Your task is to create an implementation plan for the following user-requested objective:\n' +
     `<argo-objective>\n${objective}\n</argo-objective>\n\n` +
     'Your task is complete once you call `conclude` with status PLAN and your ordered list of concrete, actionable sub-tasks that can be assigned to implementation sub-agents as the message. The plan should make dependencies and sequencing clear, and each sub-task should have a sufficiently specific and verifiable objective.\n\n' +
+    'Prefer the smallest number of independently verifiable sub-tasks that preserve coherent implementation boundaries. Do not split work merely to create more agents.\n\n' +
     'Do not implement anything. The project is READ-ONLY: your role is to plan and orchestrate the implementation, and nothing may be modified. Inspect the relevant project files as needed to understand the codebase and ground your plan. Use the web when necessary for current or external information rather than relying on assumptions.\n\n' +
-    'You have a hard budget of 20 iterations to call `conclude` with status PLAN and the produced plan as the message. If the full implementation cannot yet be predicted reliably, plan the portions that can be determined with confidence and explicitly account for a later re-planning step.'
+    'You have a hard budget of 20 iterations to call `conclude` with status PLAN and the produced plan as the message. If the full implementation cannot yet be predicted reliably, plan the portions that can be determined with confidence and identify the decision point that should be reassessed after those parts are implemented and verified.'
   )
 }
 
@@ -783,10 +786,10 @@ export function buildInitialPlannerPrompt(objective: string): string {
 export function buildBossConclusionAssignment(
   objective: string,
   plannerConclusion: string,
-  completedTasks: Array<{ prompt: string; conclusion: string }>,
+  completedTasks: Array<{ prompt: string; conclusion: string; testerConclusion?: string }>,
 ): string {
   const taskSummaries = completedTasks
-    .map((t, i) => `Task ${i + 1}: ${t.prompt}\nResult: ${t.conclusion}`)
+    .map((t, i) => `Task ${i + 1}: ${t.prompt}\nImplementer result: ${t.conclusion}\nTester result: ${t.testerConclusion || 'not tested'}`)
     .join('\n\n')
   return (
     'CHECKPOINT: run-conclusion\n' +
@@ -797,6 +800,8 @@ export function buildBossConclusionAssignment(
     (taskSummaries
       ? `Implementation results:\n<argo-implementation-results>\n${taskSummaries}\n</argo-implementation-results>\n\n`
       : '') +
+    'Treat Tester verdicts and concrete verification evidence as the basis for claims about correctness. ' +
+    'Do not describe something as verified merely because an Implementer reported success.\n\n' +
     'Summarize concisely:\n' +
     '1. What was the objective and was it fully met?\n' +
     '2. What concrete changes were made?\n' +
@@ -814,7 +819,7 @@ export function buildNextTaskPrompt(completedMessage: string | null, taskNumber:
       'The implementation agent will NOT see the overall plan or any previous planner context. Its assignment must therefore be fully self-contained and include everything needed to understand and complete this specific sub-task.\n\n' +
       'Call `conclude` with one of these statuses:\n' +
       '- IMPLEMENT: your message is the complete sub-objective for the implementation agent.\n' +
-      '- SUCCESS: the objective is fully met; your message is a final concluding statement.\n' +
+      '- SUCCESS: inspection shows the objective is already satisfied and no implementation work remains; your message is a final concluding statement.\n' +
       '- FAIL: the objective cannot be completed; your message explains why.\n\n' +
       'When using IMPLEMENT, the message should:\n' +
       '- Clearly state what must be implemented and define the expected outcome in concrete, verifiable terms.\n' +
@@ -824,7 +829,8 @@ export function buildNextTaskPrompt(completedMessage: string | null, taskNumber:
       '- Identify relevant files, components, interfaces, constraints, or existing behaviour when already known.\n' +
       '- Clearly distinguish what is in scope from what should remain unchanged or be deferred.\n' +
       '- Include appropriate testing or validation expectations.\n' +
-      '- Exclude context that does not affect this implementation step.\n\n' +
+      '- Exclude context that does not affect this implementation step.\n' +
+      '- Specify required behaviour and constraints without prescribing an implementation technique, unless the technique itself is required by the objective or project architecture.\n\n' +
       'Inspect relevant project files as needed to ground the assignment in the current codebase. Also inspect `AGENTS.md` and `MEMORY.md`, and include directly in the sub-objective any relevant instructions, conventions, architectural constraints, project facts, or prior decisions. But remember, the project remains READ-ONLY at this point: do not implement anything yourself.\n\n' +
       'You have a hard budget of 20 iterations to call `conclude` with the final self-contained sub-objective. If the next planned step is no longer appropriate given the current project state, adapt the sub-objective while preserving the intent and sequencing of the overall plan.'
     )
@@ -838,7 +844,7 @@ export function buildNextTaskPrompt(completedMessage: string | null, taskNumber:
     'If the result changes or invalidates your original plan, adapt the next step accordingly.\n\n' +
     'Call `conclude` with one of these statuses:\n' +
     '- IMPLEMENT: your message is the complete sub-objective for the implementation agent.\n' +
-    '- SUCCESS: the objective is fully met; your message is a final concluding statement summarizing what was accomplished and verified.\n' +
+    '- SUCCESS: inspection shows the objective is already satisfied and no implementation work remains; your message is a final concluding statement summarizing what was accomplished and verified.\n' +
     '- FAIL: the objective cannot be completed; your message explains why.\n\n' +
     'The project remains READ-ONLY for you. You have a hard budget of 20 iterations to call `conclude`.'
   )
@@ -907,29 +913,40 @@ export function parseImplementerResult(text: string): ImplementerResult {
   return { succeeded: true, message: trimmed }
 }
 
-// ── THE TESTER — harness-spawned, not Planner-driven (this task). Prompt text is
-// VERBATIM per this task's brief; `{implementer prompt}` is the TASK the Implementer
-// was given (the raw assignment, WITHOUT appendImplementerResultFormat's bookkeeping
-// suffix — the Tester needs to know what was asked for, not how the Implementer was
-// told to format its own sign-off), and `{implementer's conclude message}` is exactly
-// what the Implementer's own `conclude` call returned (its FULL text, including its
-// own SUCCESS:/FAIL: prefix — the Tester should see precisely what was claimed).
-export function buildTesterAssignment(implementerAssignment: string, implementerConclusion: string, iteration = 1): string {
+// ── THE TESTER — harness-spawned, BLIND-THEN-COMPARE two-turn design.
+// Turn 1 (buildTesterAssignment): the Tester investigates the repository blind —
+// deliberately NOT given the Implementer's own report, so it forms an independent
+// assessment without anchoring on what the Implementer claims to have done.
+// Turn 2 (buildTesterComparePrompt): the same frame is RESUMED with the Implementer's
+// report for comparison. The harness reads the conclude status from turn 2 only.
+export function buildTesterAssignment(implementerAssignment: string, iteration = 1): string {
   return (
     `CHECKPOINT: iteration-${iteration}\n` +
     'ASSIGNMENT UNDER TEST\n' +
     'The following assignment was given to an implementation sub-agent:\n\n' +
     `<argo-implementation-assignment>\n${implementerAssignment}\n</argo-implementation-assignment>\n\n` +
     'INDEPENDENT ASSESSMENT\n' +
-    'Determine independently what should have changed and what could go wrong. Inspect and test the ' +
-    'repository before reading the implementer\'s report below. Form your own assessment of what correct ' +
-    'behaviour looks like, then compare it with the implementer\'s claims.\n\n' +
+    'Independently determine what correct completion requires. Inspect the resulting repository and attempt to ' +
+    'falsify it. You are deliberately not given the implementer\'s account of what it changed; do not infer ' +
+    'correctness from intent or apparent implementation shape.\n\n' +
     'Also account for any relevant instructions, conventions, constraints, or prior decisions in `AGENTS.md` ' +
     'and `MEMORY.md`.\n\n' +
-    'You have a hard budget of 20 iterations to call `conclude`.\n\n' +
+    'When you have formed your independent assessment, call `conclude` with status SUCCESS if serious attempts ' +
+    'to falsify the result have failed, or status FAIL with evidence of the defects found.'
+  )
+}
+
+// Turn 2: handed the Implementer's report for comparison against the independent findings.
+export function buildTesterComparePrompt(implementerConclusion: string): string {
+  return (
     'IMPLEMENTER REPORT\n' +
-    'The implementation sub-agent concluded with:\n\n' +
-    `<argo-implemented>\n${implementerConclusion}\n</argo-implemented>`
+    'Now compare your independent findings with the implementer\'s own account:\n\n' +
+    `<argo-implemented>\n${implementerConclusion}\n</argo-implemented>\n\n` +
+    'If this report reveals issues you missed, investigate them. If your findings contradict the report, ' +
+    'the repository state is the ground truth.\n\n' +
+    'Call `conclude` with your final verdict: status SUCCESS if the implementation is correct, or status FAIL ' +
+    'with evidence (observed behaviour, expected behaviour, reproduction steps, smallest known defect scope) ' +
+    'and a self-contained fix prompt.'
   )
 }
 
@@ -1225,15 +1242,22 @@ interface TesterValidationResult {
   message: string
   lastAgent: Agent // for autoCommit — whichever frame most recently ran
   fixAttempts: TesterFixAttempt[]
+  // The Tester's own final conclusion text (the compare-turn verdict), so callers can
+  // show the Planner and Boss the verified pair rather than Implementer self-reports alone.
+  testerConclusion?: string
 }
 
-// THE TESTER VALIDATION CYCLE. Spawns a Tester ONCE to validate an Implementer's
-// SUCCESS conclusion; if the Tester finds a problem, RESUMES the SAME Implementer
-// frame (context retained) with the Tester's fix assignment, then RESUMES the SAME
-// Tester frame to re-test — up to MAX_TESTER_FIX_ATTEMPTS times — before giving up.
-// `implAgent`/`implFrameId` are the already-concluded Implementer's own Agent instance
-// and frameId (its iteration-1, spawned by the caller). This function never spawns a
-// fresh Implementer frame, only resumes the existing one for fixes.
+// THE TESTER VALIDATION CYCLE. Spawns a Tester for a BLIND independent assessment,
+// then immediately resumes that SAME frame with the Implementer's own report for
+// comparison (buildTesterAssignment / buildTesterComparePrompt — "blind tester, two
+// turns") — the harness reads the conclude status from the SECOND (compare) turn only.
+// If that verdict finds a problem, RESUMES the SAME Implementer frame (context
+// retained) with the fix assignment, then RESUMES the SAME Tester frame to re-test —
+// up to MAX_TESTER_FIX_ATTEMPTS times — before giving up. Re-test rounds stay
+// single-turn since the Tester already carries its independent mental model from the
+// blind first turn. `implAgent`/`implFrameId` are the already-concluded Implementer's
+// own Agent instance and frameId (its iteration-1, spawned by the caller). This
+// function never spawns a fresh Implementer frame, only resumes the existing one.
 async function runTesterValidation(
   parentFrameId: string | null,
   assignment: string,
@@ -1255,14 +1279,19 @@ async function runTesterValidation(
     let testerResultRaw: FrameResultRaw
 
     if (testerAgent === null) {
-      // First test: spawn a fresh Tester frame (full system prompt + context).
+      // First test, turn 1: BLIND independent assessment (no Implementer report).
       const testerFrame = await spawnFrame(
-        { role: 'tester', parentFrameId, assignment: buildTesterAssignment(assignment, currentConclusion, testerIteration) },
+        { role: 'tester', parentFrameId, assignment: buildTesterAssignment(assignment, testerIteration) },
         emit,
       )
       testerAgent = testerFrame.agent
       testerFrameId = testerFrame.result.frameId
-      testerResultRaw = testerFrame.result
+      // First test, turn 2: hand the Implementer's report for comparison. This
+      // turn's conclude is the cycle's actual verdict, not turn 1's preliminary.
+      testerAgent.resetIterations()
+      testerResultRaw = await resumeFrame(
+        testerFrameId, testerAgent, buildTesterComparePrompt(currentConclusion),
+      )
     } else {
       // Re-test: RESUME the same Tester frame (context retained, fresh budget).
       testerAgent.resetIterations()
@@ -1285,7 +1314,7 @@ async function runTesterValidation(
       ? { passed: testerStatus === 'SUCCESS', fixAssignment: testerStatus === 'FAIL' ? testerResultRaw.rawSummary : undefined }
       : parseTesterResult(testerResultRaw.rawSummary)
     if (testerResult.passed) {
-      return { passed: true, message: currentConclusion, lastAgent, fixAttempts }
+      return { passed: true, message: currentConclusion, lastAgent, fixAttempts, testerConclusion: testerResultRaw.rawSummary }
     }
     if (attempt === MAX_TESTER_FIX_ATTEMPTS) {
       return { passed: false, message: testerResultRaw.rawSummary, lastAgent, fixAttempts }
@@ -1350,7 +1379,7 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
   // Implementer has run yet).
   let taskNumber = 1
   let plannerFollowUp: string = buildNextTaskPrompt(null, taskNumber)
-  const completedTasks: Array<{ prompt: string; conclusion: string }> = []
+  const completedTasks: Array<{ prompt: string; conclusion: string; testerConclusion?: string }> = []
   let done = false
   // The Planner's own concluding text — captured from the detailResult that trips
   // isPlannerDone below — so the end-of-run Boss conclusion frame can quote exactly
@@ -1419,10 +1448,11 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
       nextAssignment,
     )
     commitAgent = implFrame.agent
-    // BUG-1: rawSummary throughout — this text feeds buildImplementerCapFollowUp/
-    // parseImplementerResult/buildNextTaskPrompt/the Tester assignment below, all of
-    // which must see the Implementer's FULL conclude text, not a 2000-char-capped one.
-    completedTasks.push({ prompt: nextAssignment, conclusion: implFrame.result.rawSummary })
+    // Kept as a direct reference so the Tester's verdict can be attached below.
+    const taskEntry: { prompt: string; conclusion: string; testerConclusion?: string } = {
+      prompt: nextAssignment, conclusion: implFrame.result.rawSummary,
+    }
+    completedTasks.push(taskEntry)
 
     if (implFrame.agent.hitIterationCap()) {
       implementerCapHits++
@@ -1461,6 +1491,7 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
       implFrame.result.frameId,
     )
     commitAgent = cycle.lastAgent
+    taskEntry.testerConclusion = cycle.testerConclusion ?? cycle.message
     for (const fa of cycle.fixAttempts) completedTasks.push({ prompt: fa.assignment, conclusion: fa.conclusion })
 
     const cappedFix = cycle.fixAttempts.find(fa => fa.capped)
@@ -1478,12 +1509,14 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
     }
 
     taskNumber++
-    plannerFollowUp = cycle.passed
-      ? buildNextTaskPrompt(cycle.message, taskNumber)
-      : buildNextTaskPrompt(
-          `Tester could not validate this task after ${MAX_TESTER_FIX_ATTEMPTS} fix attempt(s). ${cycle.message}`,
-          taskNumber,
-        )
+    // Feed the Planner VERIFIED results — both the Implementer report and the Tester's
+    // independent verdict — not the Implementer's self-report alone.
+    const verifiedReport = cycle.passed
+      ? 'The previous implementation task has passed adversarial verification.\n\n'
+        + `Implementer report:\n${cycle.message}\n\n`
+        + `Tester conclusion:\n${cycle.testerConclusion ?? '(not available)'}`
+      : `Tester could not validate this task after ${MAX_TESTER_FIX_ATTEMPTS} fix attempt(s). ${cycle.message}`
+    plannerFollowUp = buildNextTaskPrompt(verifiedReport, taskNumber)
   }
 
   if (!done) {
