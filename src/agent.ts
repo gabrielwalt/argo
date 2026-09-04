@@ -254,6 +254,20 @@ export function repetitionKey(name: string, args: Record<string, unknown>): stri
   return `${name}:${JSON.stringify(args)}`
 }
 
+// Short human-readable summary of a call's key arguments — included in the loop
+// detection warning so the reader can verify WHICH call was repeated, not just that
+// "the same tool" was. See loop.ts's LoopContext.callSummary.
+function summarizeCall(name: string, args: Record<string, unknown>): string {
+  if (name === 'fetch_url' && typeof args.url === 'string') return args.url
+  if (name === 'read_file' && typeof args.path === 'string') return args.path
+  if (name === 'bash' && typeof args.command === 'string') {
+    const cmd = args.command
+    return cmd.length > 80 ? `${cmd.slice(0, 80)}…` : cmd
+  }
+  const json = JSON.stringify(args)
+  return json.length > 80 ? `${json.slice(0, 80)}…` : json
+}
+
 // A "project mutation" is an edit_file/write_file targeting the git-tracked
 // workspace (scratch writes elsewhere don't count). The plan/act gate in chat()
 // uses this to enforce plan-before-act: the model may investigate (read/grep)
@@ -2222,7 +2236,7 @@ export class Agent {
             // entire block is inside `if (this.loop)`, so it is always a string here.
             // TypeScript cannot narrow through the intervening assignment; this is the
             // same narrowing-cast pattern the file already uses for activePlan.
-            const action = evaluateCall(this.loopState, loopKey as string, args, { toolName: name, recite, hasTasks: this.tasks && recite.length > 0 })
+            const action = evaluateCall(this.loopState, loopKey as string, args, { toolName: name, recite, hasTasks: this.tasks && recite.length > 0, callSummary: summarizeCall(name, args) })
             // H21(b): 'halt' is handled SEPARATELY from the other non-allow kinds
             // below — it has no `level` field (it fires only after L2 has already
             // been reported once for this streak, see loop.ts's LoopAction doc

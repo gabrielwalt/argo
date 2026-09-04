@@ -624,6 +624,11 @@ export interface LoopContext {
   // Whether a task ledger is active — changes L2 wording (update_plan reconcile
   // vs a generic re-plan instruction).
   hasTasks: boolean
+  // Short human-readable summary of the repeated call's key args (e.g. a URL, a
+  // path, a truncated command) — lets the L0 messages show WHAT was repeated, not
+  // just that something was. Optional: falls back to the plain wording when
+  // absent (agent.ts is the only caller and may not always have a summariser).
+  callSummary?: string
 }
 
 // Decide what to do about an about-to-run tool call identified by `key` (=
@@ -707,8 +712,9 @@ export function evaluateCall(
 // L0, replay form — the FIRST no-progress repeat(s) of a key (see cfg.maxReplaysPerKey):
 // tells the model plainly that the result it is about to see again is old, not new.
 export function l0ReplayMessage(ctx: LoopContext): string {
+  const call = ctx.callSummary ? `\`${ctx.toolName}\` call (\`${ctx.callSummary}\`)` : `\`${ctx.toolName}\` call`
   return (
-    `You just issued the EXACT same \`${ctx.toolName}\` call that already ran, with nothing changed since — ` +
+    `You just issued the EXACT same ${call} that already ran, with nothing changed since — ` +
     'the result below is reproduced verbatim from that earlier run, not a fresh observation. Nothing has ' +
     `changed, so running it again will not tell you anything new: take a DIFFERENT concrete action, or give ` +
     `your final answer if the task is already done.\n\n${ctx.recite}`
@@ -720,8 +726,9 @@ export function l0ReplayMessage(ctx: LoopContext): string {
 // 1/FIX 2 above): names the exact repeat, demand a different concrete action or a
 // final answer if the task is actually done.
 export function l0SteerMessage(ctx: LoopContext): string {
+  const call = ctx.callSummary ? `\`${ctx.toolName}\` call (\`${ctx.callSummary}\`)` : `\`${ctx.toolName}\` call`
   return (
-    `You just issued the EXACT same \`${ctx.toolName}\` call that already ran, with nothing changed since. ` +
+    `You just issued the EXACT same ${call} that already ran, with nothing changed since. ` +
     `STOP repeating it — take a DIFFERENT concrete action toward the current task, or, if it is truly already done, say so.\n\n${ctx.recite}`
   )
 }
