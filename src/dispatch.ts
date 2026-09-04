@@ -49,6 +49,8 @@
 // verification checkpoints — periodic health checks over a task-graph execution loop
 // that no longer exists. Still true; not revisited by this task.
 
+import { promises as fs } from 'fs'
+import path from 'path'
 import { Agent } from './agent.js'
 import { config } from './config.js'
 import { SessionLogger } from './logger.js'
@@ -127,6 +129,111 @@ let currentVerbatimRequest: string | undefined
 // side calls elsewhere (critic.ts) is zero extra resident memory.
 function effectiveModel(): string {
   return currentModel ?? config.model
+}
+
+// PERSISTENT BOSS MEMORY ACROSS MULTI-TURN CALLS (this task,
+// /shared/argo-ui/MULTI-TURN.md). Every runDispatchLoop call spawns a completely
+// FRESH Boss frame (spawnFrame, below) — the Boss has no conversation history of its
+// own across turns, so a follow-up prompt like "now add tests for that" is classified
+// with zero awareness of what "that" refers to. This is the harness-owned fix: a
+// small, bounded record of recent turns, kept BOTH in this module's own memory (so a
+// same-process second /chat sees it immediately) AND persisted to
+// /workspace/.argo/turn-history.json (so it survives a container restart) — the same
+// durability pattern ledger.ts already uses for its own state.json (append/rewrite a
+// small JSON file under .argo/, not a database).
+//
+// Deliberately NOT the Boss's own raw conversation (that would mean keeping a whole
+// Agent/history resident across runs, defeating "fresh Agent each turn" and quietly
+// reintroducing unbounded per-turn memory growth) — just a short digest per turn,
+// injected as plain text ahead of the LOCKED buildTaskStartAssignment prompt (see
+// runBossTaskStart below and buildTurnHistoryBlock's own comment).
+export interface TurnDigest {
+  userMessage: string
+  mode: string
+  objective: string
+  outcome: string
+  timestamp: number
+}
+
+// Bounded — "last 10 turns", not a growing log. Exported (pure) so the trim
+// behavior itself is directly testable without touching fs or this module's own
+// mutable turnHistory binding.
+export const TURN_HISTORY_MAX = 10
+
+export function boundTurnHistory(history: TurnDigest[], max: number = TURN_HISTORY_MAX): TurnDigest[] {
+  return history.length > max ? history.slice(history.length - max) : history
+}
+
+// The module-level store itself — same pattern as liveFrames/currentModel above:
+// safe as plain module state only because server.ts's `isBusy` guard already
+// prevents a second /chat from starting a new runDispatchLoop while one is in
+// flight. Loaded fresh at the top of every runDispatchLoop (loadTurnHistory) so a
+// restarted worker process picks the disk copy back up rather than starting empty.
+let turnHistory: TurnDigest[] = []
+
+function turnHistoryFile(rootDir: string): string {
+  return path.join(rootDir, '.argo', 'turn-history.json')
+}
+
+async function loadTurnHistory(): Promise<void> {
+  try {
+    const raw = await fs.readFile(turnHistoryFile(root()), 'utf-8')
+    const parsed = JSON.parse(raw)
+    turnHistory = Array.isArray(parsed) ? boundTurnHistory(parsed as TurnDigest[]) : []
+  } catch {
+    // No file yet (first turn ever in this workspace) or unreadable/corrupt — fails
+    // open to an empty history, exactly like ledger.ts's own readState()/readAll().
+    turnHistory = []
+  }
+}
+
+async function persistTurnHistory(): Promise<void> {
+  try {
+    const dir = path.join(root(), '.argo')
+    await fs.mkdir(dir, { recursive: true })
+    const file = turnHistoryFile(root())
+    const tmp = `${file}.tmp`
+    await fs.writeFile(tmp, JSON.stringify(turnHistory, null, 2))
+    await fs.rename(tmp, file) // atomic swap, same convention as ledger.ts's writeState()
+  } catch (err) {
+    // Harness bookkeeping, never something that should be able to abort a run —
+    // same fail-open stance as ledger.ts's ensureGitignored().
+    console.error('[dispatch] persistTurnHistory failed (continuing):', err)
+  }
+}
+
+function recordTurnDigest(digest: TurnDigest): void {
+  turnHistory = boundTurnHistory([...turnHistory, digest])
+}
+
+// Set by runDispatchLoopBody right after the Boss classifies (runBossTaskStart),
+// read by runDispatchLoop's own wrapper once the body settles (success, abort, or
+// error) to build this turn's digest — runDispatchLoopBody only returns the final
+// answer STRING, so this is how the wrapper learns which mode/objective produced
+// it without threading an extra return value through every call site. Reset to
+// null at the top of every runDispatchLoop, same lifecycle as currentVerbatimRequest.
+let lastTaskStartVerdict: { mode: string; text: string } | null = null
+
+// The exact text prepended to the Boss's task-start assignment, BEFORE the LOCKED
+// buildTaskStartAssignment output (runBossTaskStart splices this in — that function
+// itself is NOT locked, only buildTaskStartAssignment's own body is). Empty on the
+// very first turn of a session (no history yet), so the prompt a fresh workspace
+// sees is byte-identical to before this feature existed. Pure and exported so the
+// exact injected text is directly testable without spawning a real frame.
+export function buildTurnHistoryBlock(history: TurnDigest[]): string {
+  if (history.length === 0) return ''
+  const lines = history.map((d, i) => {
+    const userExcerpt = d.userMessage.length > 80 ? `${d.userMessage.slice(0, 80)}…` : d.userMessage
+    const outcomeExcerpt = d.outcome.length > 100 ? `${d.outcome.slice(0, 100)}…` : d.outcome
+    return `${i + 1}. User: "${userExcerpt}" \u2192 ${d.mode.toUpperCase()} \u2192 ${outcomeExcerpt}`
+  }).join('\n')
+  return (
+    'Previous turns in this session (most recent last):\n' +
+    `${lines}\n\n` +
+    'The user\u2019s new request follows. If it builds on or references previous work, incorporate that ' +
+    'context into your objective so the Planner and Implementer understand the broader situation without ' +
+    'needing to rediscover it.\n\n'
+  )
 }
 
 // Matches Agent's own constructor param exactly (agent.ts), so a tagged emit can be
@@ -554,7 +661,11 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
     // TASK_START_HARD_CAP (20) — see that constant's comment for why the two are
     // deliberately split.
     maxIterations: TASK_START_HARD_CAP,
-    assignment: buildTaskStartAssignment(userMessage, config.verbatimRequest),
+    // MULTI-TURN MEMORY (this task): buildTurnHistoryBlock's text is prepended AHEAD
+    // of the LOCKED buildTaskStartAssignment output, never inside it — that function's
+    // own body is off-limits and stays byte-for-byte what it always was. Empty string
+    // (first turn / no history yet) makes this a no-op concatenation.
+    assignment: buildTurnHistoryBlock(turnHistory) + buildTaskStartAssignment(userMessage, config.verbatimRequest),
   }
   // TASK_START_TOOLS (frames.ts), not ROLE_TOOLS.boss — this checkpoint is read-only
   // classification, see that constant's comment for why and the incident that forced it.
@@ -932,6 +1043,12 @@ export async function runDispatchLoop(
   // ask for it.
   currentVerbatimRequest = config.verbatimRequest ? userMessage : undefined
   const model = currentModel ?? config.model
+  // PERSISTENT BOSS MEMORY (this task): reload the durable turn-history store fresh
+  // for every run (picks up a disk copy written by a prior process, e.g. after a
+  // container restart) and reset this run's own captured verdict — see both
+  // declarations above for the full lifecycle.
+  await loadTurnHistory()
+  lastTaskStartVerdict = null
 
   // The dispatch run's own top-level narrative (start/objective/message/done) gets a
   // REAL persisted log — a SessionLogger exactly like agent.ts's baseline chat()
@@ -964,12 +1081,41 @@ export async function runDispatchLoop(
   // chat() exactly (start ... message/done), so the existing status bar, trace block,
   // notifications, and git/file refresh in app.js work unmodified for the WHOLE
   // dispatch run; every tagged per-frame event nests inside this same trace block.
+  // MULTI-TURN UI FIX (this task, /shared/argo-ui/MULTI-TURN.md): the multi-agent
+  // dispatch loop never used to emit a role:'user' message event of its own (only
+  // agent.ts's baseline chat() did) — 'start' carries `query`, but nothing renders
+  // that as a chat bubble on replay. The live path already shows the user's own
+  // message optimistically (app.js's startRun, before this event even reaches the
+  // browser), so this is a no-op there (handleEvent's 'message' case only acts on
+  // role 'assistant'); on session replay (handleEventForSession) it is what makes a
+  // PRIOR turn's prompt visible again after a reload — previously silently dropped.
+  emit({ type: 'message', role: 'user', content: userMessage })
   emit({ type: 'start', model, query: userMessage, options: currentOptions ?? {} })
+
+  // MULTI-TURN MEMORY (this task): a short digest of THIS turn, recorded once the
+  // run settles (success, abort, or error) — see TurnDigest's own comment. Built
+  // from `lastTaskStartVerdict` (set by runDispatchLoopBody right after the Boss
+  // classifies; still null if classification itself never completed, e.g. the
+  // TASK_START_CAP_FAILURE_MESSAGE path returns mode 'answer' same as any other
+  // classified request, so this only stays null on a genuine unhandled error before
+  // or during runBossTaskStart).
+  const recordDigest = async (outcome: string) => {
+    recordTurnDigest({
+      userMessage: userMessage.slice(0, 200),
+      mode: lastTaskStartVerdict?.mode ?? 'unknown',
+      objective: (lastTaskStartVerdict?.text ?? '').slice(0, 200),
+      outcome: outcome.slice(0, 300),
+      timestamp: Date.now(),
+    })
+    await persistTurnHistory()
+  }
+
   try {
     const finalAnswer = await runDispatchLoopBody(userMessage, emit)
     emit({ type: 'message', role: 'assistant', content: finalAnswer })
     emit({ type: 'done', content: finalAnswer })
     await logger.flush()
+    await recordDigest(finalAnswer)
     return finalAnswer
   } catch (err) {
     if (err instanceof DispatchAborted) {
@@ -978,6 +1124,7 @@ export async function runDispatchLoop(
       const stopped = 'Stopped.'
       emit({ type: 'done', content: stopped })
       await logger.flush()
+      await recordDigest('stopped')
       return stopped
     }
     // H13: planning that could not produce a usable decision is a REPORTED failure,
@@ -987,11 +1134,13 @@ export async function runDispatchLoop(
     if (err instanceof PlanningFailed) {
       emit({ type: 'error', message: err.message })
       await logger.flush()
+      await recordDigest('failed')
       return err.message
     }
     const message = `Unexpected error: ${err instanceof Error ? err.message : String(err)}`
     emit({ type: 'error', message })
     await logger.flush()
+    await recordDigest('failed')
     return message
   }
 }
@@ -1083,19 +1232,22 @@ async function runTesterValidation(
       // The Tester itself never concluded — its own cap-hit string is not a real
       // verdict to extract a fix assignment from. Read as "still failing" rather
       // than risk spawning a fix-Implementer with garbage as its assignment.
-      return { passed: false, message: testerFrame.result.summary, lastAgent, fixAttempts }
+      return { passed: false, message: testerFrame.result.rawSummary, lastAgent, fixAttempts }
     }
 
-    const testerResult = parseTesterResult(testerFrame.result.summary)
+    // BUG-1: parseTesterResult must see the FULL conclude text — a fix assignment
+    // that runs past capSummary's 2000-char cap must never reach the next
+    // Implementer truncated mid-sentence.
+    const testerResult = parseTesterResult(testerFrame.result.rawSummary)
     if (testerResult.passed) {
       return { passed: true, message: currentConclusion, lastAgent, fixAttempts }
     }
     if (attempt === MAX_TESTER_FIX_ATTEMPTS) {
       // Out of fix attempts — still failing, escalate.
-      return { passed: false, message: testerFrame.result.summary, lastAgent, fixAttempts }
+      return { passed: false, message: testerFrame.result.rawSummary, lastAgent, fixAttempts }
     }
 
-    const fixAssignment = testerResult.fixAssignment ?? testerFrame.result.summary
+    const fixAssignment = testerResult.fixAssignment ?? testerFrame.result.rawSummary
     const fixFrame = await spawnFrame(
       { role: 'implementer', parentFrameId, assignment: appendImplementerResultFormat(fixAssignment) },
       emit,
@@ -1104,13 +1256,13 @@ async function runTesterValidation(
     )
     lastAgent = fixFrame.agent
     const capped = fixFrame.agent.hitIterationCap()
-    fixAttempts.push({ assignment: fixAssignment, conclusion: fixFrame.result.summary, capped })
+    fixAttempts.push({ assignment: fixAssignment, conclusion: fixFrame.result.rawSummary, capped })
     if (capped) {
-      return { passed: false, message: fixFrame.result.summary, lastAgent, fixAttempts }
+      return { passed: false, message: fixFrame.result.rawSummary, lastAgent, fixAttempts }
     }
 
     currentAssignment = fixAssignment
-    currentConclusion = fixFrame.result.summary
+    currentConclusion = fixFrame.result.rawSummary
     // Loop again — re-test the fix. Deliberately NOT parsing the fix-Implementer's
     // own SUCCESS/FAIL here: the Tester is the one gate that decides whether a fix
     // actually landed, not the Implementer's own self-report (that's the entire
@@ -1174,18 +1326,23 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
     // GIVE-UP (this task) is checked BEFORE "done" — an explicit failure signal must
     // never be misread as quiet success. Ends the run immediately with a failure
     // message that includes the Planner's own explanation, per the brief.
-    if (isPlannerGiveUp(detailResult.summary)) {
+    // BUG-1: isPlannerGiveUp/isPlannerDone and the assignment handed to the next
+    // Implementer must all read the Planner's FULL conclude text — a "the objective
+    // is complete" or "GIVE_UP:" phrase the model puts at the end of a long answer,
+    // or an assignment that itself runs past 2000 characters, must never be silently
+    // cut off before the harness gets to look at it.
+    if (isPlannerGiveUp(detailResult.rawSummary)) {
       if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
-      return `Objective: ${objective}\n\nThe Planner gave up: ${detailResult.summary}\n\n`
+      return `Objective: ${objective}\n\nThe Planner gave up: ${detailResult.rawSummary}\n\n`
         + completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
     }
 
-    if (isPlannerDone(detailResult.summary)) {
+    if (isPlannerDone(detailResult.rawSummary)) {
       done = true
       break
     }
 
-    const nextAssignment = detailResult.summary
+    const nextAssignment = detailResult.rawSummary
     // What's actually given to the Implementer — the Planner's task text PLUS the
     // SUCCESS:/FAIL: sign-off convention (this task, "Testers are back"). nextAssignment
     // itself stays the plain task text, used for completedTasks/buildImplementerCapFollowUp
@@ -1209,7 +1366,10 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
       nextAssignment,
     )
     commitAgent = implFrame.agent
-    completedTasks.push({ prompt: nextAssignment, conclusion: implFrame.result.summary })
+    // BUG-1: rawSummary throughout — this text feeds buildImplementerCapFollowUp/
+    // parseImplementerResult/buildNextTaskPrompt/the Tester assignment below, all of
+    // which must see the Implementer's FULL conclude text, not a 2000-char-capped one.
+    completedTasks.push({ prompt: nextAssignment, conclusion: implFrame.result.rawSummary })
 
     if (implFrame.agent.hitIterationCap()) {
       implementerCapHits++
@@ -1220,22 +1380,22 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
           + 'narrower each time. Reporting this instead of continuing to loop.\n\n'
           + completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
       }
-      plannerFollowUp = buildImplementerCapFollowUp(nextAssignment, implFrame.result.summary)
+      plannerFollowUp = buildImplementerCapFollowUp(nextAssignment, implFrame.result.rawSummary)
       continue
     }
 
     // NEW (this task): the Implementer's own SUCCESS/FAIL verdict decides whether the
     // harness spawns a Tester at all — a FAIL skips the Tester entirely and goes
     // straight back to the Planner with the failure details, per the brief.
-    const implResult = parseImplementerResult(implFrame.result.summary)
+    const implResult = parseImplementerResult(implFrame.result.rawSummary)
     if (!implResult.succeeded) {
-      plannerFollowUp = buildNextTaskPrompt(implFrame.result.summary)
+      plannerFollowUp = buildNextTaskPrompt(implFrame.result.rawSummary)
       continue
     }
 
     // SUCCESS → the harness spawns a Tester to validate, with up to
     // MAX_TESTER_FIX_ATTEMPTS fix-and-retest rounds if it finds a problem.
-    const cycle = await runTesterValidation(plannerFrameId, nextAssignment, implFrame.result.summary, emit)
+    const cycle = await runTesterValidation(plannerFrameId, nextAssignment, implFrame.result.rawSummary, emit)
     commitAgent = cycle.lastAgent
     for (const fa of cycle.fixAttempts) completedTasks.push({ prompt: fa.assignment, conclusion: fa.conclusion })
 
@@ -1283,6 +1443,7 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
   await ledger.ensureGitignored(root())
 
   const taskStart = await runBossTaskStart(userMessage, emit)
+  lastTaskStartVerdict = { mode: taskStart.mode, text: taskStart.text }
 
   // ANSWER: the Boss already knows, verified it himself — no Planner/Implementer
   // frame ever spawns. The whole point of this mode is zero further iteration.
@@ -1314,7 +1475,9 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
       objective,
     )
     if (config.autoCommit) await frame.agent.autoCommit(emit)
-    return `Objective: ${objective}\n\n${frame.result.summary}`
+    // BUG-1: rawSummary — this comment's own words are "echoed back verbatim", which
+    // capSummary's 2000-char cap would silently violate for a long conclusion.
+    return `Objective: ${objective}\n\n${frame.result.rawSummary}`
   }
 
   // SIMPLE: tries ONE well-scoped Implementer first, exactly like TRIVIAL — no Planner
@@ -1336,19 +1499,23 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
       return await runObjectiveViaPlanner(objective, emit)
     }
 
-    const implResult = parseImplementerResult(frame.result.summary)
+    // BUG-1: rawSummary — same reasoning as the OBJECTIVE loop's Implementer handling
+    // above: parseImplementerResult and the Tester assignment below must see the full
+    // conclude text, and a FAIL's own explanation, returned verbatim as the final
+    // answer just below, must never be silently cut off.
+    const implResult = parseImplementerResult(frame.result.rawSummary)
     if (!implResult.succeeded) {
       // FAIL, and SIMPLE has no Planner conversation to route the failure back to —
       // the Implementer's own explanation of what it tried and why it failed IS the
       // final answer, same as this branch's pre-Tester behavior for any failure text.
       if (config.autoCommit) await frame.agent.autoCommit(emit)
-      return `Objective: ${objective}\n\n${frame.result.summary}`
+      return `Objective: ${objective}\n\n${frame.result.rawSummary}`
     }
 
     // SUCCESS → the harness spawns a Tester, with up to MAX_TESTER_FIX_ATTEMPTS
     // fix-and-retest rounds if it finds a problem — "same SUCCESS/FAIL parsing" as
     // the OBJECTIVE path, via the SAME shared runTesterValidation helper.
-    const cycle = await runTesterValidation(null, implementerAssignment, frame.result.summary, emit)
+    const cycle = await runTesterValidation(null, implementerAssignment, frame.result.rawSummary, emit)
 
     // Either a fix-attempt Implementer hit its own hard cap, or the Tester still
     // found a problem after using up its fix attempts. SIMPLE has no ongoing Planner

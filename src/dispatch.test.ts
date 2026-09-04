@@ -7,9 +7,10 @@
 // PLANNER DISPATCH REWRITE (this task) — buildInitialPlannerPrompt/buildNextTaskPrompt/
 // isPlannerDone are pure, tested the same way; they replace the earlier TASK:/TEST:/
 // DONE line convention (buildNextTaskPrompt/parseNextTask/detailNextTask, all removed)
-// entirely — see dispatch.ts's module header for the full flow. There is no Tester in
-// this pipeline any more (not even for SIMPLE), so buildTesterAssignment/
-// buildTesterPromptFromImpl have no dispatch.ts callers left and are not re-tested here.
+// entirely — see dispatch.ts's module header for the full flow. The Tester IS back in
+// this pipeline (harness-spawned via runTesterValidation, not Planner-driven — see
+// dispatch.ts's module header) for both OBJECTIVE and SIMPLE; see the runTesterValidation
+// tests further down this file for that coverage.
 //
 // PLAN/ACT GATE SEEDING (2026-09-05) — Agent.seedPlan's actual gate-bypass effect
 // DOES need a live chat() loop, so those tests use the SAME scripted-Ollama-client
@@ -31,9 +32,15 @@ import {
   buildImplementerCapFollowUp,
   isPlannerDone,
   isPlannerGiveUp,
+  deriveFrameResult,
+  parseTesterResult,
   TASK_START_MAX_ITERATIONS,
   TASK_START_HARD_CAP,
   TASK_START_CAP_FAILURE_MESSAGE,
+  buildTurnHistoryBlock,
+  boundTurnHistory,
+  TURN_HISTORY_MAX,
+  type TurnDigest,
 } from './dispatch.js'
 import { parseTaskStartVerdict, ROLE_TOOLS, ROLE_MAX_ITERATIONS } from './frames.js'
 
@@ -888,11 +895,14 @@ test('Implementer role: escalating PROGRESS CHECK nudges fire at 50, 60 and 70 b
   }
 })
 
-test('Tester/Boss roles keep the pre-existing generic fraction-based checkpoints untouched (no entry in PROGRESS_CHECK_ITERATIONS)', async () => {
-  // Regression guard for the "every other role's 0.4/0.65/0.85 scaling is untouched"
-  // claim in agent.ts's stallCheckpoints comment — a Tester frame at its own 20-
-  // iteration cap should still see the GENERIC wording, not a role-specific one
-  // (there is none defined for 'tester').
+// Tester role-specific escalation (owner directive, superseding the earlier flow
+// audit finding "Tester has no soft/hard split"). ROLE_MAX_ITERATIONS.tester raised
+// 20->40 and PROGRESS_CHECK_ITERATIONS.tester/PROGRESS_CHECK_MESSAGES.tester added at
+// [20, 30], mirroring the Planner's own pattern exactly (frames.ts) — buildTesterAssignment
+// (dispatch.ts) still states the 20-iteration budget in the prompt itself; that's now
+// the SOFT budget, with these two nudges making it a real mid-run steer instead of a
+// number the model only reads once, and 40 the actual hard cap.
+test('Tester role: escalating PROGRESS CHECK nudges fire at 20 and 30, mirroring the Planner\'s own pattern, before the iteration cap at 40', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-role-progress-tester-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([thinkingTurn]))
@@ -901,11 +911,46 @@ test('Tester/Boss roles keep the pre-existing generic fraction-based checkpoints
   agent.setRole('tester')
   agent.setMaxIterations(ROLE_MAX_ITERATIONS.tester)
   try {
-    await agent.chat('argo role-progress tester case')
+    const answer = await agent.chat('argo role-progress tester case')
+    const warnings = events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning')
+      .map(e => e.message)
+    assert.ok(
+      warnings.includes('PROGRESS CHECK: 20 iterations in. Wrap up your validation and call conclude with your result.'),
+    )
+    assert.ok(
+      warnings.includes('PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.'),
+    )
+    // The role-specific checkpoint REPLACES the generic mechanism for this frame —
+    // none of the generic fraction-based STALL wording, and no Planner-specific
+    // "analysis" wording, should appear.
+    assert.equal(warnings.some(w => w.startsWith('STALL:')), false)
+    assert.equal(warnings.some(w => w.includes('Wrap up your analysis')), false, 'the Planner-specific wording must not leak into a Tester frame')
+    assert.equal(agent.getLastRunOutcome(), 'cap')
+    assert.ok(answer.startsWith('Reached maximum iterations (40)'))
+  } finally {
+    await cleanupSeedPlanSession(sessionId)
+  }
+})
+
+test('Boss role keeps the pre-existing generic fraction-based checkpoints untouched (no entry in PROGRESS_CHECK_ITERATIONS)', async () => {
+  // Regression guard for the "every other role's 0.4/0.65/0.85 scaling is untouched"
+  // claim in agent.ts's stallCheckpoints comment — a Boss frame at its own iteration
+  // cap should still see the GENERIC wording, not a role-specific one (there is none
+  // defined for 'boss').
+  const events: AgentEvent[] = []
+  const sessionId = `test-role-progress-boss-${Date.now()}`
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([thinkingTurn]))
+  agent.setSessionId(sessionId)
+  agent.setAllowedTools(ROLE_TOOLS.boss)
+  agent.setRole('boss')
+  agent.setMaxIterations(ROLE_MAX_ITERATIONS.boss)
+  try {
+    await agent.chat('argo role-progress boss case')
     const warnings = events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning')
       .map(e => e.message)
     assert.ok(warnings.some(w => w.startsWith('STALL:') || w.startsWith('PROGRESS CHECK:')))
-    assert.equal(warnings.some(w => w.includes('Wrap up your analysis')), false, 'the Planner-specific wording must not leak into a Tester frame')
+    assert.equal(warnings.some(w => w.includes('Wrap up your analysis')), false, 'the Planner-specific wording must not leak into a Boss frame')
+    assert.equal(warnings.some(w => w.includes('Wrap up your validation')), false, 'the Tester-specific wording must not leak into a Boss frame')
   } finally {
     await cleanupSeedPlanSession(sessionId)
   }
@@ -986,4 +1031,150 @@ test('isPlannerGiveUp: still matches "give up" / "gives up" / "given up"', () =>
 
 test('isPlannerGiveUp: unrelated success text does not match', () => {
   assert.equal(isPlannerGiveUp('The objective is complete and all tests pass.'), false)
+})
+
+// ── BUG-1 (CRITICAL): control-flow strings truncated at 2000 chars before the
+// harness parses them ───────────────────────────────────────────────────────
+//
+// capSummary (frames.ts) is a head-only 2000-char cap, kept for ledger storage/
+// display. Before this fix, deriveFrameResult stored ONLY that capped text as
+// `.summary`, and every control-flow reader in dispatch.ts (isPlannerDone/
+// isPlannerGiveUp, the next Implementer assignment, parseImplementerResult/
+// parseTesterResult, and every prompt built from any of that text) read `.summary`
+// — so a phrase a model puts at the END of a long message (exactly where
+// isPlannerDone/isPlannerGiveUp's own phrase lists look) was silently cut off.
+// deriveFrameResult now also returns `.rawSummary`, the FULL, uncapped
+// finalAnswer, and every dispatch.ts control-flow call site reads that instead.
+// These tests exercise the real deriveFrameResult (not a hand-built fixture), so a
+// future edit that goes back to capSummary(finalAnswer) for `.rawSummary`, or reads
+// `.summary` again at a control-flow site, breaks visibly here.
+
+test('BUG-1: deriveFrameResult keeps `.summary` capped but carries the FULL text as `.rawSummary`', () => {
+  const longPrefix = 'x'.repeat(2100)
+  const finalAnswer = `${longPrefix} The objective is complete.`
+  const agent = new Agent(() => {}, 'test-model', scriptedOllama([]))
+  const result = deriveFrameResult('frame-bug1-a', finalAnswer, agent)
+
+  // `.summary` is still capSummary's 2000-char-capped text — unchanged behavior,
+  // still what gets persisted to the ledger.
+  assert.equal(result.summary, `${'x'.repeat(2000)}\u2026`)
+  // `.rawSummary` is the untouched, full finalAnswer — nothing trimmed.
+  assert.equal(result.rawSummary, finalAnswer)
+})
+
+test('BUG-1: a Planner "done" phrase past char 2000 is invisible through `.summary` but survives through `.rawSummary`', () => {
+  const longPrefix = 'x'.repeat(2100) // pushes the completion phrase well past the 2000-char cap
+  const finalAnswer = `${longPrefix} The objective is complete.`
+  const agent = new Agent(() => {}, 'test-model', scriptedOllama([]))
+  const result = deriveFrameResult('frame-bug1-b', finalAnswer, agent)
+
+  // This IS the bug, demonstrated directly: reading the capped text, the harness
+  // would misread a genuinely finished Planner as "one more assignment" and loop.
+  assert.equal(isPlannerDone(result.summary), false)
+  // Reading rawSummary (what dispatch.ts's OBJECTIVE loop now actually reads),
+  // the same conclude text is correctly recognized as done.
+  assert.equal(isPlannerDone(result.rawSummary), true)
+})
+
+test('BUG-1: a Planner give-up phrase past char 2000 is invisible through `.summary` but survives through `.rawSummary`', () => {
+  const longPrefix = 'x'.repeat(2100)
+  const finalAnswer = `${longPrefix} I give up, this cannot be completed as scoped.`
+  const agent = new Agent(() => {}, 'test-model', scriptedOllama([]))
+  const result = deriveFrameResult('frame-bug1-c', finalAnswer, agent)
+
+  assert.equal(isPlannerGiveUp(result.summary), false)
+  assert.equal(isPlannerGiveUp(result.rawSummary), true)
+})
+
+test('BUG-1: a Tester FAIL fix-assignment longer than 2000 chars is not truncated when read via `.rawSummary`', () => {
+  // The tail of the fix assignment (after char 2000) carries instructions a
+  // capped read would silently drop before the next Implementer ever saw them.
+  const fixBody = `${'y'.repeat(2050)} — and be sure to update the regression test too.`
+  const finalAnswer = `FAIL: ${fixBody}`
+  const agent = new Agent(() => {}, 'test-model', scriptedOllama([]))
+  const result = deriveFrameResult('frame-bug1-d', finalAnswer, agent)
+
+  // Reading the capped `.summary`, the trailing instruction is gone.
+  const cappedParsed = parseTesterResult(result.summary)
+  assert.equal(cappedParsed.passed, false)
+  assert.equal(cappedParsed.fixAssignment?.includes('update the regression test'), false)
+
+  // Reading `.rawSummary` (what runTesterValidation now actually reads), the fix
+  // assignment survives intact, end to end.
+  const rawParsed = parseTesterResult(result.rawSummary)
+  assert.equal(rawParsed.passed, false)
+  assert.equal(rawParsed.fixAssignment, fixBody.trim())
+})
+
+// ── PERSISTENT BOSS MEMORY (this task) — buildTurnHistoryBlock/boundTurnHistory ──
+// Both pure, no Ollama/fs/ledger involved, same reasoning as buildTaskStartAssignment's
+// own tests above: directly testable without spawning a real frame.
+
+function digest(userMessage: string, mode: string, objective: string, outcome: string): TurnDigest {
+  return { userMessage, mode, objective, outcome, timestamp: 0 }
+}
+
+test('buildTurnHistoryBlock: empty history is the empty string (byte-identical prompt on turn 1)', () => {
+  assert.equal(buildTurnHistoryBlock([]), '')
+})
+
+test('buildTurnHistoryBlock: renders one entry with mode uppercased and an arrow between fields', () => {
+  const text = buildTurnHistoryBlock([digest('Make the hexagons bigger', 'trivial', 'Change HEX_RADIUS', 'Changed HEX_RADIUS to 40')])
+  assert.ok(text.includes('1. User: "Make the hexagons bigger"'))
+  assert.ok(text.includes('TRIVIAL'))
+  assert.ok(text.includes('Changed HEX_RADIUS to 40'))
+})
+
+test('buildTurnHistoryBlock: numbers entries in order, most recent last, and never mutates the input array', () => {
+  const history = [
+    digest('first request', 'simple', 'obj1', 'outcome1'),
+    digest('second request', 'objective', 'obj2', 'outcome2'),
+  ]
+  const before = JSON.stringify(history)
+  const text = buildTurnHistoryBlock(history)
+  assert.ok(text.indexOf('1. User: "first request"') < text.indexOf('2. User: "second request"'))
+  assert.equal(JSON.stringify(history), before)
+})
+
+test('buildTurnHistoryBlock: truncates a long user message/outcome to a bounded excerpt, not the raw text', () => {
+  const longMessage = 'x'.repeat(500)
+  const longOutcome = 'y'.repeat(500)
+  const text = buildTurnHistoryBlock([digest(longMessage, 'objective', 'obj', longOutcome)])
+  assert.equal(text.includes(longMessage), false)
+  assert.equal(text.includes(longOutcome), false)
+  assert.ok(text.includes('…'))
+})
+
+test('buildTurnHistoryBlock: ends with guidance telling the Boss to fold prior context into its objective, before any assignment text', () => {
+  const text = buildTurnHistoryBlock([digest('a', 'trivial', 'b', 'c')])
+  assert.ok(/incorporate that/i.test(text))
+  assert.ok(text.endsWith('\n\n'))
+})
+
+test('boundTurnHistory: leaves a short history untouched', () => {
+  const history = [digest('a', 'trivial', 'b', 'c')]
+  assert.deepEqual(boundTurnHistory(history, TURN_HISTORY_MAX), history)
+})
+
+test('boundTurnHistory: trims to the last N entries (most recent kept), default max is 10', () => {
+  const history = Array.from({ length: 15 }, (_, i) => digest(`msg${i}`, 'trivial', 'obj', 'outcome'))
+  const bounded = boundTurnHistory(history)
+  assert.equal(bounded.length, TURN_HISTORY_MAX)
+  assert.equal(bounded[0].userMessage, 'msg5')
+  assert.equal(bounded[bounded.length - 1].userMessage, 'msg14')
+})
+
+test('boundTurnHistory: a custom max is respected', () => {
+  const history = Array.from({ length: 5 }, (_, i) => digest(`msg${i}`, 'trivial', 'obj', 'outcome'))
+  const bounded = boundTurnHistory(history, 2)
+  assert.deepEqual(bounded.map(d => d.userMessage), ['msg3', 'msg4'])
+})
+
+test('buildTaskStartAssignment itself stays untouched by the turn-history feature — the Boss prompt is locked', () => {
+  // The multi-turn history block is prepended by runBossTaskStart, not baked into
+  // buildTaskStartAssignment's own body — this is a regression guard on the exact
+  // prompt text this task was explicitly told never to modify.
+  const text = buildTaskStartAssignment('hello', false)
+  assert.equal(text.startsWith('CHECKPOINT: task-start\n'), true)
+  assert.equal(text.includes('Previous turns'), false)
 })
