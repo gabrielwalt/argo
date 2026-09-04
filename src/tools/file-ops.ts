@@ -256,6 +256,25 @@ export async function readFile(filePath: string, offset?: number, limit?: number
   }
 }
 
+export async function readFiles(paths: string[]): Promise<ToolResult> {
+  const sections: string[] = []
+  for (const filePath of paths) {
+    try {
+      const abs = await safePath(filePath)
+      const content = await fs.readFile(abs, 'utf-8')
+      if (content.length === 0) {
+        sections.push(`── ${filePath} ──\n(empty file)`)
+      } else {
+        sections.push(`── ${filePath} ──\n${truncateOutput(content, 8000)}`)
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      sections.push(`── ${filePath} ──\nError: ${msg}`)
+    }
+  }
+  return { output: sections.join('\n\n') }
+}
+
 export async function writeFile(filePath: string, content: string): Promise<ToolResult> {
   try {
     const abs = await safePath(filePath)
