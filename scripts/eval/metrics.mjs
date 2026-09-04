@@ -48,6 +48,23 @@ import path from 'node:path';
 // src      the exact construction site the pattern is anchored to
 // sample   a literal instance, used by selfCheckCounters()
 export const WARNING_INTERVENTIONS = [
+  // SCHEMA-CONSTRAINED CONTROL PLANE (src/schema.ts, wired in dispatch.ts, flag
+  // ARGO_SCHEMA_CONTROL_PLANE). Added 2026-09-04 after the counter self-check did exactly
+  // its job: it reported these as UNMATCHED WARNING blind spots on the first batch that
+  // ran with the flag on, rather than silently scoring them as nothing. Four separate keys
+  // rather than one, because the four extraction sites have very different value and the
+  // aggregate would hide that: the Planner-graph site converted a dead run (0/60, pfail=1)
+  // into a pass, while both observed Boss firings recovered `action: none` — identical to
+  // the fail-open default they replaced, i.e. no observable effect. A single `schemaRecover`
+  // counter would have averaged a decisive win together with a no-op.
+  { key: 'schemaGraph', re: /^schema-extraction recovered a \d+-step task graph for Planner frame /, src: 'dispatch.ts:752',
+    sample: 'schema-extraction recovered a 3-step task graph for Planner frame planner-mtm1xz2j-10 (initial plan) after the fenced JSON block was missing or unreadable.' },
+  { key: 'schemaTaskStart', re: /^schema-extraction recovered a task-start classification for frame /, src: 'dispatch.ts:419',
+    sample: 'schema-extraction recovered a task-start classification for frame boss-mtm1xz2j-1 (mode: objective) after no ANSWER/TRIVIAL/SIMPLE/OBJECTIVE line could be read.' },
+  { key: 'schemaBossVerdict', re: /^schema-extraction recovered a Boss \S+ verdict for frame /, src: 'dispatch.ts:524',
+    sample: 'schema-extraction recovered a Boss final verdict for frame boss-mtm3yru7-137 (action: none) after no NONE/INJECT/RESTART/ESCALATE line could be read.' },
+  { key: 'schemaTesterVerdict', re: /^schema-extraction recovered a Tester verdict for frame /, src: 'dispatch.ts:622',
+    sample: 'schema-extraction recovered a Tester verdict for frame tester-mtm3yru7-99 (verdict: release) after no RELEASE/REDO line could be read.' },
   { key: 'criticRevise', re: /^CRITIC \(/, src: 'agent.ts:1077 (steer)',
     sample: 'CRITIC (pre-done) — revise before continuing.\nIssues: x' },
   { key: 'groundingRevise', re: /^GROUNDING CHECK \(pre-done\) — fix before finishing/, src: 'agent.ts:1158 (steer)',
