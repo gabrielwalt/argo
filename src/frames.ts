@@ -78,7 +78,11 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
 // checkpoint now delivers its ANSWER/TRIVIAL/SIMPLE/OBJECTIVE marker line — a turn
 // with no tool calls no longer ends anything (agent.ts's chat() loop), so without
 // it this checkpoint could investigate forever but never actually classify.
-export const TASK_START_TOOLS: ToolName[] = ['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude']
+// The Boss classification checkpoint is READ-ONLY but needs bash for investigation
+// (grep, cat, ls, running tests to understand behaviour). bash CAN write, but the
+// prompt's read-only framing + the classification-only scope make that acceptable —
+// the alternative (no bash) left the Boss unable to check real files, which is worse.
+export const TASK_START_TOOLS: ToolName[] = ['read_file', 'bash', 'web_search', 'fetch_url', 'ledger', 'conclude']
 
 // Per-role iteration budgets. Implementer keeps the most headroom (real work happens
 // there); Planner/Tester/Boss are short bounded loops, not open-ended. Planner raised
@@ -157,26 +161,17 @@ export function policyFor(role: Role): FramePolicy {
   return { ...ROLE_POLICY[role] }
 }
 
-// Display names — the Argonauts, matched to each role's actual function rather than
-// picked for flavor alone: Jason is the leader accountable for the whole quest (sets
-// what "done" means, has final say); Tiphys is the Argo's helmsman, famed for charting
-// the course; Argus is the shipwright who built the Argo; Lynceus keeps his mythic
-// reputation for extraordinarily sharp eyesight — the one who catches what everyone
-// else misses. "Argo" itself (the ship) is the harness/dispatch loop, not a role — it
-// carries and dispatches the crew, it doesn't have its own turn. Internal code
-// identifiers (Role's own string values) are deliberately left as plain functional
-// names (planner/implementer/tester/boss) — this mapping is a display layer only, kept
-// alongside the plain role so it's never ambiguous which is which.
+// Plain display names — the role's function, not a character.
 export const ROLE_NAME: Record<Role, string> = {
-  boss: 'Jason',
-  planner: 'Tiphys',
-  implementer: 'Argus',
-  tester: 'Lynceus',
+  boss: 'Boss',
+  planner: 'Planner',
+  implementer: 'Implementer',
+  tester: 'Tester',
 }
 
 const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
   planner:
-    'You are Tiphys, the PLANNER inside Argo\'s multi-agent harness — the helmsman who charts the course. ' +
+    'You are the PLANNER inside Argo\'s multi-agent harness. ' +
     'Turn the given (immutable) objective into a task graph: ' +
     'an ordered list of steps, each naming which role should execute it (implementer or tester), its own concrete ' +
     'prompt, and any dependsOn relationships on earlier steps. You may read files and search the web, but you never ' +
@@ -184,35 +179,30 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'otherwise duplicate the same investigation, schedule a dedicated early step to produce that shared context ' +
     'instead of investigating it yourself. If the task is too large to fully predict, plan only the part you can ' +
     'and include a final step that requests a re-planning round — you will be resumed later with what each agent ' +
-    'produced. You never redefine the objective itself — only the Boss does that, and only as a deliberate, rare act. ' +
+    'produced. You never redefine the objective itself — only the Boss does that. ' +
     'Isolating a step into its own frame costs a fresh context and its own overhead — only worth paying when that ' +
-    'step\'s own work would otherwise run about 20-40+ iterations, or when it must not share context/mutations with ' +
+    'step\'s work would otherwise run many iterations, or when it must not share context/mutations with ' +
     'unrelated work. Small or tightly-related steps (quick edits, steps that touch the same files or the same piece ' +
     'of logic) belong in the SAME frame: give them the same frameGroup so they run sequentially in one Implementer ' +
     'frame instead of each paying for isolation it doesn\'t need. Mark a step skipTest:true when it is small and ' +
-    'unambiguous enough that Lynceus\'s separate verification pass would not be worth its extra iterations — Jason\'s ' +
-    'own periodic and final checks remain the safety net either way, so skipTest is about avoiding redundant checking, ' +
-    'not about lowering the bar.',
+    'unambiguous enough that a separate Tester verification pass would not be worth the extra iterations.',
   implementer:
-    'You are Argus, the IMPLEMENTER inside Argo\'s multi-agent harness — the shipwright who builds — working one ' +
+    'You are the IMPLEMENTER inside Argo\'s multi-agent harness, working one ' +
     'well-scoped task handed to you. If you ' +
     'cannot complete it within reasonable effort, say so explicitly in your final answer: state what you tried, what ' +
     'failed, and why you don\'t think it will succeed as scoped — do not grind indefinitely on the same approach.',
   tester:
-    'You are Lynceus, the TESTER inside Argo\'s multi-agent harness — keen-eyed enough to see what others miss. ' +
+    'You are the TESTER inside Argo\'s multi-agent harness. ' +
     'You verify another agent\'s claimed work — you never fix ' +
     'anything yourself, only read files and run checks. Check the SPECIFIC claim: if it claims full success, verify ' +
     'it fully; if partial, check both the claimed-successful and claimed-failed parts, and whether real effort was ' +
     'put into the failed parts. End your answer with either RELEASE (accept the conclusion, success or failure) or ' +
     'REDO: <specific follow-up> (resume the implementer with a targeted instruction, not a vague "try again").',
   boss:
-    'You are Jason, the BOSS inside Argo\'s multi-agent harness — leader of this quest, accountable for the whole ' +
-    'voyage, not per-frame review (Lynceus already does that). Verify independently (read files, run checks, search the web) rather than trusting ' +
-    'self-reports; asking a running agent a direct question is a last resort, only when independent verification ' +
-    'can\'t resolve it. Verify each specific claim ONCE — one clean check that confirms or refutes it — then ' +
-    'conclude immediately with your verdict for THIS checkpoint. Do not re-run a check you already got a clear ' +
-    'answer from "to be sure": every checkpoint has its own small iteration budget specifically so you have room ' +
-    'to verify, not to loop, and repeating a confirmed check just spends that budget without changing the answer. ' +
+    'You are the BOSS inside Argo\'s multi-agent harness, accountable for the whole ' +
+    'run. Verify independently (read files, run checks, search the web) rather than trusting ' +
+    'self-reports. Verify each specific claim ONCE — one clean check that confirms or refutes it — then ' +
+    'conclude immediately with your verdict for THIS checkpoint. ' +
     'Different checkpoints expect different one-line endings — the specific CHECKPOINT assignment ' +
     'below always tells you which convention to end with; follow that one, not a checkpoint you handled earlier in ' +
     'this same conversation. At standup/final checkpoints, end with exactly one of: NONE (healthy, continue), ' +

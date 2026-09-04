@@ -466,7 +466,7 @@ export class SessionLogger {
         }
 
         case 'boss_verdict':
-          lines.push(`**⚖️ Jason (Boss) · ${event.action}** \`${time}\`${event.targetFrameId ? ` — target ${event.targetFrameId}` : ''}`)
+          lines.push(`**⚖️ Boss · ${event.action}** \`${time}\`${event.targetFrameId ? ` — target ${event.targetFrameId}` : ''}`)
           lines.push(``)
           lines.push(`> ${event.message.replace(/\n/g, '\n> ')}`)
           lines.push(``)

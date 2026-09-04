@@ -1381,10 +1381,10 @@ function addTraceItem(className, label, body, collapsible, container) {
 // see frames.ts's ROLE_NAME for the same mapping, chosen for an actual functional
 // match rather than flavor alone.
 const ROLE_META = {
-  boss:        { name: 'Jason',   title: 'Boss',        icon: '⚖️' },
-  planner:     { name: 'Tiphys',  title: 'Planner',     icon: '🧭' },
-  implementer: { name: 'Argus',   title: 'Implementer', icon: '🔨' },
-  tester:      { name: 'Lynceus', title: 'Tester',      icon: '👁️' },
+  boss:        { name: 'Boss',         title: 'Boss',        icon: '⚖️' },
+  planner:     { name: 'Planner',     title: 'Planner',     icon: '🧭' },
+  implementer: { name: 'Implementer', title: 'Implementer', icon: '🔨' },
+  tester:      { name: 'Tester',      title: 'Tester',      icon: '👁️' },
 }
 
 // frameId -> { el, arrow, items, outcome, hasItems }. Cleared per top-level run
@@ -1565,14 +1565,14 @@ function renderTaskGraph(event) {
 }
 
 const BOSS_VERDICT_META = {
-  inject:   { icon: '💬', label: 'Jason injects a correction' },
-  restart:  { icon: '🔁', label: 'Jason restarts this attempt' },
-  escalate: { icon: '⛔', label: 'Jason escalates back to Tiphys' },
+  inject:   { icon: '💬', label: 'Boss injects a correction' },
+  restart:  { icon: '🔁', label: 'Boss restarts this attempt' },
+  escalate: { icon: '⛔', label: 'Boss escalates to Planner' },
 }
 
 function renderBossVerdict(event) {
   if (!currentTraceBlock) return
-  const meta = BOSS_VERDICT_META[event.action] || { icon: '⚖️', label: `Jason: ${event.action}` }
+  const meta = BOSS_VERDICT_META[event.action] || { icon: '⚖️', label: `Boss: ${event.action}` }
   const el = document.createElement('div')
   el.className = `role-divider role-divider-${event.action}`
   el.title = event.message

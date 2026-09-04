@@ -55,9 +55,16 @@ test('buildTaskStartAssignment: keeps the "never NONE / no objective" constraint
   assert.ok(/Never "NONE" or "no objective"/.test(text))
 })
 
-test('buildTaskStartAssignment: keeps the stop-reading-and-classify-OBJECTIVE guidance', () => {
+test('buildTaskStartAssignment: classification modes are present without excessive guidance', () => {
   const text = buildTaskStartAssignment('fix the bug', false)
-  assert.ok(/STOP reading and classify OBJECTIVE/.test(text))
+  // The four modes and their format lines must be present
+  assert.ok(text.includes('ANSWER:'))
+  assert.ok(text.includes('TRIVIAL:'))
+  assert.ok(text.includes('SIMPLE:'))
+  assert.ok(text.includes('OBJECTIVE:'))
+  // The old "STOP reading" and "hard budget" lines must NOT be present
+  assert.equal(text.includes('STOP reading'), false)
+  assert.equal(text.includes('hard budget'), false)
 })
 
 test('buildTaskStartAssignment: no verbatim-request note when the flag is off', () => {

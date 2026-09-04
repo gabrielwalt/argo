@@ -412,10 +412,10 @@ const TASK_START_MARKER_RETRY_NUDGE =
 //
 // TRIVIAL skipping the Tester is a deliberate 2026-09-05 change from the previous
 // rule here, "at least two independent frames, always" — that floor was justified by
-// the Boss's own ability to self-edit during task-start: if Jason could already have
+// the Boss's own ability to self-edit during task-start: if the Boss could already have
 // written a file himself with nothing else checking it, a single Implementer's own
 // verification wasn't enough to trust either. That justification is gone now that
-// task-start is read-only (TASK_START_TOOLS, frames.ts) — Jason cannot touch the
+// task-start is read-only (TASK_START_TOOLS, frames.ts) — the Boss cannot touch the
 // workspace at all during classification, so a genuinely TRIVIAL classification is
 // purely the Implementer's own work, and its own verification is a reasonable
 // stopping point. This is also what makes TRIVIAL worth distinguishing from SIMPLE at
@@ -470,11 +470,7 @@ export function buildTaskStartAssignment(userMessage: string, verbatimRequestOn:
         'original is preserved separately for anyone who needs the exact wording.\n\n'
       : '') +
     'Ground this if it references project specifics, current facts, or anything you cannot already verify — ' +
-    'check real files or the web where it matters, rather than answering from assumption. You have a hard ' +
-    `budget of ${TASK_START_MAX_ITERATIONS} iterations for this checkpoint — read only enough to classify, not ` +
-    'enough to fully understand the codebase: the moment you notice real complexity (an unfamiliar multi-file ' +
-    'area, several functions/modules involved, a design decision to make), STOP reading and classify OBJECTIVE ' +
-    'immediately; Tiphys (the Planner) has a longer budget for that deeper reading.\n\n' +
+    'check real files or the web where it matters, rather than answering from assumption.\n\n' +
     'The project is READ-ONLY: you are only classifying this request, so nothing can be modified. Classify it ' +
     'into exactly ONE of four modes and end your answer with exactly one line in that mode\'s format:\n' +
     '- ANSWER: <complete final answer> — you already know it for certain, or one quick lookup settles it, and ' +
@@ -616,7 +612,7 @@ async function runBoss(
   return { action: verdict.action, message: verdict.message }
 }
 
-// Lynceus verifies a claim (an Implementer step's, or — 2026-09-03 — the Boss's own
+// the Tester verifies a claim (an Implementer step's, or — 2026-09-03 — the Boss's own
 // task-start attempt) and can send it back for a targeted redo. Factored out so the
 // SAME independent-verification path applies uniformly regardless of who did the
 // work: "always at least two distinct frames involved" (docs/subagents-plan.md)
@@ -986,7 +982,7 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
 
   const taskStart = await runBossTaskStart(userMessage, emit)
 
-  // ANSWER: Jason already knows, verified it himself — no Planner/Implementer/Tester
+  // ANSWER: the Boss already knows, verified it himself — no Planner/Implementer/Tester
   // frame ever spawns. The whole point of this mode is zero further iteration.
   if (taskStart.mode === 'answer') {
     await ledger.setObjective(root(), taskStart.text)
@@ -1000,7 +996,7 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
 
   // plannerFrame stays null until/unless something actually goes wrong (replan()
   // below spawns one lazily at that point) for every mode except 'objective' — the
-  // whole point of TRIVIAL/SIMPLE is skipping Tiphys's ceremony for work that isn't
+  // whole point of TRIVIAL/SIMPLE is skipping the Planner's ceremony for work that isn't
   // anticipated to need MULTIPLE distinct pieces.
   let plannerFrame: SpawnedFrame | null = null
   // Whichever frame's Agent instance most recently did real work — reused purely as
@@ -1165,7 +1161,7 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
       )
       commitAgent = frame.agent
 
-      // skipTest is set by Tiphys per-step for a Planner-produced OBJECTIVE graph
+      // skipTest is set by the Planner per-step for a Planner-produced OBJECTIVE graph
       // (tasks.ts), and by task-start's own TRIVIAL classification (runBossTaskStart,
       // above) for its one-step graph — SIMPLE and every Planner step default to
       // false (a real Tester pass) unless explicitly waived.

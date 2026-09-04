@@ -295,9 +295,9 @@ export interface TaskStep {
   // both "too cheap to warrant its own frame" and "touches the same files/logic as
   // another step, must not be isolated" (see docs/subagents-plan.md).
   frameGroup?: string
-  // Tiphys (the Planner) marks a step trivial when it's small/unambiguous enough
-  // that Lynceus's (the Tester's) separate verification pass wouldn't earn its
-  // extra iterations — Jason's own periodic/final checks remain the safety net
+  // the Planner marks a step trivial when it's small/unambiguous enough
+  // that the Tester's separate verification pass wouldn't earn its
+  // extra iterations — the Boss's own periodic/final checks remain the safety net
   // either way. Default false (unchanged behavior) when omitted.
   skipTest?: boolean
 }

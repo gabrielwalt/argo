@@ -9,11 +9,13 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ROLE_TOOLS, TASK_START_TOOLS, systemPromptFor } from './frames.js'
 
-test('TASK_START_TOOLS has no write capability at all', () => {
-  assert.equal(TASK_START_TOOLS.includes('bash'), false, 'bash was the only path the Boss had to touch the workspace')
+test('TASK_START_TOOLS has bash for investigation but no direct write tools', () => {
+  // bash is included so the Boss can grep, cat, ls, run tests to understand
+  // behaviour. write_file/edit_file are excluded — the prompt's read-only framing
+  // is the guard, not the tool set (bash can write, but the Boss is classifying).
+  assert.equal(TASK_START_TOOLS.includes('bash'), true)
   assert.equal(TASK_START_TOOLS.includes('write_file'), false)
   assert.equal(TASK_START_TOOLS.includes('edit_file'), false)
-  assert.equal(TASK_START_TOOLS.includes('browser_fetch'), false)
   assert.equal(TASK_START_TOOLS.includes('update_plan'), false)
 })
 
@@ -33,8 +35,8 @@ test('TASK_START_TOOLS keeps ledger — the tool itself exposes no write action'
   assert.equal(TASK_START_TOOLS.includes('ledger'), true)
 })
 
-test('TASK_START_TOOLS is exactly five tools (read-only + conclude), not a filtered copy of ROLE_TOOLS.boss', () => {
-  assert.deepEqual([...TASK_START_TOOLS].sort(), ['conclude', 'fetch_url', 'ledger', 'read_file', 'web_search'])
+test('TASK_START_TOOLS includes bash for investigation plus read-only tools and conclude', () => {
+  assert.deepEqual([...TASK_START_TOOLS].sort(), ['bash', 'conclude', 'fetch_url', 'ledger', 'read_file', 'web_search'])
 })
 
 test('ROLE_TOOLS.boss (the Boss\'s OTHER checkpoints — standup, final) still has bash', () => {
