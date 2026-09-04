@@ -43,7 +43,10 @@ export const config = {
   // exactly 120.010s — genuinely still working, not stuck (the process didn't
   // crash, thanks to the catch in chat(); the user just got a clean error and
   // had to retry, and the retry answered normally).
-  chatTimeoutMs:           parseInt(process.env.CHAT_TIMEOUT_MS ?? '180000', 10),
+  // Reduced from 180s to 60s: with num_predict:8192 capping generation, a single
+  // call should complete in ~10-30s. A 60s timeout catches genuine hangs without
+  // making the user wait 3+ minutes per stuck call.
+  chatTimeoutMs:           parseInt(process.env.CHAT_TIMEOUT_MS ?? '60000', 10),
   // Delay before the single automatic retry of a failed main per-iteration chat
   // call (see chatWithRetry in agent.ts). Two real incidents ended a whole run
   // with no retry: a 180s timeout, and Ollama's Go backend rejecting a malformed
