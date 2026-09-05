@@ -1,5 +1,5 @@
 import { Ollama } from 'ollama'
-import type { Message } from 'ollama'
+import type { Message, ChatResponse } from 'ollama'
 import { promises as fs } from 'fs'
 import path from 'path'
 import { config } from './config.js'
@@ -1249,22 +1249,105 @@ export class Agent {
     const offeredTools = this.allowedTools
       ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
       : toolDefinitions
-    // TIMEOUT ABORT: on timeout, call this.ollama.abort() to cancel any ongoing
-    // streaming requests. For non-streaming requests (our case), the Ollama JS client
-    // does NOT support per-call abort — the underlying fetch stays open. The timeout
-    // rejection from withTimeout still fires, and chatWithRetry's soft recovery
-    // (returning { timeoutError } instead of throwing) handles the case where both
-    // the original call and the retry time out — the iteration loop injects an error
-    // message and continues rather than killing the run.
-    return withTimeout(this.ollama.chat({
-      model: this.model,
-      messages,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      tools: offeredTools as any[],
-      stream: false,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      options: this.options as any,
-    }), config.chatTimeoutMs, () => { try { this.ollama.abort() } catch { /* best effort */ } })
+    // TIMEOUT ABORT — STREAMING (2026-09-05, replaces the old stream:false call):
+    // the Ollama JS client only tracks a request in `ongoingStreamedRequests` (what
+    // its own abort() walks and cancels) when the request is STREAMED — a
+    // stream:false call's underlying fetch has no abort hook at all, so the old
+    // `this.ollama.abort()` here was a no-op for the request that actually mattered.
+    // On a slow prefill that blew past chatTimeoutMs, the old request kept running
+    // server-side, the retry queued behind it, and if prefill genuinely needed more
+    // than chatTimeoutMs, the retry timed out too — the timeout-cancel-retry death
+    // spiral this change exists to break. Ollama v0.33.0 added restore points so a
+    // CANCELLED prefill resumes on retry instead of restarting — but only if the
+    // cancellation actually reaches the server, which requires a real abort signal,
+    // which requires streaming.
+    //
+    // Streamed chunks are DELTAS, not cumulative snapshots (see the ollama package's
+    // own README: `for await (const part of response) process.stdout.write(part.
+    // message.content)` — writing content incrementally only makes sense if each
+    // chunk carries the NEXT fragment, not the whole answer so far). content and
+    // thinking must be concatenated across every chunk; tool_calls arrive whole on
+    // the terminal chunk (done:true) and are never split. Every other ChatResponse
+    // field (model, created_at, done, done_reason, the *_duration/*_count timing
+    // fields) is only meaningful on that terminal chunk, so it is taken from there
+    // and used to seed the accumulator up front — an early throw (e.g. the stream
+    // ending with no done:true chunk at all) must not surface an accumulator with
+    // model:'' etc. and silently mislabel the response.
+    //
+    // Test-mock compatibility: agent.test.ts's scriptedOllama()/flakyOllama() mock
+    // `chat()` to return a plain ChatResponse object directly, matching the OLD
+    // stream:false call — there is no live Ollama server in those tests, so they
+    // cannot exercise real NDJSON streaming, and rewriting ~30 call sites to yield
+    // an async-iterable stub is a lot of churn for no behavioral gain (the thing
+    // under test in those cases is chatWithRetry's retry/timeout bookkeeping, not
+    // the accumulation logic). Detect which shape came back and branch: a real
+    // AbortableAsyncIterator has a Symbol.asyncIterator method; a mocked plain
+    // response does not.
+    const streamPromise = (async (): Promise<ChatResponse> => {
+      const result = await this.ollama.chat({
+        model: this.model,
+        messages,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        tools: offeredTools as any[],
+        stream: true,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        options: this.options as any,
+      })
+      if (!(result && typeof (result as AsyncIterable<ChatResponse>)[Symbol.asyncIterator] === 'function')) {
+        // Mocked non-streaming shape (tests) — already the complete response.
+        return result as unknown as ChatResponse
+      }
+      let final: ChatResponse | null = null
+      let content = ''
+      let thinking = ''
+      let toolCalls: ChatResponse['message']['tool_calls'] | undefined
+      for await (const chunk of result as AsyncIterable<ChatResponse>) {
+        content += chunk.message?.content ?? ''
+        thinking += chunk.message?.thinking ?? ''
+        // tool_calls arrive on a NON-TERMINAL chunk (measured: chunk N-1 carries
+        // the tool_calls array, chunk N is the done:true terminal with no
+        // tool_calls). Capture from whichever chunk has them — never overwrite
+        // a captured value with a later chunk's undefined/empty array.
+        if (chunk.message?.tool_calls?.length) toolCalls = chunk.message.tool_calls
+        // The terminal done:true chunk carries timing/count fields. Keep
+        // overwriting so the last chunk wins for everything except the
+        // accumulators above.
+        final = chunk
+      }
+      if (!final) throw new Error('Empty stream response from Ollama')
+      return { ...final, message: { ...final.message, content, thinking: thinking || undefined, tool_calls: toolCalls ?? final.message?.tool_calls } }
+    })()
+    // ALTERNATIVE FIX (not active — see config.ts's firstRequestTimeoutMs doc
+    // comment): if the streaming change above ever needs to be backed out (e.g.
+    // an Ollama-server-side streaming+tools regression), replace the line above
+    // with the block below AND revert stream:true to stream:false / drop the
+    // accumulation IIFE, keeping just the underlying this.ollama.chat({...}) call
+    // as the promise passed to withTimeout. this.lastIterationCount is set to
+    // this call's iterCurrent by chat()'s loop immediately before invoking
+    // chatWithRetry (which invokes chatCall), so `=== 1` here is exactly "the
+    // first request of this frame, including a resumed frame's own first
+    // request" — a resumed frame's iterationBase carries the OLD count forward
+    // (see chat()'s resume branch), so a resumed follow-up's first call is NOT
+    // misclassified as this frame's cold-prefill call, because it isn't one:
+    // Ollama's prefix cache keys off the actual message bytes sent, and a
+    // resumed frame resends the same growing history a warm-cache continuation
+    // of, not a fresh system-prompt+tools prefix the server has never seen.
+    //   const timeoutMs = this.lastIterationCount === 1 ? config.firstRequestTimeoutMs : config.chatTimeoutMs
+    //   return withTimeout(this.ollama.chat({ model: this.model, messages, tools: offeredTools as any[], stream: false, options: this.options as any }), timeoutMs, () => { try { this.ollama.abort() } catch {} })
+    // This is the SAFER of the two fixes (a bigger fixed number, not a new code
+    // path) but does not fix the underlying defect: abort() is still a no-op on
+    // stream:false, so a first request that genuinely exceeds 180s still leaves
+    // an orphaned request running server-side, and the retry still queues behind
+    // it rather than resuming from a restore point. It only widens the window
+    // before that failure mode can trigger — recommended only as a fallback if
+    // streaming turns out to have a complication the repro/deploy step surfaces.
+    //
+    // ACTIVE PATH: on timeout, this.ollama.abort() now reaches a REAL ongoing
+    // streamed request and the server sees the cancellation (restore point
+    // preserved server-side on v0.33.0+) instead of the old no-op — the retry
+    // that chatWithRetry issues next can resume rather than queuing behind a
+    // still-running orphaned request.
+    return withTimeout(streamPromise, config.chatTimeoutMs, () => { try { this.ollama.abort() } catch { /* best effort */ } })
   }
 
   // The main per-iteration chat call with ONE automatic retry. This is safe to

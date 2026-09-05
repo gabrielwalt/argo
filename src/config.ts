@@ -47,6 +47,22 @@ export const config = {
   // call should complete in ~10-30s. A 60s timeout catches genuine hangs without
   // making the user wait 3+ minutes per stuck call.
   chatTimeoutMs:           parseInt(process.env.CHAT_TIMEOUT_MS ?? '60000', 10),
+  // ALTERNATIVE/COMPLEMENTARY fix to the streaming change in agent.ts's chatCall
+  // (2026-09-05): the FIRST Ollama call of a frame pays for prefilling the entire
+  // system prompt + tool definitions + assignment from a cold KV cache — measured
+  // in real Argo logs as the single most expensive call in a frame (Tester frames
+  // failed starting at their FIRST iteration with 11 messages already in context;
+  // the Implementer's failures clustered at iteration 5 then never recurred once
+  // the cache was warm). chatTimeoutMs (60s) is sized for a WARM-cache call, not a
+  // cold-prefill one — every call after the first in a frame reuses Ollama's KV
+  // cache for the unchanged prefix, so only the first call's prefill is genuinely
+  // this expensive. 180s budgets for roughly a 50K-token cold prefill at a
+  // conservative ~280 tok/s prefill rate on the M5 Max target hardware; unused by
+  // every later call in the same frame, which still uses chatTimeoutMs unchanged.
+  // Only meaningful if chatCall's stream:false path is kept instead of (or
+  // alongside) the streaming fix — streaming lets a slow-but-progressing prefill
+  // avoid the timeout entirely rather than needing a bigger fixed budget for it.
+  firstRequestTimeoutMs:   parseInt(process.env.FIRST_REQUEST_TIMEOUT_MS ?? '180000', 10),
   // Delay before the single automatic retry of a failed main per-iteration chat
   // call (see chatWithRetry in agent.ts). Two real incidents ended a whole run
   // with no retry: a 180s timeout, and Ollama's Go backend rejecting a malformed
