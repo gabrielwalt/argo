@@ -883,7 +883,7 @@ export function buildNextTaskPrompt(completedMessage: string | null, taskNumber:
       '- Include appropriate testing or validation expectations.\n' +
       '- Exclude context that does not affect this implementation step.\n' +
       '- Specify required behaviour and constraints without prescribing an implementation technique, unless the technique itself is required by the objective or project architecture.\n\n' +
-      'Inspect relevant project files as needed to ground the assignment in the current codebase. Also inspect `AGENTS.md` and `MEMORY.md`, and include directly in the sub-objective any relevant instructions, conventions, architectural constraints, project facts, or prior decisions. But remember, the project remains READ-ONLY at this point: do not implement anything yourself.\n\n' +
+      'Inspect relevant project files as needed to ground the assignment in the current codebase. The implementation agent does NOT have access to `AGENTS.md` or `MEMORY.md` — inspect those files yourself and include directly in the assignment any relevant instructions, conventions, architectural constraints, project facts, or prior decisions. But remember, the project remains READ-ONLY at this point: do not implement anything yourself.\n\n' +
       'You have a hard budget of 20 iterations to call `conclude` with the final self-contained implementation assignment. If the next planned step is no longer appropriate given the current project state, adapt the assignment while preserving the intent and sequencing of the overall plan.'
     )
   }
@@ -892,7 +892,7 @@ export function buildNextTaskPrompt(completedMessage: string | null, taskNumber:
     'The previous implementation agent concluded with:\n' +
     `<argo-implemented>\n${completedMessage}\n</argo-implemented>\n\n` +
     'Review this result against your plan and the current project state, then create the next self-contained implementation assignment.\n\n' +
-    'Formulate it as a clear implementation assignment with a verifiable expected outcome. Include any relevant consequences of the completed work, dependencies, and instructions or context from `AGENTS.md` and `MEMORY.md` that the agent will need. Explicitly scope what to change, preserve, or defer, including what to test.\n\n' +
+    'Formulate it as a clear implementation assignment with a verifiable expected outcome. Include any relevant consequences of the completed work and dependencies. The implementation agent does NOT have access to `AGENTS.md` or `MEMORY.md` — include in the assignment any relevant instructions or context from those files that the agent needs. Explicitly scope what to change, preserve, or defer, including what to test.\n\n' +
     'If the result changes or invalidates your original plan, adapt the next step accordingly.\n\n' +
     'Call `conclude` with one of these statuses:\n' +
     '- IMPLEMENT: your message is the complete implementation assignment for the agent.\n' +
@@ -981,8 +981,7 @@ export function buildTesterAssignment(implementerAssignment: string, iteration =
     'Independently determine what correct completion requires. Inspect the resulting repository and attempt to ' +
     'falsify it. You are deliberately not given the implementer\'s account of what it changed; do not infer ' +
     'correctness from intent or apparent implementation shape.\n\n' +
-    'Also account for any relevant instructions, conventions, constraints, or prior decisions in `AGENTS.md` ' +
-    'and `MEMORY.md`.\n\n' +
+    'The implementation agent does NOT have access to `AGENTS.md` or `MEMORY.md`. Account for any relevant instructions, conventions, constraints, or prior decisions from those files and include them directly in the assignment.\n\n' +
     'When you have formed your independent assessment, call `conclude` with status ASSESSMENT.\n\n' +
     'Your message must record:\n' +
     '- whether you found any apparent defects;\n' +

@@ -1220,10 +1220,13 @@ export class Agent {
     } else if (this.currentPlan) {
       messages.push({ role: 'tool', content: this.renderPlanReminder(this.currentPlan) })
     }
+    // Implementer/Tester never get AGENTS.md/MEMORY.md content (the Planner reads
+    // those files and folds anything relevant directly into the assignment instead).
+    const skipCtx = this.roleTag === 'implementer' || this.roleTag === 'tester'
     // Task-scoped MEMORY.md retrieval (this.memory): auto-inject the relevant durable
     // memory entries for the current work at the tail. Never model-fetched; a recall
     // pointer already OFFERS the full file (see buildProjectMemoryContext).
-    if (this.memory && this.memoryRaw) {
+    if (this.memory && this.memoryRaw && !skipCtx) {
       const mem = selectMemoryEntries(this.memoryRaw, this.retrievalQuery())
       if (mem.text) {
         messages.push({ role: 'tool', content: `RELEVANT MEMORY (from MEMORY.md, for the current work):\n${mem.text}` })
@@ -1234,7 +1237,7 @@ export class Agent {
     // CURRENT task at the tail, re-selected each step via retrievalQuery(), so project
     // instructions track the active task the same way MEMORY.md does. A small (whole)
     // AGENTS.md is already fully in the system prompt, so skip it here to avoid duplication.
-    if (this.memory && this.agentsRaw) {
+    if (this.memory && this.agentsRaw && !skipCtx) {
       const asel = selectAgentsSections(this.agentsRaw, this.retrievalQuery())
       if (asel.mode === 'selected' && asel.text) {
         messages.push({ role: 'tool', content: `RELEVANT PROJECT INSTRUCTIONS (from AGENTS.md, for the current task):\n${asel.text}` })
@@ -1762,9 +1765,12 @@ export class Agent {
     // Baseline: loadProjectContext (AGENTS.md + MEMORY.md whole-injected). When
     // this.memory is on, build the context via the memory module instead (AGENTS.md
     // section-selected + recall pointer; MEMORY.md retrieved task-scoped at the tail).
-    const projectContext = this.memory
-      ? await this.buildProjectMemoryContext(userMessage)
-      : await loadProjectContext()
+    const skipProjectContext = this.roleTag === 'implementer' || this.roleTag === 'tester'
+    const projectContext = skipProjectContext
+      ? ''
+      : this.memory
+        ? await this.buildProjectMemoryContext(userMessage)
+        : await loadProjectContext()
     // this.allowedTools (null for the unrestricted baseline) is the frame's REAL
     // tool set — buildSystemPrompt derives hasUpdatePlan from it internally the
     // same way canUpdatePlan() does, so passing it here (rather than the boolean)

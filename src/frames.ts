@@ -314,7 +314,8 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     '- Relevant context and dependencies on prior work\n' +
     '- Relevant files, interfaces, and constraints\n' +
     '- What is in scope vs out of scope\n' +
-    '- Testing and validation expectations\n\n' +
+    '- Testing and validation expectations\n' +
+    '- The implementation agent does NOT have access to /workspace/AGENTS.md or /workspace/MEMORY.md. You must inspect those files and include directly in the assignment any relevant instructions, conventions, architectural constraints, project facts, or prior decisions that the agent needs to carry out the work correctly.\n\n' +
     'COMPLETION\n' +
     'When the objective is fully met and no further implementation work remains, say so plainly in your `conclude` answer instead of producing another assignment.\n\n' +
     'SCOPE\n' +
