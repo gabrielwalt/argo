@@ -13,31 +13,48 @@ const MAX_OUTPUT = 4000
 // just displaying it) should compare against this constant, not against ''.
 export const NO_OUTPUT = '(no output)'
 
-// Most commands finish in well under this; keeping it low means a genuinely
-// stuck command fails fast rather than blocking the run for minutes.
-const DEFAULT_TIMEOUT_MS = 30_000
-// Playwright commands routinely need a browser launch + page load + a real
-// wait for a page/animation to do something — 30s isn't a fair default for
-// them specifically (confirmed live: a verification run burned 5 retries and
-// ~7 minutes hitting this exact wall before switching approach entirely,
-// because "Command failed" gave no hint the real cause was just the clock).
-const PLAYWRIGHT_DEFAULT_TIMEOUT_MS = 45_000
-// A ceiling on the model's own timeout_ms request — long enough for real
-// Playwright work, short enough that a stuck command can't block a run
+// Raised from 30s to 120s: Argo runs its bash tool inside Docker, where
+// npm install, npm test, python3 scripts, and build commands routinely take
+// 30-60s on their own before any real work-specific slowness is added. The old
+// 30s default was catching normal container overhead, not just genuine hangs —
+// wasting agent iterations on retries for commands that were always going to
+// finish, just not within 30s. 120s gives real commands room to finish while
+// still failing a genuinely stuck command well before it can block a run
 // indefinitely.
-const MAX_TIMEOUT_MS = 180_000
+const DEFAULT_TIMEOUT_MS = 120_000
+// Playwright commands routinely need a browser launch + page load + a real
+// wait for a page/animation to do something — the plain default isn't a fair
+// baseline for them specifically (confirmed live: a verification run burned 5
+// retries and ~7 minutes hitting the old 30s wall before switching approach
+// entirely, because "Command failed" gave no hint the real cause was just the
+// clock). Now equal to DEFAULT_TIMEOUT_MS (both 120s) since the plain default
+// was raised for the same underlying reason (Docker overhead) — but the
+// Playwright-specific FLOOR below is still meaningful: it stops a model from
+// underrequesting (e.g. timeout_ms: 5000) on a command that needs browser
+// launch + page load time no matter how generous the general default is.
+const PLAYWRIGHT_DEFAULT_TIMEOUT_MS = 120_000
+// A ceiling on the model's own timeout_ms request — long enough for real
+// Playwright work and heavy builds (npm install, full test suites), short
+// enough that a stuck command can't block a run indefinitely. Raised from
+// 180s to 300s: 180s could be insufficient for npm install or heavy builds
+// inside a container; 300s (5 minutes) is generous but still a real ceiling —
+// if a command takes longer than that, something is probably wrong rather
+// than just slow.
+const MAX_TIMEOUT_MS = 300_000
 const PLAYWRIGHT_PATTERN = /playwright|chromium|firefox\.launch|webkit\.launch/i
 
 // Pure and separately testable: given the command text and whatever the model
 // asked for, what timeout should actually apply. A command that mentions
-// Playwright gets a higher default even if the model didn't ask for one —
-// it's the one case where 30s was never realistic to begin with. It also gets
-// a FLOOR at that same 120s default even when the model DID explicitly ask for
-// less: confirmed live, a Tester passed timeout_ms:30000 on a Playwright script
-// (the model has no real sense of browser launch + page load cost and routinely
-// underestimates it), which — before this floor — overrode the Playwright
-// default entirely and produced the exact 30s-wall failure this default exists
-// to prevent, indistinguishable from a real hang.
+// Playwright gets a FLOOR at PLAYWRIGHT_DEFAULT_TIMEOUT_MS (120s) even when
+// the model explicitly asked for less: confirmed live, a Tester passed
+// timeout_ms:30000 on a Playwright script (the model has no real sense of
+// browser launch + page load cost and routinely underestimates it), which —
+// before this floor existed — overrode the Playwright default entirely and
+// produced the exact under-time-budget failure this floor exists to prevent,
+// indistinguishable from a real hang. The floor stays meaningful even now
+// that the Playwright and plain defaults are numerically equal (both 120s),
+// because it only kicks in when the model explicitly underrequests — a plain
+// command that underrequests is honored as asked (see the last test below).
 export function resolveTimeoutMs(command: string, requestedMs?: number): number {
   const isPlaywright = PLAYWRIGHT_PATTERN.test(command)
   const base = isPlaywright ? PLAYWRIGHT_DEFAULT_TIMEOUT_MS : DEFAULT_TIMEOUT_MS

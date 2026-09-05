@@ -43,25 +43,26 @@ export const config = {
   // exactly 120.010s — genuinely still working, not stuck (the process didn't
   // crash, thanks to the catch in chat(); the user just got a clean error and
   // had to retry, and the retry answered normally).
-  // Reduced from 180s to 60s: with num_predict:8192 capping generation, a single
-  // call should complete in ~10-30s. A 60s timeout catches genuine hangs without
-  // making the user wait 3+ minutes per stuck call.
-  chatTimeoutMs:           parseInt(process.env.CHAT_TIMEOUT_MS ?? '60000', 10),
-  // ALTERNATIVE/COMPLEMENTARY fix to the streaming change in agent.ts's chatCall
-  // (2026-09-05): the FIRST Ollama call of a frame pays for prefilling the entire
-  // system prompt + tool definitions + assignment from a cold KV cache — measured
-  // in real Argo logs as the single most expensive call in a frame (Tester frames
-  // failed starting at their FIRST iteration with 11 messages already in context;
-  // the Implementer's failures clustered at iteration 5 then never recurred once
-  // the cache was warm). chatTimeoutMs (60s) is sized for a WARM-cache call, not a
-  // cold-prefill one — every call after the first in a frame reuses Ollama's KV
-  // cache for the unchanged prefix, so only the first call's prefill is genuinely
-  // this expensive. 180s budgets for roughly a 50K-token cold prefill at a
-  // conservative ~280 tok/s prefill rate on the M5 Max target hardware; unused by
-  // every later call in the same frame, which still uses chatTimeoutMs unchanged.
-  // Only meaningful if chatCall's stream:false path is kept instead of (or
-  // alongside) the streaming fix — streaming lets a slow-but-progressing prefill
-  // avoid the timeout entirely rather than needing a bigger fixed budget for it.
+  // Raised from 60s to 180s: with streaming enabled, a 3-hour production run
+  // still produced 162 timeouts at the old 60s value — 79 single timeouts where
+  // the retry succeeded (so the call genuinely needed 60-120s), 45 double
+  // timeouts where the retry also failed (>120s), and 18 three-consecutive
+  // kills (>180s total). Timeouts occurred at both small (9-11 message) and
+  // large (84-95 message) contexts; at larger contexts Ollama genuinely needs
+  // more than 60s for prefill on the target hardware (Apple M5 Max, 48GB,
+  // qwen3.6:latest loaded at 24GB, num_ctx=65536). 60s was never a safe margin
+  // for this model/hardware/context-size combination — 180s is.
+  chatTimeoutMs:           parseInt(process.env.CHAT_TIMEOUT_MS ?? '180000', 10),
+  // Originally sized as a bigger budget specifically for a frame's FIRST Ollama
+  // call (cold-prefill: paying for the entire system prompt + tool definitions +
+  // assignment against an empty KV cache, measured as the single most expensive
+  // call in a frame) versus chatTimeoutMs for warm-cache calls later in the same
+  // frame. Now that chatTimeoutMs itself is 180s, the two are equal by default —
+  // this key is effectively redundant as a distinct "first call" budget. Left in
+  // place (not removed) because it's still a meaningful independent override via
+  // FIRST_REQUEST_TIMEOUT_MS if a future change lowers chatTimeoutMs again while
+  // cold-prefill cost stays high, but there is currently no reason to set it
+  // differently from the default.
   firstRequestTimeoutMs:   parseInt(process.env.FIRST_REQUEST_TIMEOUT_MS ?? '180000', 10),
   // Delay before the single automatic retry of a failed main per-iteration chat
   // call (see chatWithRetry in agent.ts). Two real incidents ended a whole run
