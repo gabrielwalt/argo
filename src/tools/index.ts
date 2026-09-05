@@ -255,9 +255,7 @@ export const toolDefinitions = [
 ]
 
 export async function executeTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
-  // 'view_image' isn't (yet) part of the ToolName union in types.ts — widen the
-  // switch discriminant locally rather than touch that file for this addition.
-  switch (name as ToolName | 'view_image') {
+  switch (name as ToolName) {
     case 'bash':
       return bash(args.command as string, args.cwd as string | undefined, args.timeout_ms as number | undefined)
     case 'web_search':

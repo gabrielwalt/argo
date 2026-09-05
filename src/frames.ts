@@ -66,7 +66,7 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
   // project's own tests/checks (see the Boss's own read-only bash rationale above —
   // same reasoning: no bash would leave the Tester unable to actually verify
   // anything beyond reading code).
-  tester: ['read_file', 'bash', 'ledger', 'conclude'],
+  tester: ['read_file', 'bash', 'view_image', 'ledger', 'conclude'],
   // Deliberately no write_file/edit_file — the Boss verifies, it never fixes.
   boss: ['read_file', 'bash', 'web_search', 'fetch_url', 'ledger', 'conclude'],
 }
@@ -345,6 +345,18 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'mutant failures and try to distinguish them from the current implementation.\n\n' +
     'Whenever practical, exercise at least one meaningful behaviour or failure mode that is not already covered ' +
     'by the tests cited or apparent from the implementation.\n\n' +
+    'VISUAL VERIFICATION\n' +
+    'When the assignment affects a webpage, layout, styling, canvas, chart, animation, responsive behaviour, or ' +
+    'other user-visible UI: launch the application when practical and verify the rendered result. Use Playwright ' +
+    'or bash to exercise the relevant interaction flow. Use view_image on screenshots of meaningful states to ' +
+    'check for visual defects — clipping, overlap, incorrect geometry, doubled borders, bad spacing, invisible ' +
+    'states, broken drag, overflow, or responsive regressions. For canvas, WebGL, or custom visual controls, ' +
+    'prefer screenshot inspection over DOM assertions alone (DOM cannot establish visual correctness for drawn ' +
+    'content). Re-inspect state after interaction. Check representative viewport sizes when responsiveness ' +
+    'matters. Do not declare SUCCESS on a visual feature merely because tests pass if the rendered result has ' +
+    'not been meaningfully checked.\n' +
+    'Skip browser verification for non-visual tasks — code logic, API behaviour, data processing, and similar ' +
+    'do not need it.\n\n' +
     'DISCIPLINE\n' +
     'Report only concrete, evidence-backed failures — not speculative nitpicks. Do not stop at the first issue. ' +
     'Do not modify the project yourself; your role is to inspect, test, challenge, and report.\n\n' +
