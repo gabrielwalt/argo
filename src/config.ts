@@ -24,7 +24,14 @@ export const config = {
   // Compact when only about this many tokens of headroom remain (trigger near-full rather
   // than at a fixed 2/3 fraction) — lets the context fill more before compacting. The donut
   // draws its threshold tick from this + the run's num_ctx.
-  compactReserveTokens:    parseInt(process.env.COMPACT_RESERVE_TOKENS ?? '4096', 10),
+  // Raised from 4096 to 13107 (measured incident: token-based trigger firing at 93.75% of
+  // num_ctx=65536 outpaced char-based eviction's ability to bring usage back down — three
+  // compactions in one 3-hour run left the very next call still at 94-99% used). 13107 moves
+  // the trigger to ~80% of num_ctx (52429/65536) instead of ~93.75%, giving eviction more
+  // headroom to work with and firing before the situation is already critical. Paired with
+  // eviction.ts's move to a token-estimated (not char) budget — the trigger and the budget
+  // now agree on units.
+  compactReserveTokens:    parseInt(process.env.COMPACT_RESERVE_TOKENS ?? '13107', 10),
   compactGenerationReserve: parseInt(process.env.COMPACT_GENERATION_RESERVE ?? '2048', 10),
   // 180s (raised from an original 60s) was sized against num_ctx=32768. Since
   // then num_ctx's default doubled to 65536 — compaction's threshold is still

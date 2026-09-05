@@ -52,7 +52,7 @@ import {
   // design.
   noteGateRejection, clearPlanGateRejections, gateEscalationMessage, gateStopMessage, type GateReason,
 } from './loop.js'
-import { classifyTool, inferDependencies, evict, type EpisodeMeta } from './eviction.js'
+import { classifyTool, inferDependencies, evict, type EpisodeMeta, type EvictionBudget } from './eviction.js'
 import { recordEpisode, markEpisodeEvicted, newId as newLedgerId } from './ledger.js'
 
 // SYSTEM PROMPT — authoring guidance (for maintainers, not the model):
@@ -1022,7 +1022,13 @@ export class Agent {
     // this flag is off.
     if (config.agents) {
       const msgsBefore = this.history.length
-      const { messages, evictedEpisodeIds } = evict(this.history, this.episodes)
+      // Budget in the SAME unit the trigger fires on (tokens, via numCtx), not an
+      // unrelated flat char count — the root cause this replaces (see eviction.ts).
+      // Target ~70% of num_ctx post-eviction so there's real headroom left, not just
+      // enough to dip under the trigger threshold before immediately re-triggering.
+      const numCtx = this.options.num_ctx ?? 65536
+      const budget: EvictionBudget = { maxTokens: Math.floor(numCtx * 0.7) }
+      const { messages, evictedEpisodeIds, tokenEstimateBefore, tokenEstimateAfter } = evict(this.history, this.episodes, budget)
       if (evictedEpisodeIds.length === 0) return { newRunStart: currentRunStart, compacted: false }
       this.history = messages
       this.lastCompactedAt = Date.now()
@@ -1037,7 +1043,7 @@ export class Agent {
       }
       emitAndLog({
         type: 'compact',
-        summary: `deterministic eviction: stubbed ${evictedEpisodeIds.length} episode(s) (recoverable via ledger expand)`,
+        summary: `deterministic eviction: stubbed ${evictedEpisodeIds.length} episode(s), ~${Math.round(tokenEstimateBefore)} → ~${Math.round(tokenEstimateAfter)} est. tokens`,
         messagesBefore: msgsBefore,
         messagesAfter: this.history.length,
         contextUsagePct,
