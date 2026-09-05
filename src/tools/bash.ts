@@ -31,11 +31,19 @@ const PLAYWRIGHT_PATTERN = /playwright|chromium|firefox\.launch|webkit\.launch/i
 // Pure and separately testable: given the command text and whatever the model
 // asked for, what timeout should actually apply. A command that mentions
 // Playwright gets a higher default even if the model didn't ask for one —
-// it's the one case where 30s was never realistic to begin with.
+// it's the one case where 30s was never realistic to begin with. It also gets
+// a FLOOR at that same 120s default even when the model DID explicitly ask for
+// less: confirmed live, a Tester passed timeout_ms:30000 on a Playwright script
+// (the model has no real sense of browser launch + page load cost and routinely
+// underestimates it), which — before this floor — overrode the Playwright
+// default entirely and produced the exact 30s-wall failure this default exists
+// to prevent, indistinguishable from a real hang.
 export function resolveTimeoutMs(command: string, requestedMs?: number): number {
-  const base = PLAYWRIGHT_PATTERN.test(command) ? PLAYWRIGHT_DEFAULT_TIMEOUT_MS : DEFAULT_TIMEOUT_MS
+  const isPlaywright = PLAYWRIGHT_PATTERN.test(command)
+  const base = isPlaywright ? PLAYWRIGHT_DEFAULT_TIMEOUT_MS : DEFAULT_TIMEOUT_MS
   const wanted = requestedMs != null && requestedMs > 0 ? requestedMs : base
-  return Math.min(wanted, MAX_TIMEOUT_MS)
+  const floor = isPlaywright ? PLAYWRIGHT_DEFAULT_TIMEOUT_MS : 0
+  return Math.min(Math.max(wanted, floor), MAX_TIMEOUT_MS)
 }
 
 export async function bash(command: string, cwd?: string, timeoutMs?: number): Promise<ToolResult> {

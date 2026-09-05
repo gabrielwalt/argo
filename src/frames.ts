@@ -356,7 +356,13 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'matters. Do not declare SUCCESS on a visual feature merely because tests pass if the rendered result has ' +
     'not been meaningfully checked.\n' +
     'Skip browser verification for non-visual tasks — code logic, API behaviour, data processing, and similar ' +
-    'do not need it.\n\n' +
+    'do not need it.\n' +
+    'If a browser-verification attempt fails or times out, do not keep retrying with variations (different ' +
+    'selectors, debug scripts, longer waits) — one or two attempts is enough to know whether the harness is ' +
+    'cooperating. Confirmed live: a Tester burned 20 of its 40 iterations on repeated Playwright attempts (a ' +
+    'timeout, a wrong element ID, a missing function) and reached the hard cap without ever calling `conclude`. ' +
+    'Fall back to a source-code-only assessment and conclude with the evidence you have, noting the visual claim ' +
+    'as unverified — do not exhaust your iteration budget debugging the test infrastructure itself.\n\n' +
     'DISCIPLINE\n' +
     'Report only concrete, evidence-backed failures — not speculative nitpicks. Do not stop at the first issue. ' +
     'Do not modify the project yourself; your role is to inspect, test, challenge, and report.\n\n' +

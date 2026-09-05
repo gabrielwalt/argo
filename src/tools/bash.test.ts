@@ -107,6 +107,23 @@ test('resolveTimeoutMs: a zero or negative request falls back to the default ins
   assert.equal(resolveTimeoutMs('echo hi', -5), 30_000)
 })
 
+test('resolveTimeoutMs: an explicit request BELOW the Playwright default is floored to it, not honored', () => {
+  // Confirmed live: the model explicitly passed timeout_ms:30000 on a real
+  // Playwright script, which — before this floor existed — overrode the 120s
+  // Playwright default down to the same 30s wall that default exists to avoid.
+  // Models have no real sense of browser launch + page load cost.
+  assert.equal(resolveTimeoutMs('npx playwright test', 30_000), 120_000)
+  assert.equal(resolveTimeoutMs('node -e "chromium.launch()"', 5_000), 120_000)
+})
+
+test('resolveTimeoutMs: an explicit request AT OR ABOVE the Playwright default is still honored', () => {
+  assert.equal(resolveTimeoutMs('npx playwright test', 150_000), 150_000)
+})
+
+test('resolveTimeoutMs: the floor never applies to a plain (non-Playwright) command', () => {
+  assert.equal(resolveTimeoutMs('echo hi', 5_000), 5_000)
+})
+
 test('a real timeout is reported distinctly from a real command failure', async () => {
   // execFile's timeout kills the *direct* child with SIGTERM. In-container
   // (production — see config.inContainer in bash.ts) that child is `bash`
