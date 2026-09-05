@@ -981,7 +981,6 @@ export function buildTesterAssignment(implementerAssignment: string, iteration =
     'Independently determine what correct completion requires. Inspect the resulting repository and attempt to ' +
     'falsify it. You are deliberately not given the implementer\'s account of what it changed; do not infer ' +
     'correctness from intent or apparent implementation shape.\n\n' +
-    'The implementation agent does NOT have access to `AGENTS.md` or `MEMORY.md`. Account for any relevant instructions, conventions, constraints, or prior decisions from those files and include them directly in the assignment.\n\n' +
     'When you have formed your independent assessment, call `conclude` with status ASSESSMENT.\n\n' +
     'Your message must record:\n' +
     '- whether you found any apparent defects;\n' +

@@ -186,10 +186,10 @@ test('TASK_START_TOOLS (the read-only classification checkpoint) also holds conc
 // budget verbatim; 40 here is now the real hard cap, mirroring the Planner's own
 // soft-20/hard-40 split.
 
-test('ROLE_MAX_ITERATIONS: planner=40 (unchanged), implementer=80 (raised), tester=40 (raised, soft/hard split), boss untouched', () => {
+test('ROLE_MAX_ITERATIONS: planner=40 (unchanged), implementer=160 (raised), tester=80 (raised, soft/hard split), boss untouched', () => {
   assert.equal(ROLE_MAX_ITERATIONS.planner, 40)
-  assert.equal(ROLE_MAX_ITERATIONS.implementer, 80)
-  assert.equal(ROLE_MAX_ITERATIONS.tester, 40)
+  assert.equal(ROLE_MAX_ITERATIONS.implementer, 160)
+  assert.equal(ROLE_MAX_ITERATIONS.tester, 80)
   assert.equal(ROLE_MAX_ITERATIONS.boss, 15)
 })
 
@@ -200,16 +200,15 @@ test('PROGRESS_CHECK_ITERATIONS: planner escalates at 20/30, strictly below its 
   }
 })
 
-test('PROGRESS_CHECK_ITERATIONS: implementer escalates at 50/60/70, strictly below its 80-iteration cap', () => {
-  assert.deepEqual(PROGRESS_CHECK_ITERATIONS.implementer, [50, 60, 70])
+test('PROGRESS_CHECK_ITERATIONS: implementer escalates at 100/120/140, strictly below its 160-iteration cap', () => {
+  assert.deepEqual(PROGRESS_CHECK_ITERATIONS.implementer, [100, 120, 140])
   for (const n of PROGRESS_CHECK_ITERATIONS.implementer!) {
     assert.ok(n < ROLE_MAX_ITERATIONS.implementer, `${n} must be below the hard cap ${ROLE_MAX_ITERATIONS.implementer}`)
   }
 })
 
-test('PROGRESS_CHECK_ITERATIONS: tester escalates at 20/30, strictly below its 40-iteration cap, matching the Planner\'s pattern', () => {
-  assert.deepEqual(PROGRESS_CHECK_ITERATIONS.tester, [20, 30])
-  assert.deepEqual(PROGRESS_CHECK_ITERATIONS.tester, PROGRESS_CHECK_ITERATIONS.planner)
+test('PROGRESS_CHECK_ITERATIONS: tester escalates at 40/60, strictly below its 80-iteration cap', () => {
+  assert.deepEqual(PROGRESS_CHECK_ITERATIONS.tester, [40, 60])
   for (const n of PROGRESS_CHECK_ITERATIONS.tester!) {
     assert.ok(n < ROLE_MAX_ITERATIONS.tester, `${n} must be below the hard cap ${ROLE_MAX_ITERATIONS.tester}`)
   }
@@ -225,28 +224,27 @@ test('PROGRESS_CHECK_MESSAGES is index-aligned with PROGRESS_CHECK_ITERATIONS fo
   assert.equal(PROGRESS_CHECK_MESSAGES.tester!.length, PROGRESS_CHECK_ITERATIONS.tester!.length)
 })
 
-test('PROGRESS_CHECK_MESSAGES: tester messages mirror the Planner\'s wording, "analysis" swapped for "validation"', () => {
+test('PROGRESS_CHECK_MESSAGES: tester messages mirror the Planner\'s wording, "analysis" swapped for "validation" and "new investigations" added', () => {
   assert.equal(
     PROGRESS_CHECK_MESSAGES.tester![0],
-    'PROGRESS CHECK: 20 iterations in. Wrap up your validation and call conclude with your result.',
+    'IMPORTANT — 40 iterations used. Wrap up your validation and call conclude with your result. Do not start new investigations.',
   )
   assert.equal(
     PROGRESS_CHECK_MESSAGES.tester![1],
-    'PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.',
+    'IMPORTANT — 60 iterations used, approaching the hard limit. You MUST call conclude NOW with your best ' +
+      'result. Do not start new investigations.',
   )
-  // Second rung is byte-identical to the Planner's own — only the first differs.
-  assert.equal(PROGRESS_CHECK_MESSAGES.tester![1], PROGRESS_CHECK_MESSAGES.planner![1])
 })
 
 test('PROGRESS_CHECK_MESSAGES: planner messages match the brief\'s exact wording and escalate in tone (gentle, then firmer)', () => {
   const [gentle, firmer] = PROGRESS_CHECK_MESSAGES.planner!
   assert.equal(
     gentle,
-    'PROGRESS CHECK: 20 iterations in. Wrap up your analysis and call conclude with your result.',
+    'IMPORTANT — 20 iterations used. Wrap up your analysis and call conclude with your result.',
   )
   assert.equal(
     firmer,
-    'PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.',
+    'IMPORTANT — 30 iterations used, approaching the hard limit. You MUST call conclude NOW with your best result.',
   )
 })
 
@@ -254,17 +252,17 @@ test('PROGRESS_CHECK_MESSAGES: implementer messages match the brief\'s exact wor
   const [soft, firmer, strongest] = PROGRESS_CHECK_MESSAGES.implementer!
   assert.equal(
     soft,
-    'PROGRESS CHECK: 50 iterations in and not finished. Start wrapping up your work. Call conclude with a ' +
+    'IMPORTANT — 100 iterations used. Start wrapping up your work. Call conclude with a ' +
       'summary of what you accomplished, what didn\'t work, and what\'s left to do.',
   )
   assert.equal(
     firmer,
-    'PROGRESS CHECK: 60 iterations in. You must wrap up now. Call conclude with what you accomplished and ' +
+    'IMPORTANT — 120 iterations used. You MUST wrap up now. Call conclude with what you accomplished and ' +
       'what remains.',
   )
   assert.equal(
     strongest,
-    'PROGRESS CHECK: 70 iterations. Finish immediately. Call conclude with your final status — what was ' +
-      'done, what failed, and what\'s left.',
+    'IMPORTANT — 140 iterations used, approaching the hard limit. Finish IMMEDIATELY. Call conclude with your ' +
+      'final status — what was done, what failed, and what\'s left.',
   )
 })

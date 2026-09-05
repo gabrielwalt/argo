@@ -154,8 +154,8 @@ export const TASK_START_TOOLS: ToolName[] = ['read_file', 'bash', 'web_search', 
 // only reads once at the top of its assignment.
 export const ROLE_MAX_ITERATIONS: Record<Role, number> = {
   planner: 40,
-  implementer: 80,
-  tester: 40,
+  implementer: 160,
+  tester: 80,
   boss: 15,
 }
 
@@ -187,8 +187,8 @@ export const ROLE_MAX_ITERATIONS: Record<Role, number> = {
 // see agent.ts's stallCheckpoints computation).
 export const PROGRESS_CHECK_ITERATIONS: Partial<Record<Role, number[]>> = {
   planner: [20, 30],
-  implementer: [50, 60, 70],
-  tester: [20, 30],
+  implementer: [100, 120, 140],
+  tester: [40, 60],
 }
 
 // Message text is VERBATIM per this task's brief — index-aligned with
@@ -200,20 +200,21 @@ export const PROGRESS_CHECK_ITERATIONS: Partial<Record<Role, number[]>> = {
 // Implementer's work, not analyze a plan.
 export const PROGRESS_CHECK_MESSAGES: Partial<Record<Role, string[]>> = {
   planner: [
-    'PROGRESS CHECK: 20 iterations in. Wrap up your analysis and call conclude with your result.',
-    'PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.',
+    'IMPORTANT — 20 iterations used. Wrap up your analysis and call conclude with your result.',
+    'IMPORTANT — 30 iterations used, approaching the hard limit. You MUST call conclude NOW with your best result.',
   ],
   implementer: [
-    'PROGRESS CHECK: 50 iterations in and not finished. Start wrapping up your work. Call conclude with a ' +
+    'IMPORTANT — 100 iterations used. Start wrapping up your work. Call conclude with a ' +
       'summary of what you accomplished, what didn\'t work, and what\'s left to do.',
-    'PROGRESS CHECK: 60 iterations in. You must wrap up now. Call conclude with what you accomplished and ' +
+    'IMPORTANT — 120 iterations used. You MUST wrap up now. Call conclude with what you accomplished and ' +
       'what remains.',
-    'PROGRESS CHECK: 70 iterations. Finish immediately. Call conclude with your final status — what was ' +
-      'done, what failed, and what\'s left.',
+    'IMPORTANT — 140 iterations used, approaching the hard limit. Finish IMMEDIATELY. Call conclude with your ' +
+      'final status — what was done, what failed, and what\'s left.',
   ],
   tester: [
-    'PROGRESS CHECK: 20 iterations in. Wrap up your validation and call conclude with your result.',
-    'PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.',
+    'IMPORTANT — 40 iterations used. Wrap up your validation and call conclude with your result. Do not start new investigations.',
+    'IMPORTANT — 60 iterations used, approaching the hard limit. You MUST call conclude NOW with your best ' +
+      'result. Do not start new investigations.',
   ],
 }
 
@@ -348,7 +349,13 @@ const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {
     'VISUAL VERIFICATION\n' +
     'When the assignment affects a webpage, layout, styling, canvas, chart, animation, responsive behaviour, or ' +
     'other user-visible UI: launch the application when practical and verify the rendered result. Use Playwright ' +
-    'or bash to exercise the relevant interaction flow. Use view_image on screenshots of meaningful states to ' +
+    'or bash to exercise the relevant interaction flow. When writing Playwright scripts: start an HTTP server ' +
+    'first if the page needs one (e.g. `python3 -m http.server 8765 &` in a prior bash call, then verify with ' +
+    'curl before navigating). Read the actual HTML/JS source to find correct element IDs and function names — ' +
+    'do not guess. Functions inside IIFEs or ES modules are not available on `window`; use page.evaluate to ' +
+    'access them via their actual scope. Keep scripts short and focused on one check at a time rather than ' +
+    'complex multi-step scripts that are harder to debug.\n' +
+    'Use view_image on screenshots of meaningful states to ' +
     'check for visual defects — clipping, overlap, incorrect geometry, doubled borders, bad spacing, invisible ' +
     'states, broken drag, overflow, or responsive regressions. For canvas, WebGL, or custom visual controls, ' +
     'prefer screenshot inspection over DOM assertions alone (DOM cannot establish visual correctness for drawn ' +

@@ -726,9 +726,9 @@ test('conclude drives the task ledger exactly like a no-tool-call turn used to: 
 // its iteration cap with no other mechanism (task ledger, grounding, loop-recovery)
 // getting in the way — none of tasks/memory/grounding/layout are turned on here.
 
-test('ROLE_MAX_ITERATIONS: planner stays 40, implementer raised to 80 (this task)', () => {
+test('ROLE_MAX_ITERATIONS: planner stays 40, implementer raised to 160 (this task)', () => {
   assert.equal(ROLE_MAX_ITERATIONS.planner, 40)
-  assert.equal(ROLE_MAX_ITERATIONS.implementer, 80)
+  assert.equal(ROLE_MAX_ITERATIONS.implementer, 160)
 })
 
 const thinkingTurn: ScriptedResponse = { message: { role: 'assistant', content: 'Still working on it.' } }
@@ -746,10 +746,10 @@ test('Planner role: escalating PROGRESS CHECK nudges fire at 20 and 30 before th
     const warnings = events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning')
       .map(e => e.message)
     assert.ok(
-      warnings.includes('PROGRESS CHECK: 20 iterations in. Wrap up your analysis and call conclude with your result.'),
+      warnings.includes('IMPORTANT — 20 iterations used. Wrap up your analysis and call conclude with your result.'),
     )
     assert.ok(
-      warnings.includes('PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.'),
+      warnings.includes('IMPORTANT — 30 iterations used, approaching the hard limit. You MUST call conclude NOW with your best result.'),
     )
     // The role-specific checkpoint REPLACES the generic mechanism for this frame —
     // none of the generic fraction-based STALL/PROGRESS wording should appear.
@@ -835,10 +835,10 @@ test('resetIterations(): called before a resumed Planner detail call, the report
     // The 20/30 progress checks fire at THIS call's own 20th/30th iteration, not
     // offset by the 6 iterations the first call already used.
     assert.ok(
-      warnings.includes('PROGRESS CHECK: 20 iterations in. Wrap up your analysis and call conclude with your result.'),
+      warnings.includes('IMPORTANT — 20 iterations used. Wrap up your analysis and call conclude with your result.'),
     )
     assert.ok(
-      warnings.includes('PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.'),
+      warnings.includes('IMPORTANT — 30 iterations used, approaching the hard limit. You MUST call conclude NOW with your best result.'),
     )
     // The hard cap hits after exactly 40 MORE iterations, not 34 (40 - 6).
     assert.equal(agent.getLastRunOutcome(), 'cap')
@@ -849,7 +849,7 @@ test('resetIterations(): called before a resumed Planner detail call, the report
   }
 })
 
-test('Implementer role: escalating PROGRESS CHECK nudges fire at 50, 60 and 70 before the iteration cap at 80', async () => {
+test('Implementer role: escalating PROGRESS CHECK nudges fire at 100, 120 and 140 before the iteration cap at 160', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-role-progress-implementer-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([thinkingTurn]))
@@ -862,16 +862,16 @@ test('Implementer role: escalating PROGRESS CHECK nudges fire at 50, 60 and 70 b
     const warnings = events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning')
       .map(e => e.message)
     assert.ok(warnings.includes(
-      'PROGRESS CHECK: 50 iterations in and not finished. Start wrapping up your work. Call conclude with a ' +
+      'IMPORTANT — 100 iterations used. Start wrapping up your work. Call conclude with a ' +
         'summary of what you accomplished, what didn\'t work, and what\'s left to do.',
     ))
     assert.ok(warnings.includes(
-      'PROGRESS CHECK: 60 iterations in. You must wrap up now. Call conclude with what you accomplished and ' +
+      'IMPORTANT — 120 iterations used. You MUST wrap up now. Call conclude with what you accomplished and ' +
         'what remains.',
     ))
     assert.ok(warnings.includes(
-      'PROGRESS CHECK: 70 iterations. Finish immediately. Call conclude with your final status — what was ' +
-        'done, what failed, and what\'s left.',
+      'IMPORTANT — 140 iterations used, approaching the hard limit. Finish IMMEDIATELY. Call conclude with your ' +
+        'final status — what was done, what failed, and what\'s left.',
     ))
     assert.equal(warnings.some(w => w.startsWith('STALL:')), false)
     assert.equal(agent.getLastRunOutcome(), 'cap')
@@ -882,12 +882,11 @@ test('Implementer role: escalating PROGRESS CHECK nudges fire at 50, 60 and 70 b
 
 // Tester role-specific escalation (owner directive, superseding the earlier flow
 // audit finding "Tester has no soft/hard split"). ROLE_MAX_ITERATIONS.tester raised
-// 20->40 and PROGRESS_CHECK_ITERATIONS.tester/PROGRESS_CHECK_MESSAGES.tester added at
-// [20, 30], mirroring the Planner's own pattern exactly (frames.ts) — buildTesterAssignment
-// (dispatch.ts) still states the 20-iteration budget in the prompt itself; that's now
-// the SOFT budget, with these two nudges making it a real mid-run steer instead of a
-// number the model only reads once, and 40 the actual hard cap.
-test('Tester role: escalating PROGRESS CHECK nudges fire at 20 and 30, mirroring the Planner\'s own pattern, before the iteration cap at 40', async () => {
+// 40->80 and PROGRESS_CHECK_ITERATIONS.tester/PROGRESS_CHECK_MESSAGES.tester set at
+// [40, 60] (frames.ts) — buildTesterAssignment (dispatch.ts) still states its own
+// iteration budget in the prompt itself; these two nudges make it a real mid-run
+// steer instead of a number the model only reads once, and 80 is the actual hard cap.
+test('Tester role: escalating PROGRESS CHECK nudges fire at 40 and 60 before the iteration cap at 80', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-role-progress-tester-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([thinkingTurn]))
@@ -900,10 +899,13 @@ test('Tester role: escalating PROGRESS CHECK nudges fire at 20 and 30, mirroring
     const warnings = events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning')
       .map(e => e.message)
     assert.ok(
-      warnings.includes('PROGRESS CHECK: 20 iterations in. Wrap up your validation and call conclude with your result.'),
+      warnings.includes('IMPORTANT — 40 iterations used. Wrap up your validation and call conclude with your result. Do not start new investigations.'),
     )
     assert.ok(
-      warnings.includes('PROGRESS CHECK: 30 iterations. You must finish now. Call conclude with your best result.'),
+      warnings.includes(
+        'IMPORTANT — 60 iterations used, approaching the hard limit. You MUST call conclude NOW with your best ' +
+          'result. Do not start new investigations.',
+      ),
     )
     // The role-specific checkpoint REPLACES the generic mechanism for this frame —
     // none of the generic fraction-based STALL wording, and no Planner-specific
@@ -911,7 +913,7 @@ test('Tester role: escalating PROGRESS CHECK nudges fire at 20 and 30, mirroring
     assert.equal(warnings.some(w => w.startsWith('STALL:')), false)
     assert.equal(warnings.some(w => w.includes('Wrap up your analysis')), false, 'the Planner-specific wording must not leak into a Tester frame')
     assert.equal(agent.getLastRunOutcome(), 'cap')
-    assert.ok(answer.startsWith('Reached maximum iterations (40)'))
+    assert.ok(answer.startsWith('Reached maximum iterations (80)'))
   } finally {
     await cleanupSeedPlanSession(sessionId)
   }
