@@ -21,7 +21,7 @@ const DEFAULT_TIMEOUT_MS = 30_000
 // them specifically (confirmed live: a verification run burned 5 retries and
 // ~7 minutes hitting this exact wall before switching approach entirely,
 // because "Command failed" gave no hint the real cause was just the clock).
-const PLAYWRIGHT_DEFAULT_TIMEOUT_MS = 120_000
+const PLAYWRIGHT_DEFAULT_TIMEOUT_MS = 45_000
 // A ceiling on the model's own timeout_ms request — long enough for real
 // Playwright work, short enough that a stuck command can't block a run
 // indefinitely.

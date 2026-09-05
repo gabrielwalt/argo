@@ -89,9 +89,9 @@ test('resolveTimeoutMs: plain commands default to 30s', () => {
   assert.equal(resolveTimeoutMs('echo hi'), 30_000)
 })
 
-test('resolveTimeoutMs: a command mentioning Playwright/Chromium gets a 120s default, unasked', () => {
-  assert.equal(resolveTimeoutMs('node -e "require(\'playwright\')"'), 120_000)
-  assert.equal(resolveTimeoutMs('node -e "chromium.launch()"'), 120_000)
+test('resolveTimeoutMs: a command mentioning Playwright/Chromium gets a 45s default, unasked', () => {
+  assert.equal(resolveTimeoutMs('node -e "require(\'playwright\')"'), 45_000)
+  assert.equal(resolveTimeoutMs('node -e "chromium.launch()"'), 45_000)
 })
 
 test('resolveTimeoutMs: an explicit request is honored for a plain command', () => {
@@ -109,11 +109,11 @@ test('resolveTimeoutMs: a zero or negative request falls back to the default ins
 
 test('resolveTimeoutMs: an explicit request BELOW the Playwright default is floored to it, not honored', () => {
   // Confirmed live: the model explicitly passed timeout_ms:30000 on a real
-  // Playwright script, which — before this floor existed — overrode the 120s
+  // Playwright script, which — before this floor existed — overrode the 45s
   // Playwright default down to the same 30s wall that default exists to avoid.
   // Models have no real sense of browser launch + page load cost.
-  assert.equal(resolveTimeoutMs('npx playwright test', 30_000), 120_000)
-  assert.equal(resolveTimeoutMs('node -e "chromium.launch()"', 5_000), 120_000)
+  assert.equal(resolveTimeoutMs('npx playwright test', 30_000), 45_000)
+  assert.equal(resolveTimeoutMs('node -e "chromium.launch()"', 5_000), 45_000)
 })
 
 test('resolveTimeoutMs: an explicit request AT OR ABOVE the Playwright default is still honored', () => {
