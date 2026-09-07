@@ -79,6 +79,19 @@ let currentOptions: ModelOptions | undefined
 // comment in frames.ts).
 let currentVerbatimRequest: string | undefined
 
+// THE ORIGINAL USER QUERY (dispatch.ts's own runDispatchLoop's `userMessage` param),
+// captured once at the top of runDispatchLoop and read by every spawnFrame call
+// below — same module-level-state rationale as currentModel/currentVerbatimRequest
+// above (safe only because server.ts's `isBusy` guard prevents two concurrent
+// runDispatchLoop calls). This is NOT the same text as a frame's own `assignment`
+// (buildAssignment's output, e.g. a Boss task-start checkpoint or an Implementer's
+// CHECKPOINT: iteration-N prompt) — it is what the human actually typed, threaded
+// down to each Agent purely so its TraceLogger (al-logger.ts) can title its trace
+// file with the real request instead of the internal checkpoint text. Passed to
+// each Agent via agent.setUserQuery(), called right after construction in
+// spawnFrame below.
+let currentUserQuery: string = ''
+
 // PERSISTENT BOSS MEMORY ACROSS MULTI-TURN CALLS. Every runDispatchLoop call spawns a
 // completely FRESH Boss frame (spawnFrame, below) — the Boss has no conversation
 // history of its own across turns, so a follow-up prompt like "now add tests for
@@ -333,6 +346,7 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
   })
 
   const agent = new Agent(tagEmit(emit, frameId, req.role, req.parentFrameId), currentModel)
+  agent.setUserQuery(currentUserQuery) // TraceLogger header title — see currentUserQuery's own comment above
   if (currentOptions) agent.setOptions(currentOptions)
   agent.setAllowedTools(toolOverride ?? ROLE_TOOLS[req.role])
   agent.setRoleInstructions(systemPromptFor(req.role))
@@ -913,6 +927,11 @@ export async function runDispatchLoop(
   // SAME raw userMessage runBossTaskStart is about to paraphrase, captured before that
   // paraphrase happens.
   currentVerbatimRequest = config.verbatimRequest ? userMessage : undefined
+  // See the module-level currentUserQuery declaration above — captured unconditionally
+  // (unlike currentVerbatimRequest, which is feature-flagged), since every frame's
+  // TraceLogger header wants the real user request regardless of the verbatim-request
+  // threading setting.
+  currentUserQuery = userMessage
   const model = currentModel ?? config.model
   // PERSISTENT BOSS MEMORY: reload the durable turn-history store fresh for every run
   // (picks up a disk copy written by a prior process, e.g. after a container restart)

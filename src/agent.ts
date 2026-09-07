@@ -7,7 +7,7 @@ import { toolDefinitions, executeTool } from './tools/index.js'
 import { bash, NO_OUTPUT } from './tools/bash.js'
 import { truncateOutput } from './tools/truncate.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
-import { AlLogger } from './al-logger.js'
+import { TraceLogger } from './al-logger.js'
 import type { AgentEvent, ToolName, ModelOptions, Role } from './types.js'
 import { PROGRESS_CHECK_ITERATIONS, PROGRESS_CHECK_MESSAGES, ROLE_CONCLUDE_STATUSES, concludeStatusError } from './frames.js'
 import {
@@ -357,6 +357,16 @@ export class Agent {
   // own history, reset per run.
   private allowedTools: ToolName[] | null = null
   private frameId: string | null = null
+  // The ORIGINAL user query for this run (dispatch.ts's runDispatchLoop's own
+  // `userMessage` param), threaded down through setUserQuery() — distinct from
+  // chat()'s own `userMessage` parameter, which for a dispatched frame is the
+  // agent's ASSIGNMENT text (e.g. "CHECKPOINT: iteration-1\n..."), not what the
+  // human actually typed. Used only for the TraceLogger header's `# Run:` title, so
+  // a reader of the trace sees the human's real request rather than the internal
+  // checkpoint prompt. Empty string (never set) falls back to chat()'s own
+  // userMessage in that header, matching the pre-existing baseline behavior for the
+  // unrestricted (non-dispatched) Agent, which never calls setUserQuery.
+  private userQuery = ''
   // Which ROLE (Planner/Implementer/Boss) this frame is, set by dispatch.ts's
   // spawnFrame alongside setAllowedTools/setMaxIterations/etc (frames.ts's
   // ROLE_TOOLS/ROLE_MAX_ITERATIONS are the same per-role tables this mirrors). null
@@ -365,15 +375,15 @@ export class Agent {
   // PROGRESS_CHECK_ITERATIONS/PROGRESS_CHECK_MESSAGES) — every other role-shaped
   // decision in this file already goes through allowedTools/roleInstructions.
   private roleTag: Role | null = null
-  // NEW, ADDITIVE XML trace (al-logger.ts) — runs alongside SessionLogger, never
+  // NEW, ADDITIVE Markdown trace (al-logger.ts) — runs alongside SessionLogger, never
   // replacing it. Created fresh at the top of chat() (mirroring SessionLogger's own
   // per-call construction) and used by chatCall()/the tool-dispatch loop below via
   // this field, since chatCall() doesn't otherwise have a way to receive it (it's
   // private and its signature is unchanged — see al-logger integration notes at each
   // call site). null only in the narrow window before chat()'s first line runs;
-  // every call site below guards with `this.alLogger?.` for that reason, and because
-  // a logger failure must never interrupt the real run.
-  private alLogger: AlLogger | null = null
+  // every call site below guards with `this.traceLogger?.` for that reason, and
+  // because a logger failure must never interrupt the real run.
+  private traceLogger: TraceLogger | null = null
   // How many entries of this.history had already been presented as "new" to the
   // al-logger as of the START of the most recently opened turn — chatCall() slices
   // this.history from here to build beginTurn()'s newMessages, then advances it to
@@ -469,6 +479,12 @@ export class Agent {
 
   setFrameId(id: string | null) {
     this.frameId = id
+  }
+
+  // See the userQuery field doc above — dispatch.ts calls this once, right after
+  // constructing the Agent in spawnFrame, before agent.chat(assignment) runs.
+  setUserQuery(q: string) {
+    this.userQuery = q
   }
 
   // See the roleTag field doc above — dispatch.ts's spawnFrame calls this once, at the
@@ -739,7 +755,7 @@ export class Agent {
     this.history.forEach((m, i) => { if (m.role === 'tool') toolPos.push(i) })
     const collapse = new Set(toolPos.slice(0, Math.max(0, toolPos.length - KEEP_RECENT_TOOL_RESULTS)))
     const messages: Message[] = systemPrompt ? [{ role: 'system', content: systemPrompt }] : []
-    // NEW, ADDITIVE XML trace (al-logger.ts): collect the collapsed-message detail
+    // NEW, ADDITIVE Markdown trace (al-logger.ts): collect the collapsed-message detail
     // (original vs. sent length) as this.history is walked below, in the SAME pass
     // that decides collapsing — rather than recomputing it separately — so this can
     // never drift out of sync with what was actually sent this turn.
@@ -754,15 +770,16 @@ export class Agent {
         messages.push(m)
       }
     })
-    // NEW, ADDITIVE XML trace: open this turn's <al-turn> BEFORE the Ollama call —
-    // "new" messages are exactly this.history's tail since the previous call
-    // (alLastMessageCount), turn 1 of a run being the whole starting history. Read
-    // via a cast since this.history's Message role/content typing is the ollama
-    // package's own (broader) union; AlMessage only needs role+content as strings.
+    // NEW, ADDITIVE Markdown trace: open this turn's `## Turn` section BEFORE the
+    // Ollama call — "new" messages are exactly this.history's tail since the
+    // previous call (alLastMessageCount), turn 1 of a run being the whole starting
+    // history. Read via a cast since this.history's Message role/content typing is
+    // the ollama package's own (broader) union; AlMessage only needs role+content
+    // as strings.
     {
       const newSlice = this.history.slice(this.alLastMessageCount)
       const newAlMessages = newSlice.map(m => ({ role: String(m.role), content: typeof m.content === 'string' ? m.content : String(m.content ?? '') }))
-      this.alLogger?.beginTurn(messages.length, newAlMessages, alCollapsed.length > 0 ? alCollapsed : undefined)
+      this.traceLogger?.beginTurn(messages.length, newAlMessages, alCollapsed.length > 0 ? alCollapsed : undefined)
       this.alLastMessageCount = this.history.length
     }
     // Recitation (Manus todo.md pattern): keep the objective at the very tail of
@@ -891,8 +908,8 @@ export class Agent {
   async chat(userMessage: string, opts?: ChatOptions): Promise<string> {
     const resume = opts?.resume === true
     const logger = new SessionLogger(userMessage, this.model, this.options, this.sessionId)
-    // NEW, ADDITIVE XML trace (al-logger.ts) — see the field doc comment above. The
-    // tool set offered is computed the SAME way chatCall() computes offeredTools
+    // NEW, ADDITIVE Markdown trace (al-logger.ts) — see the field doc comment above.
+    // The tool set offered is computed the SAME way chatCall() computes offeredTools
     // (this.allowedTools ? filter : the full set) since that filtering only depends
     // on state already set before chat() runs (dispatch.ts's spawnFrame calls
     // setAllowedTools before chat()), not on anything chatCall() itself derives per
@@ -901,16 +918,20 @@ export class Agent {
       ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
       : toolDefinitions
     // sessionId/frameId/jsonl filename are cross-reference IDs only (see al-logger.ts's
-    // <al-run> header) — they let a reader of the XML trace jump straight to the
-    // matching JSONL log (logger.getFilename()) and, from there, to the session/frame
-    // this run belongs to. this.sessionId is always a string (never undefined) but an
-    // empty one means "no session yet", which the header should omit rather than
-    // render as `session_id=""`.
-    this.alLogger = new AlLogger(
-      userMessage, this.model, this.options, this.roleTag ?? 'agent', alTools,
+    // header) — they let a reader of the trace jump straight to the matching JSONL
+    // log (logger.getFilename()) and, from there, to the session/frame this run
+    // belongs to. this.sessionId is always a string (never undefined) but an empty
+    // one means "no session yet", which the header should omit rather than render
+    // as an empty label. this.userQuery (set via setUserQuery by dispatch.ts) is the
+    // ORIGINAL human request, distinct from `userMessage` below (this frame's own
+    // assignment text) — falls back to userMessage when never set, so the
+    // unrestricted baseline Agent (which never calls setUserQuery) still gets a
+    // sensible header.
+    this.traceLogger = new TraceLogger(
+      this.userQuery || userMessage, this.model, this.options, this.roleTag ?? 'agent', alTools,
       this.sessionId || undefined, this.frameId ?? undefined, logger.getFilename(),
     )
-    // Each chat() call gets its OWN al-logger file (a fresh header + turn numbering
+    // Each chat() call gets its OWN trace file (a fresh header + turn numbering
     // from 1), even on a resumed frame — so "new" for turn 1 of THIS file always
     // means "everything chatCall() is about to send", matching what that file's own
     // reader sees with no other file to cross-reference.
@@ -924,14 +945,14 @@ export class Agent {
       // UI dedupe replayed-vs-live events at the reconnect boundary.
       const seq = logger.getSeq()
       this.emit(event, seq)
-      // NEW, ADDITIVE XML trace: forward harness-level events (eviction/compact,
-      // warning, error) to the al-logger too, along with the JSONL seq this event
-      // was just written at — logEvent() stores it so the NEXT <al-turn>/<al-response>
-      // it renders carries a jsonl_seq cross-reference. logEvent() is a no-op
+      // NEW, ADDITIVE Markdown trace: forward harness-level events (eviction/
+      // compact, warning, error) to the trace logger too, along with the JSONL seq
+      // this event was just written at — logEvent() stores it so the NEXT turn/
+      // response it renders carries a seq cross-reference. logEvent() is a no-op
       // (render-wise) for any AgentEvent variant it doesn't render (see its own
       // switch), so this is safe to call unconditionally for every event without a
       // parallel filter here.
-      this.alLogger?.logEvent(event, seq)
+      this.traceLogger?.logEvent(event, seq)
     }
 
     this.pushCtx({ role: 'user', content: userMessage })
@@ -1162,16 +1183,16 @@ export class Agent {
         }
         consecutiveTimeouts = 0 // reset on any successful response
 
-        // NEW, ADDITIVE XML trace (al-logger.ts): log the raw response for this
-        // turn as soon as it's known, before any of the token/eviction/tool-call
-        // handling below runs — everything after this point reacts to the SAME
-        // response, so logging it here captures it exactly as the model returned
-        // it. toolCalls/thinking/content are read straight off response.message;
-        // native tool_calls are logged here even though the loop below may ALSO
-        // fall back to JSON-parsed calls from content (extractToolCallsFromContent)
-        // — this block only records what the model actually returned, not the
-        // harness's own fallback interpretation of it.
-        this.alLogger?.logResponse({
+        // NEW, ADDITIVE Markdown trace (al-logger.ts): log the raw response for
+        // this turn as soon as it's known, before any of the token/eviction/
+        // tool-call handling below runs — everything after this point reacts to
+        // the SAME response, so logging it here captures it exactly as the model
+        // returned it. toolCalls/thinking/content are read straight off
+        // response.message; native tool_calls are logged here even though the loop
+        // below may ALSO fall back to JSON-parsed calls from content
+        // (extractToolCallsFromContent) — this block only records what the model
+        // actually returned, not the harness's own fallback interpretation of it.
+        this.traceLogger?.logResponse({
           thinking: response.message?.thinking,
           content: response.message?.content,
           toolCalls: (response.message?.tool_calls ?? []).map((tc) => ({ name: tc.function.name, args: tc.function.arguments as object })),
@@ -1185,7 +1206,7 @@ export class Agent {
 
         const numCtx = this.options.num_ctx ?? 65536
         if (response.prompt_eval_count != null) {
-          this.alLogger?.logContext(response.prompt_eval_count, numCtx)
+          this.traceLogger?.logContext(response.prompt_eval_count, numCtx)
           emitAndLog({
             type: 'token_usage',
             prompt_tokens: response.prompt_eval_count,
@@ -1402,10 +1423,10 @@ export class Agent {
             error: result.error,
             duration_ms,
           })
-          // NEW, ADDITIVE XML trace (al-logger.ts): one <al-tool-execution> per
+          // NEW, ADDITIVE Markdown trace (al-logger.ts): one tool-result block per
           // tool actually run this turn (conclude is intercepted earlier and never
           // reaches this line, matching the existing tool_result event's own scope).
-          this.alLogger?.logToolExecution(name, args, result.output, result.error, duration_ms)
+          this.traceLogger?.logToolExecution(name, args, result.output, result.error, duration_ms)
 
           this.pushCtx({
             role: 'tool',
@@ -1511,7 +1532,7 @@ export class Agent {
       this.phase = 'error'
       return message
     } finally {
-      await Promise.all([logger.flush(), this.persistHistory(), this.alLogger?.close()])
+      await Promise.all([logger.flush(), this.persistHistory(), this.traceLogger?.close()])
     }
   }
 

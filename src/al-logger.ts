@@ -1,37 +1,38 @@
-// AL-LOGGER: a NEW, ADDITIVE XML-based log format for Argo agent frames. Runs
+// TRACE LOGGER: a NEW, ADDITIVE Markdown-based log format for Argo agent frames. Runs
 // ALONGSIDE the existing JSONL SessionLogger (logger.ts) — never replaces it,
 // never reads its state, and a failure here must never affect the existing
 // logging path (every public method below is fire-and-forget: internal errors are
 // swallowed into the write queue, not thrown back into agent.ts's hot path). The
 // `sessionId`/`frameId`/`jsonlFilename` constructor params and each turn/response's
-// `jsonl_seq` attribute are pure cross-references INTO that JSONL log — never read
+// `jsonl_seq` cross-reference are pure pointers INTO that JSONL log — never read
 // back FROM it, keeping the "never reads its state" guarantee above intact.
 //
-// One XML file per agent frame (one per SessionLogger-equivalent run), written
-// incrementally turn-by-turn into LOGS_DIR's `al/` subfolder (AL_DIR, below) —
+// One Markdown file per agent frame (one per SessionLogger-equivalent run), written
+// incrementally turn-by-turn into LOGS_DIR's `traces/` subfolder (AL_DIR, below) —
 // alongside but never mixed into the existing logger's `.jsonl` files, named
-// `{TIMESTAMP}_{ITERATION}_{AGENTNAME}.xml` — deliberately NOT the same sequence
+// `{TIMESTAMP}_{ITERATION}_{AGENTNAME}.md` — deliberately NOT the same sequence
 // counter as logger.ts's `logFileSeq` (that would couple two independently-evolving
 // files' numbering to each other for no reason); this file keeps its own counter,
 // `alLogSeq`, reset only by tests via resetAlLogSeq().
 //
-// The tags are "pseudo-XML": content is escaped (escapeXml) so the file is valid
-// XML text, but nothing here is validated against a schema or even guaranteed
-// well-formed if a caller passes multiple root elements — this is a HUMAN-READABLE
-// TRACE FORMAT first, not a machine-parsed one, matching the brief's own example.
+// The output is heading-based Markdown: content is escaped (escapeMd) only where it
+// would otherwise be misread as document structure (a line starting with `#` reading
+// as a heading, or a line that is exactly `---` reading as a horizontal rule/fold
+// boundary) — this is a HUMAN-READABLE TRACE FORMAT first, meant to render/fold
+// nicely in an editor, not a machine-parsed one, matching the brief's own example.
 
 import fs from 'fs/promises'
 import path from 'path'
 import type { AgentEvent, ModelOptions } from './types.js'
 import { LOGS_DIR } from './logger.js'
 
-// XML traces live in their own subfolder, separate from the JSONL/meta files
+// Markdown traces live in their own subfolder, separate from the JSONL/meta files
 // logger.ts writes directly into LOGS_DIR — keeps the top-level logs directory
 // listing (listLogs()/listSessions(), which glob LOGS_DIR for `.jsonl`) from ever
-// having to account for `.xml` files, and gives the al-logger format room to grow
-// its own directory structure independently. append() below creates this on
-// demand via `fs.mkdir(path.dirname(this.filepath), { recursive: true })`.
-const AL_DIR = path.join(LOGS_DIR, 'al')
+// having to account for `.md` trace files, and gives this format room to grow its
+// own directory structure independently. append() below creates this on demand via
+// `fs.mkdir(path.dirname(this.filepath), { recursive: true })`.
+const AL_DIR = path.join(LOGS_DIR, 'traces')
 
 // Shared-shape sequence counter, kept separate from logger.ts's logFileSeq (see file
 // doc comment above) — but same pattern (module-level counter + reset hook) so tests
@@ -40,26 +41,37 @@ const AL_DIR = path.join(LOGS_DIR, 'al')
 let alLogSeq = 0
 export function resetAlLogSeq() { alLogSeq = 0 }
 
-// --- XML escaping -----------------------------------------------------------------
+// --- Markdown escaping -------------------------------------------------------------
 // Applied to EVERY piece of user/model/tool-provided content written into the file
 // (queries, messages, tool arguments/results, event text) — nothing free-form is
-// ever interpolated unescaped, since tool output and model content routinely
-// contains `<`, `&`, or literal `"`/`'` that would otherwise break the pseudo-XML
-// structure for a human or a future lenient parser.
-export function escapeXml(input: unknown): string {
+// interpolated unescaped, since model/tool content routinely contains a line
+// starting with `#` (which would otherwise read as a heading) or a bare `---` line
+// (which would otherwise read as a horizontal rule / fold boundary, indistinguishable
+// from the turn separators this format itself uses). Only those two structural
+// hazards are escaped — deliberately NOT a full Markdown-special-character escape
+// (no touching `*`, `_`, backticks, etc.) since this is a human-readable trace, not
+// content meant to render as rich Markdown; over-escaping would just make it harder
+// to read.
+export function escapeMd(input: unknown): string {
   const s = typeof input === 'string' ? input : String(input ?? '')
   return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;')
+    .split('\n')
+    .map(line => {
+      // A line starting with one or more `#` followed by a space (or end of line) is
+      // heading syntax — escape just the leading `#` so it renders as literal text.
+      if (/^#+(?:\s|$)/.test(line)) return `\\${line}`
+      // A line that IS (after trim) exactly `---` (or `***`/`___`, the other two HR
+      // spellings) is a horizontal rule / our own turn-separator syntax — escape its
+      // first character only, enough to break the HR/heading-underline parse.
+      if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line.trim())) return `\\${line}`
+      return line
+    })
+    .join('\n')
 }
 
-// Renders the `<al-model>` line's trailing option string — same fields/order
+// Renders the model options line's trailing option string — same fields/order
 // logger.ts's own meta/options rendering used, so the two logs describe the same
-// run identically, but flattened to a single space-joined string here instead of
-// a table cell.
+// run identically, just as a flat space-joined string here instead of a table cell.
 function formatOptions(options: ModelOptions): string {
   const parts = [
     options.temperature != null ? `temp=${options.temperature}` : null,
@@ -75,20 +87,19 @@ export interface AlToolDef {
   function: { name: string; description: string; parameters: object }
 }
 
-// Renders the `<al-tools>` block once, for the header — never repeated per-turn
-// (the brief: "Tools logged once"). 2-space base indent, matching the rest of the
-// file's indentation convention.
+// Renders the `## Tools (N)` block once, for the header — never repeated per-turn
+// (the brief: "Tools logged once"). Each tool gets its own `###` sub-heading so the
+// block folds per-tool in an editor.
 function formatTools(tools: AlToolDef[]): string {
   const lines: string[] = []
-  lines.push(`<al-tools number="${tools.length}">`)
+  lines.push(`## Tools (${tools.length})`)
+  lines.push('')
   for (const t of tools) {
-    lines.push('  <al-tool>')
-    lines.push(`    <al-tool-name>${escapeXml(t.function.name)}</al-tool-name>`)
-    lines.push(`    <al-tool-description>${escapeXml(t.function.description)}</al-tool-description>`)
-    lines.push(`    <al-tool-parameters>${escapeXml(JSON.stringify(t.function.parameters))}</al-tool-parameters>`)
-    lines.push('  </al-tool>')
+    lines.push(`### ${escapeMd(t.function.name)}`)
+    lines.push(`- **Description**: ${escapeMd(t.function.description)}`)
+    lines.push(`- **Parameters**: \`${escapeMd(JSON.stringify(t.function.parameters))}\``)
+    lines.push('')
   }
-  lines.push('</al-tools>')
   return lines.join('\n')
 }
 
@@ -121,9 +132,20 @@ export interface AlResponse {
   evalCount?: number
 }
 
+// Renders a block of blockquoted content — content is escaped, then EVERY line
+// (including blank ones, which become a bare `>`) is prefixed with `> ` so the
+// whole block reads as one blockquote in a Markdown renderer/editor fold, matching
+// the brief's `> line1\n> line2` convention. Empty content still yields a single
+// `> ` line so the block is never entirely absent from the file.
+function blockquote(content: string): string {
+  const escaped = escapeMd(content)
+  const lines = escaped.split('\n')
+  return lines.map(l => (l.length > 0 ? `> ${l}` : '>')).join('\n')
+}
+
 // --- The logger --------------------------------------------------------------------
 
-export class AlLogger {
+export class TraceLogger {
   private filepath: string
   private writeQueue: Promise<void> = Promise.resolve()
   private turnNumber = 0
@@ -132,18 +154,18 @@ export class AlLogger {
   // itself; kept here only so close()/tests can inspect it if ever needed.
   private lastMessageCount = 0
   // True from beginTurn() until the matching turn is closed by the NEXT beginTurn()
-  // (or by close()) — used only to make sure a turn's <al-turn> element is always
-  // properly closed exactly once, even if logResponse/logToolExecution/logContext are
+  // (or by close()) — used only to make sure a turn's section is always properly
+  // separated exactly once, even if logResponse/logToolExecution/logContext are
   // never called for it (e.g. the run aborts mid-turn).
   private inTurn = false
   private headerWritten = false
   // Latest JSONL `__seq` forwarded via logEvent() (agent.ts's emitAndLog calls this
   // for every event, seq included) — read by beginTurn()/logResponse() so each
-  // <al-turn>/<al-response> can carry the exact JSONL line it corresponds to,
-  // without every call site needing to thread the seq through explicitly. Starts
-  // at 0 (no JSONL event logged yet); a turn opened before any event exists (never
-  // happens in practice — 'message'/'start' are logged before the first beginTurn)
-  // would simply carry jsonl_seq="0".
+  // turn/response heading can carry the exact JSONL line it corresponds to, without
+  // every call site needing to thread the seq through explicitly. Starts at 0 (no
+  // JSONL event logged yet); a turn opened before any event exists (never happens in
+  // practice — 'message'/'start' are logged before the first beginTurn) would simply
+  // carry seq=0.
   private lastSeq = 0
 
   constructor(
@@ -158,28 +180,33 @@ export class AlLogger {
   ) {
     const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
     const seq = String(++alLogSeq).padStart(4, '0')
-    this.filepath = path.join(AL_DIR, `${ts}_${seq}_${role}.xml`)
+    this.filepath = path.join(AL_DIR, `${ts}_${seq}_${role}.md`)
 
     const optsStr = formatOptions(options)
-    const runAttrs = [
-      sessionId ? ` session_id="${escapeXml(sessionId)}"` : '',
-      frameId ? ` frame_id="${escapeXml(frameId)}"` : '',
-      jsonlFilename ? ` jsonl_file="${escapeXml(jsonlFilename)}"` : '',
-    ].join('')
-    this.append(
-      `<al-run${runAttrs}>\n`
-      + `<al-query>${escapeXml(query)}</al-query>\n`
-      + `<al-model>${escapeXml(model)}${optsStr ? ` ${optsStr}` : ''}</al-model>\n`
-      + `<al-iteration>${seq} ${escapeXml(role)}</al-iteration>\n`
-      + formatTools(tools) + '\n\n',
-    )
+    const truncatedQuery = query.length > 120 ? `${query.slice(0, 120)}…` : query
+
+    const metaParts: string[] = []
+    if (sessionId) metaParts.push(`**Session**: ${escapeMd(sessionId)}`)
+    if (frameId) metaParts.push(`**Frame**: ${escapeMd(frameId)}`)
+    if (jsonlFilename) metaParts.push(`**JSONL**: ${escapeMd(jsonlFilename)}`)
+
+    const lines: string[] = []
+    lines.push(`# Run: ${escapeMd(truncatedQuery)}`)
+    lines.push(`- **Model**: ${escapeMd(model)}${optsStr ? ` ${optsStr}` : ''}`)
+    if (metaParts.length > 0) lines.push(`- ${metaParts.join(' | ')}`)
+    lines.push(`- **Role**: ${escapeMd(role)} | **Iteration**: ${seq}`)
+    lines.push('')
+    lines.push(formatTools(tools))
+    lines.push('')
+
+    this.append(lines.join('\n') + '\n')
     this.headerWritten = true
   }
 
   /**
    * Called right before a new Ollama request is issued for this turn. Opens a new
-   * `<al-turn>` element (closing the previous one first, if still open) and writes
-   * the `<al-call>` block: any context-editing modifications (collapsed tool
+   * `## Turn N` section (closing the previous one first, if still open) and writes
+   * the `### Call` block: any context-editing modifications (collapsed tool
    * results), then the messages newly added to history since the previous turn
    * (or ALL of them, on turn 1).
    *
@@ -197,23 +224,27 @@ export class AlLogger {
     this.lastMessageCount = totalMessages
 
     const lines: string[] = []
-    lines.push(`<al-turn number="${String(this.turnNumber).padStart(4, '0')}" jsonl_seq="${this.lastSeq}">`)
-    lines.push('  <al-call>')
+    lines.push(`## Turn ${this.turnNumber} [seq=${this.lastSeq}]`)
+    lines.push('')
+    lines.push(`### Call (${totalMessages} messages, ${newMessages.length} new)`)
+    lines.push('')
     if (collapsed && collapsed.length > 0) {
-      lines.push('    <al-context-modifications>')
-      lines.push(`      <al-collapsed count="${collapsed.length}" reason="older tool results beyond recent 5">`)
+      lines.push('#### Context modifications')
       for (const c of collapsed) {
-        lines.push(`        <al-collapsed-message index="${c.index}" original_chars="${c.originalChars}" sent_chars="${c.sentChars}" role="${escapeXml(c.role)}"/>`)
+        lines.push(`- Collapsed message #${c.index} (${escapeMd(c.role)}, ${c.originalChars}→${c.sentChars} chars)`)
       }
-      lines.push('      </al-collapsed>')
-      lines.push('    </al-context-modifications>')
+      lines.push('')
     }
-    lines.push(`    <al-messages total="${totalMessages}" new="${newMessages.length}">`)
-    for (const m of newMessages) {
-      lines.push(`      <al-message role="${escapeXml(m.role)}">${escapeXml(m.content)}</al-message>`)
+    lines.push('#### New messages')
+    if (newMessages.length === 0) {
+      lines.push('_(none)_')
+    } else {
+      for (const m of newMessages) {
+        lines.push(`> **[${escapeMd(m.role)}]**`)
+        lines.push(blockquote(m.content))
+        lines.push('')
+      }
     }
-    lines.push('    </al-messages>')
-    lines.push('  </al-call>')
     lines.push('')
 
     this.append(lines.join('\n') + '\n')
@@ -221,50 +252,53 @@ export class AlLogger {
 
   /** Called when the Ollama response for the current turn arrives. */
   logResponse(response: AlResponse) {
+    const durationStr = response.durationMs != null ? `${response.durationMs}ms, ` : ''
+    const tokensStr = response.evalCount != null ? `${response.evalCount} tokens generated, ` : ''
+    const promptStr = response.promptEvalCount != null
+      ? `prompt=${response.promptEvalCount}`
+      : ''
+
     const lines: string[] = []
-    lines.push(`  <al-response jsonl_seq="${this.lastSeq}">`)
-    lines.push(`    <al-thinking>${escapeXml(response.thinking ?? '')}</al-thinking>`)
-    lines.push(`    <al-content>${escapeXml(response.content ?? '')}</al-content>`)
+    lines.push(`### Response (${durationStr}${tokensStr}${promptStr})`)
+    lines.push('')
+    lines.push('#### Thinking')
+    lines.push(response.thinking ? blockquote(response.thinking) : '_(empty)_')
+    lines.push('')
+    lines.push('#### Content')
+    lines.push(response.content ? blockquote(response.content) : '_(empty)_')
+    lines.push('')
+    lines.push('#### Tool calls')
     if (response.toolCalls && response.toolCalls.length > 0) {
-      lines.push('    <al-tool-calls>')
-      for (const tc of response.toolCalls) {
-        lines.push('      <al-tool-call>')
-        lines.push(`        <al-tool-call-name>${escapeXml(tc.name)}</al-tool-call-name>`)
-        lines.push(`        <al-tool-call-arguments>${escapeXml(JSON.stringify(tc.args))}</al-tool-call-arguments>`)
-        lines.push('      </al-tool-call>')
-      }
-      lines.push('    </al-tool-calls>')
+      response.toolCalls.forEach((tc, i) => {
+        lines.push(`${i + 1}. \`${escapeMd(tc.name)}(${escapeMd(JSON.stringify(tc.args))})\``)
+      })
     } else {
-      lines.push('    <al-tool-calls/>')
+      lines.push('_(none)_')
     }
-    const attrs = [
-      response.durationMs != null ? `duration_ms="${response.durationMs}"` : null,
-      `role="${escapeXml(response.role ?? 'assistant')}"`,
-      `done="${response.done ?? true}"`,
-      response.doneReason != null ? `done_reason="${escapeXml(response.doneReason)}"` : null,
-      response.promptEvalCount != null ? `prompt_eval_count="${response.promptEvalCount}"` : null,
-      response.evalCount != null ? `eval_count="${response.evalCount}"` : null,
-    ].filter((a): a is string => a !== null)
-    lines.push(`    <al-details ${attrs.join(' ')}/>`)
-    lines.push('  </al-response>')
+    lines.push('')
+    const detailParts = [
+      `role=${response.role ?? 'assistant'}`,
+      `done=${response.done ?? true}`,
+      response.doneReason != null ? `done_reason=${response.doneReason}` : null,
+    ].filter((p): p is string => p !== null)
+    lines.push(`_${escapeMd(detailParts.join(' '))}_`)
     lines.push('')
 
     this.append(lines.join('\n') + '\n')
   }
 
   /** Called after each tool execution this turn. Accumulates into an open
-   *  `<al-tool-executions>` block — one call per tool run, so multiple tool calls
-   *  in the same turn each get their own `<al-tool-execution>` appended in order. */
+   *  `### Tool Results` block — one entry per tool run, so multiple tool calls
+   *  in the same turn each get their own fenced block appended in order. */
   logToolExecution(name: string, args: object, result: string, error: string | undefined, durationMs: number) {
-    const lines: string[] = []
-    lines.push('  <al-tool-executions>')
-    lines.push('    <al-tool-execution>')
-    lines.push(`      <al-tool-name>${escapeXml(name)}</al-tool-name>`)
-    lines.push(`      <al-tool-arguments>${escapeXml(JSON.stringify(args))}</al-tool-arguments>`)
     const body = error ? `Error: ${error}\n${result}` : result
-    lines.push(`      <al-tool-result duration_ms="${durationMs}">${escapeXml(body)}</al-tool-result>`)
-    lines.push('    </al-tool-execution>')
-    lines.push('  </al-tool-executions>')
+    const lines: string[] = []
+    lines.push('### Tool Results')
+    lines.push('')
+    lines.push(`**${escapeMd(name)}** (${durationMs}ms), args: \`${escapeMd(JSON.stringify(args))}\`:`)
+    lines.push('```')
+    lines.push(body)
+    lines.push('```')
     lines.push('')
 
     this.append(lines.join('\n') + '\n')
@@ -273,47 +307,44 @@ export class AlLogger {
   /** Called once token usage is known for the turn. */
   logContext(promptTokens: number, numCtx: number) {
     const pct = numCtx > 0 ? `${Math.round((promptTokens / numCtx) * 100)}%` : '0%'
-    this.append(`  <al-context tokens="${promptTokens}" percent="${pct}" num_ctx="${numCtx}"/>\n`)
+    this.append(`_Context: ${promptTokens}/${numCtx} tokens (${pct})_\n\n`)
   }
 
   /**
    * Called for harness-level events between turns (eviction/compaction, warnings,
-   * progress checks) — rendered as a standalone `<al-events><al-event .../></al-events>`
-   * block, OUTSIDE any `<al-turn>` (matching the brief's example placement). Not every
-   * AgentEvent variant produces output here — only the ones the brief calls out
-   * (eviction/compact, warning, progress_check-shaped warnings); anything else is a
-   * silent no-op so this can safely be wired to every emitAndLog call site without
-   * needing a parallel filter at each call site.
+   * progress checks) — rendered as a standalone `## Events` list item, OUTSIDE any
+   * turn section (matching the brief's example placement). Not every AgentEvent
+   * variant produces output here — only the ones the brief calls out (eviction/
+   * compact, warning, progress_check-shaped warnings); anything else is a silent
+   * no-op so this can safely be wired to every emitAndLog call site without needing
+   * a parallel filter at each call site.
    */
   logEvent(event: AgentEvent, seq?: number) {
-    // Track the latest JSONL seq regardless of whether this event renders
-    // anything here — beginTurn()/logResponse() read lastSeq lazily, so even an
-    // event this logger has no rendering for (renderEvent() returns null for it)
-    // must still advance the cross-reference forward to the next turn/response.
+    // Track the latest JSONL seq regardless of whether this event renders anything
+    // here — beginTurn()/logResponse() read lastSeq lazily, so even an event this
+    // logger has no rendering for (renderEvent() returns null for it) must still
+    // advance the cross-reference forward to the next turn/response.
     if (seq != null) this.lastSeq = seq
     const body = this.renderEvent(event)
     if (body === null) return
-    this.append(`<al-events>\n${body}\n</al-events>\n\n`)
+    this.append(`## Events\n\n${body}\n\n---\n\n`)
   }
 
   private renderEvent(event: AgentEvent): string | null {
     switch (event.type) {
       case 'compact': {
-        const lines: string[] = []
-        const trigger = `context at ${Math.round(event.contextUsagePct * 100)}%`
-        lines.push(`  <al-event type="eviction" trigger="${escapeXml(trigger)}">`)
-        lines.push(`    <al-eviction-budget messages_before="${event.messagesBefore}" messages_after="${event.messagesAfter}"/>`)
-        lines.push(`    <al-eviction-summary>${escapeXml(event.summary)}</al-eviction-summary>`)
-        lines.push('  </al-event>')
-        return lines.join('\n')
+        const before = event.messagesBefore
+        const after = event.messagesAfter
+        const pct = Math.round(event.contextUsagePct * 100)
+        return `- **[eviction]** Context at ${pct}% — evicted ${before - after} messages, ${escapeMd(event.summary)}`
       }
       case 'warning': {
         const t = event.level ? 'progress_check' : 'warning'
-        const lvl = event.level ? ` level="${escapeXml(event.level)}"` : ''
-        return `  <al-event type="${t}"${lvl}>${escapeXml(event.message)}</al-event>`
+        const lvl = event.level ? ` level=${event.level}` : ''
+        return `- **[${t}]**${lvl} ${escapeMd(event.message)}`
       }
       case 'error':
-        return `  <al-event type="error">${escapeXml(event.message)}</al-event>`
+        return `- **[error]** ${escapeMd(event.message)}`
       default:
         return null
     }
@@ -322,14 +353,13 @@ export class AlLogger {
   /** Close the file. Idempotent-ish: safe to call once at the end of a run. */
   async close() {
     this.closeTurnIfOpen()
-    this.append('</al-run>\n')
     await this.writeQueue
   }
 
   private closeTurnIfOpen() {
     if (!this.inTurn) return
     this.inTurn = false
-    this.append('</al-turn>\n\n')
+    this.append('---\n\n')
   }
 
   private append(text: string) {
