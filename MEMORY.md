@@ -65,13 +65,13 @@
 
 ## Model
 
-- Target agentic model: `qwen3.6:latest` — the only model validated end-to-end across the dispatch pipeline's role-scoped frames (Boss/Planner/Implementer). Use it for real work.
+- Target agentic model: `qwen3.6:latest` — the only model validated end-to-end across the dispatch pipeline's role-scoped frames (Dispatcher/Planner/Implementer). Use it for real work.
 - `devstral:24b` emits tool calls but under-executes multi-step tasks. `llama3.1:8b` engages but lacks coding depth. Both are kept only as comparators, not for real work.
 
 ## Multi-agent dispatch gotchas (`docs/subagents-plan.md`)
 
 - `Agent.setMaxIterations` has a hard floor of 10 — a smaller request (e.g. a role-specific budget of 6) is silently clamped, so a `hitCap`-style comparison against the *requested* number checks the wrong value. Always size role-specific iteration constants to at least 10, or compare against `agent.getIterationCount()`/the actual clamped max, not the literal constant.
 - `autoCommit()` (`src/agent.ts`) can move HEAD forward mid-run (it commits the agent's own work after a run completes). A diff captured against bare `HEAD` afterward can show almost nothing even for a fully correct, large change — diff against the run's own baseline ref (e.g. an `eval-baseline` tag or the pre-run SHA) instead, never bare `HEAD`.
-- The Boss's task-start checkpoint (`src/frames.ts`'s `parseTaskStartVerdict`) can skip its required ANSWER:/SIMPLE:/OBJECTIVE: marker line when the answer is a short, direct fact (e.g. "408") — the structured `conclude` status is checked first (`agent.getConcludeStatus()`) and is the authoritative signal; the regex parse is only a fallback for a frame that never concluded cleanly.
+- The Dispatcher's task-start checkpoint (`src/frames.ts`'s `parseTaskStartVerdict`) can skip its required ANSWER:/SIMPLE:/OBJECTIVE: marker line when the answer is a short, direct fact (e.g. "408") — the structured `conclude` status is checked first (`agent.getConcludeStatus()`) and is the authoritative signal; the regex parse is only a fallback for a frame that never concluded cleanly. (This role was previously named "Boss".)
 - There is no Tester agent any more — the Implementer verifies its own work (build/lint/test, or a direct exercise of the changed behaviour) before calling `conclude` with SUCCESS. There is no separate harness-spawned re-verification step.
 - There is no `update_plan` tool, no plan/act gate, and no harness task-ledger sequencing — the Planner's decomposition IS the plan, delivered as free text via `conclude`, and the Implementer just executes the assignment it was given.

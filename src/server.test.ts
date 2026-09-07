@@ -80,7 +80,7 @@ test('GET /git-diff/:hash accepts a well-formed short hash (passes the format gu
 // unreliable, which is exactly why this logic is exercised here in isolation instead.
 
 test('parseFrameRole: recognises all three frame roles from a real frameId shape', () => {
-  assert.equal(parseFrameRole('boss-mtmm1gcc-1'), 'boss')
+  assert.equal(parseFrameRole('dispatcher-mtmm1gcc-1'), 'dispatcher')
   assert.equal(parseFrameRole('planner-mtmm1gcc-2'), 'planner')
   assert.equal(parseFrameRole('implementer-mtmm1gcc-3'), 'implementer')
 })
@@ -169,7 +169,7 @@ test('mergeFrameSummaries: a frameId present in both groups keeps the LIVE entry
 })
 
 test('chooseActiveFrame: an explicit active id wins outright', () => {
-  assert.equal(chooseActiveFrame('boss-a-1', [frame({ frameId: 'boss-a-1' })]), 'boss-a-1')
+  assert.equal(chooseActiveFrame('dispatcher-a-1', [frame({ frameId: 'dispatcher-a-1' })]), 'dispatcher-a-1')
 })
 
 test('chooseActiveFrame: null with nothing live', () => {
@@ -194,7 +194,7 @@ test('GET /frames reports baselineBypassed=true (the dispatch loop is the only e
   assert.equal(body.baselineBypassed, true)
   assert.ok(Array.isArray(body.frames))
   for (const f of body.frames) {
-    assert.ok(['planner', 'implementer', 'boss'].includes(f.role))
+    assert.ok(['planner', 'implementer', 'dispatcher'].includes(f.role))
     assert.equal(typeof f.live, 'boolean')
   }
 })

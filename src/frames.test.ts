@@ -1,8 +1,8 @@
-// TASK-START READ-ONLY CHECKPOINT — frames.ts half. dispatch.ts's runBossTaskStart
-// spawns its classification frame with TASK_START_TOOLS instead of ROLE_TOOLS.boss;
-// these tests pin the composition of both so a future edit can't silently
-// reintroduce a write path into classification. No Ollama, no ledger, no fs — plain
-// array membership checks.
+// TASK-START READ-ONLY CHECKPOINT — frames.ts half. dispatch.ts's
+// runDispatcherTaskStart spawns its classification frame with TASK_START_TOOLS
+// instead of ROLE_TOOLS.dispatcher; these tests pin the composition of both so a
+// future edit can't silently reintroduce a write path into classification. No
+// Ollama, no ledger, no fs — plain array membership checks.
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -17,9 +17,10 @@ import {
 } from './frames.js'
 
 test('TASK_START_TOOLS is read-only — no bash, no direct write tools', () => {
-  // bash is included so the Boss can grep, cat, ls, run tests to understand
+  // bash is included so the Dispatcher can grep, cat, ls, run tests to understand
   // behaviour. write_file/edit_file are excluded — the prompt's read-only framing
-  // is the guard, not the tool set (bash can write, but the Boss is classifying).
+  // is the guard, not the tool set (bash can write, but the Dispatcher is
+  // classifying).
   assert.equal(TASK_START_TOOLS.includes('bash'), false)
   assert.equal(TASK_START_TOOLS.includes('write_file'), false)
   assert.equal(TASK_START_TOOLS.includes('edit_file'), false)
@@ -44,16 +45,16 @@ test('TASK_START_TOOLS is strictly read-only tools plus conclude', () => {
   assert.deepEqual([...TASK_START_TOOLS].sort(), ['conclude', 'fetch_url', 'ledger', 'read_file', 'web_search'])
 })
 
-test('ROLE_TOOLS.boss has no bash and no write_file — the Boss is strictly read-only outside the task-start checkpoint', () => {
-  // 2026 review: ROLE_TOOLS.boss's own default contents (as opposed to
+test('ROLE_TOOLS.dispatcher has no bash and no write_file — the Dispatcher is strictly read-only outside the task-start checkpoint', () => {
+  // 2026 review: ROLE_TOOLS.dispatcher's own default contents (as opposed to
   // TASK_START_TOOLS above, the SEPARATE, deliberately different one-off override
   // dispatch.ts passes for the task-start classification checkpoint alone) no
-  // longer includes bash — the Boss classifies the request, it never executes
-  // commands, and the tool definitions sent to Ollama are filtered by this table,
-  // so removing bash here means the Boss's own role tool set never offers it as a
-  // schema at all.
-  assert.equal(ROLE_TOOLS.boss.includes('bash'), false)
-  assert.equal(ROLE_TOOLS.boss.includes('write_file'), false)
+  // longer includes bash — the Dispatcher classifies the request, it never
+  // executes commands, and the tool definitions sent to Ollama are filtered by
+  // this table, so removing bash here means the Dispatcher's own role tool set
+  // never offers it as a schema at all.
+  assert.equal(ROLE_TOOLS.dispatcher.includes('bash'), false)
+  assert.equal(ROLE_TOOLS.dispatcher.includes('write_file'), false)
 })
 
 // ── Planner prompts: ROLE_IDENTITY (message 1, [system]) + ROLE_INSTRUCTIONS
@@ -105,8 +106,8 @@ test('planner instructions: still states it never writes or edits (matches the a
 
 // ── Planner read-only framing — the Planner's tool list has no bash, write_file,
 // or edit_file (ROLE_TOOLS.planner above), and its own instructions say so
-// explicitly. Mirrors the Boss task-start checkpoint's own explicit "READ-ONLY"
-// framing.
+// explicitly. Mirrors the Dispatcher task-start checkpoint's own explicit
+// "READ-ONLY" framing.
 
 test('planner instructions: explicitly states it is READ-ONLY', () => {
   const text = ROLE_INSTRUCTIONS.planner
@@ -119,7 +120,7 @@ test('planner instructions: explicitly states it is READ-ONLY', () => {
 // `tools` parameter already shows the model its tools.
 
 test('role prompts (identity + instructions) never mention tool descriptions, filesystem paths, or AGENTS.md/MEMORY.md', () => {
-  for (const role of ['boss', 'planner', 'implementer'] as const) {
+  for (const role of ['dispatcher', 'planner', 'implementer'] as const) {
     const text = `${ROLE_IDENTITY[role]}\n${ROLE_INSTRUCTIONS[role]}`
     assert.equal(/\/workspace/.test(text), false, `${role}: no /workspace mention`)
     assert.equal(/AGENTS\.md/.test(text), false, `${role}: no AGENTS.md mention`)
@@ -133,7 +134,7 @@ test('role prompts (identity + instructions) never mention tool descriptions, fi
 // the update_plan tool were removed along with harness task sequencing.
 
 test('no role in ROLE_TOOLS holds update_plan — the tool does not exist any more', () => {
-  for (const role of ['planner', 'implementer', 'boss'] as const) {
+  for (const role of ['planner', 'implementer', 'dispatcher'] as const) {
     assert.equal(ROLE_TOOLS[role].includes('update_plan' as never), false, `${role} must not have update_plan`)
   }
 })
@@ -142,7 +143,7 @@ test('no role in ROLE_TOOLS holds update_plan — the tool does not exist any mo
 // needs an explicit way to finish.
 
 test('every role in ROLE_TOOLS holds conclude', () => {
-  for (const role of ['planner', 'implementer', 'boss'] as const) {
+  for (const role of ['planner', 'implementer', 'dispatcher'] as const) {
     assert.equal(ROLE_TOOLS[role].includes('conclude'), true, `${role} must have conclude`)
   }
 })
@@ -155,10 +156,10 @@ test('TASK_START_TOOLS (the read-only classification checkpoint) also holds conc
 
 // ── ITERATION LIMITS AND PROGRESS NUDGES ────────────────────────────────────────────
 
-test('ROLE_MAX_ITERATIONS: planner=40, implementer=160, boss=15', () => {
+test('ROLE_MAX_ITERATIONS: planner=40, implementer=160, dispatcher=15', () => {
   assert.equal(ROLE_MAX_ITERATIONS.planner, 40)
   assert.equal(ROLE_MAX_ITERATIONS.implementer, 160)
-  assert.equal(ROLE_MAX_ITERATIONS.boss, 15)
+  assert.equal(ROLE_MAX_ITERATIONS.dispatcher, 15)
 })
 
 test('PROGRESS_CHECK_ITERATIONS: planner escalates at 20/30, strictly below its 40-iteration cap', () => {
@@ -175,8 +176,8 @@ test('PROGRESS_CHECK_ITERATIONS: implementer escalates at 100/120/140, strictly 
   }
 })
 
-test('PROGRESS_CHECK_ITERATIONS: no entry for boss — it keeps the generic fraction-based mechanism', () => {
-  assert.equal(PROGRESS_CHECK_ITERATIONS.boss, undefined)
+test('PROGRESS_CHECK_ITERATIONS: no entry for dispatcher — it keeps the generic fraction-based mechanism', () => {
+  assert.equal(PROGRESS_CHECK_ITERATIONS.dispatcher, undefined)
 })
 
 test('PROGRESS_CHECK_MESSAGES is index-aligned with PROGRESS_CHECK_ITERATIONS for every role that has an entry', () => {

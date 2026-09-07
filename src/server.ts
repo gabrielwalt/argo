@@ -129,7 +129,7 @@ app.post('/chat', async (req, res) => {
   res.json({ ok: true })
 
   try {
-    // The dispatch loop drives Planner/Implementer/Boss as scoped Agent instances of
+    // The dispatch loop drives Planner/Implementer/Dispatcher as scoped Agent instances of
     // its own, sharing this same emit path — `agent` (the shared baseline instance
     // above) is never used to run a turn; it stays only as the vehicle for
     // /history, /context, /reset, session persistence, etc. Per-request overrides
@@ -163,7 +163,7 @@ app.get('/history', (req, res) => {
 // shape/meaning for backward compatibility — a deployed frontend against a new
 // backend must keep working, since the two halves of this feature land separately.
 
-const FRAME_ROLES: readonly Role[] = ['planner', 'implementer', 'boss']
+const FRAME_ROLES: readonly Role[] = ['planner', 'implementer', 'dispatcher']
 
 // frameId format is `${role}-${base36 timestamp}-${counter}` (ledger.ts's newId) —
 // none of the four role names contain a hyphen, so the segment before the first
@@ -325,7 +325,7 @@ app.get('/frames', async (req, res) => {
   const liveSummaries = listLiveFrames().map(liveFrameSummary)
   const diskOnly = await scanDiskFrames(new Set(liveSummaries.map(f => f.frameId)))
   res.json({
-    // Always true — the dispatch loop (Boss/Planner/Implementer) is the only
+    // Always true — the dispatch loop (Dispatcher/Planner/Implementer) is the only
     // execution path now; there is no single-loop baseline mode to bypass. Kept as
     // a field (rather than removed) for compatibility with any existing frontend
     // that reads it.

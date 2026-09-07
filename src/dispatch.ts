@@ -1,14 +1,14 @@
 // THE ORCHESTRATOR. Harness code, not an LLM — a strictly sequential dispatch loop
-// over the ledger. Every role (Planner, Implementer, Boss) is one scoped `Agent`
-// instance (agent.ts) reused as the call-frame execution primitive; this module owns
-// spawning them and driving the ITERATIVE PLANNER flow.
+// over the ledger. Every role (Planner, Implementer, Dispatcher) is one scoped
+// `Agent` instance (agent.ts) reused as the call-frame execution primitive; this
+// module owns spawning them and driving the ITERATIVE PLANNER flow.
 //
 // HARD RULE: no two LLM calls ever run concurrently, for any reason — every `await`
 // below fully resolves before the next one starts. One GPU, one resident model.
 //
 // THE FLOW:
-//   Boss → SIMPLE     → Implementer → done
-//   Boss → OBJECTIVE  → Planner → Implementer (per task) → done
+//   Dispatcher → SIMPLE     → Implementer → done
+//   Dispatcher → OBJECTIVE  → Planner → Implementer (per task) → done
 //
 // PLANNER DISPATCH. The Planner is called ONCE for an overall plan
 // (`buildInitialPlannerPrompt`, plain text, `conclude`d — no harness-owned plan
@@ -73,9 +73,9 @@ let currentModel: string | undefined
 let currentOptions: ModelOptions | undefined
 // VERBATIM REQUEST THREADING (frames.ts, see renderVerbatimRequestBlock). The CURRENT
 // dispatch run's raw user message, captured once at the top of runDispatchLoop from
-// the exact same `userMessage` runBossTaskStart paraphrases into an OBJECTIVE line —
-// never recomputed per frame, so every frame of one run quotes byte-identical text
-// (load-bearing for the prefix-cache argument: see buildAssignment's placement
+// the exact same `userMessage` runDispatcherTaskStart paraphrases into an OBJECTIVE
+// line — never recomputed per frame, so every frame of one run quotes byte-identical
+// text (load-bearing for the prefix-cache argument: see buildAssignment's placement
 // comment in frames.ts).
 let currentVerbatimRequest: string | undefined
 
@@ -84,29 +84,29 @@ let currentVerbatimRequest: string | undefined
 // below — same module-level-state rationale as currentModel/currentVerbatimRequest
 // above (safe only because server.ts's `isBusy` guard prevents two concurrent
 // runDispatchLoop calls). This is NOT the same text as a frame's own `assignment`
-// (buildAssignment's output, e.g. a Boss task-start checkpoint or an Implementer's
-// CHECKPOINT: iteration-N prompt) — it is what the human actually typed, threaded
-// down to each Agent purely so its TraceLogger (al-logger.ts) can title its trace
-// file with the real request instead of the internal checkpoint text. Passed to
-// each Agent via agent.setUserQuery(), called right after construction in
-// spawnFrame below.
+// (buildAssignment's output, e.g. a Dispatcher task-start checkpoint or an
+// Implementer's CHECKPOINT: iteration-N prompt) — it is what the human actually
+// typed, threaded down to each Agent purely so its TraceLogger (al-logger.ts) can
+// title its trace file with the real request instead of the internal checkpoint
+// text. Passed to each Agent via agent.setUserQuery(), called right after
+// construction in spawnFrame below.
 let currentUserQuery: string = ''
 
-// PERSISTENT BOSS MEMORY ACROSS MULTI-TURN CALLS. Every runDispatchLoop call spawns a
-// completely FRESH Boss frame (spawnFrame, below) — the Boss has no conversation
-// history of its own across turns, so a follow-up prompt like "now add tests for
-// that" is classified with zero awareness of what "that" refers to. This is the
-// harness-owned fix: a small, bounded record of recent turns, kept BOTH in this
-// module's own memory (so a same-process second /chat sees it immediately) AND
-// persisted to /workspace/.argo/turn-history.json (so it survives a container
+// PERSISTENT DISPATCHER MEMORY ACROSS MULTI-TURN CALLS. Every runDispatchLoop call
+// spawns a completely FRESH Dispatcher frame (spawnFrame, below) — the Dispatcher has
+// no conversation history of its own across turns, so a follow-up prompt like "now
+// add tests for that" is classified with zero awareness of what "that" refers to.
+// This is the harness-owned fix: a small, bounded record of recent turns, kept BOTH
+// in this module's own memory (so a same-process second /chat sees it immediately)
+// AND persisted to /workspace/.argo/turn-history.json (so it survives a container
 // restart) — the same durability pattern ledger.ts already uses for its own
 // state.json (append/rewrite a small JSON file under .argo/, not a database).
 //
-// Deliberately NOT the Boss's own raw conversation (that would mean keeping a whole
-// Agent/history resident across runs, defeating "fresh Agent each turn" and quietly
-// reintroducing unbounded per-turn memory growth) — just a short digest per turn,
-// injected as plain text ahead of the buildTaskStartAssignment prompt (see
-// runBossTaskStart below and buildTurnHistoryBlock's own comment).
+// Deliberately NOT the Dispatcher's own raw conversation (that would mean keeping a
+// whole Agent/history resident across runs, defeating "fresh Agent each turn" and
+// quietly reintroducing unbounded per-turn memory growth) — just a short digest per
+// turn, injected as plain text ahead of the buildTaskStartAssignment prompt (see
+// runDispatcherTaskStart below and buildTurnHistoryBlock's own comment).
 export interface TurnDigest {
   userMessage: string
   mode: string
@@ -166,15 +166,16 @@ function recordTurnDigest(digest: TurnDigest): void {
   turnHistory = boundTurnHistory([...turnHistory, digest])
 }
 
-// Set by runDispatchLoopBody right after the Boss classifies (runBossTaskStart),
-// read by runDispatchLoop's own wrapper once the body settles (success, abort, or
-// error) to build this turn's digest — runDispatchLoopBody only returns the final
-// answer STRING, so this is how the wrapper learns which mode/objective produced
-// it without threading an extra return value through every call site. Reset to
-// null at the top of every runDispatchLoop, same lifecycle as currentVerbatimRequest.
+// Set by runDispatchLoopBody right after the Dispatcher classifies
+// (runDispatcherTaskStart), read by runDispatchLoop's own wrapper once the body
+// settles (success, abort, or error) to build this turn's digest —
+// runDispatchLoopBody only returns the final answer STRING, so this is how the
+// wrapper learns which mode/objective produced it without threading an extra return
+// value through every call site. Reset to null at the top of every runDispatchLoop,
+// same lifecycle as currentVerbatimRequest.
 let lastTaskStartVerdict: { mode: string; text: string } | null = null
 
-// The exact text prepended to the Boss's task-start assignment, BEFORE the
+// The exact text prepended to the Dispatcher's task-start assignment, BEFORE the
 // buildTaskStartAssignment output. Empty on the very first turn of a session (no
 // history yet), so the prompt a fresh workspace sees is byte-identical to before this
 // feature existed. Pure and exported so the exact injected text is directly testable
@@ -327,12 +328,12 @@ function tagEmit(emit: Emit, frameId: string, role: Role, parentFrameId: string 
   }
 }
 
-// toolOverride lets ONE call site (runBossTaskStart's classification frame) restrict
-// tools below ROLE_TOOLS[role] without a parallel spawning mechanism — every other
-// caller omits it and gets the per-role default exactly as before. Deliberately not a
-// FrameSpawnRequest field: a tool override is a harness decision about ONE hardcoded
-// checkpoint, never something a model-produced reply should be able to request for
-// itself.
+// toolOverride lets ONE call site (runDispatcherTaskStart's classification frame)
+// restrict tools below ROLE_TOOLS[role] without a parallel spawning mechanism —
+// every other caller omits it and gets the per-role default exactly as before.
+// Deliberately not a FrameSpawnRequest field: a tool override is a harness decision
+// about ONE hardcoded checkpoint, never something a model-produced reply should be
+// able to request for itself.
 async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: ToolName[]): Promise<SpawnedFrame> {
   checkAborted()
   const frameId = ledger.newId(req.role)
@@ -458,13 +459,13 @@ interface RoutedTaskStart {
   text: string
 }
 
-// Deliberately tiny — this is the STRUCTURAL enforcement of "the Boss shouldn't do
-// actual work unless it's really 1-2 iterations, else it should delegate" (an
-// orchestrator that can act itself needs a real bound on how much, not just an
-// instruction not to). Enough room to read a couple of files and classify; nowhere
-// near enough to run a real implement-then-reverify cycle to completion. Set to 10,
-// not lower — Agent.setMaxIterations clamps any smaller request UP to 10 regardless
-// (its own documented floor).
+// Deliberately tiny — this is the STRUCTURAL enforcement of "the Dispatcher
+// shouldn't do actual work unless it's really 1-2 iterations, else it should
+// delegate" (an orchestrator that can act itself needs a real bound on how much,
+// not just an instruction not to). Enough room to read a couple of files and
+// classify; nowhere near enough to run a real implement-then-reverify cycle to
+// completion. Set to 10, not lower — Agent.setMaxIterations clamps any smaller
+// request UP to 10 regardless (its own documented floor).
 //
 // This is now the PROMPT's stated budget only (buildTaskStartAssignment below), not
 // the actual enforced cap — see TASK_START_HARD_CAP just below for why the two were
@@ -477,83 +478,86 @@ export const TASK_START_MAX_ITERATIONS = 10
 // The ACTUAL iteration cap passed to spawnFrame for the task-start checkpoint —
 // deliberately larger than TASK_START_MAX_ITERATIONS (the number the PROMPT states).
 // The prompt's stated budget is a target/pacing cue for the model, not a hard kill;
-// giving the Boss real room to run past it means a classification that overruns 10 by
-// a few turns still gets to conclude normally instead of being force-ended exactly on
-// the model's own stated deadline. If the Boss genuinely exhausts even THIS budget
-// without classifying, runBossTaskStart below returns a plain failure message to the
-// user rather than either the raw "Reached maximum iterations" cap-hit string or a
-// silent fallback that treats the unclassified request as an OBJECTIVE anyway.
+// giving the Dispatcher real room to run past it means a classification that
+// overruns 10 by a few turns still gets to conclude normally instead of being
+// force-ended exactly on the model's own stated deadline. If the Dispatcher
+// genuinely exhausts even THIS budget without classifying, runDispatcherTaskStart
+// below returns a plain failure message to the user rather than either the raw
+// "Reached maximum iterations" cap-hit string or a silent fallback that treats the
+// unclassified request as an OBJECTIVE anyway.
 export const TASK_START_HARD_CAP = 20
 
 // One-shot corrective retry: observed repeatedly in eval — on a genuinely trivial
-// question the Boss answers directly ("408") and skips the required marker line
-// entirely, even though the checkpoint prompt explicitly demands one. A targeted
-// recovery, not a blind retry: the diagnosis is exact (marker missing, answer
-// otherwise already given), so the nudge asks for precisely that — reformat, don't
-// re-derive.
+// question the Dispatcher answers directly ("408") and skips the required marker
+// line entirely, even though the checkpoint prompt explicitly demands one. A
+// targeted recovery, not a blind retry: the diagnosis is exact (marker missing,
+// answer otherwise already given), so the nudge asks for precisely that —
+// reformat, don't re-derive.
 const TASK_START_MARKER_RETRY_NUDGE =
   'Your last answer didn\'t use one of the three required statuses. Call conclude again with ' +
   'status set to one of: ANSWER, SIMPLE, or OBJECTIVE — and your message as the answer or objective.'
 
 // Returned to the USER (as the run's final answer, mode 'answer' — see
-// runBossTaskStart below) when the Boss exhausts TASK_START_HARD_CAP without ever
-// classifying the request. Deliberately not the raw agent.ts cap-hit string
-// ("Reached maximum iterations (20) without a final answer.") and deliberately not
-// a silent fall-through to mode 'objective' with the user's own message as the
-// objective (the pre-existing fail-open default for an unparseable-but-NOT-capped
-// reply, still used below for that separate case) — a stalled classification
-// checkpoint has not decided anything, so treating it as either a raw internal
-// string or a tacit "treat the whole message as an OBJECTIVE" is misleading in two
-// different ways.
+// runDispatcherTaskStart below) when the Dispatcher exhausts TASK_START_HARD_CAP
+// without ever classifying the request. Deliberately not the raw agent.ts cap-hit
+// string ("Reached maximum iterations (20) without a final answer.") and
+// deliberately not a silent fall-through to mode 'objective' with the user's own
+// message as the objective (the pre-existing fail-open default for an
+// unparseable-but-NOT-capped reply, still used below for that separate case) — a
+// stalled classification checkpoint has not decided anything, so treating it as
+// either a raw internal string or a tacit "treat the whole message as an
+// OBJECTIVE" is misleading in two different ways.
 export const TASK_START_CAP_FAILURE_MESSAGE =
   'Could not classify the request within the iteration budget. Please try rephrasing or simplifying your request.'
 
-// Boss, checkpoint task-start: a THREE-way router. Never re-fires within one
+// Dispatcher, checkpoint task-start: a THREE-way router. Never re-fires within one
 // dispatch — the objective is set exactly once per task by construction
 // (setObjective's own immutability guard is the backstop if this were ever called
 // twice).
 // The task-start checkpoint's own assignment text (distinct from frames.ts's
 // buildAssignment, which wraps EVERY frame's assignment with the verbatim-request
-// block — this IS the assignment passed to that wrapper for the task-start Boss
-// specifically), and this frame's [user] message (message 2 of the frame's
-// opening messages; see agent.ts's chat()). Pure and exported so the exact prompt
-// — the <argo-user-prompt> tagging, the iteration budget — is directly testable
-// without spawning a real frame.
+// block — this IS the assignment passed to that wrapper for the task-start
+// Dispatcher specifically), and this frame's [user] message (message 2 of the
+// frame's opening messages; see agent.ts's chat()). A bare passthrough of the raw
+// user text — no tagging, no wrapping — since the classification rules themselves
+// now live entirely in frames.ts's ROLE_INSTRUCTIONS.dispatcher as a separate
+// [system] message (see that constant's own comment below).
 // The classification rules themselves (the three status keywords, READ-ONLY
 // framing, grounding/fidelity instructions) now live in frames.ts's
-// ROLE_INSTRUCTIONS.boss — sent as its OWN separate [system] message (message 3),
-// never duplicated here. What's left here is the raw user text (still tagged, for
-// unmistakable boundaries against the CHECKPOINT marker/turn-history text riding
-// alongside it) plus per-call, DYNAMIC content a static role-wide constant can't
-// express: the CHECKPOINT marker the retry/resume plumbing keys on, the
-// verbatim-threading note (config-flag-dependent), and the iteration budget (a
+// ROLE_INSTRUCTIONS.dispatcher — sent as its OWN separate [system] message
+// (message 3), never duplicated here. What's left here is the raw user text (still
+// tagged, for unmistakable boundaries against the CHECKPOINT marker/turn-history
+// text riding alongside it) plus per-call, DYNAMIC content a static role-wide
+// constant can't express: the CHECKPOINT marker the retry/resume plumbing keys on,
+// the verbatim-threading note (config-flag-dependent), and the iteration budget (a
 // number, not a rule).
 export function buildTaskStartAssignment(userMessage: string): string {
   return userMessage
 }
 
-async function runBossTaskStart(userMessage: string, emit: Emit): Promise<RoutedTaskStart> {
+async function runDispatcherTaskStart(userMessage: string, emit: Emit): Promise<RoutedTaskStart> {
   const req: FrameSpawnRequest = {
-    role: 'boss',
+    role: 'dispatcher',
     parentFrameId: null,
     // The prompt still STATES TASK_START_MAX_ITERATIONS (10, buildTaskStartAssignment
-    // below) as the Boss's target budget; the actual enforced cap is the larger
-    // TASK_START_HARD_CAP (20) — see that constant's comment for why the two are
-    // deliberately split.
+    // below) as the Dispatcher's target budget; the actual enforced cap is the
+    // larger TASK_START_HARD_CAP (20) — see that constant's comment for why the two
+    // are deliberately split.
     maxIterations: TASK_START_HARD_CAP,
     // MULTI-TURN MEMORY: buildTurnHistoryBlock's text is prepended AHEAD of the
     // buildTaskStartAssignment output. Empty string (first turn / no history yet)
     // makes this a no-op concatenation.
     assignment: buildTurnHistoryBlock(turnHistory) + buildTaskStartAssignment(userMessage),
   }
-  // TASK_START_TOOLS (frames.ts), not ROLE_TOOLS.boss — this checkpoint is read-only
-  // classification, see that constant's comment for why and the incident that forced it.
+  // TASK_START_TOOLS (frames.ts), not ROLE_TOOLS.dispatcher — this checkpoint is
+  // read-only classification, see that constant's comment for why and the incident
+  // that forced it.
   const { agent, result } = await spawnFrame(req, emit, TASK_START_TOOLS)
 
-  // STRUCTURED CONCLUDE STATUS: the `conclude` tool now validates the Boss's status
-  // against ['ANSWER', 'SIMPLE', 'OBJECTIVE', 'SUMMARY']. A frame that concluded has
-  // an authoritative status — prefer it over regex parsing. Falls through to the
-  // legacy path only when the frame never concluded (cap-hit).
+  // STRUCTURED CONCLUDE STATUS: the `conclude` tool now validates the Dispatcher's
+  // status against ['ANSWER', 'SIMPLE', 'OBJECTIVE', 'SUMMARY']. A frame that
+  // concluded has an authoritative status — prefer it over regex parsing. Falls
+  // through to the legacy path only when the frame never concluded (cap-hit).
   const concludeStatus = agent.getConcludeStatus()
   if (concludeStatus) {
     const modeMap: Record<string, TaskStartVerdict['mode']> = { ANSWER: 'answer', SIMPLE: 'simple', OBJECTIVE: 'objective' }
@@ -574,11 +578,12 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
     if (retryVerdict.parsed) verdict = retryVerdict
   }
 
-  // The Boss exhausted its (hard-capped) budget without ever classifying — distinct
-  // from "concluded cleanly but the marker was missing/unrecoverable" just below.
-  // Routed as mode 'answer' so runDispatchLoopBody returns this text directly as the
-  // run's final answer, with no Planner/Implementer ever spawned on an unclassified
-  // request ("soft budget 10, hard cap 20" — see TASK_START_CAP_FAILURE_MESSAGE).
+  // The Dispatcher exhausted its (hard-capped) budget without ever classifying —
+  // distinct from "concluded cleanly but the marker was missing/unrecoverable" just
+  // below. Routed as mode 'answer' so runDispatchLoopBody returns this text
+  // directly as the run's final answer, with no Planner/Implementer ever spawned on
+  // an unclassified request ("soft budget 10, hard cap 20" — see
+  // TASK_START_CAP_FAILURE_MESSAGE).
   if (!verdict.parsed && agent.hitIterationCap()) {
     return { mode: 'answer', text: TASK_START_CAP_FAILURE_MESSAGE }
   }
@@ -605,13 +610,13 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
 // "unparseable reply".
 export class PlanningFailed extends Error {}
 
-// Implementer assignments, wrapped the same way as the Boss task-start checkpoint's
-// `<argo-user-prompt>` tags (buildTaskStartAssignment, above) — one prompt shape
-// across roles instead of each spawn site below handing over a bare, untagged
-// string. Pure and exported so the exact text is directly testable without spawning
-// a real frame.
+// Implementer assignments, wrapped with the same `<argo-objective>` tagging
+// convention used elsewhere in this module (buildInitialPlannerPrompt below) —
+// one consistent, unmistakable-boundary prompt shape across roles instead of each
+// spawn site below handing over a bare, untagged string. Pure and exported so the
+// exact text is directly testable without spawning a real frame.
 //
-// Used for the SIMPLE task-start fast path below, which hands the Boss's own
+// Used for the SIMPLE task-start fast path below, which hands the Dispatcher's own
 // classified objective straight to one Implementer. The OBJECTIVE path's per-task
 // Implementer assignment is the Planner's OWN `conclude` answer, unwrapped — see
 // buildNextTaskPrompt and runDispatchLoopBody below.
@@ -625,11 +630,10 @@ export function buildImplementerAssignment(objective: string, iteration = 1): st
 
 // The Planner's FIRST call — VERBATIM; every word of this string reaches the model
 // exactly as written here. No structural markup beyond the `<argo-objective>` tag
-// (which mirrors the same unmistakable-boundary convention as the task-start
-// checkpoint's `<argo-user-prompt>` tag, buildTaskStartAssignment above) — the
-// Planner's deliverable is its own `conclude` answer (an ordered list of sub-tasks in
-// plain text), not a harness-parsed structure. Pure and exported so this exact text
-// is directly testable without spawning a real frame.
+// (the same unmistakable-boundary convention buildImplementerAssignment above
+// uses) — the Planner's deliverable is its own `conclude` answer (an ordered list
+// of sub-tasks in plain text), not a harness-parsed structure. Pure and exported
+// so this exact text is directly testable without spawning a real frame.
 export function buildInitialPlannerPrompt(objective: string): string {
   return (
     'CHECKPOINT: planning-start\n' +
@@ -692,10 +696,11 @@ export function buildInitialPlannerPrompt(objective: string): string {
   )
 }
 
-// Builds the Boss's end-of-run conclusion assignment. The Boss sees what the Planner
-// concluded with and each Implementer's own conclusion, then provides a final summary
-// of the entire run — what was done, what was verified, and the overall outcome.
-export function buildBossConclusionAssignment(
+// Builds the Dispatcher's end-of-run conclusion assignment. The Dispatcher sees what
+// the Planner concluded with and each Implementer's own conclusion, then provides a
+// final summary of the entire run — what was done, what was verified, and the
+// overall outcome.
+export function buildDispatcherConclusionAssignment(
   objective: string,
   plannerConclusion: string,
   completedTasks: Array<{ prompt: string; conclusion: string }>,
@@ -913,8 +918,8 @@ export async function runDispatchLoop(
   liveFrames.clear()
   activeFrameId = null
   // See the module-level currentVerbatimRequest declaration above. Deliberately the
-  // SAME raw userMessage runBossTaskStart is about to paraphrase, captured before that
-  // paraphrase happens.
+  // SAME raw userMessage runDispatcherTaskStart is about to paraphrase, captured
+  // before that paraphrase happens.
   currentVerbatimRequest = config.verbatimRequest ? userMessage : undefined
   // See the module-level currentUserQuery declaration above — captured unconditionally
   // (unlike currentVerbatimRequest, which is feature-flagged), since every frame's
@@ -922,10 +927,10 @@ export async function runDispatchLoop(
   // threading setting.
   currentUserQuery = userMessage
   const model = currentModel ?? config.model
-  // PERSISTENT BOSS MEMORY: reload the durable turn-history store fresh for every run
-  // (picks up a disk copy written by a prior process, e.g. after a container restart)
-  // and reset this run's own captured verdict — see both declarations above for the
-  // full lifecycle.
+  // PERSISTENT DISPATCHER MEMORY: reload the durable turn-history store fresh for
+  // every run (picks up a disk copy written by a prior process, e.g. after a
+  // container restart) and reset this run's own captured verdict — see both
+  // declarations above for the full lifecycle.
   await loadTurnHistory()
   lastTaskStartVerdict = null
 
@@ -952,7 +957,7 @@ export async function runDispatchLoop(
 
   // MULTI-TURN MEMORY: a short digest of THIS turn, recorded once the run settles
   // (success, abort, or error) — see TurnDigest's own comment. Built from
-  // `lastTaskStartVerdict` (set by runDispatchLoopBody right after the Boss
+  // `lastTaskStartVerdict` (set by runDispatchLoopBody right after the Dispatcher
   // classifies; still null if classification itself never completed).
   const recordDigest = async (outcome: string) => {
     recordTurnDigest({
@@ -1023,16 +1028,16 @@ function plannerCapFailure(stage: string, frameId: string, rawOutput: string): P
 //
 // TWO CALLERS: the OBJECTIVE task-start mode (its original, sole caller) and the
 // SIMPLE mode's ESCALATION path, when its one Implementer hits its own hard iteration
-// cap. A SIMPLE task the Boss judged as "3-20 iterations" that instead ran the full
-// budget without concluding was measurably bigger than that judgment — rather than
-// reporting a raw cap-hit string as failure, it gets the SAME decomposition machinery
-// an OBJECTIVE task gets, starting completely fresh (a NEW Planner frame, the INITIAL
-// prompt, not a resume of anything): the failed Implementer's own edits are still
-// sitting in the workspace (git, not this function's business — whichever frame
-// eventually calls autoCommit() below picks up ALL uncommitted changes, not just its
-// own), and the Planner is expected to ground itself in that current project state
-// (read_file/bash, same as any Planner) and plan forward from it rather than being
-// told about the failure explicitly.
+// cap. A SIMPLE task the Dispatcher judged as "3-20 iterations" that instead ran the
+// full budget without concluding was measurably bigger than that judgment — rather
+// than reporting a raw cap-hit string as failure, it gets the SAME decomposition
+// machinery an OBJECTIVE task gets, starting completely fresh (a NEW Planner frame,
+// the INITIAL prompt, not a resume of anything): the failed Implementer's own edits
+// are still sitting in the workspace (git, not this function's business — whichever
+// frame eventually calls autoCommit() below picks up ALL uncommitted changes, not
+// just its own), and the Planner is expected to ground itself in that current
+// project state (read_file/bash, same as any Planner) and plan forward from it
+// rather than being told about the failure explicitly.
 async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<string> {
   // Whichever frame's Agent instance most recently did real work — reused purely as
   // the vehicle for the end-of-run autoCommit (it only needs git + a model, not a
@@ -1064,8 +1069,8 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
   const completedTasks: Array<{ prompt: string; conclusion: string }> = []
   let done = false
   // The Planner's own concluding text — captured from the detailResult that trips
-  // isPlannerDone below — so the end-of-run Boss conclusion frame can quote exactly
-  // what the Planner itself said, not a re-derived summary.
+  // isPlannerDone below — so the end-of-run Dispatcher conclusion frame can quote
+  // exactly what the Planner itself said, not a re-derived summary.
   let plannerConclusionText = ''
   // Counts Implementer cap-hits across THIS objective's whole OBJECTIVE loop — see
   // MAX_IMPLEMENTER_CAP_RETRIES above.
@@ -1155,15 +1160,15 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
 
   const doneSummary = completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
 
-  // Boss conclusion: spawn a Boss frame at the END of the run to summarize
-  // the entire objective, what the Planner and Implementers concluded, and
-  // the overall outcome. Uses the same TASK_START_TOOLS (read-only) and
+  // Dispatcher conclusion: spawn a Dispatcher frame at the END of the run to
+  // summarize the entire objective, what the Planner and Implementers concluded,
+  // and the overall outcome. Uses the same TASK_START_TOOLS (read-only) and
   // TASK_START_HARD_CAP as the classification checkpoint.
   const conclusionReq: FrameSpawnRequest = {
-    role: 'boss',
+    role: 'dispatcher',
     parentFrameId: null,
     maxIterations: TASK_START_HARD_CAP,
-    assignment: buildBossConclusionAssignment(objective, plannerConclusionText, completedTasks),
+    assignment: buildDispatcherConclusionAssignment(objective, plannerConclusionText, completedTasks),
   }
   const conclusionFrame = await spawnFrame(conclusionReq, emit, TASK_START_TOOLS)
   commitAgent = conclusionFrame.agent
@@ -1176,20 +1181,21 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
   // above.
   if (config.autoCommit && commitAgent) await commitAgent.autoCommit(emit)
 
-  // Use the Boss's conclusion as the run's final answer, with a fallback
-  // to the task summary if the Boss somehow fails to conclude.
-  const bossConclusion = conclusionFrame.result.rawSummary
-  return bossConclusion || `Objective: ${objective}\n\n${doneSummary || 'No implementation tasks were required.'}`
+  // Use the Dispatcher's conclusion as the run's final answer, with a fallback
+  // to the task summary if the Dispatcher somehow fails to conclude.
+  const dispatcherConclusion = conclusionFrame.result.rawSummary
+  return dispatcherConclusion || `Objective: ${objective}\n\n${doneSummary || 'No implementation tasks were required.'}`
 }
 
 async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<string> {
   await ledger.ensureGitignored(root())
 
-  const taskStart = await runBossTaskStart(userMessage, emit)
+  const taskStart = await runDispatcherTaskStart(userMessage, emit)
   lastTaskStartVerdict = { mode: taskStart.mode, text: taskStart.text }
 
-  // ANSWER: the Boss already knows, verified it himself — no Planner/Implementer
-  // frame ever spawns. The whole point of this mode is zero further iteration.
+  // ANSWER: the Dispatcher already knows, verified it himself — no Planner/
+  // Implementer frame ever spawns. The whole point of this mode is zero further
+  // iteration.
   if (taskStart.mode === 'answer') {
     await ledger.setObjective(root(), taskStart.text)
     emit({ type: 'objective', text: taskStart.text })
@@ -1208,10 +1214,10 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
       { role: 'implementer', parentFrameId: null, assignment: appendImplementerResultFormat(implementerAssignment) },
       emit,
     )
-    // The task was measurably bigger than the Boss's "3-20 iterations" judgment —
-    // escalate to the full OBJECTIVE pipeline (runObjectiveViaPlanner, the SAME
-    // iterative Planner+Implementer loop an OBJECTIVE task gets) rather than
-    // reporting a raw "Reached maximum iterations" string as failure.
+    // The task was measurably bigger than the Dispatcher's "3-20 iterations"
+    // judgment — escalate to the full OBJECTIVE pipeline (runObjectiveViaPlanner,
+    // the SAME iterative Planner+Implementer loop an OBJECTIVE task gets) rather
+    // than reporting a raw "Reached maximum iterations" string as failure.
     if (frame.agent.getLastRunOutcome() === 'cap') {
       return await runObjectiveViaPlanner(objective, emit)
     }

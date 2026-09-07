@@ -70,7 +70,7 @@ test('a reply following the prompt\'s OBJECTIVE format parses as objective', () 
   assert.equal(verdict.parsed, true)
 })
 
-// ── Boss classification: soft budget 10, hard cap 20 ────────────────────────
+// ── Dispatcher classification: soft budget 10, hard cap 20 ──────────────────
 // The prompt still STATES 10 iterations (buildTaskStartAssignment already asserts
 // this above); the actual enforced cap given to spawnFrame is a separate, larger
 // constant so a classification a few turns over its stated budget still gets to
@@ -503,8 +503,8 @@ test('Planner role: escalating PROGRESS CHECK nudges fire at 20 and 30 before th
 // ── Agent.resetIterations() — the Planner's per-resume iteration budget reset.
 // The Planner's CONTEXT carries over on resumeFrame (same Agent, same history), but
 // the iteration BUDGET must restart at 0 for each detail call, unlike resumeFrame's
-// default accumulating behavior that other resume call sites (the Boss task-start
-// marker-retry resume) still rely on. resetIterations() is a small, targeted method
+// default accumulating behavior that other resume call sites (the Dispatcher
+// task-start marker-retry resume) still rely on. resetIterations() is a small, targeted method
 // — it zeroes exactly the one field (lastIterationCount) that chat()'s resume
 // branch reads to set iterationBase, and only when a caller explicitly asks for it
 // right before the next chat(..., { resume: true }) call.
@@ -612,22 +612,23 @@ test('Implementer role: escalating PROGRESS CHECK nudges fire at 100, 120 and 14
   }
 })
 
-test('Boss role keeps the pre-existing generic fraction-based checkpoints untouched (no entry in PROGRESS_CHECK_ITERATIONS)', async () => {
-  // Regression guard: a Boss frame at its own iteration cap should still see the
-  // GENERIC wording, not a role-specific one (there is none defined for 'boss').
+test('Dispatcher role keeps the pre-existing generic fraction-based checkpoints untouched (no entry in PROGRESS_CHECK_ITERATIONS)', async () => {
+  // Regression guard: a Dispatcher frame at its own iteration cap should still see
+  // the GENERIC wording, not a role-specific one (there is none defined for
+  // 'dispatcher').
   const events: AgentEvent[] = []
-  const sessionId = `test-role-progress-boss-${Date.now()}`
+  const sessionId = `test-role-progress-dispatcher-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([thinkingTurn]))
   agent.setSessionId(sessionId)
-  agent.setAllowedTools(ROLE_TOOLS.boss)
-  agent.setRole('boss')
-  agent.setMaxIterations(ROLE_MAX_ITERATIONS.boss)
+  agent.setAllowedTools(ROLE_TOOLS.dispatcher)
+  agent.setRole('dispatcher')
+  agent.setMaxIterations(ROLE_MAX_ITERATIONS.dispatcher)
   try {
-    await agent.chat('argo role-progress boss case')
+    await agent.chat('argo role-progress dispatcher case')
     const warnings = events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning')
       .map(e => e.message)
     assert.ok(warnings.some(w => w.startsWith('STALL:') || w.startsWith('PROGRESS CHECK:')))
-    assert.equal(warnings.some(w => w.includes('Wrap up your analysis')), false, 'the Planner-specific wording must not leak into a Boss frame')
+    assert.equal(warnings.some(w => w.includes('Wrap up your analysis')), false, 'the Planner-specific wording must not leak into a Dispatcher frame')
   } finally {
     await cleanupDispatchSession(sessionId)
   }
@@ -776,7 +777,7 @@ test('an Implementer FAIL explanation longer than 2000 chars is not truncated wh
   assert.equal(rawParsed.message, failBody.trim())
 })
 
-// ── PERSISTENT BOSS MEMORY — buildTurnHistoryBlock/boundTurnHistory ──────────
+// ── PERSISTENT DISPATCHER MEMORY — buildTurnHistoryBlock/boundTurnHistory ────
 // Both pure, no Ollama/fs/ledger involved, same reasoning as buildTaskStartAssignment's
 // own tests above: directly testable without spawning a real frame.
 
@@ -815,7 +816,7 @@ test('buildTurnHistoryBlock: truncates a long user message/outcome to a bounded 
   assert.ok(text.includes('…'))
 })
 
-test('buildTurnHistoryBlock: ends with guidance telling the Boss to fold prior context into its objective, before any assignment text', () => {
+test('buildTurnHistoryBlock: ends with guidance telling the Dispatcher to fold prior context into its objective, before any assignment text', () => {
   const text = buildTurnHistoryBlock([digest('a', 'simple', 'b', 'c')])
   assert.ok(/incorporate that/i.test(text))
   assert.ok(text.endsWith('\n\n'))

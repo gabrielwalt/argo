@@ -39,17 +39,6 @@ export const config = {
   // qwen3.6:latest loaded at 24GB, num_ctx=65536). 60s was never a safe margin
   // for this model/hardware/context-size combination — 180s is.
   chatTimeoutMs:           parseInt(process.env.CHAT_TIMEOUT_MS ?? '180000', 10),
-  // Originally sized as a bigger budget specifically for a frame's FIRST Ollama
-  // call (cold-prefill: paying for the entire system prompt + tool definitions +
-  // assignment against an empty KV cache, measured as the single most expensive
-  // call in a frame) versus chatTimeoutMs for warm-cache calls later in the same
-  // frame. Now that chatTimeoutMs itself is 180s, the two are equal by default —
-  // this key is effectively redundant as a distinct "first call" budget. Left in
-  // place (not removed) because it's still a meaningful independent override via
-  // FIRST_REQUEST_TIMEOUT_MS if a future change lowers chatTimeoutMs again while
-  // cold-prefill cost stays high, but there is currently no reason to set it
-  // differently from the default.
-  firstRequestTimeoutMs:   parseInt(process.env.FIRST_REQUEST_TIMEOUT_MS ?? '180000', 10),
   // Delay before the single automatic retry of a failed main per-iteration chat
   // call (see chatWithRetry in agent.ts). Two real incidents ended a whole run
   // with no retry: a 180s timeout, and Ollama's Go backend rejecting a malformed
@@ -63,13 +52,11 @@ export const config = {
   // flags above) so uncommitted changes stay visible in the Changes view until the user
   // (or an explicit toggle) decides to commit them. See Agent.autoCommit() in agent.ts.
   autoCommit:       ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_AUTOCOMMIT ?? '').trim().toLowerCase()),
-  // Local vision model, kept for tools that may still read/judge images.
-  visionModel:      process.env.ARGO_VISION_MODEL ?? 'qwen2.5vl:7b',
   // VERBATIM REQUEST THREADING (frames.ts buildAssignment, dispatch.ts spawnFrame). ON
   // by default (env ARGO_VERBATIM_REQUEST=0/false/off to disable). When on, the run's
   // raw user message threads, verbatim and capped (4000 chars, head-and-tail), into
-  // EVERY spawned frame's assignment, alongside (never replacing) the Boss's OBJECTIVE
-  // paraphrase — see frames.ts's renderVerbatimRequestBlock for the full rationale
+  // EVERY spawned frame's assignment, alongside (never replacing) the Dispatcher's
+  // OBJECTIVE paraphrase — see frames.ts's renderVerbatimRequestBlock for the full rationale
   // (traced eval failures where the paraphrase alone dropped load-bearing detail).
   verbatimRequest:  !['0', 'false', 'no', 'off'].includes((process.env.ARGO_VERBATIM_REQUEST ?? '').trim().toLowerCase()),
 }

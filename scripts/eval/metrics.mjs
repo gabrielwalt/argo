@@ -483,8 +483,8 @@ export function listJsonlFiles(logsDir, ws) {
 
 /**
  * Scrape every JSONL log this run produced (see the snapshot-diff rationale in e2e.mjs:
- * one /chat call under config.agents produces one file per spawned frame plus the
- * dispatch's own narrative).
+ * one /chat call to the multi-agent dispatch loop produces one file per spawned frame
+ * plus the dispatch's own narrative).
  *
  * Returns the run's status/finalAnswer plus a COST vector and a FRICTION vector. Speed
  * is in the cost vector and deliberately NOT in the score (EVAL-PLAN §3.1): it is

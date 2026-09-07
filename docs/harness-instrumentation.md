@@ -278,17 +278,14 @@ to make sure the agent is genuinely done, not just claiming to be.
 
 ---
 
-## Current defaults (summary)
+## Historical defaults (as of the single-loop architecture described above)
 On by default: task ledger, memory (AGENTS.md/MEMORY.md), loop-recovery ladder, grounding
 fact-check, executable per-task verification + summaries + final reconciliation (all part of
 tasks mode). Off by default: critic, layout judge, auto-commit, multi-agent mode. Always on: the plan/act gate,
 no-progress + stall guards, progress trace, context compaction + recitation, whole-run conclusion
 gate.
 
-## What's still open
-- **Measure the oracle in use:** an eval (n≥3 + a deliberately looping/adversarial case) that hands
-  tasks `verify` commands, to see how well the model uses executable verification + reconciliation,
-  and to finally exercise the loop ladder's rescue in a real run.
-- **Validate the layout judge live**, then decide whether to turn `ARGO_LAYOUT` on for UI/writing tasks.
-- **Smaller improvements:** stable task IDs (vs. text matching), semantic memory selection (vs. word
-  overlap), routing compaction to a faster model, and surfacing task-checklist progress to the user.
+None of the toggles above exist any more — see the SUPERSEDED note at the top of this document
+for the current architecture (`src/dispatch.ts`, `src/loop.ts`, `src/eviction.ts`) and `CLAUDE.md`
+for what's actually on today (always: multi-agent dispatch, the loop-recovery ladder, deterministic
+eviction; auto-commit remains the one real opt-in, via `config.autoCommit`).

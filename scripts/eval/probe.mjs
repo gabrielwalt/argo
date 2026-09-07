@@ -5,10 +5,14 @@
  * NATIVE tool call (so the ReAct loop can act), or stall — narrate, or write the
  * tool call as text/XML in the message body (which Argo can't parse → the run ends)?
  *
- * It loads Argo's REAL system prompt from src/agent.ts (so it tests whatever is in
- * the file), sends representative task cases with Argo's tool set, and prints a
- * per-model scorecard. Cheap (one turn per cell) so we can tune the system prompt
- * and context budget without slow end-to-end runs.
+ * It loads Argo's REAL Implementer role prompt (src/frames.ts's ROLE_IDENTITY.implementer
+ * + ROLE_INSTRUCTIONS.implementer — so it tests whatever is in the file), sends
+ * representative task cases with Argo's tool set, and prints a per-model scorecard.
+ * Cheap (one turn per cell) so we can tune the role prompts and context budget without
+ * slow end-to-end runs. The Implementer role is used as the probe target because it is
+ * the one role every task case below actually exercises (write/edit/bash) — the harness
+ * no longer has a single undifferentiated system prompt (see src/dispatch.ts's Boss/
+ * Planner/Implementer dispatch loop).
  *
  * The metric is NATIVE-TOOL-CALL RELIABILITY: PASS = the model emitted a native
  * tool call (any tool — appropriateness is a separate, human-judged column), OR,
@@ -20,7 +24,6 @@
  * Run on the host (Ollama reachable; set OLLAMA_ORIGINS if calling cross-origin):
  *   npm run eval
  *   EVAL_RUNS=3 EVAL_MODELS="qwen3.6:latest,<candidate>" npm run eval
- *   EVAL_MEMORY_FILE=~/Sources/test/test-two/MEMORY.md npm run eval   # test with a workspace MEMORY.md appended (bloats context)
  */
 import { readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
@@ -38,14 +41,32 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const HARNESS_SHA = (() => { try { return execSync('git rev-parse --short HEAD', { cwd: repo }).toString().trim(); } catch { return 'nogit'; } })();
 const DIRTY = (() => { try { return execSync('git status --porcelain', { cwd: repo }).toString().trim().length > 0 ? '+dirty' : ''; } catch { return ''; } })();
 
+// Extracts one role's ROLE_IDENTITY + ROLE_INSTRUCTIONS entry out of src/frames.ts by
+// locating the object literal and pulling the string value keyed by `role` — a small,
+// deliberately narrow parse (not a real TS parser) since both tables are simple
+// `Record<Role, string>` literals with one string value per role, quoted with `'`.
+function extractRoleEntry(src, tableName, role) {
+  const tableStart = src.indexOf(`export const ${tableName}`);
+  if (tableStart === -1) throw new Error(`${tableName} not found in src/frames.ts`);
+  const roleStart = src.indexOf(`${role}:`, tableStart);
+  if (roleStart === -1) throw new Error(`${tableName}.${role} not found in src/frames.ts`);
+  // The value is one or more '...' + string-concatenated segments up to the line
+  // ending in a bare comma before the next role key — collect every quoted segment.
+  const afterColon = src.slice(roleStart + role.length + 1);
+  // Stops at the next role key OR the table's own closing brace (the last role's
+  // value has no following role key to bound it, only the literal's own `}`).
+  const stopIdx = afterColon.search(/\n\s*(?:boss|planner|implementer):|\n\}/);
+  const segment = stopIdx === -1 ? afterColon : afterColon.slice(0, stopIdx);
+  const parts = [...segment.matchAll(/'((?:[^'\\]|\\.)*)'/g)].map(m => m[1].replace(/\\'/g, "'"));
+  if (parts.length === 0) throw new Error(`could not parse ${tableName}.${role} in src/frames.ts`);
+  return parts.join('');
+}
+
 function systemPrompt() {
-  const src = readFileSync(path.join(repo, 'src/agent.ts'), 'utf8');
-  const m = src.match(/const SYSTEM_PROMPT = `([\s\S]*?)`\n\n\/\/ Parses/);
-  if (!m) throw new Error('SYSTEM_PROMPT not found in src/agent.ts');
-  let sys = m[1];
-  const mem = process.env.EVAL_MEMORY_FILE;
-  if (mem) { try { sys += `\n\n--- /workspace/MEMORY.md (durable project memory) ---\n${readFileSync(mem, 'utf8')}`; } catch { /* optional */ } }
-  return sys;
+  const src = readFileSync(path.join(repo, 'src/frames.ts'), 'utf8');
+  const identity = extractRoleEntry(src, 'ROLE_IDENTITY', 'implementer');
+  const instructions = extractRoleEntry(src, 'ROLE_INSTRUCTIONS', 'implementer');
+  return `${identity}\n\n${instructions}`;
 }
 
 const fn = (name, description, props, required) => ({ type: 'function', function: { name, description, parameters: { type: 'object', properties: props, required } } });
@@ -54,10 +75,10 @@ const TOOLS = [
   fn('read_file', 'Read a file.', { path: { type: 'string' } }, ['path']),
   fn('write_file', 'Write a file.', { path: { type: 'string' }, content: { type: 'string' } }, ['path', 'content']),
   fn('edit_file', 'Replace an exact string in a file.', { path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } }, ['path', 'old_string', 'new_string']),
-  fn('update_plan', 'Record or refine your plan (objective + steps). Does not end your turn.', { objective: { type: 'string' }, steps: { type: 'array', items: { type: 'string' } } }, ['objective']),
   fn('fetch_url', 'Fetch the text content of a URL (no JS).', { url: { type: 'string' } }, ['url']),
   fn('browser_fetch', 'Fetch a JavaScript-rendered page.', { url: { type: 'string' } }, ['url']),
   fn('web_search', 'Search the web for current information.', { query: { type: 'string' } }, ['query']),
+  fn('conclude', 'End the turn with a status keyword and message.', { status: { type: 'string' }, message: { type: 'string' } }, ['status', 'message']),
 ];
 
 // Representative cases. `allowDirect` = a substantive no-tool answer also counts as
@@ -69,7 +90,7 @@ const TASKS = [
   { id: 'complex-plan',    kind: 'plan + implement', allowDirect: false, prompt: 'Make the wind in the simulation (/workspace/index.html) decay noticeably faster over time.' },
 ];
 
-const TOOL_IN_TEXT = /<\s*\/?\s*(update_plan|read_file|edit_file|write_file|bash|web_search|fetch_url|browser_fetch)\b|```json[\s\S]*?"name"\s*:/i;
+const TOOL_IN_TEXT = /<\s*\/?\s*(read_file|edit_file|write_file|bash|web_search|fetch_url|browser_fetch|conclude)\b|```json[\s\S]*?"name"\s*:/i;
 
 async function probe(model, sys, prompt) {
   const body = { model, stream: false, messages: [{ role: 'system', content: sys }, { role: 'user', content: prompt }], tools: TOOLS, options: { temperature: TEMP, top_p: 0.9, top_k: 40, num_ctx: NUM_CTX } };

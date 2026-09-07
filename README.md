@@ -215,7 +215,7 @@ Any model pulled via `ollama pull` appears in the UI dropdown automatically.
 
 | Model | Size | Agentic use | Notes |
 |---|---|---|---|
-| `qwen3.6:latest` 🔧 | 23 GB | ✅ **Recommended** | The only model validated end-to-end. Reliable native tool calls, strong ReAct reasoning, multi-step tasks with compaction. Eval: 4/4 tasks completed. Requires ~24 GB RAM. |
+| `qwen3.6:latest` 🔧 | 23 GB | ✅ **Recommended** | The only model validated end-to-end. Reliable native tool calls, strong ReAct reasoning, holds up over long multi-step runs under deterministic context eviction. Eval: 4/4 tasks completed. Requires ~24 GB RAM. |
 | `devstral:24b` 🔧 | ~14 GB | ⚠️ Tool-capable, under-performs | Mistral's agentic-coding model. Emits native tool calls (~75% on the single-turn probe) but under-executes end-to-end — finishes early with the suite still failing (eval: 0/4). An emission/behaviour ceiling, not reasoning. Re-vet as it improves. |
 | `qwen2.5-coder:14b` | 9.0 GB | ⚠️ Partial | Tool calling works but reasoning is weaker. Prone to hallucinating exact strings (URLs, paths) from memory. Usable for simple, single-step tasks. |
 | `llama3.1:8b` | 4.9 GB | ⚠️ Partial | Consistent tool-call API compatibility, but limited reasoning depth — engages the plan workflow yet cannot complete multi-step tasks (eval: 0/4; once re-planned to the iteration cap). Best option on memory-constrained machines. |
@@ -230,15 +230,15 @@ To add any model: `ollama pull <name>` — appears in the UI immediately without
 ## Multi-agent architecture
 
 Every request runs through the dispatch loop (`src/dispatch.ts`) — a harness-code Orchestrator
-that never itself calls the model. It routes each task through a **Boss** that classifies the
+that never itself calls the model. It routes each task through a **Dispatcher** that classifies the
 request (ANSWER / SIMPLE / OBJECTIVE) and, for anything beyond a direct answer, delegates to
 dedicated **Planner** and **Implementer** call frames — each its own scoped `Agent` instance
 (`src/agent.ts`), reusing the same battle-tested ReAct loop (streaming Ollama calls, deterministic
 context eviction, the loop-recovery ladder, tool execution) with a restricted tool set and a
 distinct system-prompt suffix.
 
-- **Boss** — classifies the request, has no direct file-modification tools, and (for an OBJECTIVE
-  run) writes the final summary once every task is complete.
+- **Dispatcher** — classifies the request, has no direct file-modification tools, and (for an
+  OBJECTIVE run) writes the final summary once every task is complete.
 - **Planner** — read-only. Produces an ordered list of implementation units for a genuinely
   multi-part objective, then is resumed to detail one self-contained Implementer assignment at a
   time, informed by the previous Implementer's own conclusion. There is no separate re-planning
@@ -247,7 +247,7 @@ distinct system-prompt suffix.
   verifies its own work (build/lint/test, or a direct exercise of the changed behaviour), and
   reports SUCCESS or FAIL via `conclude`.
 
-The SIMPLE path (a well-scoped, single-unit change) skips the Planner entirely: Boss →
+The SIMPLE path (a well-scoped, single-unit change) skips the Planner entirely: Dispatcher →
 Implementer → done. If that one Implementer hits its iteration cap without concluding, the run
 escalates to the full OBJECTIVE pipeline (Planner → Implementer per task) rather than reporting a
 raw cap-hit as failure.
@@ -291,9 +291,9 @@ frame halts rather than looping indefinitely — reported as a partial result, n
 | `write_file` | Write a file at any absolute path in the container | Saving scripts or results |
 | `edit_file` | Replace an exact string in an existing file | Targeted changes without rewriting a whole file |
 | `ledger` | Query the multi-agent delegation/conclusion/episode ledger | Looking up a dependency's prior work, recovering evicted content |
-| `conclude` | End the current frame's turn with a status keyword + message | The only way any role (Boss/Planner/Implementer) finishes |
+| `conclude` | End the current frame's turn with a status keyword + message | The only way any role (Dispatcher/Planner/Implementer) finishes |
 
-Not every role gets every tool — the Planner and Boss are read-only (no `write_file`/`edit_file`); only the Implementer holds the full write-capable set. See `src/frames.ts`'s `ROLE_TOOLS`.
+Not every role gets every tool — the Planner and Dispatcher are read-only (no `write_file`/`edit_file`); only the Implementer holds the full write-capable set. See `src/frames.ts`'s `ROLE_TOOLS`.
 
 ### The filesystem model
 
@@ -303,12 +303,13 @@ The agent is instructed to keep work-in-progress files outside `/workspace` and 
 
 ### Project memory
 
-Two optional, plain-Markdown files at the project root, auto-loaded (fresh, once per run) and appended to the system prompt if present — no embeddings, no database, no daemon:
-
-- **`AGENTS.md`** — human-authored project instructions (conventions, non-obvious constraints). The agent treats this as read-only, the same way it treats this project's own `CLAUDE.md`.
-- **`MEMORY.md`** — agent-maintained durable memory: architecture facts, conventions, decisions, recurring pitfalls. The agent is instructed to update it conservatively (durable, reusable facts only — never one-off task state or debugging detail), in place rather than by appending, and to split a section out to `memory/<topic>.md` (with a one-line pointer left in `MEMORY.md`) if it grows large — so detail stays available on demand without bloating every run's context.
-
-Both files live inside `/workspace` like any other project file, so they're versioned and auto-committed the same way code changes are — visible and git-diffable, not a hidden side channel. Each is capped at 8,000 characters on load (same as `read_file`'s own truncation) — see `loadProjectContext()` in `src/agent.ts`.
+There is no automatic memory-loading step — no frame's system prompt auto-includes any project
+file. `AGENTS.md`/`MEMORY.md` are an optional convention some projects use for human-authored
+instructions and durable notes, but a frame only sees their contents if a Planner or Implementer
+explicitly reads them with `read_file` and carries forward whatever's relevant. The Planner's own
+prompt calls this out directly: the Implementer it hands an assignment to has no access to
+`AGENTS.md`/`MEMORY.md` at all, so the Planner is instructed to inspect those files itself and
+fold anything load-bearing directly into the assignment text.
 
 ---
 
@@ -351,17 +352,13 @@ For any other package: `npm install <package>` (installs locally in `/workspace`
 
 Served at `http://localhost:3000/ws/{workspace-name}/`.
 
-**Header** — model picker, context usage counter, settings panel (temperature, top_p, top_k, context window), workspace switcher with dropdown to switch between running workspaces.
+**Breadcrumb nav** — session dropdown, workspace switcher, and model picker, plus a settings panel (temperature, top_p, top_k, context window).
 
-**Chat (left)** — conversation with Markdown rendering. "New session" resets history without restarting the server.
+**Chat panel (left)** — message history (user messages, assistant responses) and, inline in the conversation, a collapsible **trace block** for each run: iteration counter, model thoughts, tool calls with full arguments, tool results with timing, git commits. Collapsed by default; click to expand. "New session" resets history without restarting the server.
 
-**Agent Trace (right)** — live stream of every internal step: iteration counter, model thoughts, tool calls with full arguments, tool results with timing, errors. Long items collapse. This is the cockpit view — every decision the agent makes is visible as it happens.
+**Files panel (right)** — split into a file tree pane (a single tree rooted at the container's filesystem, `/workspace` expanded and labeled by default) and a file viewer pane that opens inline when a file is clicked. Both panes are user-resizable. Refreshes automatically after each completed task.
 
-**Files (right tab)** — a single file tree rooted at the container's filesystem, with `/workspace` expanded and labeled by default. Click any file to preview its contents. Refreshes automatically after each completed task.
-
-**Session Logs (right tab)** — list of all past sessions. Click any entry to read the full trace as Markdown or JSONL. Sessions accumulate across restarts and are the primary source of data for improving prompts and comparing models.
-
-**Git Log (bottom)** — latest commit shown inline; click to expand older ones. Click "diff" to view exact changes. Auto-updates when the agent commits. Commit messages summarize whatever is dirty in `/workspace` at commit time (`git diff --cached --stat`), not a strict authorship guarantee — if a file changed outside the agent's own tool calls (e.g. a human edit between turns), it's swept into the same commit and message.
+There is no separate trace tab or session-logs tab — the trace lives inline in the chat window, and past sessions are reached via the session dropdown (which loads a session's messages read-only, with a Resume button to make it live again). Git history is inspected the same way: commit hashes surface inline in the trace as `git_commit` events when the agent auto-commits.
 
 ---
 
@@ -515,7 +512,7 @@ argo/
 │   ├── index.ts                ← Entry point: central mode or worker/standalone
 │   ├── central.ts              ← Central server: workspace registry, Docker mgmt, proxy
 │   ├── server.ts               ← Worker/standalone: agent API, SSE, git, files endpoints
-│   ├── dispatch.ts             ← The Orchestrator: Boss/Planner/Implementer dispatch loop
+│   ├── dispatch.ts             ← The Orchestrator: Dispatcher/Planner/Implementer dispatch loop
 │   ├── frames.ts                ← Per-role tool sets, iteration budgets, system-prompt suffixes
 │   ├── agent.ts                ← ReAct loop, Ollama integration, auto-commit, loop-recovery ladder
 │   ├── loop.ts                 ← Loop-recovery ladder mechanics (repeat detection, cached replay)
@@ -558,7 +555,7 @@ The containment model and logging infrastructure point toward more ambitious use
 - **Agent memory** — persistent knowledge of the codebase across sessions, built from the structured JSONL logs already being written
 - **Visual trace** — Playwright screenshots streamed into the trace panel so you can see what the agent saw, not just the text it returned
 - **Specialised agent roles** — distinct system prompts and tool subsets for test writer, code reviewer, documenter, and migrator roles
-- **Multi-agent delegation** — ✅ built; a Boss/Planner/Implementer architecture, sequential (one LLM call at a time), not concurrent — see "Multi-agent architecture" above and `docs/subagents-plan.md`
+- **Multi-agent delegation** — ✅ built; a Dispatcher/Planner/Implementer architecture, sequential (one LLM call at a time), not concurrent — see "Multi-agent architecture" above and `docs/subagents-plan.md`
 - **MCP integration** — expose Argo workspaces as MCP servers so agents can delegate to each other across tool boundaries
 - **Agent-to-agent communication** — a local message bus for agents to hand off tasks, share results, and build context cooperatively
 

@@ -5,7 +5,7 @@ COPY package.json ./
 RUN npm install --ignore-scripts
 COPY src/ ./src/
 COPY tsconfig.json ./
-RUN npx tsc
+RUN node node_modules/typescript/bin/tsc
 
 # ── Stage 2: runtime ─────────────────────────────────────────────
 FROM ubuntu:24.04

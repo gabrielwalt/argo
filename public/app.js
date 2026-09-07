@@ -79,13 +79,17 @@ let manualCompacting = false
 // while compactingNow is true, which always wins (a compaction can happen
 // mid-run, and should visually override "Running").
 let indicatorState = 'ready'
-// True from 'compact_start' until 'compact' (or a safety-net clear on the next
-// 'iteration'/'error') — independent of `busy` since manual compaction can run
-// between agent runs.
+// True while a 'compact' event's eviction pass is in flight, cleared by that same
+// event (or a safety-net clear on the next 'iteration'/'error') — independent of
+// `busy` since a manual compaction can run between agent runs. Deterministic
+// eviction (src/eviction.ts) is in-memory and fast, so this window is normally
+// too brief to see; kept as a safety net rather than removed.
 let compactingNow = false
 let compactStartTime = null
-// Live progress from 'compact_progress' (precise, while available); falls back
-// to the previous compaction's duration as a rough estimate.
+// Deprecated fields from the old LLM-summarization compaction's progress reporting
+// (no longer emitted — deterministic eviction has no multi-step sub-calls to report
+// progress on). Left in place only because the "Compacting…" status label formatter
+// still reads them defensively; always null in the current harness.
 let compactElapsedS = null
 let compactTimeoutS = null
 let compactStep = null
@@ -592,18 +596,6 @@ function handleEvent(event) {
       renderObjective(event)
       break
 
-    case 'task_graph':
-      renderTaskGraph(event)
-      break
-
-    case 'boss_verdict':
-      renderBossVerdict(event)
-      break
-
-    case 'replan':
-      renderReplan(event)
-      break
-
     case 'iteration':
       iterLabel.textContent = `${event.current}`
       addIterationSeparator(event.current)
@@ -644,10 +636,6 @@ function handleEvent(event) {
       }
       break
 
-    case 'plan':
-      renderPlan(event)
-      break
-
     case 'token_usage':
       updateCtx(event.prompt_tokens, event.num_ctx)
       break
@@ -684,35 +672,6 @@ function handleEvent(event) {
       break
     }
 
-    case 'compact_start':
-      // Compaction involves separate LLM calls (update + validate) that can take
-      // up to a couple minutes total — without this the run just looks stalled.
-      // compactingNow (checked by setStatus) makes the indicator's core flash
-      // violet and its dropdown status row show compaction progress, regardless
-      // of whether this happens mid-run or as a standalone manual compaction.
-      compactingNow = true
-      compactStartTime = Date.now()
-      compactElapsedS = null
-      compactTimeoutS = null
-      compactStep = null
-      setStatus('busy', 'Compacting context…')
-      addTraceItem('compact', '📦 Compacting context', `${event.messageCount} messages, ${Math.round(event.contextUsagePct * 100)}% context — updating working memory…`, false)
-      surfaceActivity('📦 Compacting context…')
-      break
-
-    case 'compact_progress': {
-      // Periodic proof-of-life from a still-running compaction sub-call (see
-      // withCompactHeartbeat in agent.ts) — this is what tells you it's actually
-      // working and not just hung, since compact_start only fires once at the start.
-      const elapsedS = Math.round(event.elapsedMs / 1000)
-      const timeoutS = Math.round(event.timeoutMs / 1000)
-      compactElapsedS = elapsedS
-      compactTimeoutS = timeoutS
-      compactStep = event.step
-      setStatus('busy', `Compacting context… ${event.step} (${elapsedS}s / ${timeoutS}s)`)
-      break
-    }
-
     case 'compact':
       // A manually triggered compaction (see the indicator dropdown / context
       // viewer's "Compact now") has no run following it to eventually fire
@@ -725,7 +684,7 @@ function handleEvent(event) {
       }
       if (event.manual) setStatus('ready', 'Ready')
       else setStatus('busy', `Running · ${currentRunModel}`)
-      addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}${event.activeWorkingStateSummary ? `\n\n--- Active working state (unvalidated) ---\n${event.activeWorkingStateSummary}` : ''}`, true)
+      addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
       surfaceActivity('⚡ Context compacted')
       // A user-triggered manual compaction (no run to fire 'done') finalizes its
       // own trace block here; an in-run auto-compaction leaves the block open for
@@ -765,8 +724,8 @@ function handleEvent(event) {
 // live-only side effect (status bar, busy state, git/file refreshes, iteration
 // and token counters — those reflect a *running* agent, not history). Unlike the
 // live path it also renders user messages: on replay there is no submit handler
-// to have added them optimistically. ollama_request / compact_progress /
-// token_usage are live-only telemetry with nothing to draw into the trace.
+// to have added them optimistically. ollama_request / token_usage are live-only
+// telemetry with nothing to draw into the trace.
 function handleEventForSession(event) {
   if (event.__frameId) {
     handleFrameEvent(event)
@@ -779,18 +738,6 @@ function handleEventForSession(event) {
 
     case 'objective':
       renderObjective(event)
-      break
-
-    case 'task_graph':
-      renderTaskGraph(event)
-      break
-
-    case 'boss_verdict':
-      renderBossVerdict(event)
-      break
-
-    case 'replan':
-      renderReplan(event)
       break
 
     case 'iteration':
@@ -818,16 +765,8 @@ function handleEventForSession(event) {
       addChatMessage(event.role, event.content)
       break
 
-    case 'plan':
-      renderPlan(event)
-      break
-
-    case 'compact_start':
-      addTraceItem('compact', '📦 Compacting context', `${event.messageCount} messages, ${Math.round(event.contextUsagePct * 100)}% context — updating working memory…`, false)
-      break
-
     case 'compact':
-      addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}${event.activeWorkingStateSummary ? `\n\n--- Active working state (unvalidated) ---\n${event.activeWorkingStateSummary}` : ''}`, true)
+      addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
       break
 
     case 'warning':
@@ -852,9 +791,9 @@ function handleEventForSession(event) {
 // ── UI helpers ───────────────────────────────────────────────────
 // Drives BOTH the legacy (now hidden) #status dot/text and the combined
 // indicator: state is 'ready' | 'busy' | 'error'; compactingNow (module state,
-// set/cleared around the compact_start/compact events) overrides to
-// 'compacting' regardless of what's passed here, since a compaction can occur
-// either mid-run or standalone between runs.
+// set/cleared around the 'compact' event) overrides to 'compacting' regardless
+// of what's passed here, since a compaction can occur either mid-run or
+// standalone between runs.
 function setStatus(state, text) {
   statusDot.className = state === 'ready' ? '' : state
   statusText.textContent = text
@@ -1150,8 +1089,8 @@ tokenCounter.addEventListener('click', (e) => {
 })
 
 // Manual compaction. Disabled in the UI while busy/in-flight, but guard anyway.
-// Ensures a trace block exists so the compact_start/compact events have somewhere
-// to render; those events (see handleEvent) finalize the block on completion.
+// Ensures a trace block exists so the 'compact' event has somewhere to render;
+// that event (see handleEvent) finalizes the block on completion.
 async function compactNow() {
   if (busy || manualCompacting) return
   manualCompacting = true
@@ -1175,8 +1114,8 @@ async function compactNow() {
       cleanupManualCompaction(createdBlock)
       return
     }
-    // Success: the compact_start / compact events render into the trace and
-    // finalize the block (see handleEvent). Nothing more to do here.
+    // Success: the 'compact' event renders into the trace and finalizes the
+    // block (see handleEvent). Nothing more to do here.
   } catch {
     showToast('Failed to compact')
     cleanupManualCompaction(createdBlock)
@@ -1449,16 +1388,15 @@ const ROLE_META = {
   boss:        { name: 'Boss',         title: 'Boss',        icon: '⚖️' },
   planner:     { name: 'Planner',     title: 'Planner',     icon: '🧭' },
   implementer: { name: 'Implementer', title: 'Implementer', icon: '🔨' },
-  tester:      { name: 'Tester',      title: 'Tester',      icon: '👁️' },
 }
 
 // frameId -> { el, arrow, items, outcome, hasItems }. Cleared per top-level run
 // (startTraceBlock) — see there for why stale entries can't leak across runs.
 const roleCards = new Map()
 
-// Gets the card for an already-known frameId (a RESUMED frame — the Planner
-// replanning, or a Tester's REDO waking the same Implementer back up — reuses its
-// existing card rather than creating a confusing duplicate), or creates a fresh one.
+// Gets the card for an already-known frameId (a RESUMED frame — the Planner's next
+// detail call reuses its existing card rather than creating a confusing duplicate),
+// or creates a fresh one.
 function getOrCreateRoleCard(frameId, role, assignment) {
   const existing = roleCards.get(frameId)
   if (existing) {
@@ -1559,14 +1497,8 @@ function handleFrameEvent(event) {
     case 'warning':
       addRoleCardItem(frameId, 'warning', '⚠ Warning', event.message, false)
       break
-    case 'compact_start':
-      addRoleCardItem(frameId, 'compact', '📦 Compacting context', `${event.messageCount} messages, ${Math.round(event.contextUsagePct * 100)}% context`, false)
-      break
     case 'compact':
       addRoleCardItem(frameId, 'compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
-      break
-    case 'plan':
-      addRoleCardItem(frameId, 'plan-inline', `📋 Plan (rev ${event.revision})`, `Objective: ${event.objective}\n${(event.steps || []).join('\n')}`, true)
       break
     case 'git_commit':
       addRoleCardItem(frameId, 'git', '🔀 Committed', `${event.hash} — ${event.message}`, false)
@@ -1582,17 +1514,16 @@ function handleFrameEvent(event) {
       addRoleCardItem(frameId, 'error-item', '⚠ Error', event.message, false)
       closeRoleCard(frameId, '⚠ error')
       break
-    // iteration / token_usage / ollama_request / compact_progress: live-only
-    // telemetry with nothing worth a per-frame UI element.
+    // iteration / token_usage / ollama_request: live-only telemetry with
+    // nothing worth a per-frame UI element.
   }
 }
 
-// The harness-level narrative events (config.agents) — always untagged, describing
-// the whole task rather than one frame's turn. Objective and task-graph reuse the
-// existing plan-card pattern (message-level card, splits the trace above/below);
-// boss_verdict/replan render as small always-visible dividers INSIDE the trace block
-// — they're cross-cutting relationship markers ("Jason redirected this attempt"),
-// not one role's own detail, so they don't belong nested inside any single card.
+// The harness-level 'objective' event — always untagged, describing the whole task
+// rather than one frame's turn. Rendered as a message-level card (splits the trace
+// above/below), the same pattern the old task-graph/boss_verdict/replan narrative
+// events used before the dispatch loop settled on its current, simpler shape
+// (Boss/Planner/Implementer only — no task graph, no injected corrections).
 
 function renderObjective(event) {
   const el = document.createElement('div')
@@ -1602,96 +1533,8 @@ function renderObjective(event) {
   maybeAutoScroll()
 }
 
-function renderTaskGraph(event) {
-  const model = currentRunModel
-  const resume = !!currentTraceBlock
-  if (currentTraceBlock && currentTraceBlock.items.childElementCount === 0) {
-    currentTraceBlock.el.remove()
-    currentTraceBlock = null
-  } else {
-    finalizeTraceBlock()
-  }
-
-  const el = document.createElement('div')
-  el.className = 'message plan md'
-  const title = event.revision > 1 ? `📋 Task graph · revised (v${event.revision})` : '📋 Task graph'
-  const steps = (event.steps || []).map(s => {
-    const meta = ROLE_META[s.role] || { icon: '🤖', title: s.role }
-    const deps = s.dependsOn && s.dependsOn.length
-      ? ` <span class="plan-step-deps">(after ${escHtml(s.dependsOn.join(', '))})</span>`
-      : ''
-    return `<li>${meta.icon} <span class="plan-step-role">${escHtml(meta.title)}</span> — ${escHtml(s.prompt)}${deps}</li>`
-  }).join('')
-  el.innerHTML = `<div class="plan-title">${escHtml(title)}</div>` + (steps ? `<ol class="plan-steps">${steps}</ol>` : '')
-  messagesEl.appendChild(el)
-
-  if (resume) startTraceBlock(model)
-  maybeAutoScroll()
-}
-
-const BOSS_VERDICT_META = {
-  inject:   { icon: '💬', label: 'Boss injects a correction' },
-  restart:  { icon: '🔁', label: 'Boss restarts this attempt' },
-  escalate: { icon: '⛔', label: 'Boss escalates to Planner' },
-}
-
-function renderBossVerdict(event) {
-  if (!currentTraceBlock) return
-  const meta = BOSS_VERDICT_META[event.action] || { icon: '⚖️', label: `Boss: ${event.action}` }
-  const el = document.createElement('div')
-  el.className = `role-divider role-divider-${event.action}`
-  el.title = event.message
-  el.innerHTML = `<span class="role-divider-icon">${meta.icon}</span><span class="role-divider-label">${escHtml(meta.label)}</span>`
-  currentTraceBlock.items.appendChild(el)
-  maybeAutoScroll()
-}
-
-function renderReplan(event) {
-  if (!currentTraceBlock) return
-  const el = document.createElement('div')
-  el.className = 'trace-separator replan-separator'
-  el.title = event.reason
-  el.innerHTML = `<span class="trace-separator-line"></span><span class="trace-separator-label">🔄 Replanning</span><span class="trace-separator-line"></span>`
-  currentTraceBlock.items.appendChild(el)
-  maybeAutoScroll()
-}
-
 function renderMarkdown(content) {
   return marked.parse(content, { breaks: true, gfm: true })
-}
-
-// Renders the agent's plan as a message-level card in the chat flow (not buried
-// in the collapsed trace) so the user sees it like any other message. Each
-// update_plan call emits a fresh 'plan' event, so refinements pop up as their own
-// cards, labelled with the revision.
-function renderPlan(event) {
-  // A plan is a milestone in the run. Close off the trace that led up to it,
-  // render the plan as its own card, then RESUME the trace in a fresh block so
-  // post-plan execution unrolls *below* the plan (chronological order) instead
-  // of continuing to fill the pre-plan block *above* it — the latter read as
-  // "the agent planned but never proceeded." An empty pre-plan block (the model
-  // planned immediately) is dropped rather than left as a stray "0 tools" block.
-  const model = currentRunModel
-  const resume = !!currentTraceBlock
-  if (currentTraceBlock && currentTraceBlock.items.childElementCount === 0) {
-    currentTraceBlock.el.remove()
-    currentTraceBlock = null
-  } else {
-    finalizeTraceBlock()
-  }
-
-  const el = document.createElement('div')
-  el.className = 'message plan md'
-  const title = event.revision > 1 ? `📋 Plan · revised (v${event.revision})` : '📋 Plan'
-  const steps = (event.steps || []).map(s => `<li>${escHtml(s)}</li>`).join('')
-  el.innerHTML = `<div class="plan-title">${escHtml(title)}</div>`
-    + `<div class="plan-objective"><span class="plan-label">Objective</span> ${escHtml(event.objective)}</div>`
-    + (steps ? `<ol class="plan-steps">${steps}</ol>` : '')
-  messagesEl.appendChild(el)
-
-  // Resume the live trace below the plan card so execution renders in order.
-  if (resume) startTraceBlock(model)
-  maybeAutoScroll()
 }
 
 function addChatMessage(role, content) {

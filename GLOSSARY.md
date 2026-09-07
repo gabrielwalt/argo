@@ -25,7 +25,7 @@ frame(s) that do the actual work. Implemented by `runDispatchLoop` in
 `dispatch.ts`.
 
 ### Frame
-A single scoped agent execution — one Boss, Planner, or Implementer running
+A single scoped agent execution — one Dispatcher, Planner, or Implementer running
 against one self-contained Assignment. A Frame has its own iteration budget,
 its own tool allowlist, and its own conversation history (isolated by
 `frameId`/`sessionId`). A Dispatch is composed of one or more Frames.
@@ -43,9 +43,9 @@ Calls.
 
 ## Agent Roles
 
-### Agent Roles: Boss, Planner, Implementer
-- **Boss** — the classifier. Runs at the start of a Conversation to route the
-  request (answer directly, hand to a single Implementer, or hand to a
+### Agent Roles: Dispatcher, Planner, Implementer
+- **Dispatcher** — the classifier. Runs at the start of a Conversation to route
+  the request (answer directly, hand to a single Implementer, or hand to a
   Planner) and, at the end, to summarize the whole Dispatch.
 - **Planner** — the decomposer. Breaks an objective into a sequence of
   self-contained Implementer assignments, one at a time, informed by each
@@ -101,5 +101,5 @@ before a Frame burns its iteration budget looping.
 
 **Note:** the full agent suite — including the Tester, Critic, LLM-based
 compaction, and the task ledger — has been preserved on branch
-`feature/full-agent-suite`. The current mainline is a reduced set (Boss,
+`feature/full-agent-suite`. The current mainline is a reduced set (Dispatcher,
 Planner, Implementer plus deterministic Eviction) documented above.

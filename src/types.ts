@@ -88,7 +88,7 @@ export interface GitCommit {
 // (see src/frames.ts). The Orchestrator itself is harness code (src/dispatch.ts),
 // never an LLM call.
 
-export type Role = 'planner' | 'implementer' | 'boss'
+export type Role = 'planner' | 'implementer' | 'dispatcher'
 
 export type FrameStatus = 'success' | 'partial' | 'failed' | 'gave_up' | 'killed' | 'restarted'
 

@@ -202,10 +202,11 @@ export async function getFrameTrail(root: string, frameId: string): Promise<Ledg
   return entries.filter(e => (hasFrameId(e) && e.frameId === frameId) || (hasTargetFrameId(e) && e.targetFrameId === frameId))
 }
 
-// Sliding window over the ledger — what the Boss reads for a standup. `scope`
+// Sliding window over the ledger — what the Dispatcher reads for a standup. `scope`
 // filters standup entries to just one granularity when present; every other entry
-// kind is unaffected by the filter (the Boss still wants delegations/conclusions in
-// its recent-activity view regardless of which standup scope it's checking).
+// kind is unaffected by the filter (the Dispatcher still wants delegations/
+// conclusions in its recent-activity view regardless of which standup scope it's
+// checking).
 export async function getRecent(root: string, n: number, scope?: 'frame' | 'task'): Promise<LedgerEntry[]> {
   const entries = await readAll(root)
   const filtered = scope ? entries.filter(e => e.kind !== 'standup' || e.scope === scope) : entries
@@ -222,8 +223,9 @@ export async function expand(root: string, episodeId: string): Promise<string | 
 }
 
 // Count of ACTION episodes across the whole task since a given timestamp — the
-// pacing signal for task-scope Boss standups (paced by real work, not raw steps;
-// see docs/subagents-plan.md "The Boss"). Exploratory episodes don't count.
+// pacing signal for task-scope Dispatcher standups (paced by real work, not raw
+// steps; see docs/subagents-plan.md "The Boss" — historical name for this role).
+// Exploratory episodes don't count.
 export async function countActionEpisodesSince(root: string, sinceTs: number): Promise<number> {
   const entries = await readAll(root)
   return entries.filter(

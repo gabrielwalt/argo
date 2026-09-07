@@ -22,12 +22,13 @@ import type { EpisodeKind } from './types.js'
 // `bash` invocation from a mutating one would require parsing the command string, which
 // is not worth the false-negative risk (treating a mutation as exploratory would let it
 // be evicted as if its effect weren't durably persisted, when it might not be).
+// Everything not listed here (write_file, edit_file, bash, and any unknown/future
+// tool) defaults to 'action' — the safer default, since an action episode is never
+// evicted early.
 const EXPLORATORY_TOOLS = new Set(['read_file', 'web_search', 'fetch_url'])
-const ACTION_TOOLS = new Set(['write_file', 'edit_file', 'bash'])
 
 export function classifyTool(name: string): EpisodeKind {
-  if (EXPLORATORY_TOOLS.has(name)) return 'exploratory'
-  return ACTION_TOOLS.has(name) ? 'action' : 'action' // unknown tools default to action (safer: never evicted early)
+  return EXPLORATORY_TOOLS.has(name) ? 'exploratory' : 'action'
 }
 
 export interface EpisodeMeta {
@@ -56,14 +57,14 @@ export function inferDependencies(priorEpisodes: EpisodeMeta[], newKind: Episode
   return deps
 }
 
-// The pinned anchor: the objective (immutable, Boss-authored). Always present, recited
-// at the tail, NEVER subject to eviction — small and structured by construction.
-// Locking the objective here is a direct structural fix for the original failure that
-// motivated this project: a run quietly solving a different, more interesting problem
-// than the one asked.
+// The pinned anchor: the objective (immutable, Dispatcher-authored). Always present,
+// recited at the tail, NEVER subject to eviction — small and structured by
+// construction. Locking the objective here is a direct structural fix for the
+// original failure that motivated this project: a run quietly solving a different,
+// more interesting problem than the one asked.
 export function renderPinnedAnchor(objective: string | null): string {
   if (!objective) return ''
-  return `[OBJECTIVE — immutable, set once by the Boss; never redefine it]\n${objective}`
+  return `[OBJECTIVE — immutable, set once by the Dispatcher; never redefine it]\n${objective}`
 }
 
 // Chars-per-token estimate used to translate a token budget into the char counts we can

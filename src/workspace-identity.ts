@@ -6,10 +6,9 @@
 // apart from "a folder that used to have this name but is now someone else's
 // content" — that is CONTENT identity, not the workspace name LOGS_DIR is keyed by.
 //
-// Pure module except for the tiny injectable fs surface below (same shape as
-// src/memory.ts's persistToMemory: an optional `io` object, each field defaulted to
-// the real node:fs/promises call) — so the decision logic here is unit-testable with
-// no real disk, no network, no Ollama.
+// Pure module except for the tiny injectable fs surface below (an optional `io`
+// object, each field defaulted to the real node:fs/promises call) — so the decision
+// logic here is unit-testable with no real disk, no network, no Ollama.
 
 import { readFile as fsReadFile, writeFile as fsWriteFile, mkdir as fsMkdir, readdir as fsReaddir } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'

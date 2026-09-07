@@ -20,7 +20,9 @@
     "express": "^4.19.2",
     "node-html-parser": "^6.1.13",
     "ollama": "^0.5.9",
-    "tsc": "^2.0.4"
+    "tsc": "^2.0.4",
+    "esbuild": "^0.28.2",
+    "pnpapi": "^0.0.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",

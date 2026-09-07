@@ -81,19 +81,6 @@ export function buildFallbackCommitMessage(changedFiles: string[]): string {
   return `Agent: update ${changedFiles.length} files`
 }
 
-// Harness-level loop STEERING — deliberately not a stop. When the model repeats
-// a tool call that yields no new information, the run is never terminated:
-// instead the redundant call is skipped and replaced with an escalating steer
-// that hands the model a different observation and concrete escape routes, so it
-// can break out on its own and keep working toward a conclusion. MAX_ITERATIONS
-// and the user's stop button remain the only hard bounds. The threshold is loose
-// (steer only from the 3rd repeat) to leave room for a legitimate repeat (e.g.
-// re-running one test to confirm a fix). Thought-text repetition is intentionally
-// not a separate detector: in every observed incident it co-occurred with an
-// identical tool call, which this already catches.
-export const REPEAT_WINDOW = 6
-export const REPEAT_THRESHOLD = 3
-
 // Deterministic context editing (see chatCall): the most recent N tool results are
 // kept verbatim in the context sent to the model; older ones longer than M chars are
 // collapsed to a short restorable stub. This keeps the LIVE window small over long
@@ -103,10 +90,6 @@ export const REPEAT_THRESHOLD = 3
 // model shrinks.
 export const KEEP_RECENT_TOOL_RESULTS = 4
 export const TOOL_RESULT_COLLAPSE_OVER = 600
-
-export function repetitionKey(name: string, args: Record<string, unknown>): string {
-  return `${name}:${JSON.stringify(args)}`
-}
 
 // Short human-readable summary of a call's key arguments — included in the loop
 // detection warning so the reader can verify WHICH call was repeated, not just that
@@ -129,24 +112,6 @@ export function isProjectMutation(name: string, args: Record<string, unknown>): 
   if (name !== 'edit_file' && name !== 'write_file') return false
   const p = typeof args.path === 'string' ? args.path : ''
   return p.startsWith('/workspace')
-}
-
-// The escalating steer injected when a call repeats with no new information (see
-// the loop in chat()). Kept OUT of the system prompt on purpose: it's contextual
-// harness help, surfaced only when a loop is actually detected — not a blanket
-// instruction the model must always carry. Level 1 observes and offers options;
-// level 2+ is firmer. It names the single most common cause (verifying a change
-// that doesn't appear to take) because that is the loop seen in practice.
-export function loopSteerMessage(name: string, priorRepeats: number, level: number, objective: string): string {
-  // A sustained loop (level 3+) has ignored the gentler hints — escalate to a grounded
-  // re-anchor that restates the objective and forces a concrete action or a conclusion.
-  if (level >= 3 && objective) {
-    return regroundSteer(objective, `you have repeated the same \`${name}\` call ${priorRepeats}+ times with no new result`)
-  }
-  const lead = level >= 2
-    ? `STOP — you keep calling \`${name}\` with identical arguments and getting the same result (${priorRepeats}+ times). Repeating it will not help.`
-    : `That \`${name}\` call used identical arguments and returned the same result as before — no new information.`
-  return `${lead} If you were checking whether a change took effect, verify it where it actually applies — edit_file reports the exact lines it changed, and a view that looks unchanged can mean the edit didn't match or you're looking at the wrong place. Otherwise: try genuinely different arguments or a different tool, or give your final answer if you already have what you need.`
 }
 
 // A GROUNDED re-anchor for a stuck run — a call repeated many times, or many tool calls
@@ -204,12 +169,8 @@ export class Agent {
   // show ready/running/compacting/error instead of just busy/idle. 'idle' between
   // runs.
   private phase: 'idle' | 'running' | 'compacting' | 'error' = 'idle'
-  // Rolling record of the last REPEAT_WINDOW executed (name+args) keys. Reset per
-  // chat() run, never persisted — a legitimately repeated action in a later run
-  // must start from a clean slate (see the repetition guard in chat()).
-  private recentCalls: string[] = []
-  // Mutation-aware loop-recovery ladder state. Reset per chat() run like
-  // recentCalls — a legitimately repeated action in a later run starts clean.
+  // Mutation-aware loop-recovery ladder state. Reset per chat() run — a
+  // legitimately repeated action in a later run starts clean.
   private loopState: LoopState = createLoopState()
   // Records when each this.history message entered the live context, keyed on the
   // message object itself (not its index/content) so it survives eviction's
@@ -272,7 +233,7 @@ export class Agent {
   // userMessage in that header, matching the pre-existing baseline behavior for the
   // unrestricted (non-dispatched) Agent, which never calls setUserQuery.
   private userQuery = ''
-  // Which ROLE (Planner/Implementer/Boss) this frame is, set by dispatch.ts's
+  // Which ROLE (Planner/Implementer/Dispatcher) this frame is, set by dispatch.ts's
   // spawnFrame alongside setAllowedTools/setMaxIterations/etc (frames.ts's
   // ROLE_TOOLS/ROLE_MAX_ITERATIONS are the same per-role tables this mirrors). null
   // for the unrestricted baseline, which never sets it. Drives which progress-check
@@ -362,7 +323,7 @@ export class Agent {
   // resumeFrame keeps the frame's history/etc, but each detail call must get its own
   // 40-iteration budget and its own 20/30 progress checks, not an offset-by-whatever-
   // the-previous-call-used budget). Deliberately NOT the default for every resume:
-  // other resume call sites (e.g. the Boss task-start marker-retry resume) rely on
+  // other resume call sites (e.g. the Dispatcher task-start marker-retry resume) rely on
   // the EXISTING accumulating behavior (iterationBase = lastIterationCount, set in
   // chat()'s resume branch) to report a frame's total effort across its whole life —
   // this only zeroes the ONE piece of state (lastIterationCount) that decision reads,
@@ -810,9 +771,11 @@ export class Agent {
   }
 
   // Re-anchor text for the loop-recovery steer, and for the per-iteration tail
-  // recitation in chatCall: just the run's objective, when one is known. Roles
-  // without a harness-tracked objective (the unrestricted baseline) get an empty
-  // string, which is a no-op wherever this is used.
+  // recitation in chatCall: intended to carry the run's objective (see
+  // eviction.ts's renderPinnedAnchor) when one is known, so a steered/recited
+  // message can re-anchor the model to it. Currently always returns '' — no call
+  // site here looks up the harness-tracked objective (ledger.ts's getObjective) —
+  // so every caller below gets a no-op today, same as the unrestricted baseline.
   private buildLoopRecite(): string {
     return ''
   }
@@ -941,8 +904,7 @@ export class Agent {
     } else {
       this.iterationBase = 0
       this.lastIterationCount = 0
-      // Loop-steering state, scoped to this run only (see REPEAT_WINDOW above).
-      this.recentCalls = []
+      // Loop-recovery ladder state, scoped to this run only.
       this.loopState = createLoopState()
       this.mutationCountAtLastStallCheck = 0
       this.loopSteerEscalated = false
@@ -952,7 +914,6 @@ export class Agent {
       this.actionTrace = []
       this.episodes = []
     }
-    let loopSteers = 0
     // No-progress detector: tool calls since the last actual change to the project.
     // A run that keeps inspecting without ever editing is stuck (the novel-arg
     // thrash the identical-call guard misses); noProgressSteers escalates the re-anchor.
@@ -976,36 +937,37 @@ export class Agent {
     }
 
     // Stall/progress-check iteration numbers for THIS run, scaled to THIS run's own
-    // budget (multi-agent roles run short, fixed budgets — Boss/Planner 15-40, a Boss
-    // task-start checkpoint as low as 6 — and the original fixed 20/35/45 checkpoints
-    // below simply never fired for them, since they hit their own hard maxIterations
-    // ceiling first and got ZERO mid-run steering. Each checkpoint is min(the
-    // original fixed value, a fraction of this run's own maxIterations) — for any
-    // budget >=~60 (Implementer's, and the baseline's own typical config) this
-    // reduces to exactly the original fixed values (unchanged); for a short-budget
-    // role it scales down proportionally instead of never firing at all.
+    // budget (multi-agent roles run short, fixed budgets — Dispatcher/Planner 15-40,
+    // a Dispatcher task-start checkpoint as low as 6 — and the original fixed
+    // 20/35/45 checkpoints below simply never fired for them, since they hit their
+    // own hard maxIterations ceiling first and got ZERO mid-run steering. Each
+    // checkpoint is min(the original fixed value, a fraction of this run's own
+    // maxIterations) — for any budget >=~60 (Implementer's, and the baseline's own
+    // typical config) this reduces to exactly the original fixed values (unchanged);
+    // for a short-budget role it scales down proportionally instead of never firing
+    // at all.
     // Offset by iterationBase on a RESUMED turn so the checkpoints keep firing at
     // the same positions WITHIN this turn — the alternative (absolute numbering)
     // would put every checkpoint in the past for a resumed frame and silently give
     // it no mid-run steering at all.
-    // The Boss task-start classification checkpoint (dispatch.ts's
+    // The Dispatcher task-start classification checkpoint (dispatch.ts's
     // buildTaskStartAssignment, marked 'CHECKPOINT: task-start') gets its first
     // check pushed all the way to its own 10-iteration cap instead of 0.4 of it
     // (=4) — classification is expected to finish fast, and a mid-run steer at 4
     // was firing well before the model had a real chance to converge.
-    const isBossTaskStartCheckpoint = this.roleTag === 'boss'
+    const isDispatcherTaskStartCheckpoint = this.roleTag === 'dispatcher'
     // PER-ROLE FIXED PROGRESS CHECKS (frames.ts's PROGRESS_CHECK_ITERATIONS/
     // PROGRESS_CHECK_MESSAGES). When this frame's role has an entry there (currently
     // Planner and Implementer only), its checkpoints are these EXACT per-call
     // iteration numbers with EXACT message text, replacing the generic fraction-of-
     // maxIterations mechanism below for this frame only. null for every other role
-    // (Boss, the unrestricted baseline), which keeps the generic mechanism exactly
-    // as it was.
+    // (Dispatcher, the unrestricted baseline), which keeps the generic mechanism
+    // exactly as it was.
     const roleProgressIterations = this.roleTag ? PROGRESS_CHECK_ITERATIONS[this.roleTag] : undefined
     const roleProgressMessages = this.roleTag ? PROGRESS_CHECK_MESSAGES[this.roleTag] : undefined
     const stallCheckpoints = roleProgressIterations
       ? roleProgressIterations.map(n => this.iterationBase + n)
-      : [isBossTaskStartCheckpoint ? 1 : 0.4, 0.65, 0.85].map((frac, idx) =>
+      : [isDispatcherTaskStartCheckpoint ? 1 : 0.4, 0.65, 0.85].map((frac, idx) =>
           this.iterationBase + Math.min([20, 35, 45][idx], Math.max(1, Math.round(frac * this.maxIterations))),
         )
     // A resumed turn gets its own full iteration allowance; what carries over is the
@@ -1064,13 +1026,13 @@ export class Agent {
           if (mutationsSinceLastCheck === 0) {
             const objective = userMessage
             const isLastCheckpoint = iterNum === stallCheckpoints[stallCheckpoints.length - 1]
-            // The Boss task-start checkpoint gets its own short one-liner instead of
-            // the generic PROGRESS CHECK below — that one restates the full
-            // objective/userMessage, which for this checkpoint is the ENTIRE
+            // The Dispatcher task-start checkpoint gets its own short one-liner
+            // instead of the generic PROGRESS CHECK below — that one restates the
+            // full objective/userMessage, which for this checkpoint is the ENTIRE
             // original user request (often long, sometimes multi-paragraph);
             // classification only needs a reminder of the mode split, not its own
             // input echoed back at it.
-            const stall = isBossTaskStartCheckpoint
+            const stall = isDispatcherTaskStartCheckpoint
               ? `PROGRESS CHECK: ${iterNum} iterations in and not finished. Your task is not to dig deep into ` +
                 'the project, but to classify the original user request into one of the three modes: ANSWER, ' +
                 'SIMPLE or OBJECTIVE, followed by the answer or the objective.'
@@ -1277,17 +1239,11 @@ export class Agent {
             if (stop !== null) return this.endFrameStalled(stop, emitAndLog)
             continue
           }
-          // Loop steering (see REPEAT_* above): recentCalls holds calls actually
-          // executed this run, so REPEAT_THRESHOLD prior occurrences means this
-          // identical call has already produced the same result that many times.
-          //
           // Mutation-aware ladder: blocks the 2nd NORMALISED-identical call when
           // nothing changed since it last ran, and serves the CACHED result of the
           // earlier call back (labeled as a repeat) rather than a bare block, for as
           // long as that key's replay budget lasts — see loop.ts's evaluateCall/
           // l0ReplayMessage. Escalates L0 -> L1 eviction -> L2 forced reframe.
-          const key = repetitionKey(name, args)
-          let priorRepeats = 0
           const loopKey = gateKey
           const recite = this.buildLoopRecite()
           // args passed through so evaluateCall can enforce a raw-args match before
@@ -1415,12 +1371,6 @@ export class Agent {
             this.actionTrace.push(`${name} ${typeof args.path === 'string' ? args.path : ''}`.trim())
           }
           if (this.actionTrace.length > 16) this.actionTrace.shift()
-
-          this.recentCalls.push(key)
-          if (this.recentCalls.length > REPEAT_WINDOW) this.recentCalls.shift()
-          // A novel action (not already in the window) means the model moved on —
-          // reset steer escalation so any later, unrelated loop starts gentle.
-          if (priorRepeats === 0) loopSteers = 0
 
           // NO-PROGRESS re-anchor. A successful project mutation resets the counter;
           // otherwise, once a run has made many tool calls without changing any

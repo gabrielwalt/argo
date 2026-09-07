@@ -166,7 +166,7 @@ interface StoredResult extends LoopCachedResult {
 }
 
 export interface LoopState {
-  // mutationCount recorded the last time each repetitionKey executed (or was
+  // mutationCount recorded the last time each normalizeCallKey executed (or was
   // last evaluated) — lets evaluateCall tell "same call, nothing changed" apart
   // from "same call, but progress happened since".
   lastMutationByKey: Map<string, number>
@@ -360,11 +360,9 @@ export function gateStopMessage(reason: GateReason, toolName: string, count: num
 
 // ── L0 key normalisation (H20) ──────────────────────────────────────────────
 //
-// evaluateCall's `key` is normally repetitionKey(name, args) from agent.ts — the
-// literal JSON.stringify of the arguments. normalizeCallKey below computes a
-// SEPARATE, coarser key that the ARGO_LOOP ladder uses instead (the baseline
-// REPEAT_THRESHOLD path in agent.ts keeps using the raw key unchanged, so
-// behaviour with the ladder OFF is untouched by any of this).
+// evaluateCall's `key` is normalizeCallKey(name, args) below — a coarser key than
+// the literal JSON.stringify of the arguments, chosen to catch cosmetic evasions
+// (see the redirection/quoting rules below) that a raw-arguments key would miss.
 //
 // Every rule here is chosen because it can be shown NOT to change what the call
 // actually does — never because it merely looks similar. The governing principle:
@@ -388,8 +386,8 @@ export function gateStopMessage(reason: GateReason, toolName: string, count: num
 // What this DOES collapse:
 //   - Object key order in the args object (`{a,b}` vs `{b,a}` serialize the same).
 //   - A leading `./` or a doubled internal `/` in a `path` argument
-//     (read_file/write_file/edit_file/view_image) — unambiguous POSIX-equivalent
-//     spellings of the same path with no symlink/`..` resolution attempted.
+//     (read_file/write_file/edit_file) — unambiguous POSIX-equivalent spellings of
+//     the same path with no symlink/`..` resolution attempted.
 //   - For `bash`'s `command` string only, and only at the very END of the string
 //     (see the "why only the end" note on normalizeBashCommand): leading/trailing
 //     whitespace; a trailing chain of `2>&1` / `1>&2` / `>/dev/null` / `1>/dev/null`
@@ -529,9 +527,7 @@ function normalizeArgsForKey(name: string, args: Record<string, unknown>): Recor
   return canon
 }
 
-// The ARGO_LOOP ladder's own repeat key — NOT used by the baseline REPEAT_THRESHOLD
-// path in agent.ts (which keeps repetitionKey's raw JSON.stringify unchanged), so
-// this can only ever affect behaviour when the ladder is on.
+// The loop-recovery ladder's own repeat key — see evaluateCall's doc comment above.
 export function normalizeCallKey(name: string, args: Record<string, unknown>): string {
   return `${name}:${JSON.stringify(normalizeArgsForKey(name, args))}`
 }

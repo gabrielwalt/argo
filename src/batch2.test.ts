@@ -63,7 +63,7 @@ function neverConcludes(budget: number): Ollama {
   return scriptedOllama(responses)
 }
 
-for (const role of ['planner', 'implementer', 'boss'] as Role[]) {
+for (const role of ['planner', 'implementer', 'dispatcher'] as Role[]) {
   test(`H13: a ${role} frame that hits its iteration cap derives status 'partial', not 'success'`, async () => {
     const budget = ROLE_MAX_ITERATIONS[role]
     const events: AgentEvent[] = []
@@ -169,9 +169,9 @@ test('H16: loop-recovery warnings carry action.level (L0/L1/L2) instead of only 
 test('no role holds update_plan — the tool and the plan/act gate it satisfied are both gone', () => {
   assert.equal(ROLE_TOOLS.planner.includes('update_plan' as never), false)
   assert.equal(ROLE_TOOLS.implementer.includes('update_plan' as never), false)
-  assert.equal(ROLE_TOOLS.boss.includes('update_plan' as never), false)
+  assert.equal(ROLE_TOOLS.dispatcher.includes('update_plan' as never), false)
   // Unchanged guarantees the rest of the harness relies on.
   assert.equal(ROLE_TOOLS.planner.includes('write_file'), false)
-  assert.equal(ROLE_TOOLS.boss.includes('write_file'), false)
+  assert.equal(ROLE_TOOLS.dispatcher.includes('write_file'), false)
   assert.ok(ROLE_TOOLS.planner.includes('read_file'))
 })

@@ -171,14 +171,14 @@ async function waitIdle(ws) {
 }
 
 // Scrape per-run quality + cost from ALL JSONL logs touched during this run, not just
-// "the newest file" — under the multi-agent harness (config.agents), ONE /chat call
-// produces MULTIPLE log files: the dispatch's own top-level narrative (start/
-// objective/task_graph/boss_verdict/replan/message/done) PLUS one separate file per
-// spawned frame (Planner/Implementer/Tester/Boss each get their own real Agent.chat()
-// log). Taking only the alphabetically-last file silently picked up whichever frame
-// happened to write last (often a short Boss check, e.g. "it=2") and completely
-// missed the real Implementer/Planner work — a baseline-era assumption ("one /chat
-// call, one log file") that no longer holds.
+// "the newest file" — the multi-agent dispatch loop (src/dispatch.ts, the only
+// execution path now) means ONE /chat call produces MULTIPLE log files: the dispatch's
+// own top-level narrative (start/objective/message/done) PLUS one separate file per
+// spawned frame (Planner/Implementer/Boss each get their own real Agent.chat() log).
+// Taking only the alphabetically-last file silently picked up whichever frame happened
+// to write last (often a short Boss check, e.g. "it=2") and completely missed the real
+// Implementer/Planner work — a baseline-era assumption ("one /chat call, one log file")
+// that no longer holds.
 //
 // Selection is by SNAPSHOT DIFF (listJsonlFiles before/after), not an mtime window —
 // an mtime window with a negative clock-skew buffer was tried first and is provably
@@ -201,9 +201,9 @@ async function waitIdle(ws) {
 // metrics.mjs anchors each pattern to a named construction site in src/, self-checks them
 // against known samples at start-up, and counts every unmatched warning so a future
 // wording change surfaces as data rather than as a zero.
-//   frames   — how many separate Agent.chat() logs this run produced (1 under the
-//              baseline single-loop path; >1 whenever the multi-agent harness spawned
-//              a Planner/Implementer/Tester/Boss frame)
+//   frames   — how many separate Agent.chat() logs this run produced: 1 for the Boss
+//              task-start checkpoint alone (an ANSWER), or more whenever it spawned a
+//              Planner/Implementer frame
 //   tok/s    — generation throughput; needs the harness to log Ollama eval_duration
 //              (token_usage.eval_duration_ms). "?" until that lands — see roadmap Phase 3(b).
 

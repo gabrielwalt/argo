@@ -523,11 +523,11 @@ export const TASKS = [
   // skippable-phase mechanism (docs/subagents-plan.md, "Boss task-start router")
   // should collapse to near-zero ceremony for these two. No prior tier here took
   // fewer than ~11-20 iterations even at its cheapest — these exist specifically
-  // to see whether ANSWER/TRIVIAL classification actually fires, or whether the
+  // to see whether ANSWER/SIMPLE classification actually fires, or whether the
   // Boss defaults to the full OBJECTIVE pipeline regardless.
   //
   // Pure Q&A, no project relevance at all — the ideal case for the Boss's ANSWER
-  // mode: classify-and-answer immediately, no Planner/Implementer/Tester frame ever
+  // mode: classify-and-answer immediately, no Planner/Implementer frame ever
   // spawned. Verified against the run's own final answer text (there is no file to
   // check — nothing should change on disk at all).
   // UNSCORED floor probe (EVAL-PLAN §2: "Exempt from the score; report frames only") —
@@ -538,8 +538,8 @@ export const TASKS = [
     prompt: 'What is 17 multiplied by 24? Reply with just the resulting number — nothing in this project needs to change for this question.',
     check: (m) => /\b408\b/.test(m.finalAnswer || '') },
 
-  // A single, unambiguous one-word fix — the ideal case for the Boss's TRIVIAL mode:
-  // skip the Planner and Tester, one Implementer frame, done.
+  // A single, unambiguous one-word fix — the ideal case for the Boss's SIMPLE mode:
+  // skip the Planner, one Implementer frame, done.
   // UNSCORED floor probe (EVAL-PLAN §2), same treatment as trivial-qa-arithmetic.
   { id: 'trivial-fix-greeting-typo', ws: 'eval-suite2', band: 'floor', observed: 1.0, saturated: true, scored: false,
     allowFiles: ['src/greeting.js'],

@@ -13,8 +13,8 @@ import type { Role, ToolName, FrameSpawnRequest } from './types.js'
 // `conclude` finishes). The Planner's plan (both its initial overall plan and each
 // per-task assignment, read straight through as free text — see dispatch.ts's
 // isPlannerDone/isPlannerGiveUp; there is no TASK:/TEST:/DONE line convention) and the
-// Boss's checkpoint markers are all delivered as `conclude`'s `answer` argument instead
-// of a bare no-tool-call final message.
+// Dispatcher's checkpoint markers are all delivered as `conclude`'s `answer` argument
+// instead of a bare no-tool-call final message.
 export const ROLE_TOOLS: Record<Role, ToolName[]> = {
   // Deliberately NO update_plan. The Planner's deliverable is its own FRAME'S FINAL
   // ANSWER on each call (delivered via `conclude`'s `answer` — see dispatch.ts's
@@ -25,31 +25,32 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
   // to execute it, not define or refine it.
   implementer: ['read_file', 'write_file', 'edit_file', 'bash', 'fetch_url', 'web_search', 'browser_fetch', 'ledger', 'conclude'],
   // Deliberately no write_file/edit_file, and (2026 review) no bash either — the
-  // Boss is strictly read-only: it classifies the request, it never executes
+  // Dispatcher is strictly read-only: it classifies the request, it never executes
   // commands. The tool definitions sent to Ollama are filtered by ROLE_TOOLS
-  // (agent.ts's chatCall/chat), so removing bash here means the Boss's OWN default
-  // role tool set never even offers it as a schema, not just "the prompt says don't
-  // use it." TASK_START_TOOLS (below) is a SEPARATE, deliberately different tool set
-  // used only for the task-start classification checkpoint — it keeps bash for
-  // investigation for reasons recorded in its own comment; this change does not
-  // touch it.
-  boss: ['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude'],
+  // (agent.ts's chatCall/chat), so removing bash here means the Dispatcher's OWN
+  // default role tool set never even offers it as a schema, not just "the prompt
+  // says don't use it." TASK_START_TOOLS (below) is a SEPARATE, deliberately
+  // different tool set used only for the task-start classification checkpoint — it
+  // keeps bash for investigation for reasons recorded in its own comment; this
+  // change does not touch it.
+  dispatcher: ['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude'],
 }
 
-// The task-start checkpoint's tool set (dispatch.ts's runBossTaskStart) — deliberately
-// NOT ROLE_TOOLS.boss. The owner asked classification to be STRICTLY read-only
-// (2026-09-05): ROLE_TOOLS.boss's only real editing path was `bash` (no write_file/
-// edit_file there either) — its one way to "fix" something was a full heredoc file
-// rewrite, an inherently blunt, all-or-nothing instrument. Measured damage from
-// exactly that: in eval, a Boss judged a 6-method feature TRIVIAL, rewrote the whole
-// target file via `cat > file << EOF`, hallucinated surrounding code, and broke an
-// unrelated constructor signature other files depended on; the same failure recurred
-// in a real session (frame boss-mtmm1gcc-1: refused write_file, then ran the same
-// heredoc trick via bash on its very next turn and committed). Removing `bash` here
-// removes the capability at its root, so the git-diff-sizing guard rails that used to
-// contain it (TRIVIAL_DIFF_LINE_LIMIT, the before/after dirty check in
-// runBossTaskStart) are removed alongside it, not left behind as dead code for a
-// capability that no longer exists.
+// The task-start checkpoint's tool set (dispatch.ts's runDispatcherTaskStart) —
+// deliberately NOT ROLE_TOOLS.dispatcher. The owner asked classification to be
+// STRICTLY read-only (2026-09-05): ROLE_TOOLS.dispatcher's only real editing path
+// was `bash` (no write_file/edit_file there either) — its one way to "fix"
+// something was a full heredoc file rewrite, an inherently blunt, all-or-nothing
+// instrument. Measured damage from exactly that: in eval, the Dispatcher judged a
+// 6-method feature TRIVIAL, rewrote the whole target file via `cat > file << EOF`,
+// hallucinated surrounding code, and broke an unrelated constructor signature other
+// files depended on; the same failure recurred in a real session (frame
+// dispatcher-mtmm1gcc-1: refused write_file, then ran the same heredoc trick via
+// bash on its very next turn and committed). Removing `bash` here removes the
+// capability at its root, so the git-diff-sizing guard rails that used to contain
+// it (TRIVIAL_DIFF_LINE_LIMIT, the before/after dirty check in
+// runDispatcherTaskStart) are removed alongside it, not left behind as dead code
+// for a capability that no longer exists.
 // `ledger` stays: the TOOL only exposes read actions (get_goal/get_plan/get_recent/
 // get_conclusion/get_frame_trail/expand — see tools/index.ts's ledger case); the
 // harness's OWN ledger.setObjective/recordDelegation calls are direct module calls
@@ -61,14 +62,15 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
 // OBJECTIVE status — a turn with no tool calls no longer ends anything (agent.ts's
 // chat() loop), so without it this checkpoint could investigate forever but never
 // actually classify.
-// The Boss classification checkpoint is READ-ONLY but needs bash for investigation
-// (grep, cat, ls, running tests to understand behaviour). bash CAN write, but the
-// prompt's read-only framing + the classification-only scope make that acceptable —
-// the alternative (no bash) left the Boss unable to check real files, which is worse.
+// The Dispatcher classification checkpoint is READ-ONLY but needs bash for
+// investigation (grep, cat, ls, running tests to understand behaviour). bash CAN
+// write, but the prompt's read-only framing + the classification-only scope make
+// that acceptable — the alternative (no bash) left the Dispatcher unable to check
+// real files, which is worse.
 export const TASK_START_TOOLS: ToolName[] = ['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude']
 
 // Per-role iteration budgets. Implementer keeps the most headroom (real work happens
-// there); Planner/Boss are short bounded loops, not open-ended. Planner raised
+// there); Planner/Dispatcher are short bounded loops, not open-ended. Planner raised
 // 15->20->40 (2026-09-03/04, overnight large-task eval + unattended driver session):
 // on a genuinely large objective against a real 11-file codebase, 15-20 wasn't enough
 // room to read the codebase AND produce a task graph — it hit its cap with NO plan at
@@ -94,20 +96,20 @@ export const TASK_START_TOOLS: ToolName[] = ['read_file', 'web_search', 'fetch_u
 export const ROLE_MAX_ITERATIONS: Record<Role, number> = {
   planner: 40,
   implementer: 160,
-  boss: 15,
+  dispatcher: 15,
 }
 
 // PER-ROLE PROGRESS-CHECK ESCALATION. Distinct from the generic fraction-of-
 // maxIterations stall/progress mechanism already in agent.ts (the `stallCheckpoints`
 // local in chat(), scaled 0.4/0.65/0.85 of a run's own budget) — that mechanism stays
-// exactly as it is for every role NOT listed here (Boss, the unrestricted baseline).
-// Planner/Implementer instead get FIXED, ABSOLUTE per-call iteration thresholds with
-// role-specific wording, because the numbers involved don't fall out of the generic
-// fractions and neither role is well served by the generic table's coarser rungs.
-// agent.ts reads these keyed by the frame's role (Agent.setRole, called by
-// dispatch.ts's spawnFrame alongside setAllowedTools/setMaxIterations/etc.) and, when a
-// role has an entry here, replaces the generic mechanism for that one frame's
-// checkpoints with these exact iteration numbers and exact message text —
+// exactly as it is for every role NOT listed here (Dispatcher, the unrestricted
+// baseline). Planner/Implementer instead get FIXED, ABSOLUTE per-call iteration
+// thresholds with role-specific wording, because the numbers involved don't fall out
+// of the generic fractions and neither role is well served by the generic table's
+// coarser rungs. agent.ts reads these keyed by the frame's role (Agent.setRole,
+// called by dispatch.ts's spawnFrame alongside setAllowedTools/setMaxIterations/etc.)
+// and, when a role has an entry here, replaces the generic mechanism for that one
+// frame's checkpoints with these exact iteration numbers and exact message text —
 // unconditionally: these are fixed checkpoints on a countdown to a hard cap, not a
 // stall detector, so they fire every time regardless of how much real progress is
 // happening. Iteration numbers here are per-CALL (i.e. per resumeFrame/chat() turn on
@@ -143,7 +145,7 @@ export const PROGRESS_CHECK_MESSAGES: Partial<Record<Role, string[]>> = {
 
 // Plain display names — the role's function, not a character.
 export const ROLE_NAME: Record<Role, string> = {
-  boss: 'Boss',
+  dispatcher: 'Dispatcher',
   planner: 'Planner',
   implementer: 'Implementer',
 }
@@ -153,9 +155,9 @@ export const ROLE_NAME: Record<Role, string> = {
 // if invalid, repeating the expected keywords. This replaces all regex-based parsing of
 // conclude text in dispatch.ts.
 export const ROLE_CONCLUDE_STATUSES: Record<Role, string[]> = {
-  // Boss: ANSWER (knows the answer), SIMPLE (one implementer), OBJECTIVE (needs a
-  // planner to decompose), SUMMARY (end-of-run conclusion).
-  boss: ['ANSWER', 'SIMPLE', 'OBJECTIVE', 'SUMMARY'],
+  // Dispatcher: ANSWER (knows the answer), SIMPLE (one implementer), OBJECTIVE
+  // (needs a planner to decompose), SUMMARY (end-of-run conclusion).
+  dispatcher: ['ANSWER', 'SIMPLE', 'OBJECTIVE', 'SUMMARY'],
   // Planner initial call: PLAN (the plan is the message).
   // Planner detail calls: IMPLEMENT (assignment for next sub-agent), SUCCESS (objective
   // fully met, final statement), FAIL (cannot complete, explain why).
@@ -250,11 +252,11 @@ export function withConcludeStatusEnum<T extends ConcludeLikeTool>(tools: readon
 // memory/git details — those lived in agent.ts's buildSystemPrompt (removed) and
 // were never role-specific.
 export const ROLE_IDENTITY: Record<Role, string> = {
-  boss:
-    'You are the BOSS inside Argo, a multi-agent coding harness. You are accountable for the entire run across ' +
-    'multiple turns. For each user request, classify how it should be handled, so the harness can delegate its ' +
-    'execution to the appropriate sub-agents. When the run is complete, synthesize the verified sub-agent ' +
-    'results into the final answer to the user.',
+  dispatcher:
+    'You are the DISPATCHER inside Argo, a multi-agent coding harness. You are accountable for the entire run ' +
+    'across multiple turns. For each user request, classify how it should be handled, so the harness can ' +
+    'delegate its execution to the appropriate sub-agents. When the run is complete, synthesize the verified ' +
+    'sub-agent results into the final answer to the user.',
   planner:
     'You are Argo\'s PLANNER agent in a multi-agent coding harness. You decompose objectives into ' +
     'implementation units and produce detailed assignments for each.',
@@ -272,7 +274,7 @@ export const ROLE_IDENTITY: Record<Role, string> = {
 // next detail call (see dispatch.ts's module header for the full flow, and
 // isPlannerDone for how the harness detects "no further work needed").
 export const ROLE_INSTRUCTIONS: Record<Role, string> = {
-  boss:
+  dispatcher:
     'Your task is to classify the user request into exactly one of the three statuses below with an ' +
     'appropriate status message:\n' +
     '- Status ANSWER; Message: The complete final answer — use only if you already know the answer with ' +
@@ -328,13 +330,13 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
 
 const SUMMARY_CHAR_CAP = 2000
 
-// VERBATIM REQUEST THREADING. Argo's Boss task-start checkpoint paraphrases the user's
-// raw message into one `OBJECTIVE:` line, and the paraphrase used to be the ONLY thing
-// any downstream frame (Planner/Implementer) ever saw. Traced twice in eval: a
-// paraphrase dropped a pointer to seeded test files, causing the Planner to invent a
-// target file; a paraphrase dropped a "do NOT modify existing tests" constraint that
-// sat at the end of the message, causing the Implementer to ship against its own
-// invented verification.
+// VERBATIM REQUEST THREADING. Argo's Dispatcher task-start checkpoint paraphrases the
+// user's raw message into one `OBJECTIVE:` line, and the paraphrase used to be the
+// ONLY thing any downstream frame (Planner/Implementer) ever saw. Traced twice in
+// eval: a paraphrase dropped a pointer to seeded test files, causing the Planner to
+// invent a target file; a paraphrase dropped a "do NOT modify existing tests"
+// constraint that sat at the end of the message, causing the Implementer to ship
+// against its own invented verification.
 //
 // The fix: dispatch.ts's spawnFrame attaches the run's raw user message to EVERY
 // frame's assignment via buildAssignment below, unconditionally and by construction —
@@ -369,13 +371,13 @@ export function capVerbatimRequest(text: string): string {
 }
 
 // Bracketed-label convention, matching the existing `[CURRENT PLAN — ...]` (agent.ts)
-// and `[OBJECTIVE — immutable, set once by the Boss; never redefine it]` (eviction.ts)
-// blocks, not a novel format — the same recitation shape a frame already sees elsewhere
-// in this codebase, so it reads as one more instance of a known convention rather than a
-// new kind of thing to parse. "Authoritative" and "governs" are the operative words: this
-// is not one more piece of context to weigh against the others, it is the tie-breaker
-// when the objective/plan/step prompt below it turns out to have paraphrased something
-// away.
+// and `[OBJECTIVE — immutable, set once by the Dispatcher; never redefine it]`
+// (eviction.ts) blocks, not a novel format — the same recitation shape a frame
+// already sees elsewhere in this codebase, so it reads as one more instance of a
+// known convention rather than a new kind of thing to parse. "Authoritative" and
+// "governs" are the operative words: this is not one more piece of context to weigh
+// against the others, it is the tie-breaker when the objective/plan/step prompt
+// below it turns out to have paraphrased something away.
 export function renderVerbatimRequestBlock(userMessage: string): string {
   const text = capVerbatimRequest(userMessage)
   return '[ORIGINAL USER REQUEST — global intent and constraints. The current assignment defines this agent\'s '
@@ -416,11 +418,11 @@ export async function buildAssignment(root: string, req: FrameSpawnRequest, verb
   return [verbatimBlock, req.assignment].filter(Boolean).join('\n\n')
 }
 
-// ── Boss task-start verdict parsing ────────────────────────────────────────────────
-// The Boss is a real Agent-based frame (its own ReAct loop, real tools), not a
+// ── Dispatcher task-start verdict parsing ──────────────────────────────────────────
+// The Dispatcher is a real Agent-based frame (its own ReAct loop, real tools), not a
 // single-shot JSON-mode critic call — so its verdict comes from a simple text
-// convention at the end of its final answer (see ROLE_INSTRUCTIONS.boss above), used as a
-// fallback when the frame's own `conclude` status wasn't set/valid.
+// convention at the end of its final answer (see ROLE_INSTRUCTIONS.dispatcher above),
+// used as a fallback when the frame's own `conclude` status wasn't set/valid.
 //
 // The convention: parseTaskStartVerdict returns an explicit `parsed` flag, so
 // "unparseable" is a fact the caller can act on rather than something laundered into a
@@ -439,14 +441,15 @@ export function parseTaskStartVerdict(finalAnswer: string): TaskStartVerdict {
   const objective = /OBJECTIVE\s*:\s*([\s\S]+)/i.exec(finalAnswer)
   if (objective) return { mode: 'objective', text: objective[1].trim(), parsed: true }
   // No marker found at all — do NOT fall back to the raw final answer text. A real
-  // failure observed in eval: the Boss did the fix itself via bash instead of just
-  // classifying, then reported that as free-form prose with no ANSWER/SIMPLE/
+  // failure observed in eval: the Dispatcher did the fix itself via bash instead of
+  // just classifying, then reported that as free-form prose with no ANSWER/SIMPLE/
   // OBJECTIVE line; the raw prose ("All 7 tests pass. The three functions are
   // now implemented: ...") became the "objective" fed to the Planner, which had no
   // idea what to plan for a COMPLETION REPORT and hallucinated an entire unrelated
   // project structure trying to find something to do. Returning empty text here
-  // signals "unparseable" so the caller (dispatch.ts's runBossTaskStart) falls back
-  // to the ORIGINAL user message instead — always a valid objective by construction,
-  // unlike the Boss's free-form answer. `parsed: false` says the same thing explicitly.
+  // signals "unparseable" so the caller (dispatch.ts's runDispatcherTaskStart) falls
+  // back to the ORIGINAL user message instead — always a valid objective by
+  // construction, unlike the Dispatcher's free-form answer. `parsed: false` says the
+  // same thing explicitly.
   return { mode: 'objective', text: '', parsed: false }
 }
