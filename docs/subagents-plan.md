@@ -1,10 +1,20 @@
 # Multi-agent architecture: call frames, the ledger, structured eviction, and the Boss
 
-Status (2026-09-02): DESIGN AGREED — this is a buildable spec, intended to be implemented
-in one pass (v1 scope at the bottom), landed behind a single flag (`ARGO_AGENTS`, default
-off) so the existing, already-validated single-loop path stays the default until this is
-proven. Measured against the eval before it's trusted (same rule as everything else in
-this project: `docs/roadmap.md`'s "reject any mechanism the eval doesn't show helps").
+Status (current): IMPLEMENTED AND PERMANENT. This design shipped, was validated, and is now
+the ONLY execution path — the single-loop baseline and the `ARGO_AGENTS` toggle this
+document originally proposed have both been removed; `src/dispatch.ts`'s dispatch loop
+always runs. The Tester role this document describes (and its harness-spawned
+`runTesterValidation` re-verification cycle) has also been removed since — the
+Implementer verifies its own work before concluding, and there is no separate
+harness-spawned re-check. Likewise the per-frame `FramePolicy` (tasks/memory/loop/
+grounding/layout toggles), harness task-ledger sequencing (`update_plan`), the plan/act
+gate, the actor-critic checkpoint, and the grounding/layout judges described below are all
+gone — read this document as the ARCHITECTURAL HISTORY of the call-frame/ledger/eviction
+design (which is current and accurate), not as a description of every mechanism still
+active today. `src/frames.ts`'s `ROLE_TOOLS`/`ROLE_MAX_ITERATIONS`/`ROLE_CONCLUDE_STATUSES`
+and `src/dispatch.ts`'s module header are the authoritative source for the CURRENT set of
+roles (Boss, Planner, Implementer) and the CURRENT flow (SIMPLE: Implementer only;
+OBJECTIVE: Planner → Implementer per task).
 
 ## Why
 

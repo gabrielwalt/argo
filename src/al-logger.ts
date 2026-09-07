@@ -307,10 +307,6 @@ export class AlLogger {
         lines.push('  </al-event>')
         return lines.join('\n')
       }
-      case 'compact_start': {
-        const trigger = `context at ${Math.round(event.contextUsagePct * 100)}% (${event.messageCount} messages)`
-        return `  <al-event type="compact_start" trigger="${escapeXml(trigger)}"/>`
-      }
       case 'warning': {
         const t = event.level ? 'progress_check' : 'warning'
         const lvl = event.level ? ` level="${escapeXml(event.level)}"` : ''

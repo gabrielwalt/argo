@@ -15,7 +15,6 @@ import { checkEnvironment, logEnvironment, type EnvCheck } from './health.js'
 import { installAuth } from './auth.js'
 import { runDispatchLoop, abortDispatch, listLiveFrames, getLiveFrame, getActiveFrameId, type LiveFrame } from './dispatch.js'
 import { ensureWorkspaceId, workspaceHasContent, parseSessionPointer, formatSessionPointer, decideSessionResume, type SessionResumeReason } from './workspace-identity.js'
-import { coerceCompactionState, emptyCompactionState, renderCompactionState, type CompactionState } from './compaction.js'
 
 const execAsync = promisify(exec)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -52,7 +51,7 @@ if (!config.workerMode) {
 // (persisted) events against this live SSE stream at the reconnect boundary — the
 // JSONL replay (readLogEvents) carries the same __seq. Named (not inline) so
 // dispatch.ts's runDispatchLoop can share the exact same emit path for every
-// role-scoped Agent instance it spawns (config.agents) — one SSE stream either way.
+// role-scoped Agent instance it spawns — one SSE stream either way.
 function emitEvent(event: AgentEvent, seq?: number) {
   bus.emit('agent', typeof seq === 'number' ? { ...event, __seq: seq } : event)
 }
@@ -111,10 +110,7 @@ app.post('/chat', async (req, res) => {
     return
   }
 
-  // Per-request harness toggles mirror `grounding`: env sets the default (config.*),
-  // the UI/eval can override per run. Lets the A/B eval flip tasks/memory/loop on the
-  // SAME worker (no rebuild) and lets the settings panel dogfood them live.
-  const { message, model, options, maxIterations, grounding, tasks, memory, loop, autoCommit } = req.body as { message: string; model?: string; options?: ModelOptions; maxIterations?: number; grounding?: boolean; tasks?: boolean; memory?: boolean; loop?: boolean; autoCommit?: boolean }
+  const { message, model, options, maxIterations, autoCommit } = req.body as { message: string; model?: string; options?: ModelOptions; maxIterations?: number; autoCommit?: boolean }
   if (!message?.trim()) {
     res.status(400).json({ error: 'message required' })
     return
@@ -127,28 +123,20 @@ app.post('/chat', async (req, res) => {
   if (model) agent.setModel(model)
   if (options) agent.setOptions(options)
   if (maxIterations != null) agent.setMaxIterations(maxIterations)
-  if (grounding != null) agent.setGrounding(grounding)
-  if (tasks != null) agent.setTasks(tasks)
-  if (memory != null) agent.setMemory(memory)
-  if (loop != null) agent.setLoop(loop)
   if (autoCommit != null) agent.setAutoCommit(autoCommit)
 
   isBusy = true
   res.json({ ok: true })
 
   try {
-    // MULTI-AGENT ARCHITECTURE (config.agents / ARGO_AGENTS, docs/subagents-plan.md):
-    // the dispatch loop drives Planner/Implementer/Tester/Boss as scoped Agent
-    // instances of its own, sharing this same emit path — `agent` (the baseline
-    // single-loop instance above) is bypassed entirely while this flag is on, so its
-    // /history, /context, /reset etc. reflect the baseline path only. Per-request
-    // overrides (model/options/maxIterations/...) above still apply to `agent` even
-    // when unused here, matching every other flag's existing pattern in this route.
-    if (config.agents) {
-      await runDispatchLoop(message, emitEvent, { model, options, sessionId: currentSessionId })
-    } else {
-      await agent.chat(message)
-    }
+    // The dispatch loop drives Planner/Implementer/Boss as scoped Agent instances of
+    // its own, sharing this same emit path — `agent` (the shared baseline instance
+    // above) is never used to run a turn; it stays only as the vehicle for
+    // /history, /context, /reset, session persistence, etc. Per-request overrides
+    // (model/options/maxIterations/autoCommit) above still apply to `agent` even
+    // though this route never calls `agent.chat()` directly, since some of those
+    // fields (sessionId, model default) are read elsewhere off the same instance.
+    await runDispatchLoop(message, emitEvent, { model, options, sessionId: currentSessionId })
   } finally {
     // Set BEFORE any async cleanup (logger flush already happened inside
     // runDispatchLoop/chat before they returned). The `done` SSE event was
@@ -168,14 +156,14 @@ app.get('/history', (req, res) => {
 // ── Frame context (context viewer backend) ─────────────────────────
 // /shared/argo-ui/CONTEXT-VIEWER-CONTRACT.md is the authoritative shape for GET
 // /frames and GET /context?frame=<id>. The root cause this exists for: GET /context
-// below always read the baseline single-loop `agent`, which /chat bypasses entirely
-// whenever config.agents is on (dispatch.ts's runDispatchLoop drives scoped Agent
-// instances of its own instead) — so the real per-frame contexts were simply never
-// reachable from the API. GET /context with no `frame` param keeps its pre-existing
+// below always read the baseline single-loop `agent`, which /chat never actually
+// runs a turn on (dispatch.ts's runDispatchLoop drives scoped Agent instances of
+// its own instead) — so the real per-frame contexts were simply never reachable
+// from the API. GET /context with no `frame` param keeps its pre-existing
 // shape/meaning for backward compatibility — a deployed frontend against a new
 // backend must keep working, since the two halves of this feature land separately.
 
-const FRAME_ROLES: readonly Role[] = ['planner', 'implementer', 'tester', 'boss']
+const FRAME_ROLES: readonly Role[] = ['planner', 'implementer', 'boss']
 
 // frameId format is `${role}-${base36 timestamp}-${counter}` (ledger.ts's newId) —
 // none of the four role names contain a hyphen, so the segment before the first
@@ -236,24 +224,6 @@ export function buildDiskContextMessages(rawMessages: unknown): { messages: Disk
     return { role: typeof rec.role === 'string' ? rec.role : 'unknown', content, chars, ts: null }
   })
   return { messages, messageCount: messages.length, totalChars }
-}
-
-// Mirrors agent.ts getContext()'s own "does this compaction state actually have
-// anything to show" check exactly, so the disk-recovery path renders compaction
-// identically to the live path instead of showing an empty-but-present state as if
-// it were real content.
-export function compactionHasContent(state: CompactionState): boolean {
-  return !!state.projectCapsule || [
-    state.userRequirements,
-    state.verifiedFacts,
-    state.decisionsMade,
-    state.changesMade,
-    state.testsAndVerification,
-    state.openQuestions,
-    state.hypotheses,
-    state.failedAttempts,
-    state.invalidatedConclusions,
-  ].some(arr => Array.isArray(arr) && arr.length > 0)
 }
 
 export interface FrameSummary {
@@ -355,7 +325,11 @@ app.get('/frames', async (req, res) => {
   const liveSummaries = listLiveFrames().map(liveFrameSummary)
   const diskOnly = await scanDiskFrames(new Set(liveSummaries.map(f => f.frameId)))
   res.json({
-    baselineBypassed: config.agents,
+    // Always true — the dispatch loop (Boss/Planner/Implementer) is the only
+    // execution path now; there is no single-loop baseline mode to bypass. Kept as
+    // a field (rather than removed) for compatibility with any existing frontend
+    // that reads it.
+    baselineBypassed: true,
     active: chooseActiveFrame(getActiveFrameId(), liveSummaries),
     frames: mergeFrameSummaries(liveSummaries, diskOnly),
   })
@@ -368,7 +342,7 @@ app.get('/context', async (req, res) => {
   if (frameId === null) {
     // Unchanged shape/meaning (backward compat: an old frontend against a new
     // backend keeps working) plus the three additive fields plus baselineBypassed.
-    res.json({ ...agent.getContext(), frameId: null, role: null, live: false, baselineBypassed: config.agents })
+    res.json({ ...agent.getContext(), frameId: null, role: null, live: false, baselineBypassed: true })
     return
   }
 
@@ -391,14 +365,6 @@ app.get('/context', async (req, res) => {
     return
   }
   const { messages, messageCount, totalChars } = buildDiskContextMessages(rawMessages)
-  let compaction: string | null = null
-  try {
-    const raw = JSON.parse(await fs.readFile(path.join(LOGS_DIR, `compaction-${frameId}.json`), 'utf-8'))
-    const state = coerceCompactionState(raw, emptyCompactionState())
-    if (compactionHasContent(state)) compaction = renderCompactionState(state)
-  } catch {
-    // No persisted compaction state for this frame — compaction stays null, not an error.
-  }
   res.json({
     frameId,
     role: parseFrameRole(frameId),
@@ -407,17 +373,17 @@ app.get('/context', async (req, res) => {
     messageCount,
     totalChars,
     numCtx: null,       // not persisted anywhere once the Agent instance is gone — never fabricated
-    compaction,
+    compaction: null,   // eviction-based context management has no structured summary to show
     compactionTs: null, // same reason — lastCompactedAt is in-memory only on Agent, never persisted
   })
 })
 
 app.post('/stop', (_req, res) => {
   agent.abort()
-  // MULTI-AGENT ARCHITECTURE (config.agents): agent.abort() alone only reaches the
-  // shared baseline instance above — every frame a dispatch run spawns is a separate
-  // Agent, so it needs its own stop path (see dispatch.ts's abortDispatch). Harmless to
-  // call unconditionally: a no-op when no dispatch run is in flight.
+  // agent.abort() alone only reaches the shared baseline instance above — every
+  // frame a dispatch run spawns is a separate Agent, so it needs its own stop path
+  // (see dispatch.ts's abortDispatch). Harmless to call unconditionally: a no-op
+  // when no dispatch run is in flight.
   abortDispatch()
   res.json({ ok: true })
 })
@@ -629,27 +595,7 @@ app.get('/status', (req, res) => {
     // UI can refine it from the run's live num_ctx (see /context) + compactReserveTokens.
     compactThreshold: (65536 - config.compactReserveTokens) / 65536,
     compactReserveTokens: config.compactReserveTokens,
-    // Harness feature flags (defaults; per-run overridable via the /chat body). Let the
-    // settings UI reflect current state and the eval confirm what it's testing.
-    grounding: config.grounding,
-    tasks: config.tasks,
-    memory: config.memory,
-    loop: config.loopRecovery,
-    // Dispatch-path flags (src/dispatch.ts, src/frames.ts, src/schema.ts). Unlike the four
-    // above these are PROCESS-level, not per-run overridable via the /chat body, because
-    // they are read inside the dispatch pipeline at frame-spawn time rather than set on an
-    // Agent instance. They are reported here so an eval arm can be attributed from the
-    // WORKER ITSELF instead of from ~/.config/argo/env — the env file has silently
-    // diverged from code defaults three times, and 17 of 33 rows in the old eval ledger
-    // were unattributable for exactly this reason. Adding a flag to the pipeline without
-    // adding it here makes every run using it unverifiable after the fact.
-    schemaControlPlane: config.schemaControlPlane,
-    verbatimRequest: config.verbatimRequest,
     autoCommit: config.autoCommit,
-    // MULTI-AGENT ARCHITECTURE (docs/subagents-plan.md). Lets the settings panel hide
-    // controls that don't apply to the dispatch path (e.g. grounding isn't wired to
-    // dispatch.ts's frames) instead of showing a toggle that would silently do nothing.
-    agents: config.agents,
   })
 })
 
@@ -754,8 +700,8 @@ interface FileEntry {
   size?: number
 }
 
-// .argo (config.agents) is harness bookkeeping — the multi-agent ledger and scratch
-// work, not a project deliverable — same treatment as .git.
+// .argo is harness bookkeeping — the multi-agent ledger and scratch work, not a
+// project deliverable — same treatment as .git.
 const SKIP = new Set(['node_modules', '.git', '.argo'])
 // Only excluded at the true filesystem root — virtual/pseudo filesystems with
 // no meaningful content to browse (huge or synthetic on every read).

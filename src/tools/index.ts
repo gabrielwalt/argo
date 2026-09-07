@@ -3,18 +3,17 @@ import { webSearch } from './web-search.js'
 import { readFile, readFiles, writeFile, editFile } from './file-ops.js'
 import { fetchUrl } from './fetch-url.js'
 import { browserFetch } from './browser-fetch.js'
-import { viewImage } from './view-image.js'
 import * as ledger from '../ledger.js'
 import { config } from '../config.js'
 import type { ToolName, ToolResult } from '../types.js'
 
-// MULTI-AGENT LEDGER TOOL (config.agents / ARGO_AGENTS). Query-only from a model's
-// perspective — the harness-automatic writers (recordDelegation, recordConclusion, ...)
-// are called directly from dispatch.ts/frames.ts, never through this tool, so they can
-// never be forgotten. Root is config.workspacePath, NOT a literal '/workspace' — that
-// literal only exists on the filesystem in-container; standalone dev mode runs this
-// process directly on the host (see dispatch.ts's root() for the full rationale). Never
-// throws — errors go in the `error` field, matching every other tool in this module.
+// MULTI-AGENT LEDGER TOOL. Query-only from a model's perspective — the harness-automatic
+// writers (recordDelegation, recordConclusion, ...) are called directly from
+// dispatch.ts/frames.ts, never through this tool, so they can never be forgotten. Root
+// is config.workspacePath, NOT a literal '/workspace' — that literal only exists on the
+// filesystem in-container; standalone dev mode runs this process directly on the host
+// (see dispatch.ts's root() for the full rationale). Never throws — errors go in the
+// `error` field, matching every other tool in this module.
 async function runLedgerTool(args: Record<string, unknown>): Promise<ToolResult> {
   const root = config.workspacePath || '/workspace'
   const action = typeof args.action === 'string' ? args.action : ''
@@ -23,10 +22,6 @@ async function runLedgerTool(args: Record<string, unknown>): Promise<ToolResult>
       case 'get_goal': {
         const obj = await ledger.getObjective(root)
         return { output: obj ?? '(no objective set yet)' }
-      }
-      case 'get_plan': {
-        const plan = await ledger.getPlan(root)
-        return { output: plan ? JSON.stringify(plan) : '(no plan recorded yet)' }
       }
       case 'get_recent': {
         const n = typeof args.n === 'number' ? args.n : 10
@@ -51,7 +46,7 @@ async function runLedgerTool(args: Record<string, unknown>): Promise<ToolResult>
         return { output: content ?? '(no content recorded for that episode, or it was never evicted)' }
       }
       default:
-        return { output: '', error: `Unknown ledger action: ${action}. Valid: get_goal, get_plan, get_recent, get_conclusion, get_frame_trail, expand.` }
+        return { output: '', error: `Unknown ledger action: ${action}. Valid: get_goal, get_recent, get_conclusion, get_frame_trail, expand.` }
     }
   } catch (err) {
     return { output: '', error: String(err) }
@@ -172,52 +167,6 @@ export const toolDefinitions = [
   {
     type: 'function' as const,
     function: {
-      name: 'view_image',
-      description: 'View an image file (screenshot, diagram, or rendered UI) and ask a question about it, answered by a local vision model. Use it to read screenshots/diagrams or to judge a rendered UI\'s layout (alignment, overflow, overlap, truncation).',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Path to an image file (png/jpg/jpeg/webp/gif) in the workspace, e.g. /workspace/screenshot.png' },
-          prompt: { type: 'string', description: 'The question to ask about the image. Defaults to a general description + UI-layout check if omitted.' },
-        },
-        required: ['path'],
-      },
-    },
-  },
-  {
-    type: 'function' as const,
-    function: {
-      name: 'update_plan',
-      description: 'Record or refine your plan for a non-trivial task. Call it AFTER reading the relevant files, so the plan is grounded in this project, with ONE concrete, verifiable objective (a definition of done) plus the ordered steps to reach it. Recording a plan does NOT end your turn — keep working after calling it. Call it again to refine the plan when the work contradicts an assumption. The plan is shown to the user and kept in front of you as you work. Skip it entirely for simple questions or one-line changes.\n\nEach step may be given either as plain text, or as an object {"task": "...", "verify": "..."} when it can be checked PROGRAMMATICALLY. `verify` is a shell command, run from the workspace root, that must exit 0 EXACTLY when that step is truly complete — e.g. a test command, a build, or a grep for the change you made. The harness RUNS this command itself before letting you move to the next step; it does not just take your word for it. Provide a verify for every step where a real check is possible — it is far more reliable than a manual claim. Steps left as plain text (or with no verify) fall back to a self-check where you state how you confirmed the step is done.',
-      parameters: {
-        type: 'object',
-        properties: {
-          objective: { type: 'string', description: 'One concrete, verifiable success criterion — specific enough to tell unambiguously when the task is done.' },
-          steps: {
-            type: 'array',
-            items: {
-              oneOf: [
-                { type: 'string' },
-                {
-                  type: 'object',
-                  properties: {
-                    task: { type: 'string', description: 'The step text.' },
-                    verify: { type: 'string', description: 'Shell command (run from the workspace root) that exits 0 exactly when this step is genuinely done — e.g. a test command, a build, or a grep. Omit if there is no real programmatic check.' },
-                  },
-                  required: ['task'],
-                },
-              ],
-            },
-            description: 'Ordered steps to reach the objective. Rewrite the whole list when refining. Give each step as a plain string, or as {"task", "verify"} to attach a shell command the harness will run to confirm the step before advancing.',
-          },
-        },
-        required: ['objective'],
-      },
-    },
-  },
-  {
-    type: 'function' as const,
-    function: {
       name: 'conclude',
       description: 'End your session with a structured result. This is the ONLY way to finish — a turn with no tool calls is a thinking turn, not a termination signal.',
       parameters: {
@@ -240,8 +189,8 @@ export const toolDefinitions = [
         properties: {
           action: {
             type: 'string',
-            enum: ['get_goal', 'get_plan', 'get_recent', 'get_conclusion', 'get_frame_trail', 'expand'],
-            description: 'get_goal: the immutable objective. get_plan: the current mutable execution plan. get_recent: sliding window over the ledger (needs n). get_conclusion/get_frame_trail: a specific frame\'s result or full story (needs frame_id). expand: recover a specific evicted episode\'s original content (needs episode_id).',
+            enum: ['get_goal', 'get_recent', 'get_conclusion', 'get_frame_trail', 'expand'],
+            description: 'get_goal: the immutable objective. get_recent: sliding window over the ledger (needs n). get_conclusion/get_frame_trail: a specific frame\'s result or full story (needs frame_id). expand: recover a specific evicted episode\'s original content (needs episode_id).',
           },
           frame_id: { type: 'string', description: 'Required for get_conclusion and get_frame_trail.' },
           episode_id: { type: 'string', description: 'Required for expand.' },
@@ -279,11 +228,6 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
       return fetchUrl(args.url as string)
     case 'browser_fetch':
       return browserFetch(args.url as string, args.wait_for as string | undefined)
-    case 'view_image':
-      return viewImage(args.path as string, args.prompt as string | undefined)
-    case 'update_plan':
-      // Handled in the agent loop (needs agent state); never dispatched here.
-      return { output: '', error: 'update_plan is handled by the agent loop' }
     case 'conclude':
       // Handled in the agent loop (terminates the session); never dispatched here.
       return { output: '', error: 'conclude is handled by the agent loop' }

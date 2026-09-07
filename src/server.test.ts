@@ -1,9 +1,8 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import type { Server } from 'http'
-import { app, parseFrameRole, frameIdFromHistoryFilename, buildDiskContextMessages, compactionHasContent, mergeFrameSummaries, chooseActiveFrame, type FrameSummary } from './server.js'
+import { app, parseFrameRole, frameIdFromHistoryFilename, buildDiskContextMessages, mergeFrameSummaries, chooseActiveFrame, type FrameSummary } from './server.js'
 import { config } from './config.js'
-import { emptyCompactionState } from './compaction.js'
 
 // server.ts's Express app, listening on an ephemeral port — no startServer()
 // (no history loading, no session bookkeeping needed for these route-level
@@ -80,19 +79,20 @@ test('GET /git-diff/:hash accepts a well-formed short hash (passes the format gu
 // unrelated past runs) makes exact-count assertions against the real /frames route
 // unreliable, which is exactly why this logic is exercised here in isolation instead.
 
-test('parseFrameRole: recognises all four frame roles from a real frameId shape', () => {
+test('parseFrameRole: recognises all three frame roles from a real frameId shape', () => {
   assert.equal(parseFrameRole('boss-mtmm1gcc-1'), 'boss')
   assert.equal(parseFrameRole('planner-mtmm1gcc-2'), 'planner')
   assert.equal(parseFrameRole('implementer-mtmm1gcc-3'), 'implementer')
-  assert.equal(parseFrameRole('tester-mtmm1gcc-4'), 'tester')
 })
 
 test('parseFrameRole: the baseline agent\'s own session id (ISO-derived, hyphenated) is not a frame', () => {
   assert.equal(parseFrameRole('2026-09-04T07-03-37'), null)
 })
 
-test('parseFrameRole: a prefix that is not one of the four known roles is not a frame', () => {
+test('parseFrameRole: a prefix that is not one of the three known roles is not a frame', () => {
   assert.equal(parseFrameRole('orchestrator-mtmm1gcc-1'), null)
+  // 'tester' no longer maps to a role — the Tester agent was removed.
+  assert.equal(parseFrameRole('tester-mtmm1gcc-4'), null)
 })
 
 test('frameIdFromHistoryFilename: extracts the id from history-<id>.json', () => {
@@ -130,18 +130,6 @@ test('buildDiskContextMessages: applies the same 4000-char truncation as agent.t
 test('buildDiskContextMessages: non-array input yields an empty context, not a throw', () => {
   assert.deepEqual(buildDiskContextMessages(null), { messages: [], messageCount: 0, totalChars: 0 })
   assert.deepEqual(buildDiskContextMessages('not an array'), { messages: [], messageCount: 0, totalChars: 0 })
-})
-
-test('compactionHasContent: false for a freshly-initialised state', () => {
-  assert.equal(compactionHasContent(emptyCompactionState()), false)
-})
-
-test('compactionHasContent: true when any tracked list has an entry', () => {
-  assert.equal(compactionHasContent({ ...emptyCompactionState(), verifiedFacts: ['x uses Postgres'] }), true)
-})
-
-test('compactionHasContent: true when only projectCapsule is set', () => {
-  assert.equal(compactionHasContent({ ...emptyCompactionState(), projectCapsule: 'a small CLI tool' }), true)
 })
 
 function frame(overrides: Partial<FrameSummary>): FrameSummary {
@@ -199,14 +187,14 @@ test('chooseActiveFrame: falls back to the most recently started live frame when
 // above: real leftover frame history files in this dev LOGS_DIR make exact-count
 // assertions unreliable, so these check SHAPE/invariants, not specific contents).
 
-test('GET /frames reflects config.agents as baselineBypassed and returns a well-shaped list', async () => {
+test('GET /frames reports baselineBypassed=true (the dispatch loop is the only execution path) and returns a well-shaped list', async () => {
   const resp = await fetch(`${baseUrl}/frames`, { headers: authHeaders() })
   assert.equal(resp.status, 200)
   const body = await resp.json() as { baselineBypassed: boolean; active: string | null; frames: FrameSummary[] }
-  assert.equal(body.baselineBypassed, config.agents)
+  assert.equal(body.baselineBypassed, true)
   assert.ok(Array.isArray(body.frames))
   for (const f of body.frames) {
-    assert.ok(['planner', 'implementer', 'tester', 'boss'].includes(f.role))
+    assert.ok(['planner', 'implementer', 'boss'].includes(f.role))
     assert.equal(typeof f.live, 'boolean')
   }
 })
@@ -222,7 +210,7 @@ test('GET /context with no frame param keeps the pre-existing shape plus the add
   assert.equal(body.frameId, null)
   assert.equal(body.role, null)
   assert.equal(body.live, false)
-  assert.equal(body.baselineBypassed, config.agents)
+  assert.equal(body.baselineBypassed, true)
 })
 
 test('GET /context?frame=<unknown> is a 404 with an error body', async () => {

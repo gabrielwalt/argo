@@ -46,9 +46,9 @@ const PLAYWRIGHT_PATTERN = /playwright|chromium|firefox\.launch|webkit\.launch/i
 // Pure and separately testable: given the command text and whatever the model
 // asked for, what timeout should actually apply. A command that mentions
 // Playwright gets a FLOOR at PLAYWRIGHT_DEFAULT_TIMEOUT_MS (120s) even when
-// the model explicitly asked for less: confirmed live, a Tester passed
-// timeout_ms:30000 on a Playwright script (the model has no real sense of
-// browser launch + page load cost and routinely underestimates it), which —
+// the model explicitly asked for less: confirmed live, an Implementer frame
+// passed timeout_ms:30000 on a Playwright script (the model has no real sense
+// of browser launch + page load cost and routinely underestimates it), which —
 // before this floor existed — overrode the Playwright default entirely and
 // produced the exact under-time-budget failure this floor exists to prevent,
 // indistinguishable from a real hang. The floor stays meaningful even now

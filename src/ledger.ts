@@ -1,13 +1,12 @@
-// THE LEDGER (docs/subagents-plan.md, config.agents / ARGO_AGENTS). The audit trail of
-// the call-frame stack: spawning a frame is a `delegation` entry, a frame finishing is a
-// `conclusion` entry, and every tool call inside a frame is an `episode` entry (the CWL
-// eviction graph — see eviction.ts). Append-only JSONL at /workspace/.argo/ledger.jsonl —
-// deliberately NOT a database (this project's own memory research already settled
-// grep-able files over a database for a near-identical case; nothing here needs real
-// query performance). A small separate state.json under the same directory holds the two
-// PINNED values that aren't append-only events: the immutable `objective` and the
-// current, mutable execution `plan` — read every iteration, so they don't belong in a
-// growing log.
+// THE LEDGER. The audit trail of the call-frame stack: spawning a frame is a
+// `delegation` entry, a frame finishing is a `conclusion` entry, and every tool call
+// inside a frame is an `episode` entry (the CWL eviction graph — see eviction.ts).
+// Append-only JSONL at /workspace/.argo/ledger.jsonl — deliberately NOT a database
+// (this project's own memory research already settled grep-able files over a
+// database for a near-identical case; nothing here needs real query performance). A
+// small separate state.json under the same directory holds the one PINNED value that
+// isn't an append-only event: the immutable `objective` — read every iteration, so it
+// doesn't belong in a growing log.
 //
 // Pure I/O module: no LLM calls here. The model-invoked half of this API is exposed as
 // the `ledger` tool (src/tools/index.ts); the harness-automatic half (recordDelegation,
@@ -23,7 +22,6 @@ import type {
   LedgerInjectionEntry,
   LedgerEpisodeEntry,
 } from './types.js'
-import type { TaskGraph } from './tasks.js'
 
 function argoDir(root: string): string {
   return path.join(root, '.argo')
@@ -38,10 +36,9 @@ function stateFile(root: string): string {
 interface PinnedState {
   objective: string | null
   objectiveSetAt: number | null
-  plan: TaskGraph | null
 }
 
-const EMPTY_STATE: PinnedState = { objective: null, objectiveSetAt: null, plan: null }
+const EMPTY_STATE: PinnedState = { objective: null, objectiveSetAt: null }
 
 async function readState(root: string): Promise<PinnedState> {
   try {
@@ -50,7 +47,6 @@ async function readState(root: string): Promise<PinnedState> {
     return {
       objective: typeof parsed.objective === 'string' ? parsed.objective : null,
       objectiveSetAt: typeof parsed.objectiveSetAt === 'number' ? parsed.objectiveSetAt : null,
-      plan: parsed.plan ?? null,
     }
   } catch {
     return { ...EMPTY_STATE }
@@ -189,16 +185,6 @@ export async function setObjective(
   }
   await writeState(root, { ...state, objective, objectiveSetAt: Date.now() })
   return { ok: true }
-}
-
-// setPlan REMOVED (this task, dead-code pass): zero call sites project-wide (only
-// comment mentions) — the current iterative Planner (dispatch.ts) never writes a
-// TaskGraph any more, only reads through the ledger tool's get_plan action
-// (tools/index.ts), so getPlan now permanently returns null. getPlan itself is kept
-// because that live call site exists; the type it returns (TaskGraph, tasks.ts) is
-// otherwise unused machinery this scoop cannot fully remove — see DEAD-CODE.md.
-export async function getPlan(root: string): Promise<TaskGraph | null> {
-  return (await readState(root)).plan
 }
 
 export async function getConclusion(root: string, frameId: string): Promise<LedgerConclusionEntry | null> {

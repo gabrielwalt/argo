@@ -1,22 +1,25 @@
 # How the Argo harness instruments the LLM
 
-Argo runs a **local** language model (currently `qwen3.6`) in a loop: the model thinks,
-calls tools (read/edit files, run commands, fetch pages), sees the results, and repeats
-until it produces a final answer with no tool call. On its own a small local model drifts,
-loops, forgets the goal, and claims work is done when it isn't. The **harness** is the
-scaffolding around that loop that keeps it on track. This document explains every piece of
-that scaffolding in plain terms, what it's for, and an honest take on how well it works —
-no prior context needed.
+> **SUPERSEDED — read before acting on anything below.** This document describes an earlier
+> single-loop architecture with a set of independently toggleable mechanisms (`ARGO_TASKS`,
+> `ARGO_MEMORY`, `ARGO_GROUNDING`, `ARGO_CRITIC`, `ARGO_LAYOUT`, `ARGO_AGENTS`, the
+> `update_plan` tool, the plan/act gate, "no tool call = done", the Tester agent). All of
+> that has been removed. The current, permanent architecture is: a Boss/Planner/Implementer
+> dispatch loop (`src/dispatch.ts`, always on — there is no single-loop baseline any more),
+> `conclude(status, message)` as the only way any frame ends its turn, deterministic context
+> eviction with no LLM summarization step (`src/eviction.ts`), and the loop-recovery ladder
+> (`src/loop.ts`, always on). See `CLAUDE.md`'s "Multi-agent dispatch, not a single loop" /
+> "Context management is deterministic" / "Loop recovery" sections and `docs/subagents-plan.md`
+> for the current design. The sections below are kept as historical record of mechanisms that
+> existed and were measured, not as a description of the current harness.
 
-## How to read the status tags
-Each behavior is tagged:
-- **always on** — part of the baseline loop, cannot be turned off.
-- **on by default** — enabled out of the box; can be turned off with an environment variable.
-- **optional** — built but off by default (unproven or costly); turned on with an env var or the UI.
-
-The environment flags: `ARGO_TASKS`, `ARGO_MEMORY`, `ARGO_LOOP` (all **on**, set to `0/false/off`
-to disable), `ARGO_GROUNDING` (**on**), `ARGO_CRITIC` (**off**), `ARGO_LAYOUT` (**off**),
-`ARGO_AUTOCOMMIT` (**off**), `ARGO_AGENTS` (**off** by code default, see §9). Source: `src/config.ts`.
+Argo runs a **local** language model (currently `qwen3.6`) inside a multi-agent dispatch loop:
+each role-scoped frame (Boss, Planner, Implementer) thinks, calls tools (read/edit files, run
+commands, fetch pages), sees the results, and repeats until it calls `conclude`. On its own a
+small local model drifts, loops, forgets the goal, and claims work is done when it isn't. The
+**harness** is the scaffolding around that loop that keeps it on track. This document explains
+pieces of that scaffolding as they existed historically, what they were for, and an honest take
+on how well they worked.
 
 ---
 

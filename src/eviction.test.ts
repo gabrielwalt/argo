@@ -17,7 +17,6 @@ test('classifyTool: known exploratory tools', () => {
   assert.equal(classifyTool('read_file'), 'exploratory')
   assert.equal(classifyTool('web_search'), 'exploratory')
   assert.equal(classifyTool('fetch_url'), 'exploratory')
-  assert.equal(classifyTool('view_image'), 'exploratory')
 })
 
 test('classifyTool: known action tools', () => {
@@ -55,12 +54,12 @@ test('inferDependencies: empty prior history yields no dependencies', () => {
 
 // ── renderPinnedAnchor ───────────────────────────────────────────
 
-test('renderPinnedAnchor: empty when neither objective nor plan present', () => {
-  assert.equal(renderPinnedAnchor(null, null), '')
+test('renderPinnedAnchor: empty when no objective present', () => {
+  assert.equal(renderPinnedAnchor(null), '')
 })
 
 test('renderPinnedAnchor: includes the objective verbatim', () => {
-  const rendered = renderPinnedAnchor('ship the feature exactly as specified', null)
+  const rendered = renderPinnedAnchor('ship the feature exactly as specified')
   assert.ok(rendered.includes('ship the feature exactly as specified'))
   assert.ok(rendered.includes('OBJECTIVE'))
 })

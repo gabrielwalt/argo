@@ -2,7 +2,7 @@
 
 A **contained coding harness for locally-running LLMs** (Qwen, Mistral, and the like). The goal is local, private, self-contained agentic coding: model weights stay on your machine and inference never leaves it, while the agent works inside an isolated environment. The agent itself has normal internet access (bash, fetch tools) the same way a developer's terminal would.
 
-**Means, not ends.** The *harness* is the goal — not any particular vendor. Today Argo fills two gaps with two tools: **Ollama** runs the local models, and **Docker** contains the agent's environment. Neither is a goal in itself. If a leaner or better tool fills either gap — a different local runtime (llama.cpp's `llama-server`, LM Studio, vLLM, mlx) for inference, or a lighter sandbox (e.g. WASI — see `SANDBOXING-ALTERNATIVES.md`) for containment — Argo should be able to swap it in. "Local model" is the requirement; "Ollama" is just today's implementation.
+**Means, not ends.** The *harness* is the goal — not any particular vendor. Today Argo fills two gaps with two tools: **Ollama** runs the local models, and **Docker** contains the agent's environment. Neither is a goal in itself. If a leaner or better tool fills either gap — a different local runtime (llama.cpp's `llama-server`, LM Studio, vLLM, mlx) for inference, or a lighter sandbox for containment — Argo should be able to swap it in. "Local model" is the requirement; "Ollama" is just today's implementation.
 
 **Lean and local.** Fewer moving parts and fewer external services is better. Everything runs on your machine by default; a third-party service or API is adopted only when it delivers real value that no local option provides, never as clutter. Where a remote dependency is currently unavoidable — e.g. web search, which is inherently bound to whoever indexed the web (today via Tavily) — it is a reluctant, clearly-marked exception, to be replaced with a local alternative the moment a good one exists.
 
@@ -211,7 +211,7 @@ Used only in standalone `pnpm dev` mode.
 
 Any model pulled via `ollama pull` appears in the UI dropdown automatically.
 
-**Use `qwen3.6:latest` for agentic work.** It is the only model validated end-to-end in Argo: on the self-verifying eval (`docs/eval-log.md`) it completes every task, records a plan, and converges without drift. `devstral:24b` and `llama3.1:8b` emit tool calls but do not complete the eval tasks — they are kept as eval comparators, not for real work (details below). The UI marks tool-capable models with 🔧 and non-functional ones with ⚠️; any model pulled with `ollama pull` appears in the dropdown automatically.
+**Use `qwen3.6:latest` for agentic work.** It is the only model validated end-to-end in Argo: it completes multi-step tasks, follows the dispatch pipeline's role-scoped prompts, and converges without drift. `devstral:24b` and `llama3.1:8b` emit tool calls but do not reliably complete multi-step tasks — they are kept as comparators, not for real work (details below). The UI marks tool-capable models with 🔧 and non-functional ones with ⚠️; any model pulled with `ollama pull` appears in the dropdown automatically.
 
 | Model | Size | Agentic use | Notes |
 |---|---|---|---|
@@ -227,17 +227,55 @@ To add any model: `ollama pull <name>` — appears in the UI immediately without
 
 ---
 
-## Multi-agent mode
+## Multi-agent architecture
 
-Off by default (`ARGO_AGENTS`, set `=1/true/on` to enable). The default is a single `Agent` loop
-running the whole task. Turning this on switches to a Boss/Planner/Implementer/Tester
-architecture (`src/dispatch.ts`): a harness-code Orchestrator that never itself calls the model,
-routing each task through a Boss that classifies it (ANSWER / TRIVIAL / SIMPLE / OBJECTIVE) and,
-for anything beyond a trivial fix, delegates to dedicated Planner/Implementer/Tester call frames —
-each its own scoped `Agent`, giving the run a second set of "eyes" (independent Tester
-verification, Boss checkpoints) that a lone loop structurally can't have on itself. Still
-sequential, not concurrent: exactly one LLM call runs at a time (one GPU, one resident model).
-Full design, guards, and comparative eval results: `docs/subagents-plan.md`, `docs/eval-log.md`.
+Every request runs through the dispatch loop (`src/dispatch.ts`) — a harness-code Orchestrator
+that never itself calls the model. It routes each task through a **Boss** that classifies the
+request (ANSWER / SIMPLE / OBJECTIVE) and, for anything beyond a direct answer, delegates to
+dedicated **Planner** and **Implementer** call frames — each its own scoped `Agent` instance
+(`src/agent.ts`), reusing the same battle-tested ReAct loop (streaming Ollama calls, deterministic
+context eviction, the loop-recovery ladder, tool execution) with a restricted tool set and a
+distinct system-prompt suffix.
+
+- **Boss** — classifies the request, has no direct file-modification tools, and (for an OBJECTIVE
+  run) writes the final summary once every task is complete.
+- **Planner** — read-only. Produces an ordered list of implementation units for a genuinely
+  multi-part objective, then is resumed to detail one self-contained Implementer assignment at a
+  time, informed by the previous Implementer's own conclusion. There is no separate re-planning
+  step — adaptation happens naturally on the next detail call.
+- **Implementer** — the only role with `write_file`/`edit_file`/`bash`. Executes one assignment,
+  verifies its own work (build/lint/test, or a direct exercise of the changed behaviour), and
+  reports SUCCESS or FAIL via `conclude`.
+
+The SIMPLE path (a well-scoped, single-unit change) skips the Planner entirely: Boss →
+Implementer → done. If that one Implementer hits its iteration cap without concluding, the run
+escalates to the full OBJECTIVE pipeline (Planner → Implementer per task) rather than reporting a
+raw cap-hit as failure.
+
+Still sequential, not concurrent: exactly one LLM call runs at a time (one GPU, one resident
+model). Every delegation, conclusion, and tool-call episode is recorded to an append-only ledger
+under `/workspace/.argo/ledger.jsonl` (`src/ledger.ts`). Full design: `docs/subagents-plan.md`.
+
+### Context management
+
+There is no LLM-summarization compaction step. Context management is entirely deterministic
+(`src/eviction.ts`, following CWL — "Beyond Compaction: Structured Context Eviction for
+Long-Horizon Agents"): every tool call is typed as an episode (exploratory or action), and when
+the live context approaches `num_ctx`, the oldest already-durably-persisted episodes are stubbed
+out first — never the objective, never the current prompt. Nothing evicted is actually gone: the
+full original survives in the ledger and can be recovered with the `ledger` tool's `expand`
+action. A separate, cheaper pass (`KEEP_RECENT_TOOL_RESULTS` in `src/agent.ts`) also collapses
+older tool results before they ever reach the eviction threshold, which is what keeps native
+tool-calling reliable on a small local model over a long run.
+
+### Loop recovery
+
+A small local model tends to repeat the exact same tool call forever when stuck. The
+loop-recovery ladder (`src/loop.ts`) detects a no-progress repeat (same call, nothing changed
+since it last ran) and escalates: L0 serves back the cached result of the earlier call (labeled as
+a repeat) instead of a bare block; L1 triggers a context eviction pass; L2 forces the model to
+produce a revised plan for the same task. If the model ignores the ladder for long enough, the
+frame halts rather than looping indefinitely — reported as a partial result, never as success.
 
 ---
 
@@ -251,6 +289,11 @@ Full design, guards, and comparative eval results: `docs/subagents-plan.md`, `do
 | `browser_fetch` | Playwright/Chromium. Full JS execution (~3–5s) | SPAs, dynamic content, pages where fetch_url returns empty |
 | `read_file` | Read a file at any absolute path in the container | Inspecting files directly |
 | `write_file` | Write a file at any absolute path in the container | Saving scripts or results |
+| `edit_file` | Replace an exact string in an existing file | Targeted changes without rewriting a whole file |
+| `ledger` | Query the multi-agent delegation/conclusion/episode ledger | Looking up a dependency's prior work, recovering evicted content |
+| `conclude` | End the current frame's turn with a status keyword + message | The only way any role (Boss/Planner/Implementer) finishes |
+
+Not every role gets every tool — the Planner and Boss are read-only (no `write_file`/`edit_file`); only the Implementer holds the full write-capable set. See `src/frames.ts`'s `ROLE_TOOLS`.
 
 ### The filesystem model
 
@@ -472,16 +515,22 @@ argo/
 │   ├── index.ts                ← Entry point: central mode or worker/standalone
 │   ├── central.ts              ← Central server: workspace registry, Docker mgmt, proxy
 │   ├── server.ts               ← Worker/standalone: agent API, SSE, git, files endpoints
-│   ├── agent.ts                ← ReAct loop, Ollama integration, auto-commit, repetition guard
-│   ├── config.ts               ← Env vars, path resolution, mode flags
-│   ├── types.ts                ← Shared TypeScript types + ArgoEvent union
-│   ├── logger.ts               ← Per-session JSONL + Markdown log writer
+│   ├── dispatch.ts             ← The Orchestrator: Boss/Planner/Implementer dispatch loop
+│   ├── frames.ts                ← Per-role tool sets, iteration budgets, system-prompt suffixes
+│   ├── agent.ts                ← ReAct loop, Ollama integration, auto-commit, loop-recovery ladder
+│   ├── loop.ts                 ← Loop-recovery ladder mechanics (repeat detection, cached replay)
+│   ├── eviction.ts             ← Deterministic context eviction (no LLM summarization)
+│   ├── ledger.ts                ← Append-only delegation/conclusion/episode audit trail
+│   ├── al-logger.ts            ← Structured XML trace, one file per agent frame
+│   ├── config.ts               ← Env vars, path resolution, timeouts
+│   ├── types.ts                ← Shared TypeScript types + AgentEvent union
+│   ├── logger.ts               ← Per-session JSONL log writer
 │   └── tools/
 │       ├── index.ts            ← Tool registry (toolDefinitions) + executeTool dispatcher
 │       ├── bash.ts             ← Shell execution (local in container, docker exec in dev)
 │       ├── browser-fetch.ts    ← Playwright via node --input-type=commonjs stdin
 │       ├── fetch-url.ts        ← HTTP fetch + HTML strip
-│       ├── file-ops.ts         ← read_file / write_file
+│       ├── file-ops.ts         ← read_file / write_file / edit_file
 │       └── web-search.ts       ← Tavily API client
 ├── install.sh                  ← Symlinks bin/argo to /usr/local/bin
 ├── package.json
@@ -509,7 +558,7 @@ The containment model and logging infrastructure point toward more ambitious use
 - **Agent memory** — persistent knowledge of the codebase across sessions, built from the structured JSONL logs already being written
 - **Visual trace** — Playwright screenshots streamed into the trace panel so you can see what the agent saw, not just the text it returned
 - **Specialised agent roles** — distinct system prompts and tool subsets for test writer, code reviewer, documenter, and migrator roles
-- **Multi-agent delegation** — ✅ built (`ARGO_AGENTS`, off by default — see "Multi-agent mode" above); a Boss/Planner/Implementer/Tester architecture, sequential (one LLM call at a time), not concurrent — see `docs/subagents-plan.md`
+- **Multi-agent delegation** — ✅ built; a Boss/Planner/Implementer architecture, sequential (one LLM call at a time), not concurrent — see "Multi-agent architecture" above and `docs/subagents-plan.md`
 - **MCP integration** — expose Argo workspaces as MCP servers so agents can delegate to each other across tool boundaries
 - **Agent-to-agent communication** — a local message bus for agents to hand off tasks, share results, and build context cooperatively
 

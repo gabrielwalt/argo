@@ -1,13 +1,10 @@
-// STRUCTURED CONTEXT EVICTION (docs/subagents-plan.md, config.agents / ARGO_AGENTS).
-// Replaces LLM-summarization compaction (compaction.ts) as the default context-management
-// mechanism, following CWL ("Beyond Compaction: Structured Context Eviction for
+// STRUCTURED CONTEXT EVICTION. The ONLY context-management mechanism in this
+// codebase, following CWL ("Beyond Compaction: Structured Context Eviction for
 // Long-Horizon Agents", arXiv:2606.11213): a deterministic, no-LLM policy that types every
 // tool call as an episode (exploratory | action) and evicts the oldest, already-durably-
 // persisted ones first when the live window gets too large. Nothing evicted is actually
 // gone — the full original survives in the ledger's episode record (ledger.ts) and can be
-// pulled back via expand(). compaction.ts is kept only as the rare fallback for a slice
-// that's still genuinely load-bearing after eviction alone (see agent.ts's gate on
-// config.agents).
+// pulled back via expand().
 //
 // v1 SIMPLIFICATION, noted explicitly: CWL's paper describes FOUR graduated eviction
 // levels (reasoning trace -> bulk output -> intermediate artifact -> full removal). This
@@ -19,15 +16,13 @@
 
 import type { Message } from 'ollama'
 import type { EpisodeKind } from './types.js'
-import type { TaskGraph } from './tasks.js'
-import { renderTaskGraph } from './tasks.js'
 
 // Mapped onto Argo's actual tools (docs/subagents-plan.md). `bash` is classified as an
 // action for ALL calls, not just mutating ones — reliably distinguishing a read-only
 // `bash` invocation from a mutating one would require parsing the command string, which
 // is not worth the false-negative risk (treating a mutation as exploratory would let it
 // be evicted as if its effect weren't durably persisted, when it might not be).
-const EXPLORATORY_TOOLS = new Set(['read_file', 'web_search', 'fetch_url', 'view_image'])
+const EXPLORATORY_TOOLS = new Set(['read_file', 'web_search', 'fetch_url'])
 const ACTION_TOOLS = new Set(['write_file', 'edit_file', 'bash'])
 
 export function classifyTool(name: string): EpisodeKind {
@@ -61,17 +56,14 @@ export function inferDependencies(priorEpisodes: EpisodeMeta[], newKind: Episode
   return deps
 }
 
-// The pinned anchor: objective (immutable, Boss-authored) + the current execution plan
-// (mutable, Planner-authored). Always present, recited at the tail (same mechanism
-// agent.ts already uses for the task ledger), NEVER subject to eviction — small and
-// structured by construction. Locking the objective here is a direct structural fix for
-// the original failure that motivated this project: a run quietly solving a different,
-// more interesting problem than the one asked.
-export function renderPinnedAnchor(objective: string | null, plan: TaskGraph | null): string {
-  if (!objective && !plan) return ''
-  const objLine = objective ? `[OBJECTIVE — immutable, set once by the Boss; never redefine it]\n${objective}` : ''
-  const planBlock = plan && plan.steps.length > 0 ? renderTaskGraph(plan) : ''
-  return [objLine, planBlock].filter(Boolean).join('\n\n')
+// The pinned anchor: the objective (immutable, Boss-authored). Always present, recited
+// at the tail, NEVER subject to eviction — small and structured by construction.
+// Locking the objective here is a direct structural fix for the original failure that
+// motivated this project: a run quietly solving a different, more interesting problem
+// than the one asked.
+export function renderPinnedAnchor(objective: string | null): string {
+  if (!objective) return ''
+  return `[OBJECTIVE — immutable, set once by the Boss; never redefine it]\n${objective}`
 }
 
 // Chars-per-token estimate used to translate a token budget into the char counts we can

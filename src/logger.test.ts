@@ -22,7 +22,6 @@ const sampleEvents: AgentEvent[] = [
   { type: 'done', content: 'DONE_CONTENT_MARKER' },
   { type: 'error', message: 'ERROR_MESSAGE_MARKER' },
   { type: 'warning', message: 'WARNING_MESSAGE_MARKER' },
-  { type: 'compact_start', messageCount: 10, contextUsagePct: 0.7 },
   {
     type: 'compact',
     summary: 'COMPACT_SUMMARY_MARKER',

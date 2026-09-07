@@ -1,21 +1,11 @@
-// TASK-START READ-ONLY CHECKPOINT (2026-09-05) — dispatch.ts half. No Ollama, no
-// ledger, no git, no fs: buildTaskStartAssignment is a pure function extracted
-// specifically so this prompt/routing change is testable without spawning a real
-// frame (spawnFrame/runBossTaskStart themselves still can't be, for the same reason
-// noted throughout this file: they write a ledger entry and run a real model turn).
-//
-// PLANNER DISPATCH REWRITE (this task) — buildInitialPlannerPrompt/buildNextTaskPrompt/
-// isPlannerDone are pure, tested the same way; they replace the earlier TASK:/TEST:/
-// DONE line convention (buildNextTaskPrompt/parseNextTask/detailNextTask, all removed)
-// entirely — see dispatch.ts's module header for the full flow. The Tester IS back in
-// this pipeline (harness-spawned via runTesterValidation, not Planner-driven — see
-// dispatch.ts's module header) for both OBJECTIVE and SIMPLE; see the runTesterValidation
-// tests further down this file for that coverage.
-//
-// PLAN/ACT GATE SEEDING (2026-09-05) — Agent.seedPlan's actual gate-bypass effect
-// DOES need a live chat() loop, so those tests use the SAME scripted-Ollama-client
-// technique agent.test.ts's own plan/act gate tests use (Agent's injectable
-// constructor seam) — no real model, no network, no Docker.
+// dispatch.ts unit tests. No Ollama, no ledger, no git, no fs where avoidable:
+// buildTaskStartAssignment/buildInitialPlannerPrompt/buildNextTaskPrompt/
+// isPlannerDone/isPlannerGiveUp are pure functions, tested directly.
+// spawnFrame/resumeFrame/runObjectiveViaPlanner themselves still can't be
+// unit-tested this way — they write a ledger entry and run a real model turn —
+// so this file covers the pure prompt-building/parsing halves plus the
+// Agent-level mechanics (conclude, role-restricted system prompt, iteration
+// checkpoints) via the same scripted-Ollama-client technique agent.test.ts uses.
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -33,7 +23,7 @@ import {
   isPlannerDone,
   isPlannerGiveUp,
   deriveFrameResult,
-  parseTesterResult,
+  parseImplementerResult,
   TASK_START_MAX_ITERATIONS,
   TASK_START_HARD_CAP,
   TASK_START_CAP_FAILURE_MESSAGE,
@@ -96,10 +86,10 @@ test('buildTaskStartAssignment: roughly half the length of the old ~450-word pro
 })
 
 // ── mode-line format stays compatible with frames.ts's parser ──────────────
-// The prompt instructs a format; the parser (frames.ts, unchanged by this task)
-// reads it back. Nothing previously asserted the two actually agree — a rewritten
-// prompt drifting from what parseTaskStartVerdict expects would fail silently
-// (parsed: false, falls back to 'objective') rather than as a loud test failure.
+// The prompt instructs a format; the parser (frames.ts) reads it back. Nothing
+// previously asserted the two actually agree — a rewritten prompt drifting from
+// what parseTaskStartVerdict expects would fail silently (parsed: false, falls
+// back to 'objective') rather than as a loud test failure.
 
 test('a reply following the prompt\'s ANSWER format parses as answer', () => {
   const verdict = parseTaskStartVerdict('The current version is 4.2.\nANSWER: 4.2')
@@ -124,7 +114,7 @@ test('a reply following the prompt\'s OBJECTIVE format parses as objective', () 
   assert.equal(verdict.parsed, true)
 })
 
-// ── Boss classification: soft budget 10, hard cap 20 (2026-09) ─────────────
+// ── Boss classification: soft budget 10, hard cap 20 ────────────────────────
 // The prompt still STATES 10 iterations (buildTaskStartAssignment already asserts
 // this above); the actual enforced cap given to spawnFrame is a separate, larger
 // constant so a classification a few turns over its stated budget still gets to
@@ -139,10 +129,6 @@ test('TASK_START_HARD_CAP is strictly greater than the prompt\'s stated TASK_STA
 test('the prompt itself still states the soft budget (10), not the hard cap (20)', () => {
   const text = buildTaskStartAssignment('fix the bug', false)
   assert.ok(text.includes(`hard budget of ${TASK_START_MAX_ITERATIONS} iterations`))
-  // Note: the OBJECTIVE mode's own "more than 20 iterations" threshold is unrelated
-  // prose that happens to share TASK_START_HARD_CAP's value — checking the specific
-  // "hard budget of 20" phrase (not a bare "20 iterations" substring) avoids a false
-  // positive against that unrelated line.
   assert.equal(text.includes(`hard budget of ${TASK_START_HARD_CAP} iterations`), false)
 })
 
@@ -151,7 +137,7 @@ test('TASK_START_CAP_FAILURE_MESSAGE is a plain user-facing failure, not the raw
   assert.equal(/Reached maximum iterations/.test(TASK_START_CAP_FAILURE_MESSAGE), false)
 })
 
-// ── buildImplementerAssignment — TRIVIAL/SIMPLE fast path, unchanged shape ─────
+// ── buildImplementerAssignment — SIMPLE fast path, unchanged shape ─────────
 
 test('buildImplementerAssignment: wraps the objective in <argo-objective> tags, framed as "implement"', () => {
   const text = buildImplementerAssignment('fix the off-by-one in nextId()')
@@ -160,7 +146,7 @@ test('buildImplementerAssignment: wraps the objective in <argo-objective> tags, 
   assert.ok(text.includes('<argo-objective>\nfix the off-by-one in nextId()\n</argo-objective>'))
 })
 
-// ── buildInitialPlannerPrompt — VERBATIM per this task's brief ─────────────────
+// ── buildInitialPlannerPrompt ────────────────────────────────────────────────
 
 test('buildInitialPlannerPrompt: contains the objective, PLAN status, and READ-ONLY instruction', () => {
   const text = buildInitialPlannerPrompt('add pagination across three endpoints')
@@ -170,7 +156,7 @@ test('buildInitialPlannerPrompt: contains the objective, PLAN status, and READ-O
   assert.ok(text.includes('20 iterations'))
 })
 
-// ── buildNextTaskPrompt — VERBATIM per this task's brief, two shapes ───────────
+// ── buildNextTaskPrompt — two shapes ─────────────────────────────────────────
 
 test('buildNextTaskPrompt(null): contains the three status keywords and self-contained instruction', () => {
   const text = buildNextTaskPrompt(null, 1)
@@ -202,11 +188,11 @@ test('buildNextTaskPrompt: null vs a completed message select genuinely differen
 })
 
 // ── isPlannerDone — the natural-language completion heuristic ─────────────────
-// No TASK:/TEST:/DONE marker any more: the Planner's `conclude` answer is read
-// straight through. isPlannerDone is the ONLY signal the dispatch loop uses to
-// stop asking for more tasks, so it is tested against both the phrasings the
-// prompt itself invites ("conclude that the objective is complete") and a set of
-// realistic self-contained assignments that must NOT be mistaken for completion.
+// No TASK:/TEST:/DONE marker: the Planner's `conclude` answer is read straight
+// through. isPlannerDone is the ONLY signal the dispatch loop uses to stop asking
+// for more tasks, so it is tested against both the phrasings the prompt itself
+// invites and a set of realistic self-contained assignments that must NOT be
+// mistaken for completion.
 
 test('isPlannerDone: recognizes the phrasing the prompt itself asks for', () => {
   assert.equal(isPlannerDone('The objective is complete.'), true)
@@ -242,9 +228,7 @@ test('isPlannerDone: empty or blank text is never treated as done (conclude itse
   assert.equal(isPlannerDone('   '), false)
 })
 
-// ── Agent.seedPlan — the plan/act gate is bypassed for a SEEDED frame, unchanged for
-// everyone else. Scripted-Ollama-client style, matching agent.test.ts's own plan/act
-// gate tests exactly (Agent's injectable constructor seam) — no live model.
+// ── Agent scripting scaffold — shared by everything below ──────────────────
 
 type ScriptedResponse = {
   message: { role: string; content: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> }
@@ -255,205 +239,17 @@ function scriptedOllama(responses: ScriptedResponse[]): Ollama {
   return { chat: async () => responses[Math.min(i++, responses.length - 1)] } as unknown as Ollama
 }
 
-// Targets a NONEXISTENT file — the point is whether the call reaches the tool at
-// all (gate-blocked vs. attempted), not whether the edit itself succeeds on disk;
-// agent.test.ts's own plan/act gate fixture uses the identical shape for the same
-// reason.
-const editCall: ScriptedResponse = {
-  message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'edit_file', arguments: { path: '/workspace/nonexistent-argo-seedplan-gate.txt', old_string: 'a', new_string: 'b' } } }] },
-}
 const finalAnswer: ScriptedResponse = { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
 
-async function cleanupSeedPlanSession(sessionId: string): Promise<void> {
-  await Promise.all([
-    fs.unlink(`${LOGS_DIR}/history-${sessionId}.json`).catch(() => {}),
-    fs.unlink(`${LOGS_DIR}/compaction-${sessionId}.json`).catch(() => {}),
-  ])
+async function cleanupDispatchSession(sessionId: string): Promise<void> {
+  await fs.unlink(`${LOGS_DIR}/history-${sessionId}.json`).catch(() => {})
 }
 
-test('seedPlan: a FIRST-turn edit_file call is not gate-blocked once the plan is seeded', async () => {
-  const events: AgentEvent[] = []
-  const sessionId = `test-seedplan-${Date.now()}`
-  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([editCall, finalAnswer]))
-  agent.setSessionId(sessionId)
-  agent.seedPlan('Change the file')
-  try {
-    const answer = await agent.chat('argo seed-plan case')
-    // No plan-gate steer at all — the seeded plan means the model's FIRST tool call
-    // reaches the tool directly, never forced through update_plan first.
-    assert.equal(events.some(e => e.type === 'plan'), false, 'seedPlan must not itself emit a plan event')
-    assert.equal(events.filter(e => e.type === 'tool_result' && e.tool === 'edit_file' && e.rejected).length, 0)
-    assert.equal(events.filter(e => e.type === 'tool_result' && e.tool === 'edit_file' && !e.rejected).length, 1)
-    assert.equal(answer, 'Final answer.')
-  } finally {
-    await cleanupSeedPlanSession(sessionId)
-  }
-})
-
-test('seedPlan: WITHOUT it, the identical first-turn edit_file is still gate-blocked (the gate itself is unchanged)', async () => {
-  const events: AgentEvent[] = []
-  const sessionId = `test-seedplan-baseline-${Date.now()}`
-  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([editCall, finalAnswer]))
-  agent.setSessionId(sessionId)
-  // No seedPlan call — confirms seeding is opt-in and the underlying gate
-  // (isProjectMutation && !this.currentPlan, agent.ts) was NOT weakened or made
-  // conditional by adding seedPlan.
-  try {
-    await agent.chat('argo seed-plan baseline case')
-    assert.equal(events.filter(e => e.type === 'tool_result' && e.tool === 'edit_file' && e.rejected).length, 1)
-  } finally {
-    await cleanupSeedPlanSession(sessionId)
-  }
-})
-
-// ── update_plan: trace visibility + no-op suppression (2026-09-05) ─────────
-// agent.test.ts already covers the plan/act gate end to end and isn't on this task's
-// write list — these two fixes are tested here instead, via the same
-// scripted-Ollama-client technique. this.tasks is turned off on every Agent below
-// (setTasks(false)) to isolate what's under test: the harness task-ledger's own
-// per-task verify/summary flow is orthogonal to update_plan's own event emission
-// and no-op detection, and is already covered by agent.test.ts's own task-ledger
-// tests — entangling it here would only make these tests slower and less targeted.
-
-function updatePlanCall(objective: string, steps: string[]): ScriptedResponse {
+function concludeCall(answer: string, status = 'SUCCESS'): ScriptedResponse {
   return {
-    message: {
-      role: 'assistant',
-      content: '',
-      tool_calls: [{ function: { name: 'update_plan', arguments: { objective, steps } } }],
-    },
+    message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status, message: answer } } }] },
   }
 }
-
-function toolResultOutputs(events: AgentEvent[], tool: string): string[] {
-  return events
-    .filter((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === tool)
-    .map(e => e.output)
-}
-
-test('update_plan emits tool_call/tool_result like every other tool (previously invisible in the trace)', async () => {
-  const events: AgentEvent[] = []
-  const sessionId = `test-update-plan-visibility-${Date.now()}`
-  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
-    updatePlanCall('Fix the bug', ['read the file', 'apply the fix']),
-    finalAnswer,
-  ]))
-  agent.setSessionId(sessionId)
-  agent.setTasks(false)
-  try {
-    await agent.chat('argo update-plan visibility case')
-    assert.equal(events.filter(e => e.type === 'tool_call' && e.tool === 'update_plan').length, 1)
-    const outputs = toolResultOutputs(events, 'update_plan')
-    assert.equal(outputs.length, 1)
-    assert.ok(outputs[0].includes('Plan recorded'))
-    // The harness-level 'plan' event (the UI's plan card) still fires too — this
-    // fix is additive, not a replacement for it.
-    assert.equal(events.some(e => e.type === 'plan'), true)
-  } finally {
-    await cleanupSeedPlanSession(sessionId)
-  }
-})
-
-test('update_plan: a byte-identical second call is a no-op — no revision bump, no plan event', async () => {
-  const events: AgentEvent[] = []
-  const sessionId = `test-update-plan-noop-${Date.now()}`
-  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
-    updatePlanCall('Fix the bug', ['read the file', 'apply the fix']),
-    updatePlanCall('Fix the bug', ['read the file', 'apply the fix']),
-    finalAnswer,
-  ]))
-  agent.setSessionId(sessionId)
-  agent.setTasks(false)
-  try {
-    await agent.chat('argo update-plan noop case')
-    // The model DID call update_plan twice — both get their own tool_call/tool_result.
-    assert.equal(events.filter(e => e.type === 'tool_call' && e.tool === 'update_plan').length, 2)
-    const outputs = toolResultOutputs(events, 'update_plan')
-    assert.equal(outputs.length, 2)
-    assert.ok(outputs[0].includes('Plan recorded'))
-    assert.ok(outputs[1].includes('Plan unchanged'))
-    // Exactly ONE 'plan' event — the second, identical call must not produce another.
-    assert.equal(events.filter(e => e.type === 'plan').length, 1)
-  } finally {
-    await cleanupSeedPlanSession(sessionId)
-  }
-})
-
-test('update_plan: whitespace-only differences still count as a no-op (normalised comparison)', async () => {
-  const events: AgentEvent[] = []
-  const sessionId = `test-update-plan-noop-ws-${Date.now()}`
-  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
-    updatePlanCall('Fix   the bug', ['read the file', 'apply the fix']),
-    updatePlanCall('  Fix the bug  ', ['read   the file', '  apply the fix']),
-    finalAnswer,
-  ]))
-  agent.setSessionId(sessionId)
-  agent.setTasks(false)
-  try {
-    await agent.chat('argo update-plan whitespace noop case')
-    assert.equal(events.filter(e => e.type === 'plan').length, 1)
-    const outputs = toolResultOutputs(events, 'update_plan')
-    assert.ok(outputs[1].includes('Plan unchanged'))
-  } finally {
-    await cleanupSeedPlanSession(sessionId)
-  }
-})
-
-test('update_plan: a genuinely different plan is NOT suppressed — not a fuzzy/prefix match', async () => {
-  const events: AgentEvent[] = []
-  const sessionId = `test-update-plan-real-change-${Date.now()}`
-  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
-    updatePlanCall('Fix the bug', ['read the file', 'apply the fix']),
-    updatePlanCall('Fix the bug', ['read the file', 'apply the fix', 'run the tests']),
-    finalAnswer,
-  ]))
-  agent.setSessionId(sessionId)
-  agent.setTasks(false)
-  try {
-    await agent.chat('argo update-plan real change case')
-    // A real change (one more step) — TWO plan events, revision actually bumped.
-    assert.equal(events.filter(e => e.type === 'plan').length, 2)
-    const outputs = toolResultOutputs(events, 'update_plan')
-    assert.ok(outputs[1].includes('Plan updated (revision 2)'))
-  } finally {
-    await cleanupSeedPlanSession(sessionId)
-  }
-})
-
-// ── update_plan removed as a callable tool for multi-agent roles (2026-09-05) ──
-// frames.ts's ROLE_TOOLS.implementer no longer lists update_plan (frames.test.ts
-// covers the table itself); this covers the RUNTIME consequence — a role-scoped
-// Agent (setAllowedTools without update_plan) must never reach the harness plan
-// handler for it, even for a hallucinated call the model was never offered. Before
-// this fix, the `if (name === 'update_plan')` intercept ran BEFORE the role-
-// availability gate, so ANY role could silently mutate the plan through a call it
-// was never given — a latent bug this change also closes, not just the removal.
-
-test('update_plan: a role-scoped Agent without it gets the STANDARD role rejection, never the harness plan handler', async () => {
-  const events: AgentEvent[] = []
-  const sessionId = `test-update-plan-role-gate-${Date.now()}`
-  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
-    updatePlanCall('Fix the bug', ['read the file']),
-    finalAnswer,
-  ]))
-  agent.setSessionId(sessionId)
-  // Mirrors the real post-2026-09-05 Implementer role tool set (no update_plan).
-  agent.setAllowedTools(['read_file', 'write_file', 'edit_file', 'bash'])
-  // seedPlan so this test isolates the ROLE gate specifically — without it, the
-  // (unrelated) plan/act gate's own rejection could otherwise mask which gate fired.
-  agent.seedPlan('Fix the bug')
-  try {
-    await agent.chat('argo update-plan role-gate case')
-    // Never reached handleUpdatePlan — no 'plan' event, no "Plan recorded" output.
-    assert.equal(events.some(e => e.type === 'plan'), false)
-    const results = toolResultOutputsWithMeta(events, 'update_plan')
-    assert.equal(results.length, 1)
-    assert.equal(results[0].rejected, true)
-    assert.match(results[0].error ?? '', /not available in this role/)
-  } finally {
-    await cleanupSeedPlanSession(sessionId)
-  }
-})
 
 function toolResultOutputsWithMeta(events: AgentEvent[], tool: string): Array<{ output: string; error?: string; rejected?: boolean }> {
   return events
@@ -461,26 +257,20 @@ function toolResultOutputsWithMeta(events: AgentEvent[], tool: string): Array<{ 
     .map(e => ({ output: e.output, error: e.error, rejected: e.rejected }))
 }
 
-// ── System prompt: explains the no-tool-call-ends-the-session convention (2026-09-05) ──
-// buildSystemPrompt itself is not exported (module-private in agent.ts), so this
-// captures the ACTUAL system message sent to the model via a scripted client —
-// direct proof of what reaches Ollama, not just of a string constant in isolation.
+// ── System prompt: describes ONLY the tools a given role actually has ───────
+// buildSystemPrompt (agent.ts) derives its TOOLS section from Agent.setAllowedTools
+// rather than sending every role the same list — proven here via ROLE_TOOLS.planner's
+// own restricted set (read_file, web_search, fetch_url, ledger, conclude), captured
+// via a scripted client (direct proof of what reaches the model).
 
-// SUPERSEDED (2026-09-06): the owner replaced the "no tool call = done" convention
-// with an explicit `conclude` tool (see the "conclude" section below) — the text
-// this test checked for is gone from the system prompt, and the mock it used (a
-// single bare no-tool-call reply, repeated forever by a real Ollama client) would
-// now describe a thinking turn that never ends, not a same-iteration final answer.
-// Rewritten to match: captures the same system message, but via a `conclude` call
-// so the run actually finishes, and checks the NEW terminal-condition text.
 test('system prompt: explains that calling conclude ends the session', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-system-prompt-eot-${Date.now()}`
   let capturedFirstMessage = ''
   const ollama = {
     chat: async (args: { messages: Array<{ role: string; content: string }> }) => {
-      // System prompt is now prepended to the first user message in <argo-system-prompt>
-      // tags, not sent as a separate system role message.
+      // System prompt is prepended to the first user message, not sent as a
+      // separate system role message.
       capturedFirstMessage = args.messages[0]?.content ?? ''
       return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
     },
@@ -490,7 +280,6 @@ test('system prompt: explains that calling conclude ends the session', async () 
   try {
     const answer = await agent.chat('argo system prompt end-of-turn case')
     assert.equal(answer, 'Final answer.')
-    // System prompt is prepended to the first user message (no wrapper tags).
     assert.ok(capturedFirstMessage.includes('You are Argo, a multi-agent system'), 'first message should contain the system prompt')
     assert.ok(capturedFirstMessage.includes(
       'To finish, call `conclude` with the appropriate status keyword and your message to end your session.',
@@ -499,17 +288,9 @@ test('system prompt: explains that calling conclude ends the session', async () 
       'conclude(status, message): end your session with a status keyword and a message.',
     ))
   } finally {
-    await cleanupSeedPlanSession(sessionId)
+    await cleanupDispatchSession(sessionId)
   }
 })
-
-// ── system prompt: describes ONLY the tools this role actually has (2026-09-06) ──
-// buildSystemPrompt (agent.ts) used to send every role the SAME tool list regardless
-// of Agent.setAllowedTools — the Planner's own prompt taught it about bash, write_file,
-// edit_file, and browser_fetch, none of which it holds (frames.ts's ROLE_TOOLS.planner),
-// and a real session had it try bash anyway. Proven here via ROLE_TOOLS.planner's own
-// restricted set (read_file, web_search, fetch_url, ledger, conclude) — the SAME
-// scripted-client technique as the test above, direct proof of what reaches the model.
 
 test('system prompt: a role-restricted frame (Planner\'s tool set) is not told about tools it does not have', async () => {
   const events: AgentEvent[] = []
@@ -537,7 +318,7 @@ test('system prompt: a role-restricted frame (Planner\'s tool set) is not told a
     // The explicit read-only note is present since it has neither write_file nor edit_file.
     assert.ok(capturedSystemPrompt.includes('You have no file-modification tools in this role'))
   } finally {
-    await cleanupSeedPlanSession(sessionId)
+    await cleanupDispatchSession(sessionId)
   }
 })
 
@@ -560,22 +341,13 @@ test('system prompt: an unrestricted frame (allowedTools null, the baseline) sti
     }
     assert.equal(capturedSystemPrompt.includes('You have no file-modification tools in this role'), false)
   } finally {
-    await cleanupSeedPlanSession(sessionId)
+    await cleanupDispatchSession(sessionId)
   }
 })
 
-// ── conclude: the only terminal condition now (2026-09-06) ─────────────────
-// Replaces "no tool call = done". A thinking turn (no tool calls) pushes the
-// model's text to context and nudges it, but never ends the run; only calling
-// `conclude` does, and every gate that used to fire on the old terminal condition
-// (task-ledger verify/summary/advance, final reconciliation, critic, grounding,
-// layout, re-ground) now fires inside the `conclude` handler instead.
-
-function concludeCall(answer: string, status = 'SUCCESS'): ScriptedResponse {
-  return {
-    message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status, message: answer } } }] },
-  }
-}
+// ── conclude: the only terminal condition ────────────────────────────────────
+// A thinking turn (no tool calls) pushes the model's text to context and nudges
+// it, but never ends the run; only calling `conclude` does.
 
 test('a turn with no tool calls is a thinking turn — it does not end the session', async () => {
   const events: AgentEvent[] = []
@@ -594,7 +366,7 @@ test('a turn with no tool calls is a thinking turn — it does not end the sessi
     // The thinking turn's own text is captured as a thought, not silently dropped.
     assert.equal(events.some(e => e.type === 'thought' && e.content === 'Let me think about this for a moment.'), true)
   } finally {
-    await cleanupSeedPlanSession(sessionId)
+    await cleanupDispatchSession(sessionId)
   }
 })
 
@@ -613,7 +385,7 @@ test('conclude({ status, message }) ends the session with the message as the ans
     assert.equal(events.filter(e => e.type === 'tool_call' && e.tool === 'conclude').length, 1)
     assert.equal(events.filter(e => e.type === 'tool_result' && e.tool === 'conclude' && !e.rejected).length, 1)
   } finally {
-    await cleanupSeedPlanSession(sessionId)
+    await cleanupDispatchSession(sessionId)
   }
 })
 
@@ -632,7 +404,7 @@ test('conclude with an empty message is rejected (validation, not a gate) and do
     assert.equal(results.length, 2)
     assert.match(results[0].error ?? '', /non-empty "message"/)
   } finally {
-    await cleanupSeedPlanSession(sessionId)
+    await cleanupDispatchSession(sessionId)
   }
 })
 
@@ -657,7 +429,7 @@ test('a no-tool-call turn gets the nudge on the 2nd consecutive thinking turn, n
       'Your turn produced no tool calls. To finish, call conclude with your final answer. To keep working, make your next tool call.',
     )
   } finally {
-    await cleanupSeedPlanSession(sessionId)
+    await cleanupDispatchSession(sessionId)
   }
 })
 
@@ -677,56 +449,16 @@ test('the iteration cap is still a hard stop when the model never calls conclude
     // silent), so with 10 pure thinking turns: turn 1 silent, turns 2-10 nudged = 9.
     assert.equal(events.filter(e => e.type === 'warning' && e.message.includes('produced no tool calls')).length, 9)
   } finally {
-    await cleanupSeedPlanSession(sessionId)
+    await cleanupDispatchSession(sessionId)
   }
 })
 
-test('conclude drives the task ledger exactly like a no-tool-call turn used to: ask for a summary, then advance, then pass reconciliation', async () => {
-  const events: AgentEvent[] = []
-  const sessionId = `test-conclude-tasks-${Date.now()}`
-  const summaryText = 'Built widget.ts and wired it in; demo renders correctly.'
-  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
-    updatePlanCall('Ship the widget', ['Build the widget']),
-    concludeCall('Working on it now.'),
-    concludeCall(summaryText),
-  ]))
-  agent.setSessionId(sessionId)
-  agent.setTasks(true)
-  try {
-    // scriptedOllama repeats the LAST response (concludeCall(summaryText)) for as
-    // many further iterations as the moved gates need — final reconciliation needs
-    // one more turn before the run can genuinely conclude. Re-ground done-gate was
-    // removed (2026-09-04, owner directive).
-    const answer = await agent.chat('argo conclude tasks case')
-    const results = toolResultOutputsWithMeta(events, 'conclude')
-    // The ask fired once, for the current task, before any advance.
-    assert.equal(results.filter(r => r.output.includes('CURRENT TASK "Build the widget"')).length, 1)
-    const advanced = events.filter(
-      (e): e is Extract<AgentEvent, { type: 'tasks' }> => e.type === 'tasks' && e.action === 'advanced',
-    )
-    assert.equal(advanced.length, 1)
-    assert.equal(advanced[0].done, 1)
-    // Final reconciliation (moved into the conclude handler, one-shot) fired
-    // exactly once before the run genuinely concluded.
-    assert.equal(results.filter(r => r.output.includes('ALL PLANNED TASKS ARE DONE')).length, 1)
-    assert.equal(answer, summaryText)
-  } finally {
-    await cleanupSeedPlanSession(sessionId)
-  }
-})
-
-// ── ITERATION LIMITS AND PROGRESS NUDGES (this task) ────────────────────────────────
+// ── ITERATION LIMITS AND PROGRESS NUDGES ────────────────────────────────────────────
 // frames.ts's ROLE_MAX_ITERATIONS/PROGRESS_CHECK_ITERATIONS/PROGRESS_CHECK_MESSAGES half;
 // agent.ts consumes them once Agent.setRole() has been called (dispatch.ts's spawnFrame
 // calls it alongside setAllowedTools/setMaxIterations — see agent.ts's roleTag field).
-// Scripted-Ollama-client style, same seam as the seedPlan tests above: a "thinking" reply
-// (no tool calls) never ends the run and never trips the identical-tool-call loop guard
-// (that guard only watches EXECUTED tool calls), so scriptedOllama's "repeat the last
-// response forever" behaviour is exactly what's needed to drive the loop all the way to
-// its iteration cap with no other mechanism (task ledger, grounding, loop-recovery)
-// getting in the way — none of tasks/memory/grounding/layout are turned on here.
 
-test('ROLE_MAX_ITERATIONS: planner stays 40, implementer raised to 160 (this task)', () => {
+test('ROLE_MAX_ITERATIONS: planner stays 40, implementer raised to 160', () => {
   assert.equal(ROLE_MAX_ITERATIONS.planner, 40)
   assert.equal(ROLE_MAX_ITERATIONS.implementer, 160)
 })
@@ -757,31 +489,24 @@ test('Planner role: escalating PROGRESS CHECK nudges fire at 20 and 30 before th
     assert.equal(agent.getLastRunOutcome(), 'cap')
     assert.ok(answer.startsWith('Reached maximum iterations'))
   } finally {
-    await cleanupSeedPlanSession(sessionId)
+    await cleanupDispatchSession(sessionId)
   }
 })
 
-// ── Agent.resetIterations() — the Planner's per-resume iteration budget reset ───────
-// (owner clarification, this task). The Planner's CONTEXT carries over on resumeFrame
-// (same Agent, same history), but the iteration BUDGET must restart at 0 for each
-// detail call, unlike resumeFrame's default accumulating behavior (H14, agent.ts) that
-// other resume call sites (the Boss task-start marker-retry resume; a future Tester
-// REDO) still rely on. resetIterations() is a small, targeted method — it zeroes
-// exactly the one field (lastIterationCount) that chat()'s resume branch reads to set
-// iterationBase, and only when a caller explicitly asks for it right before the next
-// chat(..., { resume: true }) call.
-//
-// Script: 5 thinking turns + one conclude call, THEN thinkingTurn forever (scriptedOllama
-// repeats the LAST array element once its own internal call counter runs past the
-// array's length) — so the FIRST chat() call concludes after exactly 6 real iterations,
-// and any further chat() call on the same Agent just keeps thinking forever, which is
-// what's needed to observe where the iteration counter/checkpoints land on the SECOND
-// (resumed) call.
+// ── Agent.resetIterations() — the Planner's per-resume iteration budget reset.
+// The Planner's CONTEXT carries over on resumeFrame (same Agent, same history), but
+// the iteration BUDGET must restart at 0 for each detail call, unlike resumeFrame's
+// default accumulating behavior that other resume call sites (the Boss task-start
+// marker-retry resume) still rely on. resetIterations() is a small, targeted method
+// — it zeroes exactly the one field (lastIterationCount) that chat()'s resume
+// branch reads to set iterationBase, and only when a caller explicitly asks for it
+// right before the next chat(..., { resume: true }) call.
+
 function plannerTwoCallScript(): ScriptedResponse[] {
   return [thinkingTurn, thinkingTurn, thinkingTurn, thinkingTurn, thinkingTurn, concludeCall('First round result.'), thinkingTurn]
 }
 
-test('resetIterations(): WITHOUT it, a resumed call inherits the previous call\'s count — reported iteration numbers keep climbing (H14 default, unchanged for other resume sites)', async () => {
+test('resetIterations(): WITHOUT it, a resumed call inherits the previous call\'s count — reported iteration numbers keep climbing (default, unchanged for other resume sites)', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-reset-iterations-off-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama(plannerTwoCallScript()))
@@ -804,7 +529,7 @@ test('resetIterations(): WITHOUT it, a resumed call inherits the previous call\'
     assert.equal(secondCallIterations[0].current, 7)
     assert.equal(secondCallIterations[0].max, 46)
   } finally {
-    await cleanupSeedPlanSession(sessionId)
+    await cleanupDispatchSession(sessionId)
   }
 })
 
@@ -845,7 +570,7 @@ test('resetIterations(): called before a resumed Planner detail call, the report
     assert.ok(answer.startsWith('Reached maximum iterations (40)'))
     assert.equal(secondCallIterations.length, 40)
   } finally {
-    await cleanupSeedPlanSession(sessionId)
+    await cleanupDispatchSession(sessionId)
   }
 })
 
@@ -876,54 +601,13 @@ test('Implementer role: escalating PROGRESS CHECK nudges fire at 100, 120 and 14
     assert.equal(warnings.some(w => w.startsWith('STALL:')), false)
     assert.equal(agent.getLastRunOutcome(), 'cap')
   } finally {
-    await cleanupSeedPlanSession(sessionId)
-  }
-})
-
-// Tester role-specific escalation (owner directive, superseding the earlier flow
-// audit finding "Tester has no soft/hard split"). ROLE_MAX_ITERATIONS.tester raised
-// 40->80 and PROGRESS_CHECK_ITERATIONS.tester/PROGRESS_CHECK_MESSAGES.tester set at
-// [40, 60] (frames.ts) — buildTesterAssignment (dispatch.ts) still states its own
-// iteration budget in the prompt itself; these two nudges make it a real mid-run
-// steer instead of a number the model only reads once, and 80 is the actual hard cap.
-test('Tester role: escalating PROGRESS CHECK nudges fire at 40 and 60 before the iteration cap at 80', async () => {
-  const events: AgentEvent[] = []
-  const sessionId = `test-role-progress-tester-${Date.now()}`
-  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([thinkingTurn]))
-  agent.setSessionId(sessionId)
-  agent.setAllowedTools(ROLE_TOOLS.tester)
-  agent.setRole('tester')
-  agent.setMaxIterations(ROLE_MAX_ITERATIONS.tester)
-  try {
-    const answer = await agent.chat('argo role-progress tester case')
-    const warnings = events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning')
-      .map(e => e.message)
-    assert.ok(
-      warnings.includes('IMPORTANT — 40 iterations used. Wrap up your validation and call conclude with your result. Do not start new investigations.'),
-    )
-    assert.ok(
-      warnings.includes(
-        'IMPORTANT — 60 iterations used, approaching the hard limit. You MUST call conclude NOW with your best ' +
-          'result. Do not start new investigations.',
-      ),
-    )
-    // The role-specific checkpoint REPLACES the generic mechanism for this frame —
-    // none of the generic fraction-based STALL wording, and no Planner-specific
-    // "analysis" wording, should appear.
-    assert.equal(warnings.some(w => w.startsWith('STALL:')), false)
-    assert.equal(warnings.some(w => w.includes('Wrap up your analysis')), false, 'the Planner-specific wording must not leak into a Tester frame')
-    assert.equal(agent.getLastRunOutcome(), 'cap')
-    assert.ok(answer.startsWith('Reached maximum iterations (80)'))
-  } finally {
-    await cleanupSeedPlanSession(sessionId)
+    await cleanupDispatchSession(sessionId)
   }
 })
 
 test('Boss role keeps the pre-existing generic fraction-based checkpoints untouched (no entry in PROGRESS_CHECK_ITERATIONS)', async () => {
-  // Regression guard for the "every other role's 0.4/0.65/0.85 scaling is untouched"
-  // claim in agent.ts's stallCheckpoints comment — a Boss frame at its own iteration
-  // cap should still see the GENERIC wording, not a role-specific one (there is none
-  // defined for 'boss').
+  // Regression guard: a Boss frame at its own iteration cap should still see the
+  // GENERIC wording, not a role-specific one (there is none defined for 'boss').
   const events: AgentEvent[] = []
   const sessionId = `test-role-progress-boss-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([thinkingTurn]))
@@ -937,9 +621,8 @@ test('Boss role keeps the pre-existing generic fraction-based checkpoints untouc
       .map(e => e.message)
     assert.ok(warnings.some(w => w.startsWith('STALL:') || w.startsWith('PROGRESS CHECK:')))
     assert.equal(warnings.some(w => w.includes('Wrap up your analysis')), false, 'the Planner-specific wording must not leak into a Boss frame')
-    assert.equal(warnings.some(w => w.includes('Wrap up your validation')), false, 'the Tester-specific wording must not leak into a Boss frame')
   } finally {
-    await cleanupSeedPlanSession(sessionId)
+    await cleanupDispatchSession(sessionId)
   }
 })
 
@@ -947,10 +630,10 @@ test('Boss role keeps the pre-existing generic fraction-based checkpoints untouc
 // failing the run when an Implementer frame hits its hard iteration cap ─────────────
 
 test('buildImplementerCapFollowUp: includes the assignment and last status, and asks for a narrower reframed task', () => {
-  const text = buildImplementerCapFollowUp('Refactor the entire billing module.', 'Reached maximum iterations (80) without a final answer.')
+  const text = buildImplementerCapFollowUp('Refactor the entire billing module.', 'Reached maximum iterations (160) without a final answer.')
   assert.ok(text.includes('unable to complete its task within the iteration budget'))
   assert.ok(text.includes('It was working on: Refactor the entire billing module.'))
-  assert.ok(text.includes('Its last status: Reached maximum iterations (80) without a final answer.'))
+  assert.ok(text.includes('Its last status: Reached maximum iterations (160) without a final answer.'))
   assert.ok(text.includes('too broad or complex for a single implementation pass'))
   assert.ok(text.includes('Call conclude with the revised assignment'))
   assert.ok(text.includes('conclude that the objective is complete'))
@@ -961,7 +644,7 @@ test('buildImplementerCapFollowUp: never mentions the generic "concluded with" f
   assert.equal(text.includes('concluded with'), false)
 })
 
-// ── UI-CLEAN-END regression guard (2026-09) ─────────────────────────────────
+// ── UI-CLEAN-END regression guard ────────────────────────────────────────────
 //
 // The browser only ever leaves its busy/sailing state on an UNTAGGED (no
 // __frameId) 'done' or 'error' event — app.js's handleEvent() early-returns any
@@ -971,11 +654,11 @@ test('buildImplementerCapFollowUp: never mentions the generic "concluded with" f
 // untagged 'done' or 'error' — every per-frame lifecycle event goes through
 // spawnFrame/resumeFrame's emit wrapper (frames.ts), which always tags with
 // __frameId before it reaches here. If a future edit ever emits a bare
-// { type: 'done' } / { type: 'error' } from inside the Planner/Implementer/Tester
-// pipeline (runObjectiveViaPlanner, runTesterValidation, etc.) instead of just
-// `return`-ing a string up to runDispatchLoop, the UI would see it as the WHOLE
-// run finishing while frames are still in flight — this is the failure mode this
-// test exists to catch before it ships again.
+// { type: 'done' } / { type: 'error' } from inside the Planner/Implementer
+// pipeline (runObjectiveViaPlanner, etc.) instead of just `return`-ing a string
+// up to runDispatchLoop, the UI would see it as the WHOLE run finishing while
+// frames are still in flight — this is the failure mode this test exists to
+// catch before it ships again.
 test('UI-CLEAN-END: only runDispatchLoop itself emits an untagged done/error event', async () => {
   const source = await fs.readFile(new URL('./dispatch.ts', import.meta.url), 'utf-8')
   // Isolate everything OUTSIDE runDispatchLoop's own body (start...end of function)
@@ -992,13 +675,12 @@ test('UI-CLEAN-END: only runDispatchLoop itself emits an untagged done/error eve
     'return its result string and let runDispatchLoop emit done/error, never emit them itself')
 })
 
-// ── isPlannerGiveUp — BUG-2/BUG-3 regressions (this task) ──────────────────────────
-// BUG-2: the give-up phrase list used the Unicode right single quote (U+2019) only,
-// so the ASCII apostrophe (U+0027) models actually emit for "can't complete" never
-// matched. BUG-3: the "give up" alternation covered give/gives/given but not the
-// gerund "giving up", a natural phrasing ("I'm giving up on this task.").
+// ── isPlannerGiveUp — apostrophe/gerund regressions ─────────────────────────
+// The give-up phrase list must match both the ASCII apostrophe (U+0027) and the
+// Unicode right single quote (U+2019) for "can't complete", and the gerund
+// "giving up" as well as give/gives/given.
 
-test('isPlannerGiveUp: matches "can\'t complete" with the ASCII apostrophe (BUG-2)', () => {
+test('isPlannerGiveUp: matches "can\'t complete" with the ASCII apostrophe', () => {
   assert.equal(isPlannerGiveUp("I can't complete this objective."), true)
 })
 
@@ -1006,7 +688,7 @@ test('isPlannerGiveUp: still matches "can\u2019t complete" with the Unicode apos
   assert.equal(isPlannerGiveUp('I can\u2019t complete this objective.'), true)
 })
 
-test('isPlannerGiveUp: matches the gerund "giving up" (BUG-3)', () => {
+test('isPlannerGiveUp: matches the gerund "giving up"', () => {
   assert.equal(isPlannerGiveUp("I'm giving up on this task."), true)
 })
 
@@ -1020,80 +702,74 @@ test('isPlannerGiveUp: unrelated success text does not match', () => {
   assert.equal(isPlannerGiveUp('The objective is complete and all tests pass.'), false)
 })
 
-// ── BUG-1 (CRITICAL): control-flow strings truncated at 2000 chars before the
-// harness parses them ───────────────────────────────────────────────────────
+// ── control-flow strings must not be truncated at 2000 chars before the harness
+// parses them ─────────────────────────────────────────────────────────────────
 //
 // capSummary (frames.ts) is a head-only 2000-char cap, kept for ledger storage/
-// display. Before this fix, deriveFrameResult stored ONLY that capped text as
-// `.summary`, and every control-flow reader in dispatch.ts (isPlannerDone/
-// isPlannerGiveUp, the next Implementer assignment, parseImplementerResult/
-// parseTesterResult, and every prompt built from any of that text) read `.summary`
-// — so a phrase a model puts at the END of a long message (exactly where
-// isPlannerDone/isPlannerGiveUp's own phrase lists look) was silently cut off.
-// deriveFrameResult now also returns `.rawSummary`, the FULL, uncapped
-// finalAnswer, and every dispatch.ts control-flow call site reads that instead.
-// These tests exercise the real deriveFrameResult (not a hand-built fixture), so a
-// future edit that goes back to capSummary(finalAnswer) for `.rawSummary`, or reads
-// `.summary` again at a control-flow site, breaks visibly here.
+// display. deriveFrameResult ALSO returns `.rawSummary`, the FULL, uncapped
+// finalAnswer, and every dispatch.ts control-flow call site (isPlannerDone/
+// isPlannerGiveUp, the next Implementer assignment, parseImplementerResult, and
+// every prompt built from any of that text) reads that instead — a phrase a model
+// puts at the END of a long message must never be silently cut off.
 
-test('BUG-1: deriveFrameResult keeps `.summary` capped but carries the FULL text as `.rawSummary`', () => {
+test('deriveFrameResult keeps `.summary` capped but carries the FULL text as `.rawSummary`', () => {
   const longPrefix = 'x'.repeat(2100)
-  const finalAnswer = `${longPrefix} The objective is complete.`
+  const finalAnswerText = `${longPrefix} The objective is complete.`
   const agent = new Agent(() => {}, 'test-model', scriptedOllama([]))
-  const result = deriveFrameResult('frame-bug1-a', finalAnswer, agent)
+  const result = deriveFrameResult('frame-bug1-a', finalAnswerText, agent)
 
   // `.summary` is still capSummary's 2000-char-capped text — unchanged behavior,
   // still what gets persisted to the ledger.
   assert.equal(result.summary, `${'x'.repeat(2000)}\u2026`)
   // `.rawSummary` is the untouched, full finalAnswer — nothing trimmed.
-  assert.equal(result.rawSummary, finalAnswer)
+  assert.equal(result.rawSummary, finalAnswerText)
 })
 
-test('BUG-1: a Planner "done" phrase past char 2000 is invisible through `.summary` but survives through `.rawSummary`', () => {
+test('a Planner "done" phrase past char 2000 is invisible through `.summary` but survives through `.rawSummary`', () => {
   const longPrefix = 'x'.repeat(2100) // pushes the completion phrase well past the 2000-char cap
-  const finalAnswer = `${longPrefix} The objective is complete.`
+  const finalAnswerText = `${longPrefix} The objective is complete.`
   const agent = new Agent(() => {}, 'test-model', scriptedOllama([]))
-  const result = deriveFrameResult('frame-bug1-b', finalAnswer, agent)
+  const result = deriveFrameResult('frame-bug1-b', finalAnswerText, agent)
 
   // This IS the bug, demonstrated directly: reading the capped text, the harness
   // would misread a genuinely finished Planner as "one more assignment" and loop.
   assert.equal(isPlannerDone(result.summary), false)
-  // Reading rawSummary (what dispatch.ts's OBJECTIVE loop now actually reads),
-  // the same conclude text is correctly recognized as done.
+  // Reading rawSummary (what dispatch.ts's OBJECTIVE loop actually reads), the
+  // same conclude text is correctly recognized as done.
   assert.equal(isPlannerDone(result.rawSummary), true)
 })
 
-test('BUG-1: a Planner give-up phrase past char 2000 is invisible through `.summary` but survives through `.rawSummary`', () => {
+test('a Planner give-up phrase past char 2000 is invisible through `.summary` but survives through `.rawSummary`', () => {
   const longPrefix = 'x'.repeat(2100)
-  const finalAnswer = `${longPrefix} I give up, this cannot be completed as scoped.`
+  const finalAnswerText = `${longPrefix} I give up, this cannot be completed as scoped.`
   const agent = new Agent(() => {}, 'test-model', scriptedOllama([]))
-  const result = deriveFrameResult('frame-bug1-c', finalAnswer, agent)
+  const result = deriveFrameResult('frame-bug1-c', finalAnswerText, agent)
 
   assert.equal(isPlannerGiveUp(result.summary), false)
   assert.equal(isPlannerGiveUp(result.rawSummary), true)
 })
 
-test('BUG-1: a Tester FAIL fix-assignment longer than 2000 chars is not truncated when read via `.rawSummary`', () => {
-  // The tail of the fix assignment (after char 2000) carries instructions a
-  // capped read would silently drop before the next Implementer ever saw them.
-  const fixBody = `${'y'.repeat(2050)} — and be sure to update the regression test too.`
-  const finalAnswer = `FAIL: ${fixBody}`
+test('an Implementer FAIL explanation longer than 2000 chars is not truncated when read via `.rawSummary`', () => {
+  // The tail of the failure explanation (after char 2000) carries detail a capped
+  // read would silently drop.
+  const failBody = `${'y'.repeat(2050)} — and the regression test still needs updating.`
+  const finalAnswerText = `FAIL: ${failBody}`
   const agent = new Agent(() => {}, 'test-model', scriptedOllama([]))
-  const result = deriveFrameResult('frame-bug1-d', finalAnswer, agent)
+  const result = deriveFrameResult('frame-bug1-d', finalAnswerText, agent)
 
-  // Reading the capped `.summary`, the trailing instruction is gone.
-  const cappedParsed = parseTesterResult(result.summary)
-  assert.equal(cappedParsed.passed, false)
-  assert.equal(cappedParsed.fixAssignment?.includes('update the regression test'), false)
+  // Reading the capped `.summary`, the trailing detail is gone.
+  const cappedParsed = parseImplementerResult(result.summary)
+  assert.equal(cappedParsed.succeeded, false)
+  assert.equal(cappedParsed.message.includes('regression test still needs updating'), false)
 
-  // Reading `.rawSummary` (what runTesterValidation now actually reads), the fix
-  // assignment survives intact, end to end.
-  const rawParsed = parseTesterResult(result.rawSummary)
-  assert.equal(rawParsed.passed, false)
-  assert.equal(rawParsed.fixAssignment, fixBody.trim())
+  // Reading `.rawSummary` (what the OBJECTIVE/SIMPLE loop actually reads), the
+  // failure explanation survives intact, end to end.
+  const rawParsed = parseImplementerResult(result.rawSummary)
+  assert.equal(rawParsed.succeeded, false)
+  assert.equal(rawParsed.message, failBody.trim())
 })
 
-// ── PERSISTENT BOSS MEMORY (this task) — buildTurnHistoryBlock/boundTurnHistory ──
+// ── PERSISTENT BOSS MEMORY — buildTurnHistoryBlock/boundTurnHistory ──────────
 // Both pure, no Ollama/fs/ledger involved, same reasoning as buildTaskStartAssignment's
 // own tests above: directly testable without spawning a real frame.
 
@@ -1106,9 +782,9 @@ test('buildTurnHistoryBlock: empty history is the empty string (byte-identical p
 })
 
 test('buildTurnHistoryBlock: renders one entry with mode uppercased and an arrow between fields', () => {
-  const text = buildTurnHistoryBlock([digest('Make the hexagons bigger', 'trivial', 'Change HEX_RADIUS', 'Changed HEX_RADIUS to 40')])
+  const text = buildTurnHistoryBlock([digest('Make the hexagons bigger', 'simple', 'Change HEX_RADIUS', 'Changed HEX_RADIUS to 40')])
   assert.ok(text.includes('1. User: "Make the hexagons bigger"'))
-  assert.ok(text.includes('TRIVIAL'))
+  assert.ok(text.includes('SIMPLE'))
   assert.ok(text.includes('Changed HEX_RADIUS to 40'))
 })
 
@@ -1133,18 +809,18 @@ test('buildTurnHistoryBlock: truncates a long user message/outcome to a bounded 
 })
 
 test('buildTurnHistoryBlock: ends with guidance telling the Boss to fold prior context into its objective, before any assignment text', () => {
-  const text = buildTurnHistoryBlock([digest('a', 'trivial', 'b', 'c')])
+  const text = buildTurnHistoryBlock([digest('a', 'simple', 'b', 'c')])
   assert.ok(/incorporate that/i.test(text))
   assert.ok(text.endsWith('\n\n'))
 })
 
 test('boundTurnHistory: leaves a short history untouched', () => {
-  const history = [digest('a', 'trivial', 'b', 'c')]
+  const history = [digest('a', 'simple', 'b', 'c')]
   assert.deepEqual(boundTurnHistory(history, TURN_HISTORY_MAX), history)
 })
 
 test('boundTurnHistory: trims to the last N entries (most recent kept), default max is 10', () => {
-  const history = Array.from({ length: 15 }, (_, i) => digest(`msg${i}`, 'trivial', 'obj', 'outcome'))
+  const history = Array.from({ length: 15 }, (_, i) => digest(`msg${i}`, 'simple', 'obj', 'outcome'))
   const bounded = boundTurnHistory(history)
   assert.equal(bounded.length, TURN_HISTORY_MAX)
   assert.equal(bounded[0].userMessage, 'msg5')
@@ -1152,7 +828,7 @@ test('boundTurnHistory: trims to the last N entries (most recent kept), default 
 })
 
 test('boundTurnHistory: a custom max is respected', () => {
-  const history = Array.from({ length: 5 }, (_, i) => digest(`msg${i}`, 'trivial', 'obj', 'outcome'))
+  const history = Array.from({ length: 5 }, (_, i) => digest(`msg${i}`, 'simple', 'obj', 'outcome'))
   const bounded = boundTurnHistory(history, 2)
   assert.deepEqual(bounded.map(d => d.userMessage), ['msg3', 'msg4'])
 })
