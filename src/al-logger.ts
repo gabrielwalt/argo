@@ -191,10 +191,9 @@ export class TraceLogger {
     if (jsonlFilename) metaParts.push(`**JSONL**: ${escapeMd(jsonlFilename)}`)
 
     const lines: string[] = []
-    lines.push(`# Run: ${escapeMd(truncatedQuery)}`)
+    lines.push(`# ${escapeMd(role.charAt(0).toUpperCase() + role.slice(1))} ${seq}`)
     lines.push(`- **Model**: ${escapeMd(model)}${optsStr ? ` ${optsStr}` : ''}`)
     if (metaParts.length > 0) lines.push(`- ${metaParts.join(' | ')}`)
-    lines.push(`- **Role**: ${escapeMd(role)} | **Iteration**: ${seq}`)
     lines.push('')
     lines.push(formatTools(tools))
     lines.push('')

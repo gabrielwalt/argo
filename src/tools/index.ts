@@ -58,12 +58,12 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'bash',
-      description: 'Execute a bash command in the sandbox container. The whole container is your working environment — /workspace is the one special directory: the user\'s project, git-tracked, auto-committed. Only write test/scratch/verification files (via redirection, heredoc, sed, etc. — not just write_file) under /workspace if they are an intentional project deliverable; anything temporary goes in /tmp or elsewhere, the same rule as write_file, regardless of which tool you use to create the file. Everything outside /workspace is ordinary, disposable filesystem, freely usable for scripts and temporary work. Do not prefix commands with "cd /workspace &&" — use cwd instead. Commands are killed after 30s by default (120s automatically for anything mentioning Playwright/Chromium) — if a command times out, that is reported explicitly as a timeout, not a generic failure; if you know a command needs more real time than that (e.g. waiting out many simulation frames), pass timeout_ms instead of adding longer waits inside the command.',
+      description: 'Execute a Bash command in the sandbox container. /workspace is the user\'s git-tracked project. Only write there for intentional project changes or deliverables; use /tmp for temporary scripts, screenshots, diagnostics, downloads, experiments, and other disposable files. Commands time out after 30s by default, or 120s for Playwright/Chromium commands. Timeouts are reported explicitly. If a command genuinely needs longer, set timeout_ms instead of adding sleeps or unnecessary waits.',
       parameters: {
         type: 'object',
         properties: {
           command: { type: 'string', description: 'The bash command to run' },
-          cwd: { type: 'string', description: 'Working directory, any absolute path. Default /workspace.' },
+          cwd: { type: 'string', description: 'Working directory, any absolute path. Default cwd is /workspace.' },
           timeout_ms: { type: 'number', description: 'Override the default kill timeout in milliseconds, for a command you know legitimately needs more time. Capped at 180000 (3 minutes).' },
         },
         required: ['command'],
@@ -73,31 +73,16 @@ export const toolDefinitions = [
   {
     type: 'function' as const,
     function: {
-      name: 'web_search',
-      description: 'Search the web for current information.',
-      parameters: {
-        type: 'object',
-        properties: {
-          query: { type: 'string', description: 'The search query' },
-          max_results: { type: 'number', description: 'Number of results (default 5, max 10)' },
-        },
-        required: ['query'],
-      },
-    },
-  },
-  {
-    type: 'function' as const,
-    function: {
       name: 'read_file',
-      description: 'Read one or more files. Pass path for a single file, or paths (an array) to read several files in one call — each file gets a labeled section in the response, and missing files show an inline error rather than failing the call. Any absolute path in the container works; use /workspace/path for the project. Whole-file output is capped at 8000 chars per file (head + tail, middle omitted) — for a file longer than that, pass offset/limit to page through it by line instead of guessing from the head and tail alone; the response tells you the total line count and exactly which lines you got. If you do not know which lines to read, pass pattern instead: it searches the file for that exact text and returns matching line numbers, e.g. "1523: function handleOptionValue(...) {" — then call read_file again with offset/limit set to that line number to read it in context. pattern is a literal substring, not a regular expression (dots, parens, and brackets in it are matched literally). A search ALWAYS covers the whole file: when pattern is set, offset/limit are ignored, so do not narrow a search by carrying them over from a previous read.',
+      description: 'Read or search files in the container. Use path to read one file, or paths to read several files in one call. For large files, use offset/limit to read the relevant line range instead of relying on truncated whole-file output. If you do not know where relevant content is, use pattern to search the entire file for an exact literal substring and get matching line numbers, then read around those lines with offset/limit. Any absolute path works; project files are under /workspace. Whole-file reads are capped at 8000 characters per file and may omit the middle.',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Absolute path, e.g. /workspace/... or /tmp/...' },
-          paths: { type: 'array', items: { type: 'string' }, description: 'Read multiple files in one call. Each file gets its own labeled section in the response. Files that do not exist show an inline error rather than failing the whole call. When paths is set, path/offset/limit/pattern are ignored.' },
-          offset: { type: 'number', description: 'First line to return, 1-based. Omit to start at line 1. Ignored when pattern is set (a search always covers the whole file).' },
-          limit: { type: 'number', description: 'Number of lines to return starting at offset. Omit to run through end of file (still capped at 8000 chars). Ignored when pattern is set.' },
-          pattern: { type: 'string', description: 'Search the file for this exact literal text (not a regex) and return matching line numbers instead of file content, e.g. to find where a symbol you cannot see is defined or called before reading that spot with offset/limit. Omit to read normally.' },
+          path: { type: 'string', description: 'Absolute path to one file, e.g. /workspace/src/app.ts or /tmp/output.txt.' },
+          paths: { type: 'array', items: { type: 'string' }, description: 'Absolute paths to multiple files. Each file is returned in a labeled section; missing files produce inline errors without failing the whole call. When set, path, offset, limit, and pattern are ignored.' },
+          offset: { type: 'number', description: '1-based first line to return. Use with limit to page through a large file. Ignored when pattern is set.' },
+          limit: { type: 'number', description: 'Number of lines to return from offset. If omitted, reads to the end, subject to the 8000-character cap. Ignored when pattern is set.' },
+          pattern: { type: 'string', description: 'Search the entire file for this exact literal substring and return matching line numbers instead of file content. Not a regex. When set, offset and limit are ignored.' },
         },
         required: [],
       },
@@ -107,12 +92,12 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'write_file',
-      description: 'Write a file. Any absolute path in the container works; use /workspace/path only for intentional project deliverables. Creates parent directories if needed.',
+      description: 'Write the complete contents of a file, replacing any existing contents. Creates parent directories as needed. Any absolute path in the container works; write under /workspace only for intentional project changes or deliverables, and use /tmp for temporary files.',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Absolute path, e.g. /workspace/... or /tmp/...' },
-          content: { type: 'string', description: 'Content to write' },
+          path: { type: 'string', description: 'Absolute file path, e.g. /workspace/src/app.ts or /tmp/output.txt.' },
+          content: { type: 'string', description: 'Complete file contents to write.' },
         },
         required: ['path', 'content'],
       },
@@ -122,14 +107,14 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'edit_file',
-      description: 'Replace an exact string in an existing file and report exactly what changed: how many occurrences were replaced, plus the updated region shown with line numbers. Errors (and changes nothing) if old_string is not found or matches more than one place — so an edit never applies silently or to the wrong spot. old_string must match the file verbatim, including whitespace and indentation.',
+      description: 'Edit an existing file by replacing exact text. old_string must match verbatim, including whitespace. By default it must occur exactly once; if it is missing or ambiguous, the edit fails without changing the file. Set replace_all to replace every occurrence. Returns the changed region with line numbers.',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Absolute path, e.g. /workspace/...' },
-          old_string: { type: 'string', description: 'The exact existing text to replace. Must be unique in the file unless replace_all is true.' },
-          new_string: { type: 'string', description: 'The replacement text.' },
-          replace_all: { type: 'boolean', description: 'Replace every occurrence instead of requiring a unique match. Default false.' },
+          path: { type: 'string', description: 'Absolute path to the existing file, e.g. /workspace/src/app.ts.' },
+          old_string: { type: 'string', description: 'Exact existing text to replace. Must be unique unless replace_all is true.' },
+          new_string: { type: 'string', description: 'Replacement text.' },
+          replace_all: { type: 'boolean', description: 'Replace every occurrence of old_string. Default false.' },
         },
         required: ['path', 'old_string', 'new_string'],
       },
@@ -139,11 +124,11 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'fetch_url',
-      description: 'Fetch the text content of a URL by making an HTTP request (HTML stripped to plain text). Fast but does NOT execute JavaScript — use browser_fetch for JS-rendered pages.',
+      description: 'Fetch a URL and return its page content as plain text. Does not execute JavaScript; use browser_fetch when the page requires client-side rendering.',
       parameters: {
         type: 'object',
         properties: {
-          url: { type: 'string', description: 'The URL to fetch' },
+          url: { type: 'string', description: 'Absolute URL to fetch.' },
         },
         required: ['url'],
       },
@@ -152,13 +137,28 @@ export const toolDefinitions = [
   {
     type: 'function' as const,
     function: {
-      name: 'browser_fetch',
-      description: 'Fetch a webpage using a real Chromium browser (Playwright). Executes JavaScript and returns the fully-rendered page text. Use this for SPAs, React/Vue/Angular apps, AEM EDS pages, or any site that requires JS to render content. Slower than fetch_url (~3-5s) but handles dynamic content.',
+      name: 'web_search',
+      description: 'Search the web for current or external information and return relevant results.',
       parameters: {
         type: 'object',
         properties: {
-          url: { type: 'string', description: 'The URL to fetch' },
-          wait_for: { type: 'string', description: 'Optional CSS selector to wait for before extracting content (e.g. ".main-content", "#results")' },
+          query: { type: 'string', description: 'Search query.' },
+          max_results: { type: 'number', description: 'Maximum number of results to return. Default 5, maximum 10.' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'browser_fetch',
+      description: 'Open a webpage in Chromium with Playwright, execute JavaScript, and return the rendered page text. Use this when client-side rendering or browser execution is required; otherwise prefer fetch_url.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Absolute URL to open.' },
+          wait_for: { type: 'string', description: 'Optional CSS selector to wait for before extracting the rendered text.' },
         },
         required: ['url'],
       },
@@ -168,12 +168,12 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'conclude',
-      description: 'End your session with a structured result. This is the ONLY way to finish — a turn with no tool calls is a thinking turn, not a termination signal.',
+      description: 'End your session and return its structured result. This is the only way to finish; a response without a conclude call does not end the session.',
       parameters: {
         type: 'object',
         properties: {
-          status: { type: 'string', description: 'A keyword indicating the outcome. The valid keywords depend on your role and are stated in your assignment.' },
-          message: { type: 'string', description: 'Your detailed answer, summary, or explanation.' },
+          status: { type: 'string', description: 'Outcome status. Use only a status allowed by your current role and assignment.' },
+          message: { type: 'string', description: 'Final result, answer, summary, assignment, or explanation for this session.' },
         },
         required: ['status', 'message'],
       },
@@ -183,19 +183,19 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'ledger',
-      description: 'Query the multi-agent ledger — the persistent record under /workspace/.argo/ of every delegation, conclusion, standup, and injection across this task. Use it to look up prior work instead of assuming, e.g. what a dependency actually found/touched, or to recover content that was evicted from your own context.',
+      description: 'Query Argo\'s persistent multi-agent record for prior objectives, agent results, and task history. Use it to recover or verify prior work instead of guessing from memory or incomplete context.',
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
             enum: ['get_goal', 'get_recent', 'get_conclusion', 'get_frame_trail', 'expand'],
-            description: 'get_goal: the immutable objective. get_recent: sliding window over the ledger (needs n). get_conclusion/get_frame_trail: a specific frame\'s result or full story (needs frame_id). expand: recover a specific evicted episode\'s original content (needs episode_id).',
+            description: 'What to retrieve: get_goal = immutable objective; get_recent = recent ledger entries; get_conclusion = one frame\'s final result; get_frame_trail = one frame\'s full recorded history; expand = full content of an evicted episode.',
           },
-          frame_id: { type: 'string', description: 'Required for get_conclusion and get_frame_trail.' },
-          episode_id: { type: 'string', description: 'Required for expand.' },
-          n: { type: 'number', description: 'Required for get_recent — how many recent entries to return.' },
-          scope: { type: 'string', enum: ['frame', 'task'], description: 'Optional filter for get_recent, restricting standup entries to one granularity.' },
+          frame_id: { type: 'string', description: 'Frame ID for get_conclusion or get_frame_trail.' },
+          episode_id: { type: 'string', description: 'Episode ID for expand.' },
+          n: { type: 'number', description: 'Number of entries to return for get_recent.' },
+          scope: { type: 'string', enum: ['frame', 'task'], description: 'Optional get_recent filter: restrict standup entries to frame- or task-level records.' },
         },
         required: ['action'],
       },
