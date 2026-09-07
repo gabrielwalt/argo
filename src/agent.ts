@@ -7,6 +7,7 @@ import { toolDefinitions, executeTool } from './tools/index.js'
 import { bash, NO_OUTPUT } from './tools/bash.js'
 import { truncateOutput } from './tools/truncate.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
+import { AlLogger } from './al-logger.js'
 import type { AgentEvent, ToolName, ModelOptions, FramePolicy, Role } from './types.js'
 import { PROGRESS_CHECK_ITERATIONS, PROGRESS_CHECK_MESSAGES, ROLE_CONCLUDE_STATUSES, concludeStatusError } from './frames.js'
 import { runCritic, isTestOrSpecPath, type Critique, type CriticCheckpoint } from './critic.js'
@@ -552,6 +553,22 @@ export class Agent {
   // PROGRESS_CHECK_MESSAGES) — every other role-shaped decision in this file already goes
   // through allowedTools/roleInstructions/the FramePolicy switches, which stay as they are.
   private roleTag: Role | null = null
+  // NEW, ADDITIVE XML trace (al-logger.ts) — runs alongside SessionLogger, never
+  // replacing it. Created fresh at the top of chat() (mirroring SessionLogger's own
+  // per-call construction) and used by chatCall()/the tool-dispatch loop below via
+  // this field, since chatCall() doesn't otherwise have a way to receive it (it's
+  // private and its signature is unchanged — see al-logger integration notes at each
+  // call site). null only in the narrow window before chat()'s first line runs;
+  // every call site below guards with `this.alLogger?.` for that reason, and because
+  // a logger failure must never interrupt the real run.
+  private alLogger: AlLogger | null = null
+  // How many entries of this.history had already been presented as "new" to the
+  // al-logger as of the START of the most recently opened turn — chatCall() slices
+  // this.history from here to build beginTurn()'s newMessages, then advances it to
+  // this.history.length for the NEXT call. Reset to 0 at the top of chat() (fresh
+  // run) alongside the other per-run state, so turn 1 of every run reports its
+  // entire starting history as new, matching a resumed frame's own history depth.
+  private alLastMessageCount = 0
   private episodes: EpisodeMeta[] = []
   // Bounded excerpts of pages fetched this run (url + truncated content), so the
   // grounding guard can verify document specifics against what was ACTUALLY fetched
@@ -1202,14 +1219,32 @@ export class Agent {
     this.history.forEach((m, i) => { if (m.role === 'tool') toolPos.push(i) })
     const collapse = new Set(toolPos.slice(0, Math.max(0, toolPos.length - KEEP_RECENT_TOOL_RESULTS)))
     const messages: Message[] = systemPrompt ? [{ role: 'system', content: systemPrompt }] : []
+    // NEW, ADDITIVE XML trace (al-logger.ts): collect the collapsed-message detail
+    // (original vs. sent length) as this.history is walked below, in the SAME pass
+    // that decides collapsing — rather than recomputing it separately — so this can
+    // never drift out of sync with what was actually sent this turn.
+    const alCollapsed: Array<{ index: number; originalChars: number; sentChars: number; role: string }> = []
     this.history.forEach((m, i) => {
       const c = m.content
       if (collapse.has(i) && typeof c === 'string' && c.length > TOOL_RESULT_COLLAPSE_OVER) {
-        messages.push({ role: 'tool', content: `[older tool output collapsed — ${c.length} chars; re-read the file or re-run the command if you need it]\n${c.slice(0, 200).replace(/\s+/g, ' ')}…` })
+        const stub = `[older tool output collapsed — ${c.length} chars; re-read the file or re-run the command if you need it]\n${c.slice(0, 200).replace(/\s+/g, ' ')}…`
+        messages.push({ role: 'tool', content: stub })
+        alCollapsed.push({ index: i, originalChars: c.length, sentChars: stub.length, role: m.role })
       } else {
         messages.push(m)
       }
     })
+    // NEW, ADDITIVE XML trace: open this turn's <al-turn> BEFORE the Ollama call —
+    // "new" messages are exactly this.history's tail since the previous call
+    // (alLastMessageCount), turn 1 of a run being the whole starting history. Read
+    // via a cast since this.history's Message role/content typing is the ollama
+    // package's own (broader) union; AlMessage only needs role+content as strings.
+    {
+      const newSlice = this.history.slice(this.alLastMessageCount)
+      const newAlMessages = newSlice.map(m => ({ role: String(m.role), content: typeof m.content === 'string' ? m.content : String(m.content ?? '') }))
+      this.alLogger?.beginTurn(messages.length, newAlMessages, alCollapsed.length > 0 ? alCollapsed : undefined)
+      this.alLastMessageCount = this.history.length
+    }
     // Recitation (Manus todo.md pattern): keep the current plan at the very tail
     // of context every iteration so the objective stays in the model's recent
     // attention and doesn't get lost mid-history over a long run. Transient — not
@@ -1756,6 +1791,21 @@ export class Agent {
   async chat(userMessage: string, opts?: ChatOptions): Promise<string> {
     const resume = opts?.resume === true
     const logger = new SessionLogger(userMessage, this.model, this.options, this.sessionId)
+    // NEW, ADDITIVE XML trace (al-logger.ts) — see the field doc comment above. The
+    // tool set offered is computed the SAME way chatCall() computes offeredTools
+    // (this.allowedTools ? filter : the full set) since that filtering only depends
+    // on state already set before chat() runs (dispatch.ts's spawnFrame calls
+    // setAllowedTools before chat()), not on anything chatCall() itself derives per
+    // call — so recomputing it here for the header is equivalent, not a guess.
+    const alTools = this.allowedTools
+      ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
+      : toolDefinitions
+    this.alLogger = new AlLogger(userMessage, this.model, this.options, this.roleTag ?? 'agent', alTools)
+    // Each chat() call gets its OWN al-logger file (a fresh header + turn numbering
+    // from 1), even on a resumed frame — so "new" for turn 1 of THIS file always
+    // means "everything chatCall() is about to send", matching what that file's own
+    // reader sees with no other file to cross-reference.
+    this.alLastMessageCount = 0
 
     const emitAndLog = (event: AgentEvent) => {
       logger.log(event)
@@ -1764,6 +1814,11 @@ export class Agent {
       // carries the same per-run seq the JSONL persists — this is what lets the
       // UI dedupe replayed-vs-live events at the reconnect boundary.
       this.emit(event, logger.getSeq())
+      // NEW, ADDITIVE XML trace: forward harness-level events (eviction/compact,
+      // warning, error) to the al-logger too. logEvent() is a no-op for any
+      // AgentEvent variant it doesn't render (see its own switch), so this is safe
+      // to call unconditionally for every event without a parallel filter here.
+      this.alLogger?.logEvent(event)
     }
 
     this.pushCtx({ role: 'user', content: userMessage })
@@ -2067,8 +2122,30 @@ export class Agent {
         }
         consecutiveTimeouts = 0 // reset on any successful response
 
+        // NEW, ADDITIVE XML trace (al-logger.ts): log the raw response for this
+        // turn as soon as it's known, before any of the token/compaction/tool-call
+        // handling below runs — everything after this point reacts to the SAME
+        // response, so logging it here captures it exactly as the model returned
+        // it. toolCalls/thinking/content are read straight off response.message;
+        // native tool_calls are logged here even though the loop below may ALSO
+        // fall back to JSON-parsed calls from content (extractToolCallsFromContent)
+        // — this block only records what the model actually returned, not the
+        // harness's own fallback interpretation of it.
+        this.alLogger?.logResponse({
+          thinking: response.message?.thinking,
+          content: response.message?.content,
+          toolCalls: (response.message?.tool_calls ?? []).map((tc) => ({ name: tc.function.name, args: tc.function.arguments as object })),
+          durationMs: response.total_duration != null ? Math.round(response.total_duration / 1e6) : undefined,
+          role: response.message?.role,
+          done: response.done,
+          doneReason: response.done_reason,
+          promptEvalCount: response.prompt_eval_count,
+          evalCount: response.eval_count,
+        })
+
         const numCtx = this.options.num_ctx ?? 65536
         if (response.prompt_eval_count != null) {
+          this.alLogger?.logContext(response.prompt_eval_count, numCtx)
           emitAndLog({
             type: 'token_usage',
             prompt_tokens: response.prompt_eval_count,
@@ -2569,6 +2646,11 @@ export class Agent {
             error: result.error,
             duration_ms,
           })
+          // NEW, ADDITIVE XML trace (al-logger.ts): one <al-tool-execution> per
+          // tool actually run this turn (update_plan/conclude are intercepted
+          // earlier and never reach this line, matching the existing tool_result
+          // event's own scope).
+          this.alLogger?.logToolExecution(name, args, result.output, result.error, duration_ms)
 
           this.pushCtx({
             role: 'tool',
@@ -2691,7 +2773,7 @@ export class Agent {
       this.phase = 'error'
       return message
     } finally {
-      await Promise.all([logger.flush(), this.persistHistory()])
+      await Promise.all([logger.flush(), this.persistHistory(), this.alLogger?.close()])
     }
   }
 
