@@ -33,7 +33,7 @@ import { Agent } from './agent.js'
 import { config } from './config.js'
 import { SessionLogger } from './logger.js'
 import type { AgentEvent, FrameSpawnRequest, FrameResult, FrameStatus, ModelOptions, Role, ToolName } from './types.js'
-import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, systemPromptFor, buildAssignment, capSummary, parseTaskStartVerdict, TASK_START_TOOLS, type TaskStartVerdict } from './frames.js'
+import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, buildAssignment, capSummary, parseTaskStartVerdict, TASK_START_TOOLS, type TaskStartVerdict } from './frames.js'
 import * as ledger from './ledger.js'
 
 // The workspace root — config.workspacePath (NOT a literal '/workspace') because
@@ -349,8 +349,10 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
   agent.setUserQuery(currentUserQuery) // TraceLogger header title — see currentUserQuery's own comment above
   if (currentOptions) agent.setOptions(currentOptions)
   agent.setAllowedTools(toolOverride ?? ROLE_TOOLS[req.role])
-  agent.setRoleInstructions(systemPromptFor(req.role))
-  agent.setRole(req.role) // agent.ts's role-specific progress-check thresholds/messages
+  // agent.ts's chat() reads frames.ts's ROLE_IDENTITY/ROLE_INSTRUCTIONS directly off
+  // this role tag to build the frame's opening [system]/[user]/[system] messages —
+  // no separate setRoleInstructions() call needed any more.
+  agent.setRole(req.role) // also drives role-specific progress-check thresholds/messages
   agent.setFrameId(frameId)
   agent.setMaxIterations(req.maxIterations ?? ROLE_MAX_ITERATIONS[req.role])
   agent.setSessionId(frameId) // isolates history/eviction-state files per frame
@@ -513,13 +515,22 @@ export const TASK_START_CAP_FAILURE_MESSAGE =
 // The task-start checkpoint's own assignment text (distinct from frames.ts's
 // buildAssignment, which wraps EVERY frame's assignment with the verbatim-request
 // block — this IS the assignment passed to that wrapper for the task-start Boss
-// specifically). Pure and exported so the exact prompt — the <argo-user-prompt>
-// tagging, the READ-ONLY statement, the three status keywords — is directly testable
+// specifically), and this frame's [user] message (message 2 of the frame's
+// opening messages; see agent.ts's chat()). Pure and exported so the exact prompt
+// — the <argo-user-prompt> tagging, the iteration budget — is directly testable
 // without spawning a real frame.
+// The classification rules themselves (the three status keywords, READ-ONLY
+// framing, grounding/fidelity instructions) now live in frames.ts's
+// ROLE_INSTRUCTIONS.boss — sent as its OWN separate [system] message (message 3),
+// never duplicated here. What's left here is the raw user text (still tagged, for
+// unmistakable boundaries against the CHECKPOINT marker/turn-history text riding
+// alongside it) plus per-call, DYNAMIC content a static role-wide constant can't
+// express: the CHECKPOINT marker the retry/resume plumbing keys on, the
+// verbatim-threading note (config-flag-dependent), and the iteration budget (a
+// number, not a rule).
 export function buildTaskStartAssignment(userMessage: string, verbatimRequestOn: boolean): string {
   return (
     'CHECKPOINT: task-start\n' +
-    'Your task is to classify the following user request into exactly one of the three modes below:\n' +
     `<argo-user-prompt>\n${userMessage}\n</argo-user-prompt>\n\n` +
     (verbatimRequestOn
       ? 'Note: the user\'s request above is ALSO threaded verbatim to every downstream frame (Planner, ' +
@@ -527,18 +538,6 @@ export function buildTaskStartAssignment(userMessage: string, verbatimRequestOn:
         'it survives, so your mode line can be a concise digest rather than an exhaustive transcription; the ' +
         'original is preserved separately for anyone who needs the exact wording.\n\n'
       : '') +
-    'Your task is done once you call `conclude` with the appropriate status and message:\n' +
-    '- Status ANSWER, message: the complete final answer — use only if you already know the answer with ' +
-    'certainty and no project changes are required.\n' +
-    '- Status SIMPLE, message: a concrete, verifiable objective — Use for a well-scoped change that can be ' +
-    'handled by a single Implementer agent. This covers everything from trivial fixes to single-function changes.\n' +
-    'SIMPLE should be the default unless decomposition into independently verifiable sub-tasks materially improves correctness.\n' +
-    '- Status OBJECTIVE, message: a concrete, verifiable objective — Use if the task requires deeper upfront ' +
-    'analysis, involves several distinct pieces of work, or contains genuine ambiguity about the approach. A ' +
-    'Planner agent will break it down.\n\n' +
-    'Do not implement anything. The project is READ-ONLY: you may inspect files to understand the codebase, but you must not modify anything.\n' +
-    'Ground your answer or objective whenever it depends on project-specific details, current facts, or anything you cannot know with certainty. Inspect the relevant files or use the web when necessary rather than relying on assumptions.\n' +
-    'When reformulating the request as an objective, preserve every material requirement and constraint. Clarify wording, but do not silently narrow, broaden, or reinterpret the requested outcome.\n' +
     `You have a hard budget of ${TASK_START_MAX_ITERATIONS} iterations to call \`conclude\` with the classified status and message.`
   )
 }

@@ -42,21 +42,10 @@ test('buildTaskStartAssignment: wraps the user message in <argo-user-prompt> tag
     'the user message must be reproduced byte-for-byte inside the tags, regardless of its own content')
 })
 
-test('buildTaskStartAssignment: states the project is read-only', () => {
-  const text = buildTaskStartAssignment('fix the bug', false)
-  assert.ok(/READ-ONLY/.test(text))
-})
-
-test('buildTaskStartAssignment: all three status keywords are present', () => {
-  const text = buildTaskStartAssignment('fix the bug', false)
-  assert.ok(text.includes('Status ANSWER'))
-  assert.ok(text.includes('Status SIMPLE'))
-  assert.ok(text.includes('Status OBJECTIVE'))
-  // TRIVIAL was merged into SIMPLE — must not appear
-  assert.equal(text.includes('TRIVIAL'), false)
-  // Grounding instruction present
-  assert.ok(/Ground your answer/.test(text))
-})
+// The classification rules (READ-ONLY framing, the three status keywords,
+// grounding instructions) moved to frames.ts's ROLE_INSTRUCTIONS.boss — its own
+// separate [system] message (message 3) — so they're asserted there
+// (frames.test.ts), not against this function's output any more.
 
 test('buildTaskStartAssignment: no verbatim-request note when the flag is off', () => {
   const text = buildTaskStartAssignment('fix the bug', false)
@@ -68,7 +57,7 @@ test('buildTaskStartAssignment: includes the verbatim-request note when the flag
   assert.ok(text.includes('threaded verbatim to every downstream frame'))
 })
 
-test('buildTaskStartAssignment: starts with the CHECKPOINT header the Boss system prompt keys its ending convention on', () => {
+test('buildTaskStartAssignment: starts with the CHECKPOINT header agent.ts keys its progress-check wording on', () => {
   const text = buildTaskStartAssignment('fix the bug', false)
   assert.ok(text.startsWith('CHECKPOINT: task-start\n'))
 })
@@ -79,10 +68,10 @@ test('buildTaskStartAssignment: no leftover "fix it yourself" / "verify it once"
   assert.equal(/you may fix it yourself/i.test(text), false)
 })
 
-test('buildTaskStartAssignment: roughly half the length of the old ~450-word prompt (not re-padded)', () => {
+test('buildTaskStartAssignment: now that classification rules moved to ROLE_INSTRUCTIONS.boss, this is a short, purely dynamic wrapper', () => {
   const text = buildTaskStartAssignment('fix the bug', false)
   const words = text.trim().split(/\s+/).length
-  assert.ok(words < 300, `expected well under 450 words, got ${words}`)
+  assert.ok(words < 60, `expected a lean dynamic-only wrapper, got ${words} words`)
 })
 
 // ── mode-line format stays compatible with frames.ts's parser ──────────────
@@ -257,48 +246,101 @@ function toolResultOutputsWithMeta(events: AgentEvent[], tool: string): Array<{ 
     .map(e => ({ output: e.output, error: e.error, rejected: e.rejected }))
 }
 
-// ── System prompt: describes ONLY the tools a given role actually has ───────
-// buildSystemPrompt (agent.ts) derives its TOOLS section from Agent.setAllowedTools
-// rather than sending every role the same list — proven here via ROLE_TOOLS.planner's
-// own restricted set (read_file, web_search, fetch_url, ledger, conclude), captured
-// via a scripted client (direct proof of what reaches the model).
+// ── Opening messages: [system] identity, [user] assignment, [system]
+// instructions — three properly typed, separate messages instead of one giant
+// block prepended onto the first user message. Tool descriptions are NOT part of
+// either system message any more: Ollama's own `tools` parameter (role-filtered
+// by allowedTools, asserted separately below) already shows the model what it
+// has, so the prompt text itself says nothing about tools/filesystem/memory.
 
-test('system prompt: explains that calling conclude ends the session', async () => {
+test('opening messages: role-tagged frame sends [system identity, user assignment, system instructions] in that order', async () => {
   const events: AgentEvent[] = []
-  const sessionId = `test-system-prompt-eot-${Date.now()}`
-  let capturedFirstMessage = ''
+  const sessionId = `test-opening-messages-implementer-${Date.now()}`
+  let captured: Array<{ role: string; content: string }> = []
   const ollama = {
     chat: async (args: { messages: Array<{ role: string; content: string }> }) => {
-      // System prompt is prepended to the first user message, not sent as a
-      // separate system role message.
-      capturedFirstMessage = args.messages[0]?.content ?? ''
+      captured = args.messages
+      return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
+    },
+  } as unknown as Ollama
+  const agent = new Agent(e => events.push(e), 'test-model', ollama)
+  agent.setSessionId(sessionId)
+  agent.setRole('implementer')
+  try {
+    const answer = await agent.chat('fix the off-by-one bug')
+    assert.equal(answer, 'Final answer.')
+    assert.equal(captured.length, 3)
+    assert.equal(captured[0].role, 'system')
+    assert.ok(captured[0].content.includes('IMPLEMENTER'))
+    assert.equal(captured[1].role, 'user')
+    assert.equal(captured[1].content, 'fix the off-by-one bug')
+    assert.equal(captured[2].role, 'system')
+    assert.ok(captured[2].content.includes('VERIFICATION'))
+  } finally {
+    await cleanupDispatchSession(sessionId)
+  }
+})
+
+test('opening messages: the unrestricted baseline (roleTag null) still opens with a generic system identity, no instructions message', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-opening-messages-baseline-${Date.now()}`
+  let captured: Array<{ role: string; content: string }> = []
+  const ollama = {
+    chat: async (args: { messages: Array<{ role: string; content: string }> }) => {
+      captured = args.messages
       return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
     },
   } as unknown as Ollama
   const agent = new Agent(e => events.push(e), 'test-model', ollama)
   agent.setSessionId(sessionId)
   try {
-    const answer = await agent.chat('argo system prompt end-of-turn case')
-    assert.equal(answer, 'Final answer.')
-    assert.ok(capturedFirstMessage.includes('You are Argo, a multi-agent system'), 'first message should contain the system prompt')
-    assert.ok(capturedFirstMessage.includes(
-      'To finish, call `conclude` with the appropriate status keyword and your message to end your session.',
-    ))
-    assert.ok(capturedFirstMessage.includes(
-      'conclude(status, message): end your session with a status keyword and a message.',
-    ))
+    await agent.chat('argo baseline case')
+    // No role set — no ROLE_INSTRUCTIONS entry, so only identity + the user message.
+    assert.equal(captured.length, 2)
+    assert.equal(captured[0].role, 'system')
+    assert.equal(captured[1].role, 'user')
+    assert.equal(captured[1].content, 'argo baseline case')
   } finally {
     await cleanupDispatchSession(sessionId)
   }
 })
 
-test('system prompt: a role-restricted frame (Planner\'s tool set) is not told about tools it does not have', async () => {
+test('opening messages: neither system message mentions tool descriptions, filesystem paths, or AGENTS.md/MEMORY.md', async () => {
   const events: AgentEvent[] = []
-  const sessionId = `test-system-prompt-role-gate-${Date.now()}`
-  let capturedSystemPrompt = ''
+  const sessionId = `test-opening-messages-lean-${Date.now()}`
+  let captured: Array<{ role: string; content: string }> = []
   const ollama = {
     chat: async (args: { messages: Array<{ role: string; content: string }> }) => {
-      capturedSystemPrompt = args.messages[0]?.content ?? ''
+      captured = args.messages
+      return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
+    },
+  } as unknown as Ollama
+  const agent = new Agent(e => events.push(e), 'test-model', ollama)
+  agent.setSessionId(sessionId)
+  agent.setRole('planner')
+  try {
+    await agent.chat('plan the pagination work')
+    const systemText = captured.filter(m => m.role === 'system').map(m => m.content).join('\n')
+    for (const bullet of ['- bash:', '- read_file:', '- write_file:', '- edit_file:']) {
+      assert.equal(systemText.includes(bullet), false, `unexpected tool bullet "${bullet}" in system messages`)
+    }
+    assert.equal(/\/workspace/.test(systemText), false)
+    assert.equal(/AGENTS\.md/.test(systemText), false)
+    assert.equal(/MEMORY\.md/.test(systemText), false)
+  } finally {
+    await cleanupDispatchSession(sessionId)
+  }
+})
+
+test('role-restricted frame (Planner\'s tool set): the `tools` parameter sent to Ollama is filtered, independent of prompt text', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-tools-param-role-gate-${Date.now()}`
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let capturedTools: any[] = []
+  const ollama = {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    chat: async (args: { tools: any[] }) => {
+      capturedTools = args.tools
       return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
     },
   } as unknown as Ollama
@@ -306,40 +348,40 @@ test('system prompt: a role-restricted frame (Planner\'s tool set) is not told a
   agent.setSessionId(sessionId)
   agent.setAllowedTools(['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude']) // ROLE_TOOLS.planner
   try {
-    await agent.chat('argo role-gated system prompt case')
-    assert.equal(capturedSystemPrompt.includes('- bash:'), false)
-    assert.equal(capturedSystemPrompt.includes('- write_file:'), false)
-    assert.equal(capturedSystemPrompt.includes('- edit_file:'), false)
-    assert.equal(capturedSystemPrompt.includes('- browser_fetch:'), false)
-    // What it DOES have is still described.
-    assert.ok(capturedSystemPrompt.includes('- read_file:'))
-    assert.ok(capturedSystemPrompt.includes('- web_search:'))
-    assert.ok(capturedSystemPrompt.includes('- fetch_url:'))
-    // The explicit read-only note is present since it has neither write_file nor edit_file.
-    assert.ok(capturedSystemPrompt.includes('You have no file-modification tools in this role'))
+    await agent.chat('argo role-gated tools case')
+    const names = capturedTools.map(t => t.function.name)
+    assert.equal(names.includes('bash'), false)
+    assert.equal(names.includes('write_file'), false)
+    assert.equal(names.includes('edit_file'), false)
+    assert.equal(names.includes('browser_fetch'), false)
+    assert.ok(names.includes('read_file'))
+    assert.ok(names.includes('web_search'))
+    assert.ok(names.includes('fetch_url'))
   } finally {
     await cleanupDispatchSession(sessionId)
   }
 })
 
-test('system prompt: an unrestricted frame (allowedTools null, the baseline) still sees every tool', async () => {
+test('an unrestricted frame (allowedTools null, the baseline): the `tools` parameter sent to Ollama includes every tool', async () => {
   const events: AgentEvent[] = []
-  const sessionId = `test-system-prompt-baseline-tools-${Date.now()}`
-  let capturedSystemPrompt = ''
+  const sessionId = `test-tools-param-baseline-${Date.now()}`
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let capturedTools: any[] = []
   const ollama = {
-    chat: async (args: { messages: Array<{ role: string; content: string }> }) => {
-      capturedSystemPrompt = args.messages[0]?.content ?? ''
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    chat: async (args: { tools: any[] }) => {
+      capturedTools = args.tools
       return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
     },
   } as unknown as Ollama
   const agent = new Agent(e => events.push(e), 'test-model', ollama)
   agent.setSessionId(sessionId)
   try {
-    await agent.chat('argo baseline system prompt case')
-    for (const bullet of ['- bash:', '- read_file:', '- write_file:', '- edit_file:', '- fetch_url:', '- browser_fetch:', '- web_search:']) {
-      assert.ok(capturedSystemPrompt.includes(bullet), `expected baseline prompt to include "${bullet}"`)
+    await agent.chat('argo baseline tools case')
+    const names = capturedTools.map(t => t.function.name)
+    for (const tool of ['bash', 'read_file', 'write_file', 'edit_file', 'fetch_url', 'browser_fetch', 'web_search']) {
+      assert.ok(names.includes(tool), `expected baseline tools to include "${tool}"`)
     }
-    assert.equal(capturedSystemPrompt.includes('You have no file-modification tools in this role'), false)
   } finally {
     await cleanupDispatchSession(sessionId)
   }

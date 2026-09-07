@@ -7,7 +7,7 @@ import { config } from './config.js'
 import { LOGS_DIR } from './logger.js'
 import type { AgentEvent } from './types.js'
 import type { Ollama } from 'ollama'
-import { Agent, parseChangedFiles, buildFallbackCommitMessage, isCleanStatus, loadProjectContext } from './agent.js'
+import { Agent, parseChangedFiles, buildFallbackCommitMessage, isCleanStatus } from './agent.js'
 import { NO_OUTPUT } from './tools/bash.js'
 
 test('setMaxIterations clamps out-of-range values into [10, 1000]', () => {
@@ -89,56 +89,6 @@ test('compactNow evicts old tool-result episodes and marks the emitted event man
     await fs.readdir(LOGS_DIR).then(files =>
       Promise.all(files.filter(f => f.includes('manual-context-compaction')).map(f => fs.unlink(`${LOGS_DIR}/${f}`).catch(() => {})))
     ).catch(() => {})
-  }
-})
-
-test('loadProjectContext: neither AGENTS.md nor MEMORY.md present — both shown with empty placeholders', async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'argo-project-context-'))
-  try {
-    const result = await loadProjectContext(dir)
-    assert.match(result, /<argo-agents-file>/)
-    assert.match(result, /AGENTS\.md:\n\(file is empty or does not exist yet\)/)
-    assert.match(result, /<argo-memory-file>/)
-    assert.match(result, /MEMORY\.md:\n\(file is empty or does not exist yet\)/)
-  } finally {
-    await fs.rm(dir, { recursive: true, force: true })
-  }
-})
-
-test('loadProjectContext: only AGENTS.md present — content shown, MEMORY.md shows placeholder', async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'argo-project-context-'))
-  try {
-    await fs.writeFile(path.join(dir, 'AGENTS.md'), 'Use pnpm, not npm.')
-    const result = await loadProjectContext(dir)
-    assert.match(result, /<argo-agents-file>[\s\S]*AGENTS\.md:[\s\S]*Use pnpm, not npm\.[\s\S]*<\/argo-agents-file>/)
-    assert.match(result, /<argo-memory-file>[\s\S]*MEMORY\.md:\n\(file is empty or does not exist yet\)[\s\S]*<\/argo-memory-file>/)
-  } finally {
-    await fs.rm(dir, { recursive: true, force: true })
-  }
-})
-
-test('loadProjectContext: both files present — both included in XML tags with content', async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'argo-project-context-'))
-  try {
-    await fs.writeFile(path.join(dir, 'AGENTS.md'), 'Project instructions content.')
-    await fs.writeFile(path.join(dir, 'MEMORY.md'), 'Durable memory content.')
-    const result = await loadProjectContext(dir)
-    assert.match(result, /<argo-agents-file>[\s\S]*AGENTS\.md:[\s\S]*Project instructions content\.[\s\S]*<\/argo-agents-file>/)
-    assert.match(result, /<argo-memory-file>[\s\S]*MEMORY\.md:[\s\S]*Durable memory content\.[\s\S]*<\/argo-memory-file>/)
-  } finally {
-    await fs.rm(dir, { recursive: true, force: true })
-  }
-})
-
-test('loadProjectContext: an oversized MEMORY.md is truncated, not sent in full', async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'argo-project-context-'))
-  try {
-    await fs.writeFile(path.join(dir, 'MEMORY.md'), 'x'.repeat(20_000))
-    const result = await loadProjectContext(dir)
-    assert.ok(result.length < 20_000)
-    assert.match(result, /chars omitted/)
-  } finally {
-    await fs.rm(dir, { recursive: true, force: true })
   }
 })
 

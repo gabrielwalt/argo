@@ -9,7 +9,8 @@ import assert from 'node:assert/strict'
 import {
   ROLE_TOOLS,
   TASK_START_TOOLS,
-  systemPromptFor,
+  ROLE_IDENTITY,
+  ROLE_INSTRUCTIONS,
   ROLE_MAX_ITERATIONS,
   PROGRESS_CHECK_ITERATIONS,
   PROGRESS_CHECK_MESSAGES,
@@ -55,15 +56,25 @@ test('ROLE_TOOLS.boss has no bash and no write_file — the Boss is strictly rea
   assert.equal(ROLE_TOOLS.boss.includes('write_file'), false)
 })
 
-// ── Planner system prompt: the `conclude`-based ITERATIVE design — no TASK:/
-// TEST:/DONE line convention, no separate "re-planning round" request (adaptation
-// is just what happens on the next detail call). The Planner is called once for an
-// overall plan (an ordered list of sub-tasks, its `conclude` answer), then resumed
-// repeatedly to produce one fully self-contained Implementer assignment at a time,
-// also delivered via `conclude`.
+// ── Planner prompts: ROLE_IDENTITY (message 1, [system]) + ROLE_INSTRUCTIONS
+// (message 3, [system]) replace the old single-block systemPromptFor. Lean and
+// role-specific: no tool descriptions (Ollama's own `tools` parameter already
+// shows those), no filesystem/environment/memory/git mentions. The `conclude`-
+// based ITERATIVE design — no TASK:/TEST:/DONE line convention, no separate
+// "re-planning round" request (adaptation is just what happens on the next detail
+// call). The Planner is called once for an overall plan (an ordered list of
+// sub-tasks, its `conclude` answer), then resumed repeatedly to produce one fully
+// self-contained Implementer assignment at a time, also delivered via `conclude`.
 
-test('planner system prompt: describes the two-phase flow — overall plan first, then resumed to produce one assignment at a time', () => {
-  const text = systemPromptFor('planner')
+test('planner identity: one sentence, names the role and the two-part job (decompose + produce assignments)', () => {
+  const text = ROLE_IDENTITY.planner
+  assert.ok(/PLANNER/.test(text))
+  assert.ok(text.includes('decompose'))
+  assert.ok(text.includes('assignments'))
+})
+
+test('planner instructions: describes the two-phase flow — overall plan first, then resumed to produce one assignment at a time', () => {
+  const text = ROLE_INSTRUCTIONS.planner
   assert.ok(text.includes('ordered list'))
   assert.ok(text.includes('resumed for each unit'))
   assert.ok(text.includes('exactly one'))
@@ -77,35 +88,45 @@ test('planner system prompt: describes the two-phase flow — overall plan first
   assert.equal(text.includes('TEST: no'), false)
 })
 
-test('planner system prompt: mentions conclude as the way it delivers both the plan and each assignment', () => {
-  const text = systemPromptFor('planner')
+test('planner instructions: mentions conclude as the way it delivers both the plan and each assignment', () => {
+  const text = ROLE_INSTRUCTIONS.planner
   assert.ok(text.includes('`conclude`'))
 })
 
-test('planner system prompt: adaptation is natural, not a separate re-planning request', () => {
-  const text = systemPromptFor('planner')
-  assert.ok(text.includes('no separate re-planning'))
-})
-
-test('planner system prompt: does not mention a Tester (there is none)', () => {
-  const text = systemPromptFor('planner')
+test('planner instructions: does not mention a Tester (there is none)', () => {
+  const text = ROLE_INSTRUCTIONS.planner
   assert.equal(/\bTester\b/.test(text), false)
 })
 
-test('planner system prompt: still states it never writes or edits (matches the assignment prompt\'s READ-ONLY statement)', () => {
-  const text = systemPromptFor('planner')
-  assert.ok(text.includes('you never write or edit anything'))
+test('planner instructions: still states it never writes or edits (matches the assignment prompt\'s READ-ONLY statement)', () => {
+  const text = ROLE_INSTRUCTIONS.planner
+  assert.ok(text.includes('never write or edit anything'))
 })
 
 // ── Planner read-only framing — the Planner's tool list has no bash, write_file,
-// or edit_file (ROLE_TOOLS.planner above), and its own system prompt says so
+// or edit_file (ROLE_TOOLS.planner above), and its own instructions say so
 // explicitly. Mirrors the Boss task-start checkpoint's own explicit "READ-ONLY"
 // framing.
 
-test('planner system prompt: explicitly states it is READ-ONLY and points at read_file for investigation', () => {
-  const text = systemPromptFor('planner')
+test('planner instructions: explicitly states it is READ-ONLY', () => {
+  const text = ROLE_INSTRUCTIONS.planner
   assert.ok(/READ-ONLY/.test(text))
-  assert.ok(text.includes('Use read_file to inspect files'))
+})
+
+// ── Lean prompts: no tool descriptions, filesystem, environment, memory, or git
+// mentions in either message — those lived in agent.ts's old buildSystemPrompt/
+// loadProjectContext (both removed) and were never role-specific; Ollama's own
+// `tools` parameter already shows the model its tools.
+
+test('role prompts (identity + instructions) never mention tool descriptions, filesystem paths, or AGENTS.md/MEMORY.md', () => {
+  for (const role of ['boss', 'planner', 'implementer'] as const) {
+    const text = `${ROLE_IDENTITY[role]}\n${ROLE_INSTRUCTIONS[role]}`
+    assert.equal(/\/workspace/.test(text), false, `${role}: no /workspace mention`)
+    assert.equal(/AGENTS\.md/.test(text), false, `${role}: no AGENTS.md mention`)
+    assert.equal(/MEMORY\.md/.test(text), false, `${role}: no MEMORY.md mention`)
+    assert.equal(/git/i.test(text), false, `${role}: no git/autocommit mention`)
+    assert.equal(/Ubuntu/.test(text), false, `${role}: no environment mention`)
+  }
 })
 
 // ── update_plan does not exist as a tool at all any more — the plan/act gate and

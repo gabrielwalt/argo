@@ -9,7 +9,7 @@ import { truncateOutput } from './tools/truncate.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
 import { TraceLogger } from './al-logger.js'
 import type { AgentEvent, ToolName, ModelOptions, Role } from './types.js'
-import { PROGRESS_CHECK_ITERATIONS, PROGRESS_CHECK_MESSAGES, ROLE_CONCLUDE_STATUSES, concludeStatusError, withConcludeStatusEnum } from './frames.js'
+import { PROGRESS_CHECK_ITERATIONS, PROGRESS_CHECK_MESSAGES, ROLE_CONCLUDE_STATUSES, ROLE_IDENTITY, ROLE_INSTRUCTIONS, concludeStatusError, withConcludeStatusEnum } from './frames.js'
 import {
   createLoopState, noteMutation, noteBashExecution, evaluateCall, normalizeCallKey, recordResult, type LoopState,
   // H21 closes the unbounded-retry hole where a call the role gate refuses is
@@ -19,65 +19,6 @@ import {
 } from './loop.js'
 import { classifyTool, inferDependencies, evict, type EpisodeMeta, type EvictionBudget } from './eviction.js'
 import { recordEpisode, markEpisodeEvicted, newId as newLedgerId } from './ledger.js'
-
-// SYSTEM PROMPT — authoring guidance (for maintainers, not the model):
-// Use this for HIGH-LEVEL steering of *how to work*, awareness of the tools the
-// harness provides, and the Argo context the agent runs in. Do NOT add obvious,
-// low-level do/don't rules the model should already know or can infer (e.g.
-// "locate before you edit", "verify your change") — we cannot enumerate correct
-// behavior, and a growing wall of such rules dilutes the prompt and effectively
-// dumbs the model down. When a basic failure mode shows up, prefer fixing it in
-// the HARNESS (a better tool with real feedback, a loop steer, a guard) over
-// adding a line here — e.g. the edit_file tool replaced a prompt rule about not
-// reusing a stale remembered block; the harness now makes that failure impossible.
-//
-// buildSystemPrompt takes the frame's REAL tool list (null for the unrestricted
-// baseline) and builds the TOOLS section from only what `has()` says is actually
-// there — a role that lacks write_file/edit_file is never told about them, and
-// gets an explicit note instead pointing at what it DOES have for reading/
-// investigating.
-function buildSystemPrompt(tools: ToolName[] | null, roleInstructions?: string, role?: string): string {
-  const has = (t: ToolName): boolean => tools === null || tools.includes(t)
-  const canWrite = has('write_file') || has('edit_file')
-
-  const toolLines = [
-    has('bash') && '- bash: run shell commands. Pass the working directory via the cwd argument (e.g. /workspace); do not prefix with "cd /workspace &&".',
-    has('read_file') && '- read_file: whole-file read at any absolute path.',
-    has('write_file') && '- write_file: whole-file write at any absolute path.',
-    has('edit_file') && '- edit_file: replace an exact string in a file; it reports the changed lines and errors if the text is missing or matches more than once.',
-    has('fetch_url') && '- fetch_url: fetch a page\'s text content (no JavaScript execution).',
-    has('browser_fetch') && '- browser_fetch: fetch a page and run its JavaScript — for pages that need it to render.',
-    has('web_search') && '- web_search: look up things you do not already know.',
-    '- conclude(status, message): end your session with a status keyword and a message.',
-    // Read-only roles (Planner, Boss) get told explicitly what to use instead of
-    // write_file/edit_file, rather than left to infer it from the absence of a bullet.
-    !canWrite && '- You have no file-modification tools in this role: use the tools above (read_file, and bash/web_search/fetch_url where listed) to investigate — you cannot change the project.',
-  ].filter((line): line is string => typeof line === 'string').join('\n')
-
-  return `You are Argo, a multi-agent system with a coding harness. Your project is mounted at /workspace in an isolated Ubuntu Docker container. Your thoughts, tool calls, and results stream live to the user, and changes under /workspace are committed to git when auto-commit is enabled.
-${roleInstructions ? '\n' + roleInstructions + '\n' : ''}
-TOOLS — invoke them through the function-calling API; never as text in your reply.
-${toolLines}
-
-ENVIRONMENT
-${has('bash')
-    ? '- Ubuntu 24.04. CLI includes bash, git, jq, node, python3, rg, fd, sqlite3, curl. In Node use require() (NODE_PATH is set), not import; native fetch() is available; cheerio and playwright are preinstalled.'
-    : '- Ubuntu 24.04 container. This role has no direct shell access — investigate using the tools listed above.'}
-
-FILESYSTEM
-- /workspace is the git-tracked project folder — the only place that is committed. Keep scratch, experiments, and downloads elsewhere (/tmp, your home directory).
-- Use absolute paths.${has('bash') ? ' For commands about the project itself (npm test, git, node <file>), set the bash cwd to /workspace.' : ''}
-
-${(role === 'implementer') ? '' : `MEMORY
-- /workspace/AGENTS.md (project instructions) and /workspace/MEMORY.md (durable memory), are appended below.${canWrite ? ' Update MEMORY.md only for durable, reusable facts — tersely, in place — never one-off task state.' : ''}`}
-
-PRECISION
-- Before finishing, verify the objective against the original request.
-- Distinguish what you verified from what you assumed; do not present a guess as a fact.
-- Never reconstruct an exact identifier, path, URL, flag, or package name from memory — copy it verbatim from the tool result where it appeared, or re-read the source.
-
-To finish, call \`conclude\` with the appropriate status keyword and your message to end your session.`
-}
 
 // Parses tool calls that a model wrote as JSON code blocks in its text content
 // instead of using the native tool-calling API (common with smaller models).
@@ -222,42 +163,6 @@ export function regroundSteer(objective: string, detail: string): string {
   return `You appear stuck — ${detail}. Re-anchor to the objective: "${objective}". Do ONE thing now: either make the single most important change (an edit) that advances that objective, or — if it is already met, or you are genuinely blocked — call conclude with your final answer, stating what you accomplished and (if blocked) exactly what is blocking you. Stop re-inspecting the same things, and do not broaden or switch the objective.`
 }
 
-// Same cap as read_file's own truncation (file-ops.ts) — these are the same
-// kind of content (a file the agent would otherwise have to read_file itself),
-// just auto-loaded instead of requiring a tool call. Missing files are not an
-// error — most projects won't have either yet, and behavior is then unchanged.
-const PROJECT_CONTEXT_CHAR_CAP = 8000
-
-async function readProjectContextFile(absPath: string): Promise<string | null> {
-  try {
-    return truncateOutput(await fs.readFile(absPath, 'utf-8'), PROJECT_CONTEXT_CHAR_CAP)
-  } catch {
-    return null
-  }
-}
-
-// Loads AGENTS.md (human-authored project instructions) and MEMORY.md
-// (agent-maintained durable memory) from the workspace root once per run,
-// fresh each time so an update made earlier in the same session is visible on
-// the next run. Deliberately not re-read on every iteration within a run: the
-// model may edit MEMORY.md mid-run, and re-reading per-iteration would make
-// the system message inconsistent across a single run's own iterations.
-// workspaceRoot defaults to the real mount; overridable only so tests don't
-// need an actual /workspace on the host running them.
-export async function loadProjectContext(workspaceRoot = '/workspace'): Promise<string> {
-  const [agentsMd, memoryMd] = await Promise.all([
-    readProjectContextFile(path.join(workspaceRoot, 'AGENTS.md')),
-    readProjectContextFile(path.join(workspaceRoot, 'MEMORY.md')),
-  ])
-  const agentsContent = agentsMd
-    ? `/workspace/AGENTS.md:\n${agentsMd}`
-    : `/workspace/AGENTS.md:\n(file is empty or does not exist yet)`
-  const memoryContent = memoryMd
-    ? `/workspace/MEMORY.md:\n${memoryMd}`
-    : `/workspace/MEMORY.md:\n(file is empty or does not exist yet)`
-  return `<argo-agents-file>\n${agentsContent}\n</argo-agents-file>\n\n<argo-memory-file>\n${memoryContent}\n</argo-memory-file>`
-}
-
 // HOW A chat() TURN ENDED, as a fact rather than an inference:
 //   'ok'      — the model called `conclude` with a final answer (a turn with no
 //               tool calls is a thinking turn, not a terminal one — the ONLY way
@@ -370,10 +275,11 @@ export class Agent {
   // Which ROLE (Planner/Implementer/Boss) this frame is, set by dispatch.ts's
   // spawnFrame alongside setAllowedTools/setMaxIterations/etc (frames.ts's
   // ROLE_TOOLS/ROLE_MAX_ITERATIONS are the same per-role tables this mirrors). null
-  // for the unrestricted baseline, which never sets it. The ONLY thing this drives
-  // is which progress-check thresholds/messages chat() uses (frames.ts's
-  // PROGRESS_CHECK_ITERATIONS/PROGRESS_CHECK_MESSAGES) — every other role-shaped
-  // decision in this file already goes through allowedTools/roleInstructions.
+  // for the unrestricted baseline, which never sets it. Drives which progress-check
+  // thresholds/messages chat() uses (frames.ts's PROGRESS_CHECK_ITERATIONS/
+  // PROGRESS_CHECK_MESSAGES) AND which ROLE_IDENTITY/ROLE_INSTRUCTIONS strings open
+  // this frame's history (see chat()) — every other role-shaped decision in this
+  // file already goes through allowedTools.
   private roleTag: Role | null = null
   // NEW, ADDITIVE Markdown trace (al-logger.ts) — runs alongside SessionLogger, never
   // replacing it. Created fresh at the top of chat() (mirroring SessionLogger's own
@@ -399,8 +305,7 @@ export class Agent {
   }
 
   // ollama is injectable only so tests can drive the loop deterministically
-  // without a live model (same rationale as loadProjectContext's workspaceRoot);
-  // production always uses the default client.
+  // without a live model; production always uses the default client.
   constructor(
     private emit: (event: AgentEvent, seq?: number) => void,
     model?: string,
@@ -488,18 +393,11 @@ export class Agent {
   }
 
   // See the roleTag field doc above — dispatch.ts's spawnFrame calls this once, at the
-  // same spawn site as setAllowedTools/setRoleInstructions/setMaxIterations.
+  // same spawn site as setAllowedTools/setMaxIterations. Also what chat() uses to look
+  // up this frame's ROLE_IDENTITY/ROLE_INSTRUCTIONS (frames.ts) for its opening
+  // system/user/system messages — see chat()'s own comment.
   setRole(role: Role | null) {
     this.roleTag = role
-  }
-
-  // MULTI-AGENT ARCHITECTURE: appended after the baseline SYSTEM_PROMPT (whose
-  // tool-usage/filesystem conventions still apply to every role) — this is what
-  // gives a role-scoped frame its distinct job description (frames.ts's
-  // ROLE_SYSTEM_SUFFIX). Empty string (the default) leaves the baseline byte-identical.
-  private roleInstructions = ''
-  setRoleInstructions(text: string) {
-    this.roleInstructions = text
   }
 
   // What dispatch.ts reads to build a FrameResult's filesTouched/filesWritten —
@@ -742,7 +640,7 @@ export class Agent {
   // *identical* request on retry without duplicating the argument literal.
   // Return type is intentionally inferred (Promise<ChatResponse>) to avoid
   // importing the ollama response type.
-  private chatCall(systemPrompt: string) {
+  private chatCall() {
     // Deterministic context editing (Tier-0, no LLM): the model only needs recent
     // tool outputs verbatim; older large ones are collapsed to a short, restorable
     // stub so the LIVE window it sees stays small over long runs — which is what
@@ -754,7 +652,12 @@ export class Agent {
     const toolPos: number[] = []
     this.history.forEach((m, i) => { if (m.role === 'tool') toolPos.push(i) })
     const collapse = new Set(toolPos.slice(0, Math.max(0, toolPos.length - KEEP_RECENT_TOOL_RESULTS)))
-    const messages: Message[] = systemPrompt ? [{ role: 'system', content: systemPrompt }] : []
+    // The frame's opening [system]/[user]/[system] messages (ROLE_IDENTITY,
+    // userMessage, ROLE_INSTRUCTIONS — see chat()) are already IN this.history by
+    // the time chatCall runs, pushed there directly instead of being assembled
+    // into a separate leading system-role message here — so messages starts
+    // empty and the walk below carries them through like any other history entry.
+    const messages: Message[] = []
     // NEW, ADDITIVE Markdown trace (al-logger.ts): collect the collapsed-message detail
     // (original vs. sent length) as this.history is walked below, in the SAME pass
     // that decides collapsing — rather than recomputing it separately — so this can
@@ -881,10 +784,10 @@ export class Agent {
   // both the original call and the retry timed out — the iteration loop injects this as
   // context for the agent and continues rather than killing the run. Non-timeout errors
   // (e.g. malformed response, connection refused) are still rethrown to the outer catch.
-  private async chatWithRetry(systemPrompt: string, emitAndLog: (e: AgentEvent) => void) {
+  private async chatWithRetry(emitAndLog: (e: AgentEvent) => void) {
     const isTimeout = (e: unknown) => e instanceof Error && e.message.includes('did not respond within')
     try {
-      return await this.chatCall(systemPrompt)
+      return await this.chatCall()
     } catch (err) {
       this.ollamaRetryCount++
       const msg = err instanceof Error ? err.message : String(err)
@@ -892,7 +795,7 @@ export class Agent {
       await new Promise(resolve => setTimeout(resolve, this.chatRetryDelayMs))
       if (this.aborted) return null
       try {
-        return await this.chatCall(systemPrompt)
+        return await this.chatCall()
       } catch (retryErr) {
         // Only soft-recover on timeouts — other errors (malformed response, etc.) are
         // still fatal and rethrown to chat()'s outer catch as before.
@@ -968,13 +871,50 @@ export class Agent {
       this.traceLogger?.logEvent(event, seq)
     }
 
+    // OPENING MESSAGES — three properly typed, separate messages instead of one
+    // giant block prepended onto the first user message: [system] role identity
+    // (frames.ts's ROLE_IDENTITY — who this frame is, one sentence), [user] this
+    // frame's actual assignment/prompt (userMessage, unchanged), [system] this
+    // role's task-specific instructions (frames.ts's ROLE_INSTRUCTIONS — what to
+    // do and how). Neither mentions tools (Ollama's own `tools` parameter, sent by
+    // chatCall below, already shows the model what it has), the filesystem, or
+    // AGENTS.md/MEMORY.md — those lived in the old buildSystemPrompt/
+    // loadProjectContext (both removed) and were never role-specific. Falls back
+    // to a generic identity/no instructions for the unrestricted baseline
+    // (roleTag null, which never sets ROLE_IDENTITY/ROLE_INSTRUCTIONS), so that
+    // Agent still opens with a real system message rather than none at all.
+    // Skipped entirely on a RESUMED turn: the frame's history already carries
+    // these three messages from its original (non-resumed) chat() call —
+    // re-pushing them would duplicate the identity/instructions on every resume.
+    if (!resume) {
+      const identity = this.roleTag ? ROLE_IDENTITY[this.roleTag] : 'You are Argo, a coding assistant.'
+      this.pushCtx({ role: 'system', content: identity })
+    }
     this.pushCtx({ role: 'user', content: userMessage })
+    // Captured IMMEDIATELY after the [user] push, before the [system] instructions
+    // push that may or may not follow it — computing this via arithmetic after all
+    // three pushes would depend on whether the instructions message actually got
+    // pushed (it's skipped when this.roleTag has no ROLE_INSTRUCTIONS entry, e.g.
+    // the unrestricted baseline), which is exactly the kind of off-by-one that
+    // silently points currentRunStart at the wrong message.
+    const userMessageIndex = this.history.length - 1
+    if (!resume) {
+      const instructions = this.roleTag ? ROLE_INSTRUCTIONS[this.roleTag] : ''
+      if (instructions) this.pushCtx({ role: 'system', content: instructions })
+    }
     this.phase = 'running'
     // The index of the message that started this run — compactHistory() always
     // keeps history[currentRunStart] verbatim, however many iterations follow it.
     // Reassigned (not recomputed) after each eviction pass, since eviction can
     // replace `this.history` wholesale and returns the prompt's new position in it.
-    let currentRunStart = this.history.length - 1
+    // Points at the [user] assignment message specifically (not the identity
+    // message ahead of it on a fresh run, nor the instructions message after it) —
+    // matches the pre-existing convention where this always pointed at the entry
+    // userMessage's own pushCtx. On a RESUMED turn there is no identity/
+    // instructions pair around it — the follow-up message pushed for this turn IS
+    // the last entry, so this.history.length - 1 is exactly userMessageIndex would
+    // have computed anyway.
+    let currentRunStart = userMessageIndex
     // Consecutive no-tool-call ("thinking") turns, local to this chat() call (not a
     // class field — a class field would carry across a resumed frame's later chat()
     // call and could suppress or misfire the nudge for state it never actually saw).
@@ -1021,35 +961,18 @@ export class Agent {
     emitAndLog({ type: 'message', role: 'user', content: userMessage })
     emitAndLog({ type: 'start', model: this.model, query: userMessage, options: this.options })
 
-    // Implementer never gets AGENTS.md/MEMORY.md content (the Planner reads those
-    // files and folds anything relevant directly into the assignment instead).
-    const skipProjectContext = this.roleTag === 'implementer'
-    const projectContext = skipProjectContext ? '' : await loadProjectContext()
-    // this.allowedTools (null for the unrestricted baseline) is the frame's REAL
-    // tool set — buildSystemPrompt derives which tools to describe from it directly,
-    // so passing it here is what lets the TOOLS section itself stay truthful per role.
-    const rolePrompt = buildSystemPrompt(this.allowedTools, this.roleInstructions || undefined, this.roleTag || undefined)
-    const systemPrompt = projectContext ? `${rolePrompt}\n\n${projectContext}` : rolePrompt
-    // Logging-only: makes the full prompt (tool list + role suffix + AGENTS.md/
-    // MEMORY.md context) visible in the run log. Emitted before the first
-    // iteration/tool_call so a reader sees it ahead of anything it produced.
-    // Does not affect what is sent to the model.
-    emitAndLog({ type: 'system_prompt', content: systemPrompt })
-
-    // Prepend the system prompt to the FIRST user message of this run only,
-    // instead of sending it as a separate Ollama 'system' role message on every
-    // call. currentRunStart still points at the entry pushCtx added for
-    // userMessage above (eviction hasn't run yet at this point in chat()), so
-    // mutate it in place. On a RESUMED turn (opts.resume) this is skipped: the
-    // follow-up text pushed for this turn is a continuation of a frame whose
-    // history already carries the system prompt embedded in its own first message
-    // from the original (non-resumed) chat() call — prepending again would
-    // duplicate it on every resumed turn.
+    // Logging-only: surfaces the two system messages just pushed (identity +
+    // instructions) as one block in the run log/UI, exactly as a reader used to
+    // see the old single concatenated system prompt — emitted before the first
+    // iteration/tool_call so it appears ahead of anything the model produced.
+    // Does not affect what is sent to the model: that's driven entirely by
+    // this.history (chatCall reads it directly), never by this event. A no-op on
+    // a resumed turn — nothing new was pushed above, so there is nothing fresh to
+    // show.
     if (!resume) {
-      const startEntry = this.history[currentRunStart]
-      if (startEntry && startEntry.role === 'user' && typeof startEntry.content === 'string') {
-        startEntry.content = `${systemPrompt}\n\n${startEntry.content}`
-      }
+      const identity = this.roleTag ? ROLE_IDENTITY[this.roleTag] : 'You are Argo, a coding assistant.'
+      const instructions = this.roleTag ? ROLE_INSTRUCTIONS[this.roleTag] : ''
+      emitAndLog({ type: 'system_prompt', content: instructions ? `${identity}\n\n${instructions}` : identity })
     }
 
     // Stall/progress-check iteration numbers for THIS run, scaled to THIS run's own
@@ -1161,11 +1084,11 @@ export class Agent {
 
         emitAndLog({ type: 'ollama_request', iteration: i + 1, message_count: this.history.length + 1, model: this.model })
 
-        // '' — the system prompt is no longer sent as a separate Ollama 'system' role
-        // message; it was already prepended to the first user message in this.history
-        // above, and chatCall omits the system message entirely when passed an empty
-        // string.
-        const response = await this.chatWithRetry('', emitAndLog)
+        // No systemPrompt argument any more — the frame's opening [system]/[user]/
+        // [system] messages (ROLE_IDENTITY/userMessage/ROLE_INSTRUCTIONS) are
+        // already IN this.history (pushed once, above, before the iteration loop
+        // starts) and chatCall reads this.history directly.
+        const response = await this.chatWithRetry(emitAndLog)
         if (response === null) {
           // The user aborted while chatWithRetry was waiting to retry. Mirror the
           // top-of-loop stop handling exactly rather than retrying into a run the
