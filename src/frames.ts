@@ -19,38 +19,47 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
   // Deliberately NO update_plan. The Planner's deliverable is its own FRAME'S FINAL
   // ANSWER on each call (delivered via `conclude`'s `answer` — see dispatch.ts's
   // buildInitialPlannerPrompt/buildNextTaskPrompt/isPlannerDone), not a harness plan
-  // ledger.
-  planner: ['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude'],
+  // ledger. `bash` is back (2026 review, reversing the earlier removal) but for
+  // INVESTIGATION only — the Planner still has no write_file/edit_file, and its own
+  // ROLE_INSTRUCTIONS.planner still states the project is READ-ONLY for it, so the
+  // prompt's framing (not the absence of the tool) is what keeps it from editing.
+  // agent.ts's chatCall patches this role's `bash` tool DESCRIPTION to the read-only
+  // variant (patchBashForReadOnly, below) so the schema itself never invites writes.
+  planner: ['read_file', 'bash', 'web_search', 'fetch_url', 'ledger', 'conclude'],
   // Deliberately NO update_plan. The harness owns the plan; the Implementer's job is
   // to execute it, not define or refine it.
   implementer: ['read_file', 'write_file', 'edit_file', 'bash', 'fetch_url', 'web_search', 'browser_fetch', 'ledger', 'conclude'],
-  // Deliberately no write_file/edit_file, and (2026 review) no bash either — the
-  // Dispatcher is strictly read-only: it classifies the request, it never executes
-  // commands. The tool definitions sent to Ollama are filtered by ROLE_TOOLS
-  // (agent.ts's chatCall/chat), so removing bash here means the Dispatcher's OWN
-  // default role tool set never even offers it as a schema, not just "the prompt
-  // says don't use it." TASK_START_TOOLS (below) is a SEPARATE, deliberately
-  // different tool set used only for the task-start classification checkpoint — it
-  // keeps bash for investigation for reasons recorded in its own comment; this
-  // change does not touch it.
-  dispatcher: ['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude'],
+  // Deliberately no write_file/edit_file — the Dispatcher is strictly read-only: it
+  // classifies the request, it never implements anything. `bash` is back (2026
+  // review) for investigation (grep/cat/ls/running tests to understand behaviour),
+  // same rationale as the Planner above — its own prompt framing plus the
+  // classification-only scope is the guard, not the absence of the tool; see
+  // patchBashForReadOnly for how its tool description is kept honest about that.
+  // TASK_START_TOOLS (below) is a SEPARATE, deliberately different tool set used
+  // only for the task-start classification checkpoint; this change does not touch it.
+  dispatcher: ['read_file', 'bash', 'web_search', 'fetch_url', 'ledger', 'conclude'],
 }
 
 // The task-start checkpoint's tool set (dispatch.ts's runDispatcherTaskStart) —
-// deliberately NOT ROLE_TOOLS.dispatcher. The owner asked classification to be
-// STRICTLY read-only (2026-09-05): ROLE_TOOLS.dispatcher's only real editing path
-// was `bash` (no write_file/edit_file there either) — its one way to "fix"
-// something was a full heredoc file rewrite, an inherently blunt, all-or-nothing
-// instrument. Measured damage from exactly that: in eval, the Dispatcher judged a
-// 6-method feature TRIVIAL, rewrote the whole target file via `cat > file << EOF`,
-// hallucinated surrounding code, and broke an unrelated constructor signature other
-// files depended on; the same failure recurred in a real session (frame
-// dispatcher-mtmm1gcc-1: refused write_file, then ran the same heredoc trick via
-// bash on its very next turn and committed). Removing `bash` here removes the
-// capability at its root, so the git-diff-sizing guard rails that used to contain
-// it (TRIVIAL_DIFF_LINE_LIMIT, the before/after dirty check in
-// runDispatcherTaskStart) are removed alongside it, not left behind as dead code
-// for a capability that no longer exists.
+// deliberately NOT ROLE_TOOLS.dispatcher (a separate array, even though the two are
+// now identical in content: this checkpoint's set is allowed to diverge from the
+// Dispatcher's general role tools independently, and history has shown it needs to —
+// see below). Classification must stay STRICTLY read-only in EFFECT (2026-09-05):
+// `bash` CAN write, and an earlier incident traced exactly that — in eval, the
+// Dispatcher judged a 6-method feature TRIVIAL, rewrote the whole target file via
+// `cat > file << EOF`, hallucinated surrounding code, and broke an unrelated
+// constructor signature other files depended on; the same failure recurred in a real
+// session (frame dispatcher-mtmm1gcc-1: refused write_file, then ran the same heredoc
+// trick via bash on its very next turn and committed).
+//
+// `bash` is back (2026 review, reversing the earlier removal) because the
+// alternative — no bash at all — left the checkpoint unable to grep/cat/ls/run tests
+// to understand real behaviour, which is worse than the write risk above. The write
+// risk itself is contained by the PROMPT, not the tool set: the checkpoint's prompt
+// (ROLE_INSTRUCTIONS.dispatcher) states the project is READ-ONLY and its `bash` tool
+// DESCRIPTION is patched by agent.ts's chatCall to the read-only variant
+// (patchBashForReadOnly, below) so the schema itself never invites a write, unlike
+// the read-write default every tool definition carries in tools/index.ts.
 // `ledger` stays: the TOOL only exposes read actions (get_goal/get_plan/get_recent/
 // get_conclusion/get_frame_trail/expand — see tools/index.ts's ledger case); the
 // harness's OWN ledger.setObjective/recordDelegation calls are direct module calls
@@ -62,12 +71,41 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
 // OBJECTIVE status — a turn with no tool calls no longer ends anything (agent.ts's
 // chat() loop), so without it this checkpoint could investigate forever but never
 // actually classify.
-// The Dispatcher classification checkpoint is READ-ONLY but needs bash for
-// investigation (grep, cat, ls, running tests to understand behaviour). bash CAN
-// write, but the prompt's read-only framing + the classification-only scope make
-// that acceptable — the alternative (no bash) left the Dispatcher unable to check
-// real files, which is worse.
-export const TASK_START_TOOLS: ToolName[] = ['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude']
+export const TASK_START_TOOLS: ToolName[] = ['read_file', 'bash', 'web_search', 'fetch_url', 'ledger', 'conclude']
+
+// READ-ONLY ROLE BASH DESCRIPTION PATCH. Dispatcher/Planner get `bash` back (above)
+// for investigation, but tools/index.ts's own `bash` tool definition carries one
+// description shared by every role, written for the Implementer's read-write use
+// (it explicitly talks about writing to /workspace for "intentional project changes
+// or deliverables"). That wording is actively wrong advice for a role whose own
+// prompt says the project is READ-ONLY — a model reading the tool schema alone (not
+// every word of its system prompt) could reasonably conclude bash-writes-to-
+// /workspace is an endorsed path for it too. This is the same "the SCHEMA sent to
+// Ollama, not just the prompt's prose, must reflect the restriction" argument
+// withConcludeStatusEnum already makes for `conclude`'s status enum — just applied
+// to a tool description string instead of a parameter's enum.
+//
+// Generic over the tool-definition shape for the same reason withConcludeStatusEnum
+// is (avoids importing tools/index.ts's concrete type into this module beyond what
+// it already depends on); returns the input array unchanged (same reference) when
+// no `bash` tool is present in it at all (a role-filtered list that doesn't include
+// it — true for the Implementer's own tool set is irrelevant here since this is only
+// ever called for Dispatcher/Planner, but the guard is cheap and correct regardless).
+interface BashLikeTool {
+  type: 'function'
+  function: {
+    name: string
+    description: string
+    parameters: object
+  }
+}
+
+export function patchBashForReadOnly<T extends BashLikeTool>(tools: readonly T[], description: string): T[] {
+  return tools.map(t => {
+    if (t.function.name !== 'bash') return t
+    return { ...t, function: { ...t.function, description } } as T
+  })
+}
 
 // Per-role iteration budgets. Implementer keeps the most headroom (real work happens
 // there); Planner/Dispatcher are short bounded loops, not open-ended. Planner raised

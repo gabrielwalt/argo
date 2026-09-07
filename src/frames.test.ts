@@ -1,8 +1,13 @@
-// TASK-START READ-ONLY CHECKPOINT — frames.ts half. dispatch.ts's
-// runDispatcherTaskStart spawns its classification frame with TASK_START_TOOLS
-// instead of ROLE_TOOLS.dispatcher; these tests pin the composition of both so a
-// future edit can't silently reintroduce a write path into classification. No
-// Ollama, no ledger, no fs — plain array membership checks.
+// TASK-START READ-ONLY-IN-EFFECT CHECKPOINT — frames.ts half. dispatch.ts's
+// runDispatcherTaskStart spawns its classification frame with TASK_START_TOOLS,
+// a separate array from ROLE_TOOLS.dispatcher (even though the two are currently
+// identical in content) — these tests pin the composition of both so a future edit
+// can't silently reintroduce a write tool (write_file/edit_file) into
+// classification. `bash` is present in both (2026 review, reversing an earlier
+// removal) — it CAN write, but classification stays read-only in EFFECT via the
+// checkpoint's own prompt framing plus agent.ts patching this role's `bash`
+// description to the read-only variant (frames.ts's patchBashForReadOnly), not via
+// omitting the tool. No Ollama, no ledger, no fs — plain array membership checks.
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -14,14 +19,15 @@ import {
   ROLE_MAX_ITERATIONS,
   PROGRESS_CHECK_ITERATIONS,
   PROGRESS_CHECK_MESSAGES,
+  patchBashForReadOnly,
 } from './frames.js'
 
-test('TASK_START_TOOLS is read-only — no bash, no direct write tools', () => {
+test('TASK_START_TOOLS keeps bash for investigation, but excludes direct write tools', () => {
   // bash is included so the Dispatcher can grep, cat, ls, run tests to understand
   // behaviour. write_file/edit_file are excluded — the prompt's read-only framing
-  // is the guard, not the tool set (bash can write, but the Dispatcher is
-  // classifying).
-  assert.equal(TASK_START_TOOLS.includes('bash'), false)
+  // (plus the read-only bash description patch, see patchBashForReadOnly tests
+  // below) is the guard, not the absence of bash itself.
+  assert.equal(TASK_START_TOOLS.includes('bash'), true)
   assert.equal(TASK_START_TOOLS.includes('write_file'), false)
   assert.equal(TASK_START_TOOLS.includes('edit_file'), false)
 })
@@ -41,20 +47,41 @@ test('TASK_START_TOOLS keeps ledger — the tool itself exposes no write action'
   assert.equal(TASK_START_TOOLS.includes('ledger'), true)
 })
 
-test('TASK_START_TOOLS is strictly read-only tools plus conclude', () => {
-  assert.deepEqual([...TASK_START_TOOLS].sort(), ['conclude', 'fetch_url', 'ledger', 'read_file', 'web_search'])
+test('TASK_START_TOOLS is bash + read-only tools plus conclude', () => {
+  assert.deepEqual([...TASK_START_TOOLS].sort(), ['bash', 'conclude', 'fetch_url', 'ledger', 'read_file', 'web_search'])
 })
 
-test('ROLE_TOOLS.dispatcher has no bash and no write_file — the Dispatcher is strictly read-only outside the task-start checkpoint', () => {
-  // 2026 review: ROLE_TOOLS.dispatcher's own default contents (as opposed to
-  // TASK_START_TOOLS above, the SEPARATE, deliberately different one-off override
-  // dispatch.ts passes for the task-start classification checkpoint alone) no
-  // longer includes bash — the Dispatcher classifies the request, it never
-  // executes commands, and the tool definitions sent to Ollama are filtered by
-  // this table, so removing bash here means the Dispatcher's own role tool set
-  // never offers it as a schema at all.
-  assert.equal(ROLE_TOOLS.dispatcher.includes('bash'), false)
+test('ROLE_TOOLS.dispatcher has bash (investigation only) and no write_file — the Dispatcher never implements anything', () => {
+  // 2026 review: bash is back in ROLE_TOOLS.dispatcher's own default contents
+  // (reversing an earlier removal) — the Dispatcher still never writes/edits
+  // (write_file/edit_file absent), and its own prompt plus the read-only bash
+  // description patch (patchBashForReadOnly) keep bash to investigation in effect.
+  assert.equal(ROLE_TOOLS.dispatcher.includes('bash'), true)
   assert.equal(ROLE_TOOLS.dispatcher.includes('write_file'), false)
+})
+
+test('ROLE_TOOLS.planner has bash (investigation only) and no write_file/edit_file', () => {
+  assert.equal(ROLE_TOOLS.planner.includes('bash'), true)
+  assert.equal(ROLE_TOOLS.planner.includes('write_file'), false)
+  assert.equal(ROLE_TOOLS.planner.includes('edit_file'), false)
+})
+
+// ── patchBashForReadOnly — the read-only-role bash description patch ───────────────
+
+test('patchBashForReadOnly replaces only the bash tool\'s description, leaving every other tool untouched', () => {
+  const tools = [
+    { type: 'function' as const, function: { name: 'bash', description: 'read-write description', parameters: {} } },
+    { type: 'function' as const, function: { name: 'read_file', description: 'unrelated', parameters: {} } },
+  ]
+  const patched = patchBashForReadOnly(tools, 'read-only description')
+  assert.equal(patched.find(t => t.function.name === 'bash')!.function.description, 'read-only description')
+  assert.equal(patched.find(t => t.function.name === 'read_file')!.function.description, 'unrelated')
+})
+
+test('patchBashForReadOnly is a no-op (same content) when there is no bash tool in the array', () => {
+  const tools = [{ type: 'function' as const, function: { name: 'read_file', description: 'unrelated', parameters: {} } }]
+  const patched = patchBashForReadOnly(tools, 'read-only description')
+  assert.deepEqual(patched, tools)
 })
 
 // ── Planner prompts: ROLE_IDENTITY (message 1, [system]) + ROLE_INSTRUCTIONS
@@ -104,8 +131,8 @@ test('planner instructions: still states it never writes or edits (matches the a
   assert.ok(text.includes('never write or edit anything'))
 })
 
-// ── Planner read-only framing — the Planner's tool list has no bash, write_file,
-// or edit_file (ROLE_TOOLS.planner above), and its own instructions say so
+// ── Planner read-only framing — the Planner's tool list has bash (investigation
+// only, see above) but no write_file/edit_file, and its own instructions say so
 // explicitly. Mirrors the Dispatcher task-start checkpoint's own explicit
 // "READ-ONLY" framing.
 
@@ -148,7 +175,7 @@ test('every role in ROLE_TOOLS holds conclude', () => {
   }
 })
 
-test('TASK_START_TOOLS (the read-only classification checkpoint) also holds conclude', () => {
+test('TASK_START_TOOLS (the read-only-in-effect classification checkpoint) also holds conclude', () => {
   // Without it the checkpoint could investigate forever but never actually
   // classify — a turn with no tool calls no longer ends anything either.
   assert.equal(TASK_START_TOOLS.includes('conclude'), true)

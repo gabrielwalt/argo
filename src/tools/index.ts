@@ -53,12 +53,27 @@ async function runLedgerTool(args: Record<string, unknown>): Promise<ToolResult>
   }
 }
 
+// Default (read-write) bash description — used for every role unless agent.ts's
+// chatCall patches it to BASH_DESCRIPTION_READONLY (frames.ts's
+// patchBashForReadOnly) for a read-only role (Dispatcher/Planner). Exported so
+// agent.ts/tests can reference the exact default string rather than re-deriving it.
+export const BASH_DESCRIPTION_READWRITE = 'Execute a Bash command in the sandbox container. /workspace is the user\'s git-tracked project. Only write there for intentional project changes or deliverables; use /tmp for temporary scripts, screenshots, diagnostics, downloads, experiments, and other disposable files. Commands time out after 30s by default, or 120s for Playwright/Chromium commands. Timeouts are reported explicitly. If a command genuinely needs longer, set timeout_ms instead of adding sleeps or unnecessary waits.'
+
+// READ-ONLY bash description — for Dispatcher/Planner, whose own ROLE_INSTRUCTIONS
+// state the project is read-only for them. Deliberately omits any mention of
+// writing to /workspace (the read-write description's whole first half) so the
+// TOOL SCHEMA itself never suggests that path, matching the role's own prompt
+// framing instead of contradicting it. Still mentions /tmp for temporary files,
+// since investigation (e.g. downloading something to inspect, saving a scratch
+// script) is still a legitimate read-only-role use of bash.
+export const BASH_DESCRIPTION_READONLY = 'Execute a Bash command in the sandbox container for investigation. /workspace is the user\'s project (read-only for this role). Use commands like ls, find, grep, cat, head, tail, wc, tree, rg to explore the project structure and content. Use /tmp for any temporary files.'
+
 export const toolDefinitions = [
   {
     type: 'function' as const,
     function: {
       name: 'bash',
-      description: 'Execute a Bash command in the sandbox container. /workspace is the user\'s git-tracked project. Only write there for intentional project changes or deliverables; use /tmp for temporary scripts, screenshots, diagnostics, downloads, experiments, and other disposable files. Commands time out after 30s by default, or 120s for Playwright/Chromium commands. Timeouts are reported explicitly. If a command genuinely needs longer, set timeout_ms instead of adding sleeps or unnecessary waits.',
+      description: BASH_DESCRIPTION_READWRITE,
       parameters: {
         type: 'object',
         properties: {

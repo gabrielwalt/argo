@@ -297,7 +297,7 @@ test('opening messages: neither system message mentions tool descriptions, files
   }
 })
 
-test('role-restricted frame (Planner\'s tool set): the `tools` parameter sent to Ollama is filtered, independent of prompt text', async () => {
+test('role-restricted frame (a custom read-only-ish tool set): the `tools` parameter sent to Ollama is filtered, independent of prompt text', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-tools-param-role-gate-${Date.now()}`
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -311,7 +311,11 @@ test('role-restricted frame (Planner\'s tool set): the `tools` parameter sent to
   } as unknown as Ollama
   const agent = new Agent(e => events.push(e), 'test-model', ollama)
   agent.setSessionId(sessionId)
-  agent.setAllowedTools(['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude']) // ROLE_TOOLS.planner
+  // An explicit custom tool set WITHOUT bash — deliberately not ROLE_TOOLS.planner
+  // (which now includes bash, see frames.test.ts) — this test is about the role-
+  // gate filtering MECHANISM (whatever this.allowedTools names is exactly what's
+  // sent), not about the Planner's own specific tool set.
+  agent.setAllowedTools(['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude'])
   try {
     await agent.chat('argo role-gated tools case')
     const names = capturedTools.map(t => t.function.name)
@@ -322,6 +326,59 @@ test('role-restricted frame (Planner\'s tool set): the `tools` parameter sent to
     assert.ok(names.includes('read_file'))
     assert.ok(names.includes('web_search'))
     assert.ok(names.includes('fetch_url'))
+  } finally {
+    await cleanupDispatchSession(sessionId)
+  }
+})
+
+test('read-only role (Planner/Dispatcher): the `tools` parameter sent to Ollama includes bash but with the READ-ONLY description patched in', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-tools-param-bash-readonly-${Date.now()}`
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let capturedTools: any[] = []
+  const ollama = {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    chat: async (args: { tools: any[] }) => {
+      capturedTools = args.tools
+      return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
+    },
+  } as unknown as Ollama
+  const agent = new Agent(e => events.push(e), 'test-model', ollama)
+  agent.setSessionId(sessionId)
+  agent.setAllowedTools(ROLE_TOOLS.planner)
+  agent.setRole('planner')
+  try {
+    await agent.chat('argo planner bash-description case')
+    const bashTool = capturedTools.find(t => t.function.name === 'bash')
+    assert.ok(bashTool, 'expected bash to be offered to the Planner')
+    assert.ok(bashTool.function.description.includes('read-only'), 'bash description for read-only role must mention read-only')
+    assert.equal(bashTool.function.description.includes('deliverables'), false, 'read-only bash description must not mention writing deliverables')
+  } finally {
+    await cleanupDispatchSession(sessionId)
+  }
+})
+
+test('read-write role (Implementer): the `tools` parameter sent to Ollama keeps the default read-write bash description', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-tools-param-bash-readwrite-${Date.now()}`
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let capturedTools: any[] = []
+  const ollama = {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    chat: async (args: { tools: any[] }) => {
+      capturedTools = args.tools
+      return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
+    },
+  } as unknown as Ollama
+  const agent = new Agent(e => events.push(e), 'test-model', ollama)
+  agent.setSessionId(sessionId)
+  agent.setAllowedTools(ROLE_TOOLS.implementer)
+  agent.setRole('implementer')
+  try {
+    await agent.chat('argo implementer bash-description case')
+    const bashTool = capturedTools.find(t => t.function.name === 'bash')
+    assert.ok(bashTool, 'expected bash to be offered to the Implementer')
+    assert.ok(/\/workspace/.test(bashTool.function.description), 'read-write bash description should still mention /workspace')
   } finally {
     await cleanupDispatchSession(sessionId)
   }

@@ -383,6 +383,13 @@ function startTraceBlock(model) {
   // slate of role cards — frameIds are unique per run, but nothing should ever look
   // up a PRIOR run's card by accident.
   roleCards.clear()
+  // A held objective (or the frame it was waiting on) can never belong to a NEW
+  // run — drop any stale state rather than risk it flushing against an unrelated
+  // frameId later.
+  pendingObjective = null
+  activeDispatcherFrameId = null
+  lastObjectiveText = ''
+  lastConclusionKey = ''
 
   const block = document.createElement('div')
   block.className = 'trace-block running'
@@ -428,7 +435,11 @@ function startTraceBlock(model) {
 function finalizeTraceBlock() {
   if (!currentTraceBlock) return
   const dur = traceStartTime ? ((Date.now() - traceStartTime) / 1000).toFixed(1) : ''
-  currentTraceBlock.title.textContent = 'Agent trace'
+  // Not "Agent trace" — this block is a plain run log, not a container that groups
+  // agents into one collapsed accordion. Each agent's own section (see
+  // getOrCreateRoleCard) renders directly beneath, always expanded, with its own
+  // prominent heading.
+  currentTraceBlock.title.textContent = 'Run log'
   currentTraceBlock.subtitle.textContent = ''
   currentTraceBlock.meta.textContent = `${traceToolCalls} tool${traceToolCalls !== 1 ? 's' : ''} · ${dur}s`
   currentTraceBlock.el.classList.remove('running')
@@ -580,8 +591,8 @@ function handleEvent(event) {
     if (event.type === 'token_usage') updateCtx(event.prompt_tokens, event.num_ctx, event.__frameId, event.__role)
     handleFrameEvent(event)
     if (event.type === 'start') {
-      const meta = ROLE_META[event.__role] || { name: event.__role, title: event.__role }
-      setStatus('busy', `Running · ${meta.name} (${meta.title})`)
+      const meta = ROLE_META[event.__role] || { title: event.__role }
+      setStatus('busy', `Running · ${meta.title}`)
     }
     return
   }
@@ -607,22 +618,24 @@ function handleEvent(event) {
       break
 
     case 'thought':
-      addTraceItem('thought', '💭 Thought', event.content, true)
-      surfaceActivity(`💭 ${summarize(event.content)}`)
+      addTraceItem('thought', 'Thought', event.content, true)
+      surfaceActivity(summarize(event.content))
       break
 
-    case 'tool_call':
+    case 'tool_call': {
       traceToolCalls++
-      addTraceItem('tool-call', `🔧 ${event.tool}`, JSON.stringify(event.args, null, 2), true)
-      surfaceActivity(`🔧 ${event.tool}`)
+      for (const el of buildThinkingContentEls(event)) addTopLevelTraceHtml(el)
+      addTopLevelToolCall(event.tool, event.args)
+      surfaceActivity(event.tool)
       break
+    }
 
     case 'tool_result': {
       const isError = !!event.error
-      const label = `📥 Result${event.error ? ' · ERROR' : ''} · ${event.duration_ms}ms`
+      const label = `Result${event.error ? ' · ERROR' : ''} · ${event.duration_ms}ms`
       const body = event.error ? `${event.error}\n${event.output}` : event.output
       addTraceItem(isError ? 'tool-result error' : 'tool-result', label, body, true)
-      surfaceActivity(isError ? `📥 ${event.tool || 'tool'} failed` : `📥 ${event.tool || 'result'} received`)
+      surfaceActivity(isError ? `${event.tool || 'tool'} failed` : `${event.tool || 'result'} received`)
       // Live-update the file tree + the viewed file when the agent may have changed files.
       if (!isError && (event.tool === 'write_file' || event.tool === 'edit_file' || event.tool === 'bash')) {
         scheduleWorkspaceRefresh()
@@ -631,8 +644,14 @@ function handleEvent(event) {
     }
 
     case 'message':
+      // The baseline (single-loop) agent's final answer arrives as an
+      // assistant 'message' — rendered as its own conclusion card (see
+      // renderConclusionCard), same family as the per-frame cards below,
+      // rather than a plain chat bubble. (In multi-agent mode this path isn't
+      // taken at all — the baseline loop is bypassed — so it never collides
+      // with the per-frame cards rendered by handleFrameEvent.)
       if (event.role === 'assistant') {
-        addChatMessage('assistant', event.content)
+        renderConclusionCard('Agent concluded', event.content)
       }
       break
 
@@ -643,6 +662,13 @@ function handleEvent(event) {
     case 'done': {
       // Capture the user-stop flag before setBusy(false) resets stopRequested.
       const wasStopped = stopRequested
+      // Some harness builds carry the final answer directly on 'done' rather
+      // than (or in addition to) a preceding 'message' — render it the same
+      // way. renderConclusionCard()'s lastConclusionKey guard drops this call
+      // as a no-op if the 'message' case above already rendered the exact
+      // same content for this run, so a build that emits BOTH doesn't show
+      // the same conclusion twice.
+      if (event.content) renderConclusionCard('Agent concluded', event.content)
       setStatus('ready', 'Ready')
       finalizeTraceBlock()
       setBusy(false)
@@ -684,8 +710,8 @@ function handleEvent(event) {
       }
       if (event.manual) setStatus('ready', 'Ready')
       else setStatus('busy', `Running · ${currentRunModel}`)
-      addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
-      surfaceActivity('⚡ Context compacted')
+      addTraceItem('compact', `Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
+      surfaceActivity('Context compacted')
       // A user-triggered manual compaction (no run to fire 'done') finalizes its
       // own trace block here; an in-run auto-compaction leaves the block open for
       // the run to keep filling. The donut's ring keeps showing the last known size.
@@ -696,20 +722,20 @@ function handleEvent(event) {
       break
 
     case 'warning':
-      addTraceItem('warning', '⚠ Warning', event.message, false)
-      surfaceActivity(`⚠ ${summarize(event.message)}`)
+      addTraceItem('warning', 'Warning', event.message, false)
+      surfaceActivity(summarize(event.message))
       break
 
     case 'git_commit':
-      addTraceItem('git', `🔀 Committed`, `${event.hash} — ${event.message}`, false)
-      surfaceActivity('🔀 Committed')
+      addTraceItem('git', `Committed`, `${event.hash} — ${event.message}`, false)
+      surfaceActivity('Committed')
       refreshGitLog()
       // The new commit + cleared working changes only matter to Changes mode.
       refreshChangesIfActive()
       break
 
     case 'error':
-      addTraceItem('error-item', '⚠ Error', event.message, false)
+      addTraceItem('error-item', 'Error', event.message, false)
       compactingNow = false
       setStatus('error', 'Error')
       finalizeTraceBlock()
@@ -717,6 +743,21 @@ function handleEvent(event) {
       confirmRunEnded()
       break
   }
+}
+
+// Appends a pre-built HTML element directly into the top-level (current) trace
+// block's item list — the top-level equivalent of addRoleCardHtml, used for
+// formatted tool calls and thinking/content blocks outside any per-frame section.
+function addTopLevelTraceHtml(el) {
+  if (!currentTraceBlock || !el) return
+  currentTraceBlock.items.appendChild(el)
+  maybeAutoScroll()
+}
+
+function addTopLevelToolCall(tool, args) {
+  const wrap = document.createElement('div')
+  wrap.innerHTML = formatToolCall(tool, args)
+  addTopLevelTraceHtml(wrap.firstElementChild)
 }
 
 // Renders one PERSISTED (replayed) event into the trace/chat. Reuses the same
@@ -745,44 +786,52 @@ function handleEventForSession(event) {
       break
 
     case 'thought':
-      addTraceItem('thought', '💭 Thought', event.content, true)
+      addTraceItem('thought', 'Thought', event.content, true)
       break
 
-    case 'tool_call':
+    case 'tool_call': {
       traceToolCalls++
-      addTraceItem('tool-call', `🔧 ${event.tool}`, JSON.stringify(event.args, null, 2), true)
+      for (const el of buildThinkingContentEls(event)) addTopLevelTraceHtml(el)
+      addTopLevelToolCall(event.tool, event.args)
       break
+    }
 
     case 'tool_result': {
       const isError = !!event.error
-      const label = `📥 Result${event.error ? ' · ERROR' : ''} · ${event.duration_ms}ms`
+      const label = `Result${event.error ? ' · ERROR' : ''} · ${event.duration_ms}ms`
       const body = event.error ? `${event.error}\n${event.output}` : event.output
       addTraceItem(isError ? 'tool-result error' : 'tool-result', label, body, true)
       break
     }
 
     case 'message':
-      addChatMessage(event.role, event.content)
+      // Only a genuine USER message is a plain chat bubble on replay — the
+      // baseline agent's own final answer renders as a conclusion card (see
+      // the live path in handleEvent for why), same on replay for identical
+      // visual output.
+      if (event.role === 'assistant') renderConclusionCard('Agent concluded', event.content)
+      else addChatMessage(event.role, event.content)
       break
 
     case 'compact':
-      addTraceItem('compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
+      addTraceItem('compact', `Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
       break
 
     case 'warning':
-      addTraceItem('warning', '⚠ Warning', event.message, false)
+      addTraceItem('warning', 'Warning', event.message, false)
       break
 
     case 'git_commit':
-      addTraceItem('git', `🔀 Committed`, `${event.hash} — ${event.message}`, false)
+      addTraceItem('git', `Committed`, `${event.hash} — ${event.message}`, false)
       break
 
     case 'done':
+      if (event.content) renderConclusionCard('Agent concluded', event.content)
       finalizeTraceBlock()
       break
 
     case 'error':
-      addTraceItem('error-item', '⚠ Error', event.message, false)
+      addTraceItem('error-item', 'Error', event.message, false)
       finalizeTraceBlock()
       break
   }
@@ -1177,15 +1226,15 @@ function pickDefaultFrame(framesData) {
 
 function baselineOptionLabel(baselineBypassed) {
   return baselineBypassed
-    ? '⏸ Baseline agent — bypassed in multi-agent mode'
-    : '🧵 Baseline agent (single-loop)'
+    ? 'Baseline agent — bypassed in multi-agent mode'
+    : 'Baseline agent (single-loop)'
 }
 
-// Reuses ROLE_META (the same names/icons the role cards use) rather than inventing a
+// Reuses ROLE_META (the same names the role sections use) rather than inventing a
 // second vocabulary for the same four roles.
 function frameOptionLabel(f) {
-  const meta = ROLE_META[f.role] || { icon: '🤖', title: f.role }
-  return `${meta.icon} ${meta.title} (${f.frameId}) · ${(f.totalChars ?? 0).toLocaleString()} chars${f.live ? ' · live' : ''}`
+  const meta = ROLE_META[f.role] || { title: f.role }
+  return `${meta.title} (${f.frameId}) · ${(f.totalChars ?? 0).toLocaleString()} chars${f.live ? ' · live' : ''}`
 }
 
 // Rebuilds the selector from ctxFramesData — or, when it's null (no /frames route),
@@ -1231,7 +1280,7 @@ function updateCompactBtnState(data) {
     diffCompactBtn.disabled = busy || manualCompacting
     diffCompactBtn.title = 'Compact context now'
   }
-  diffCompactBtn.textContent = '⚡ Compact now'
+  diffCompactBtn.textContent = 'Compact now'
 }
 
 // Loads one frame's context (or the baseline's, when frameId is null) into the already-open
@@ -1250,8 +1299,8 @@ async function loadFrameContext(frameId) {
   }
   // Title names the owner (never a bare, unattributed count) but keeps the bypass
   // explanation itself inside the body (renderContext) rather than repeating it here.
-  const meta = data.role ? (ROLE_META[data.role] || { title: data.role, icon: '🤖' }) : null
-  const owner = meta ? `${meta.icon} ${meta.title}` : '🧵 Baseline agent'
+  const meta = data.role ? (ROLE_META[data.role] || { title: data.role }) : null
+  const owner = meta ? meta.title : 'Baseline agent'
   diffTitle.textContent = `${owner} — Context (${data.messageCount ?? 0} messages · ${(data.totalChars ?? 0).toLocaleString()} chars · num_ctx ${(data.numCtx ?? 0).toLocaleString()})`
   diffContent.innerHTML = renderContext(data)
   updateCompactBtnState(data)
@@ -1287,7 +1336,7 @@ function renderContext(data) {
   // that is genuinely empty (e.g. spawned but never ran) still falls through to the
   // ordinary "(empty context)" fallback below.
   if (data.frameId == null && data.baselineBypassed) {
-    html += '<div class="ctx-msg ctx-bypassed"><div class="ctx-content">⏸ Baseline loop — bypassed in multi-agent mode. It never ran this session, so there is nothing here to show. Select a frame above to see what the agents actually did.</div></div>'
+    html += '<div class="ctx-msg ctx-bypassed"><div class="ctx-content">Baseline loop — bypassed in multi-agent mode. It never ran this session, so there is nothing here to show. Select a frame above to see what the agents actually did.</div></div>'
   }
   // Right-aligned wall-clock time (when the message entered the model context, from the
   // backend WeakMap via getContext). Omitted when unknown (e.g. messages restored from disk).
@@ -1385,66 +1434,63 @@ function addTraceItem(className, label, body, collapsible, container) {
 // see frames.ts's ROLE_NAME for the same mapping, chosen for an actual functional
 // match rather than flavor alone.
 const ROLE_META = {
-  dispatcher:  { name: 'Dispatcher',  title: 'Dispatcher',  icon: '⚖️' },
-  planner:     { name: 'Planner',     title: 'Planner',     icon: '🧭' },
-  implementer: { name: 'Implementer', title: 'Implementer', icon: '🔨' },
+  dispatcher:  { name: 'Dispatcher',  title: 'Dispatcher Agent' },
+  planner:     { name: 'Planner',     title: 'Planner Agent' },
+  implementer: { name: 'Implementer', title: 'Implementer Agent' },
 }
 
-// frameId -> { el, arrow, items, outcome, hasItems }. Cleared per top-level run
+// frameId -> { el, items, outcome, role }. Cleared per top-level run
 // (startTraceBlock) — see there for why stale entries can't leak across runs.
 const roleCards = new Map()
 
-// Gets the card for an already-known frameId (a RESUMED frame — the Planner's next
-// detail call reuses its existing card rather than creating a confusing duplicate),
-// or creates a fresh one.
+// Held 'objective' event awaiting the Dispatcher frame's card to close (see
+// renderObjective/flushPendingObjectiveIfReady below), plus which frame it's
+// waiting on.
+let pendingObjective = null
+let activeDispatcherFrameId = null
+// The most recent objective text seen this run — see stripDuplicatedObjective()
+// below, which uses it to drop a conclusion's verbatim-restated objective.
+let lastObjectiveText = ''
+
+// Gets the section for an already-known frameId (a RESUMED frame — the Planner's next
+// detail call reuses its existing section rather than creating a confusing duplicate),
+// or creates a fresh one. Each agent's turn gets its OWN always-visible section with a
+// prominent heading, rendered directly in the trace flow — not grouped into a single
+// collapsible "Agent trace" accordion, and not nested inside one either. `assignment`
+// (the frame's originating query/request) is deliberately NOT rendered here — it's
+// already shown as the user's chat message, and isn't readable in this compact form.
 function getOrCreateRoleCard(frameId, role, assignment) {
   const existing = roleCards.get(frameId)
   if (existing) {
     existing.el.classList.add('active')
     return existing
   }
-  const meta = ROLE_META[role] || { name: role, title: role, icon: '🤖' }
+  const meta = ROLE_META[role] || { name: role, title: role }
+  if (role === 'dispatcher') activeDispatcherFrameId = frameId
 
   const card = document.createElement('div')
   card.className = 'role-card active'
 
-  const toggle = document.createElement('div')
-  toggle.className = 'role-card-toggle'
-
-  const arrow = document.createElement('span')
-  arrow.className = 'role-card-arrow'
-  // No expand affordance until this frame actually accumulates a nested item —
-  // a one-shot answer with nothing else to show gets no arrow at all.
-
-  const titleWrap = document.createElement('div')
-  titleWrap.className = 'role-card-title-wrap'
-  const title = document.createElement('span')
-  title.className = 'role-card-title'
-  title.textContent = `${meta.icon} ${meta.name} · ${meta.title}`
-  const subtitle = document.createElement('span')
-  subtitle.className = 'role-card-subtitle'
-  subtitle.textContent = summarize(assignment, 120)
-  titleWrap.append(title, subtitle)
+  const heading = document.createElement('h3')
+  heading.className = 'agent-heading'
+  heading.textContent = meta.title
 
   const outcome = document.createElement('span')
   outcome.className = 'role-card-outcome'
 
-  toggle.append(arrow, titleWrap, outcome)
-  toggle.addEventListener('click', () => {
-    if (!card.classList.contains('expandable')) return
-    card.classList.toggle('open')
-    arrow.textContent = card.classList.contains('open') ? '▼' : '▶'
-  })
+  const headRow = document.createElement('div')
+  headRow.className = 'role-card-head'
+  headRow.append(heading, outcome)
 
   const items = document.createElement('div')
   items.className = 'role-card-items'
 
-  card.append(toggle, items)
+  card.append(headRow, items)
   if (!currentTraceBlock) startTraceBlock(currentRunModel)
   currentTraceBlock.items.appendChild(card)
   maybeAutoScroll()
 
-  const record = { el: card, arrow, items, outcome, hasItems: false }
+  const record = { el: card, items, outcome, role }
   roleCards.set(frameId, record)
   return record
 }
@@ -1452,12 +1498,17 @@ function getOrCreateRoleCard(frameId, role, assignment) {
 function addRoleCardItem(frameId, className, label, body, collapsible) {
   const card = roleCards.get(frameId)
   if (!card) return
-  if (!card.hasItems) {
-    card.hasItems = true
-    card.el.classList.add('expandable')
-    card.arrow.textContent = '▶'
-  }
   addTraceItem(className, label, body, collapsible, card.items)
+}
+
+// Appends a pre-built HTML element (used for formatted tool calls / thinking /
+// content blocks) directly into a frame's section, in order alongside the plain
+// trace items added via addRoleCardItem.
+function addRoleCardHtml(frameId, el) {
+  const card = roleCards.get(frameId)
+  if (!card || !el) return
+  card.items.appendChild(el)
+  maybeAutoScroll()
 }
 
 // Closes out a frame's card with its one-line outcome — a SYNTHESIS (short status +
@@ -1469,6 +1520,99 @@ function closeRoleCard(frameId, outcomeText) {
   if (!card) return
   card.outcome.textContent = outcomeText
   card.el.classList.remove('active')
+  flushPendingObjectiveIfReady(frameId)
+}
+
+// ── Per-tool formatted call display ──────────────────────────────
+// Replaces the old raw JSON.stringify(event.args, null, 2) dump with a small,
+// tool-specific rendering. Returns an HTML string (caller wraps it in whatever
+// container is appropriate — a role-card item or a top-level trace item).
+function formatToolCall(tool, args) {
+  args = args || {}
+  switch (tool) {
+    case 'bash': {
+      const cmd = args.command ?? args.cmd ?? ''
+      return `<div class="tool-call"><strong>Bash</strong><pre><code>${escHtml(String(cmd))}</code></pre></div>`
+    }
+    case 'read_file': {
+      const path = args.path ?? ''
+      const hasRange = args.offset != null || args.limit != null
+      const start = args.offset ?? 1
+      const end = args.limit != null ? (Number(start) + Number(args.limit) - 1) : null
+      const range = hasRange ? ` (lines ${start}${end != null ? '-' + end : '+'})` : ''
+      return `<div class="tool-call"><strong>Read file</strong> <code>${escHtml(String(path))}</code>${range}</div>`
+    }
+    case 'write_file': {
+      const path = args.path ?? ''
+      return `<div class="tool-call"><strong>Write file</strong> <code>${escHtml(String(path))}</code></div>`
+    }
+    case 'edit_file': {
+      const path = args.path ?? ''
+      return `<div class="tool-call"><strong>Edit file</strong> <code>${escHtml(String(path))}</code></div>`
+    }
+    case 'conclude': {
+      const status = args.status ?? args.outcome ?? ''
+      const message = args.message ?? args.content ?? ''
+      return `<div class="tool-call conclude"><strong>Concluded</strong>${status ? ` <span class="status">${escHtml(String(status))}</span>` : ''}<div class="conclude-message">${escHtml(String(message))}</div></div>`
+    }
+    case 'web_search': {
+      const q = args.query ?? args.q ?? ''
+      return `<div class="tool-call"><strong>Search</strong> <code>${escHtml(String(q))}</code></div>`
+    }
+    case 'fetch_url':
+    case 'browser_fetch': {
+      const url = args.url ?? ''
+      return `<div class="tool-call"><strong>Fetch</strong> <code>${escHtml(String(url))}</code></div>`
+    }
+    case 'ledger': {
+      const op = args.op ?? args.action ?? ''
+      const rest = Object.entries(args).filter(([k]) => k !== 'op' && k !== 'action')
+        .map(([k, v]) => `${k}=${v}`).join(', ')
+      return `<div class="tool-call"><strong>Ledger</strong> ${escHtml(String(op))}${rest ? ` (${escHtml(rest)})` : ''}</div>`
+    }
+    default: {
+      const body = JSON.stringify(args, null, 2)
+      return `<div class="tool-call"><strong>${escHtml(tool || 'Tool')}</strong><pre><code>${escHtml(body)}</code></pre></div>`
+    }
+  }
+}
+
+// Builds the optional "Thinking" (collapsible) and "Content" blocks that precede
+// a model response's tool calls, when the event carries them. Returns an array of
+// DOM elements (possibly empty) — used by both the top-level and per-frame paths.
+function buildThinkingContentEls(event) {
+  const els = []
+  if (event.thinking) {
+    const wrap = document.createElement('div')
+    wrap.className = 'trace-item thinking-block'
+    const btn = document.createElement('button')
+    btn.className = 'expand-btn thinking-toggle'
+    btn.textContent = '▶ Thinking'
+    const body = document.createElement('div')
+    body.className = 'trace-body collapsed thinking-body'
+    body.textContent = event.thinking
+    let expanded = false
+    btn.onclick = () => {
+      expanded = !expanded
+      body.classList.toggle('collapsed', !expanded)
+      btn.textContent = expanded ? '▼ Thinking' : '▶ Thinking'
+    }
+    wrap.append(btn, body)
+    els.push(wrap)
+  }
+  if (event.content) {
+    const wrap = document.createElement('div')
+    wrap.className = 'trace-item content-block'
+    const label = document.createElement('div')
+    label.className = 'trace-label'
+    label.textContent = 'Content'
+    const body = document.createElement('div')
+    body.className = 'trace-body'
+    body.textContent = event.content
+    wrap.append(label, body)
+    els.push(wrap)
+  }
+  return els
 }
 
 // Routes ONE tagged event into its frame's role card. Shared by the live and replay
@@ -1482,37 +1626,44 @@ function handleFrameEvent(event) {
       getOrCreateRoleCard(frameId, role, event.query)
       break
     case 'thought':
-      addRoleCardItem(frameId, 'thought', '💭 Thought', event.content, true)
+      addRoleCardItem(frameId, 'thought', 'Thought', event.content, true)
       break
-    case 'tool_call':
-      addRoleCardItem(frameId, 'tool-call', `🔧 ${event.tool}`, JSON.stringify(event.args, null, 2), true)
+    case 'tool_call': {
+      for (const el of buildThinkingContentEls(event)) addRoleCardHtml(frameId, el)
+      const wrap = document.createElement('div')
+      wrap.innerHTML = formatToolCall(event.tool, event.args)
+      addRoleCardHtml(frameId, wrap.firstElementChild)
       break
+    }
     case 'tool_result': {
       const isError = !!event.error
-      const label = `📥 Result${event.error ? ' · ERROR' : ''} · ${event.duration_ms}ms`
+      const label = `Result${event.error ? ' · ERROR' : ''} · ${event.duration_ms}ms`
       const body = event.error ? `${event.error}\n${event.output}` : event.output
       addRoleCardItem(frameId, isError ? 'tool-result error' : 'tool-result', label, body, true)
       break
     }
     case 'warning':
-      addRoleCardItem(frameId, 'warning', '⚠ Warning', event.message, false)
+      addRoleCardItem(frameId, 'warning', 'Warning', event.message, false)
       break
     case 'compact':
-      addRoleCardItem(frameId, 'compact', `⚡ Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
+      addRoleCardItem(frameId, 'compact', `Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
       break
     case 'git_commit':
-      addRoleCardItem(frameId, 'git', '🔀 Committed', `${event.hash} — ${event.message}`, false)
+      addRoleCardItem(frameId, 'git', 'Committed', `${event.hash} — ${event.message}`, false)
       break
     case 'message':
       // Swallowed deliberately — this frame's final answer is already captured as
       // its 'done' outcome below; rendering it again here would duplicate it.
       break
-    case 'done':
+    case 'done': {
       closeRoleCard(frameId, summarize(event.content, 140))
+      const meta = ROLE_META[role] || { name: role }
+      renderConclusionCard(`${meta.name} concluded`, event.content)
       break
+    }
     case 'error':
-      addRoleCardItem(frameId, 'error-item', '⚠ Error', event.message, false)
-      closeRoleCard(frameId, '⚠ error')
+      addRoleCardItem(frameId, 'error-item', 'Error', event.message, false)
+      closeRoleCard(frameId, 'error')
       break
     // iteration / token_usage / ollama_request: live-only telemetry with
     // nothing worth a per-frame UI element.
@@ -1520,15 +1671,85 @@ function handleFrameEvent(event) {
 }
 
 // The harness-level 'objective' event — always untagged, describing the whole task
-// rather than one frame's turn. Rendered as a message-level card (splits the trace
-// above/below), the same pattern the old task-graph/boss_verdict/replan narrative
-// events used before the dispatch loop settled on its current, simpler shape
-// (Dispatcher/Planner/Implementer only — no task graph, no injected corrections).
-
+// rather than one frame's turn. It is the Dispatcher's own conclusion, emitted
+// alongside/around the Dispatcher frame's 'done' — so rather than dropping it into
+// the chat immediately (which would show it ABOVE the Dispatcher's trace, i.e.
+// before the work that produced it), it's held until the most recently active
+// Dispatcher frame card closes, then appended right after. If no Dispatcher frame
+// is currently open (baseline/legacy path, or the event arrived with nothing to
+// wait for), it renders immediately as before.
 function renderObjective(event) {
+  lastObjectiveText = String(event.text ?? '')
+  if (activeDispatcherFrameId && roleCards.has(activeDispatcherFrameId)) {
+    pendingObjective = event
+    return
+  }
+  renderObjectiveNow(event)
+}
+
+function renderObjectiveNow(event) {
   const el = document.createElement('div')
   el.className = 'message objective'
-  el.innerHTML = `<div class="objective-title">🎯 Objective</div><div class="objective-text">${escHtml(event.text)}</div>`
+  el.innerHTML = `<div class="objective-title">Objective</div><div class="objective-text">${escHtml(event.text).replace(/\n/g, '<br>')}</div>`
+  messagesEl.appendChild(el)
+  maybeAutoScroll()
+}
+
+// Called whenever a role card closes (see closeRoleCard) — flushes a held
+// objective once the Dispatcher frame it was waiting on has actually finished.
+function flushPendingObjectiveIfReady(frameId) {
+  if (pendingObjective && frameId === activeDispatcherFrameId) {
+    activeDispatcherFrameId = null
+    const ev = pendingObjective
+    pendingObjective = null
+    renderObjectiveNow(ev)
+  }
+}
+
+// Many harness conclusions restate the objective verbatim before the actual
+// answer (the model echoing back what it was asked to do). The objective
+// already has its own card — repeating it in the conclusion card is just
+// noise. Strips an exact (whitespace-insensitive-at-the-boundary) leading
+// match of the last-seen objective text, plus any separating blank
+// line/rule left behind, and returns what's left. Falls back to the
+// original text untouched if there's no such duplication.
+function stripDuplicatedObjective(text) {
+  const obj = lastObjectiveText.trim()
+  if (!obj || !text) return text
+  const trimmed = text.trim()
+  if (!trimmed.startsWith(obj)) return text
+  let rest = trimmed.slice(obj.length)
+  // Drop a leading separator the model may have inserted between the restated
+  // objective and its actual conclusion — blank lines, a markdown rule, or a
+  // leading colon/dash.
+  rest = rest.replace(/^\s*(?:[-–—:]\s*|\n?(?:\s*[-*_]{3,}\s*\n)?)*/, '')
+  return rest.trim() || text
+}
+
+// Agent-conclusion card — the harness's 'done' content, displayed as its OWN
+// card (same visual family as the Objective card, distinct accent) rather
+// than as a plain chat message. Rendered AFTER that agent's trace section
+// (role card, or the top-level run for the baseline). `label` is the
+// heading, e.g. "Dispatcher concluded" / "Implementer concluded".
+// Guards against rendering the exact same conclusion twice under the same label —
+// some harness builds emit the baseline's final answer on BOTH the 'message' and
+// 'done' events; only the first should become a card.
+let lastConclusionKey = ''
+
+function renderConclusionCard(label, content) {
+  if (content == null || content === '') return
+  const key = `${label}\u0000${content}`
+  if (key === lastConclusionKey) return
+  lastConclusionKey = key
+  const text = stripDuplicatedObjective(String(content))
+  if (!text.trim()) return
+  const el = document.createElement('div')
+  // `md` on the OUTER element (not just conclusion-text) so the shared
+  // .message.md markdown rules (paragraphs, code blocks, lists, etc. — see
+  // styles.css) apply the same way they do for a plain assistant bubble.
+  el.className = 'message conclusion md'
+  el.innerHTML = `<div class="conclusion-title">${escHtml(label)}</div><div class="conclusion-text">${renderMarkdown(text)}</div>`
+  el.querySelectorAll('a').forEach(a => a.setAttribute('target', '_blank'))
   messagesEl.appendChild(el)
   maybeAutoScroll()
 }
@@ -1547,18 +1768,18 @@ function addChatMessage(role, content) {
     const copyBtn = document.createElement('button')
     copyBtn.className = 'msg-copy-btn'
     copyBtn.type = 'button'
-    copyBtn.textContent = '⧉ Copy'
+    copyBtn.textContent = 'Copy'
     copyBtn.addEventListener('click', async () => {
       clearTimeout(copyBtn._resetTimer)
       try {
         await navigator.clipboard.writeText(content)
-        copyBtn.textContent = '✓ Copied'
+        copyBtn.textContent = 'Copied'
         copyBtn.classList.add('copied')
       } catch {
-        copyBtn.textContent = '✕ Failed'
+        copyBtn.textContent = 'Failed'
       }
       copyBtn._resetTimer = setTimeout(() => {
-        copyBtn.textContent = '⧉ Copy'
+        copyBtn.textContent = 'Copy'
         copyBtn.classList.remove('copied')
       }, 1500)
     })
@@ -2038,7 +2259,7 @@ diffCompactBtn.addEventListener('click', async () => {
     // Modal closed (or showing a git diff) mid-compaction — nothing to reload, but
     // still leave the button in a clean state for whenever it's shown again.
     diffCompactBtn.disabled = busy || manualCompacting
-    diffCompactBtn.textContent = '⚡ Compact now'
+    diffCompactBtn.textContent = 'Compact now'
   }
 })
 

@@ -143,6 +143,72 @@ function blockquote(content: string): string {
   return lines.map(l => (l.length > 0 ? `> ${l}` : '>')).join('\n')
 }
 
+// --- Per-tool-call readable formatting ----------------------------------------------
+// Replaces the old flat `N. \`toolName(JSON.stringify(args))\`` one-liner — that
+// format made every call, regardless of shape, equally opaque (a bash command's
+// spaces and quoting mangled by JSON escaping, a conclude message unreadable
+// buried in a value string). Each tool below instead gets a `#### Call <name>`
+// heading plus the one or two pieces of its arguments that actually matter to a
+// human reading the trace; a tool with no bespoke case still gets a heading and its
+// full args as a fenced JSON block (the fallback branch), never a silent no-op.
+function formatToolCall(tc: AlToolCall): string[] {
+  const args = tc.args as Record<string, unknown>
+  switch (tc.name) {
+    case 'bash': {
+      const lines = [`#### Call bash`, '```', escapeMd(String(args.command ?? '')), '```']
+      if (args.cwd) lines.push(`cwd: \`${escapeMd(String(args.cwd))}\``)
+      return lines
+    }
+    case 'read_file': {
+      // Shadows nothing named `path` at module scope by using a distinct name —
+      // this file's own top-level `import path from 'path'` (the Node module) is
+      // never referenced inside this function, but a same-named local const would
+      // still needlessly invite confusion for a future reader/editor.
+      const filePath = typeof args.path === 'string' ? args.path : (Array.isArray(args.paths) ? args.paths.join(', ') : '')
+      if (typeof args.pattern === 'string' && args.pattern) {
+        return [`#### Call read_file (search)`, `\`${escapeMd(filePath)}\` — pattern: \`${escapeMd(args.pattern)}\``]
+      }
+      const offsetNum = typeof args.offset === 'number' ? args.offset : 1
+      const limitNum = typeof args.limit === 'number' ? args.limit : null
+      const range = args.offset != null || args.limit != null
+        ? ` (lines ${offsetNum}-${limitNum != null ? offsetNum + limitNum - 1 : '?'})`
+        : ''
+      return [`#### Call read_file`, `\`${escapeMd(filePath)}\`${range}`]
+    }
+    case 'write_file': {
+      const content = typeof args.content === 'string' ? args.content : ''
+      return [`#### Call write_file`, `\`${escapeMd(String(args.path ?? ''))}\` (${content.length} chars)`]
+    }
+    case 'edit_file':
+      return [`#### Call edit_file`, `\`${escapeMd(String(args.path ?? ''))}\``]
+    case 'conclude': {
+      // Plain (not blockquoted) message text, matching the brief's example exactly
+      // — conclude's message is this frame's own final answer/assignment/summary,
+      // read as the primary content of this call rather than as quoted material
+      // the way a tool RESULT or a history message is.
+      const lines = [`#### Call conclude`, `**status**: \`${escapeMd(String(args.status ?? ''))}\``, '']
+      if (typeof args.message === 'string' && args.message) lines.push(escapeMd(args.message))
+      return lines
+    }
+    case 'web_search':
+      return [`#### Call web_search`, `\`${escapeMd(String(args.query ?? ''))}\``]
+    case 'fetch_url':
+    case 'browser_fetch':
+      return [`#### Call ${tc.name}`, `\`${escapeMd(String(args.url ?? ''))}\``]
+    case 'ledger': {
+      const action = String(args.action ?? '')
+      const extra = args.n != null
+        ? ` (n=${String(args.n)})`
+        : args.frame_id ? ` (frame_id=${escapeMd(String(args.frame_id))})`
+        : args.episode_id ? ` (episode_id=${escapeMd(String(args.episode_id))})`
+        : ''
+      return [`#### Call ledger`, `**action**: \`${escapeMd(action)}\`${extra}`]
+    }
+    default:
+      return [`#### Call ${escapeMd(tc.name)}`, '```json', escapeMd(JSON.stringify(tc.args)), '```']
+  }
+}
+
 // --- The logger --------------------------------------------------------------------
 
 export class TraceLogger {
@@ -155,7 +221,7 @@ export class TraceLogger {
   private lastMessageCount = 0
   // True from beginTurn() until the matching turn is closed by the NEXT beginTurn()
   // (or by close()) — used only to make sure a turn's section is always properly
-  // separated exactly once, even if logResponse/logToolExecution/logContext are
+  // separated exactly once, even if logResponse/logContext are
   // never called for it (e.g. the run aborts mid-turn).
   private inTurn = false
   private headerWritten = false
@@ -260,45 +326,34 @@ export class TraceLogger {
     const lines: string[] = []
     lines.push(`### Response (${durationStr}${tokensStr}${promptStr})`)
     lines.push('')
-    lines.push('#### Thinking')
-    lines.push(response.thinking ? blockquote(response.thinking) : '_(empty)_')
-    lines.push('')
-    lines.push('#### Content')
-    lines.push(response.content ? blockquote(response.content) : '_(empty)_')
-    lines.push('')
-    lines.push('#### Tool calls')
-    if (response.toolCalls && response.toolCalls.length > 0) {
-      response.toolCalls.forEach((tc, i) => {
-        lines.push(`${i + 1}. \`${escapeMd(tc.name)}(${escapeMd(JSON.stringify(tc.args))})\``)
-      })
-    } else {
-      lines.push('_(none)_')
+    // Skip empty sections entirely — a "#### Thinking" or "#### Content" heading
+    // over an "_(empty)_" placeholder was pure noise on every turn that had a tool
+    // call but no reasoning/final text, which is most of them.
+    if (response.thinking) {
+      lines.push('#### Thinking')
+      lines.push(blockquote(response.thinking))
+      lines.push('')
     }
-    lines.push('')
-    const detailParts = [
-      `role=${response.role ?? 'assistant'}`,
-      `done=${response.done ?? true}`,
-      response.doneReason != null ? `done_reason=${response.doneReason}` : null,
-    ].filter((p): p is string => p !== null)
-    lines.push(`_${escapeMd(detailParts.join(' '))}_`)
-    lines.push('')
-
-    this.append(lines.join('\n') + '\n')
-  }
-
-  /** Called after each tool execution this turn. Accumulates into an open
-   *  `### Tool Results` block — one entry per tool run, so multiple tool calls
-   *  in the same turn each get their own fenced block appended in order. */
-  logToolExecution(name: string, args: object, result: string, error: string | undefined, durationMs: number) {
-    const body = error ? `Error: ${error}\n${result}` : result
-    const lines: string[] = []
-    lines.push('### Tool Results')
-    lines.push('')
-    lines.push(`**${escapeMd(name)}** (${durationMs}ms), args: \`${escapeMd(JSON.stringify(args))}\`:`)
-    lines.push('```')
-    lines.push(body)
-    lines.push('```')
-    lines.push('')
+    if (response.content) {
+      lines.push('#### Content')
+      lines.push(blockquote(response.content))
+      lines.push('')
+    }
+    // Per-tool-call readable formatting (formatToolCall, below) replaces the old
+    // flat `toolName(JSON.stringify(args))` one-liner — a bash command, a file
+    // path, a conclude status/message are each rendered as the kind of thing they
+    // actually are, not as an opaque JSON blob.
+    if (response.toolCalls && response.toolCalls.length > 0) {
+      for (const tc of response.toolCalls) {
+        lines.push(...formatToolCall(tc))
+        lines.push('')
+      }
+    }
+    // The `_role=assistant done=true done_reason=stop_` metadata line is dropped —
+    // it was constant (role is always 'assistant', done is always true by the time
+    // this fires) for the overwhelming majority of turns and added nothing a reader
+    // needed; the few real done_reason values worth knowing (e.g. 'length') are
+    // rare enough not to warrant a line on every single turn.
 
     this.append(lines.join('\n') + '\n')
   }

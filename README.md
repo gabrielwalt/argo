@@ -238,14 +238,18 @@ context eviction, the loop-recovery ladder, tool execution) with a restricted to
 distinct system-prompt suffix.
 
 - **Dispatcher** — classifies the request, has no direct file-modification tools, and (for an
-  OBJECTIVE run) writes the final summary once every task is complete.
-- **Planner** — read-only. Produces an ordered list of implementation units for a genuinely
-  multi-part objective, then is resumed to detail one self-contained Implementer assignment at a
-  time, informed by the previous Implementer's own conclusion. There is no separate re-planning
-  step — adaptation happens naturally on the next detail call.
-- **Implementer** — the only role with `write_file`/`edit_file`/`bash`. Executes one assignment,
-  verifies its own work (build/lint/test, or a direct exercise of the changed behaviour), and
-  reports SUCCESS or FAIL via `conclude`.
+  OBJECTIVE run) writes the final summary once every task is complete. Has `bash` for
+  investigation (grep/cat/ls/running tests to understand behaviour) with a read-only tool
+  description — never `write_file`/`edit_file`.
+- **Planner** — read-only for file changes. Produces an ordered list of implementation units for a
+  genuinely multi-part objective, then is resumed to detail one self-contained Implementer
+  assignment at a time, informed by the previous Implementer's own conclusion. There is no
+  separate re-planning step — adaptation happens naturally on the next detail call. Also has
+  `bash` for investigation only (read-only tool description), never `write_file`/`edit_file`.
+- **Implementer** — the only role with `write_file`/`edit_file`, and the only role whose `bash`
+  tool carries the default read-write description. Executes one assignment, verifies its own work
+  (build/lint/test, or a direct exercise of the changed behaviour), and reports SUCCESS or FAIL via
+  `conclude`.
 
 The SIMPLE path (a well-scoped, single-unit change) skips the Planner entirely: Dispatcher →
 Implementer → done. If that one Implementer hits its iteration cap without concluding, the run

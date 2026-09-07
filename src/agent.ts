@@ -3,13 +3,13 @@ import type { Message, ChatResponse } from 'ollama'
 import { promises as fs } from 'fs'
 import path from 'path'
 import { config } from './config.js'
-import { toolDefinitions, executeTool } from './tools/index.js'
+import { toolDefinitions, executeTool, BASH_DESCRIPTION_READONLY } from './tools/index.js'
 import { bash, NO_OUTPUT } from './tools/bash.js'
 import { truncateOutput } from './tools/truncate.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
 import { TraceLogger } from './al-logger.js'
 import type { AgentEvent, ToolName, ModelOptions, Role } from './types.js'
-import { PROGRESS_CHECK_ITERATIONS, PROGRESS_CHECK_MESSAGES, ROLE_CONCLUDE_STATUSES, ROLE_IDENTITY, ROLE_INSTRUCTIONS, concludeStatusError, withConcludeStatusEnum } from './frames.js'
+import { PROGRESS_CHECK_ITERATIONS, PROGRESS_CHECK_MESSAGES, ROLE_CONCLUDE_STATUSES, ROLE_IDENTITY, ROLE_INSTRUCTIONS, concludeStatusError, withConcludeStatusEnum, patchBashForReadOnly } from './frames.js'
 import {
   createLoopState, noteMutation, noteBashExecution, evaluateCall, normalizeCallKey, recordResult, type LoopState,
   // H21 closes the unbounded-retry hole where a call the role gate refuses is
@@ -657,19 +657,10 @@ export class Agent {
     }
     // MULTI-AGENT ARCHITECTURE: a role-scoped frame only offers Ollama the tools in
     // this.allowedTools (frames.ts's ROLE_TOOLS); null (baseline, and every existing
-    // caller) offers the full set unchanged.
-    //
-    // DYNAMIC conclude.status ENUM (frames.ts's withConcludeStatusEnum): patched in
-    // here, AFTER role-filtering, so the enum reflects this frame's own role even
-    // though the base `conclude` tool definition in tools/index.ts stays role-
-    // agnostic (every role shares one static array; only the SENT copy differs).
-    // A no-op (returns the same array) for the unrestricted baseline (roleTag null).
-    const offeredTools = withConcludeStatusEnum(
-      this.allowedTools
-        ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
-        : toolDefinitions,
-      this.roleTag,
-    )
+    // caller) offers the full set unchanged. Also patches `conclude`'s status enum
+    // and (for a read-only role) `bash`'s description — see buildOfferedTools's own
+    // comment for the full three-step rationale.
+    const offeredTools = this.buildOfferedTools()
     // TIMEOUT ABORT — STREAMING: the Ollama JS client only tracks a request in
     // `ongoingStreamedRequests` (what its own abort() walks and cancels) when the
     // request is STREAMED — a stream:false call's underlying fetch has no abort
@@ -780,22 +771,40 @@ export class Agent {
     return ''
   }
 
+  // THE TOOLS ACTUALLY OFFERED TO OLLAMA for this frame's role, computed identically
+  // by chatCall() (the real per-iteration request) and chat() (the trace-log header,
+  // which must describe the same set the model is actually given). Three steps, in
+  // order: (1) role-filter to this.allowedTools (null = unrestricted baseline, every
+  // tool); (2) patch `conclude`'s status enum to this role's ROLE_CONCLUDE_STATUSES
+  // (frames.ts's withConcludeStatusEnum); (3) for a READ-ONLY role (Dispatcher/
+  // Planner — the two roles that get `bash` back for investigation only, never for
+  // writing), patch `bash`'s tool DESCRIPTION to the read-only variant
+  // (frames.ts's patchBashForReadOnly) so the SCHEMA itself never invites a write,
+  // matching the role's own read-only prompt framing instead of contradicting it.
+  // Step 3 is a no-op for every other role (Implementer, the unrestricted baseline),
+  // which keeps the default read-write bash description unchanged.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private buildOfferedTools(): any[] {
+    const roleFiltered = this.allowedTools
+      ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
+      : toolDefinitions
+    const withEnum = withConcludeStatusEnum(roleFiltered, this.roleTag)
+    if (this.roleTag === 'dispatcher' || this.roleTag === 'planner') {
+      return patchBashForReadOnly(withEnum, BASH_DESCRIPTION_READONLY)
+    }
+    return withEnum
+  }
+
   async chat(userMessage: string, opts?: ChatOptions): Promise<string> {
     const resume = opts?.resume === true
     const logger = new SessionLogger(userMessage, this.model, this.options, this.sessionId)
     // NEW, ADDITIVE Markdown trace (al-logger.ts) — see the field doc comment above.
-    // The tool set offered is computed the SAME way chatCall() computes offeredTools
-    // (this.allowedTools ? filter : the full set, then withConcludeStatusEnum) since
-    // that filtering only depends on state already set before chat() runs (dispatch.ts's
-    // spawnFrame calls setAllowedTools/setRole before chat()), not on anything
-    // chatCall() itself derives per call — so recomputing it here for the header is
-    // equivalent, not a guess.
-    const alTools = withConcludeStatusEnum(
-      this.allowedTools
-        ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
-        : toolDefinitions,
-      this.roleTag,
-    )
+    // The tool set offered is computed via the SAME buildOfferedTools() helper
+    // chatCall() uses, since that filtering only depends on state already set
+    // before chat() runs (dispatch.ts's spawnFrame calls setAllowedTools/setRole
+    // before chat()), not on anything chatCall() itself derives per call — so
+    // recomputing it here for the header is equivalent, not a guess.
+    const alTools = this.buildOfferedTools()
     // sessionId/frameId/jsonl filename are cross-reference IDs only (see al-logger.ts's
     // header) — they let a reader of the trace jump straight to the matching JSONL
     // log (logger.getFilename()) and, from there, to the session/frame this run
@@ -1157,7 +1166,18 @@ export class Agent {
         // path, and it is unchanged. So this branch is just "keep the model's
         // reasoning in context and nudge it toward an explicit next move."
         if (!hasCalls) {
-          this.pushCtx(msg)
+          // Only push a THINKING turn's message into history when it actually says
+          // something. A turn with no tool calls and no content (an entirely empty
+          // assistant message — thinking models occasionally emit exactly this)
+          // adds nothing for a later turn to read and, left in history, is what
+          // produced the empty "#### Content"/"#### Thinking" sections al-logger.ts
+          // used to render for it. Deliberately NOT applied to the hasCalls branch
+          // below: a message WITH tool_calls must always be pushed even when its
+          // own content is empty, since the tool-result messages pushed right after
+          // it need a parent assistant turn to attach to — Ollama's chat API
+          // expects a strict assistant/tool alternation, and dropping that parent
+          // would desync it.
+          if (msg.content) this.pushCtx(msg)
           consecutiveThinkingTurns++
           // Only nudge from the 2nd consecutive thinking turn on — the model gets one
           // free turn to reason/plan without being told to hurry up; a SECOND turn in
@@ -1315,10 +1335,10 @@ export class Agent {
             error: result.error,
             duration_ms,
           })
-          // NEW, ADDITIVE Markdown trace (al-logger.ts): one tool-result block per
-          // tool actually run this turn (conclude is intercepted earlier and never
-          // reaches this line, matching the existing tool_result event's own scope).
-          this.traceLogger?.logToolExecution(name, args, result.output, result.error, duration_ms)
+          // NOTE: no al-logger tool-result block here any more — the result already
+          // reaches the trace as a `[tool]` message in the NEXT turn's own
+          // `#### New messages` (beginTurn reads it straight off this.history), so a
+          // separate "Tool Results" section would only duplicate it.
 
           this.pushCtx({
             role: 'tool',
