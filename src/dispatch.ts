@@ -528,18 +528,8 @@ export const TASK_START_CAP_FAILURE_MESSAGE =
 // express: the CHECKPOINT marker the retry/resume plumbing keys on, the
 // verbatim-threading note (config-flag-dependent), and the iteration budget (a
 // number, not a rule).
-export function buildTaskStartAssignment(userMessage: string, verbatimRequestOn: boolean): string {
-  return (
-    'CHECKPOINT: task-start\n' +
-    `<argo-user-prompt>\n${userMessage}\n</argo-user-prompt>\n\n` +
-    (verbatimRequestOn
-      ? 'Note: the user\'s request above is ALSO threaded verbatim to every downstream frame (Planner, ' +
-        'Implementer) alongside whatever you write below — this checkpoint is no longer the only place ' +
-        'it survives, so your mode line can be a concise digest rather than an exhaustive transcription; the ' +
-        'original is preserved separately for anyone who needs the exact wording.\n\n'
-      : '') +
-    `You have a hard budget of ${TASK_START_MAX_ITERATIONS} iterations to call \`conclude\` with the classified status and message.`
-  )
+export function buildTaskStartAssignment(userMessage: string): string {
+  return userMessage
 }
 
 async function runBossTaskStart(userMessage: string, emit: Emit): Promise<RoutedTaskStart> {
@@ -554,7 +544,7 @@ async function runBossTaskStart(userMessage: string, emit: Emit): Promise<Routed
     // MULTI-TURN MEMORY: buildTurnHistoryBlock's text is prepended AHEAD of the
     // buildTaskStartAssignment output. Empty string (first turn / no history yet)
     // makes this a no-op concatenation.
-    assignment: buildTurnHistoryBlock(turnHistory) + buildTaskStartAssignment(userMessage, config.verbatimRequest),
+    assignment: buildTurnHistoryBlock(turnHistory) + buildTaskStartAssignment(userMessage),
   }
   // TASK_START_TOOLS (frames.ts), not ROLE_TOOLS.boss — this checkpoint is read-only
   // classification, see that constant's comment for why and the incident that forced it.

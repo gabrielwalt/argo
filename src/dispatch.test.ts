@@ -36,42 +36,9 @@ import { parseTaskStartVerdict, ROLE_TOOLS, ROLE_MAX_ITERATIONS } from './frames
 
 // ── buildTaskStartAssignment — the exact prompt text ────────────────────────
 
-test('buildTaskStartAssignment: wraps the user message in <argo-user-prompt> tags verbatim', () => {
-  const text = buildTaskStartAssignment('delete the file workspace first, then <b>bold</b>', false)
-  assert.ok(text.includes('<argo-user-prompt>\ndelete the file workspace first, then <b>bold</b>\n</argo-user-prompt>'),
-    'the user message must be reproduced byte-for-byte inside the tags, regardless of its own content')
-})
-
-// The classification rules (READ-ONLY framing, the three status keywords,
-// grounding instructions) moved to frames.ts's ROLE_INSTRUCTIONS.boss — its own
-// separate [system] message (message 3) — so they're asserted there
-// (frames.test.ts), not against this function's output any more.
-
-test('buildTaskStartAssignment: no verbatim-request note when the flag is off', () => {
-  const text = buildTaskStartAssignment('fix the bug', false)
-  assert.equal(text.includes('threaded verbatim to every downstream frame'), false)
-})
-
-test('buildTaskStartAssignment: includes the verbatim-request note when the flag is on', () => {
-  const text = buildTaskStartAssignment('fix the bug', true)
-  assert.ok(text.includes('threaded verbatim to every downstream frame'))
-})
-
-test('buildTaskStartAssignment: starts with the CHECKPOINT header agent.ts keys its progress-check wording on', () => {
-  const text = buildTaskStartAssignment('fix the bug', false)
-  assert.ok(text.startsWith('CHECKPOINT: task-start\n'))
-})
-
-test('buildTaskStartAssignment: no leftover "fix it yourself" / "verify it once" language — there is no self-edit path anymore', () => {
-  const text = buildTaskStartAssignment('fix the bug', false)
-  assert.equal(/verify it once/i.test(text), false)
-  assert.equal(/you may fix it yourself/i.test(text), false)
-})
-
-test('buildTaskStartAssignment: now that classification rules moved to ROLE_INSTRUCTIONS.boss, this is a short, purely dynamic wrapper', () => {
-  const text = buildTaskStartAssignment('fix the bug', false)
-  const words = text.trim().split(/\s+/).length
-  assert.ok(words < 60, `expected a lean dynamic-only wrapper, got ${words} words`)
+test('buildTaskStartAssignment: returns the raw user message as-is', () => {
+  const text = buildTaskStartAssignment('fix the bug in paginate()')
+  assert.equal(text, 'fix the bug in paginate()')
 })
 
 // ── mode-line format stays compatible with frames.ts's parser ──────────────
@@ -115,10 +82,8 @@ test('TASK_START_HARD_CAP is strictly greater than the prompt\'s stated TASK_STA
   assert.ok(TASK_START_HARD_CAP > TASK_START_MAX_ITERATIONS)
 })
 
-test('the prompt itself still states the soft budget (10), not the hard cap (20)', () => {
-  const text = buildTaskStartAssignment('fix the bug', false)
-  assert.ok(text.includes(`hard budget of ${TASK_START_MAX_ITERATIONS} iterations`))
-  assert.equal(text.includes(`hard budget of ${TASK_START_HARD_CAP} iterations`), false)
+test('TASK_START_HARD_CAP > TASK_START_MAX_ITERATIONS (soft stated vs hard enforced)', () => {
+  assert.ok(TASK_START_HARD_CAP > TASK_START_MAX_ITERATIONS)
 })
 
 test('TASK_START_CAP_FAILURE_MESSAGE is a plain user-facing failure, not the raw agent.ts cap-hit string', () => {
@@ -875,11 +840,7 @@ test('boundTurnHistory: a custom max is respected', () => {
   assert.deepEqual(bounded.map(d => d.userMessage), ['msg3', 'msg4'])
 })
 
-test('buildTaskStartAssignment itself stays untouched by the turn-history feature — the Boss prompt is locked', () => {
-  // The multi-turn history block is prepended by runBossTaskStart, not baked into
-  // buildTaskStartAssignment's own body — this is a regression guard on the exact
-  // prompt text this task was explicitly told never to modify.
-  const text = buildTaskStartAssignment('hello', false)
-  assert.equal(text.startsWith('CHECKPOINT: task-start\n'), true)
-  assert.equal(text.includes('Previous turns'), false)
+test('buildTaskStartAssignment returns only the raw user message — no CHECKPOINT, no harness wrapping', () => {
+  const text = buildTaskStartAssignment('fix the bug')
+  assert.equal(text, 'fix the bug')
 })

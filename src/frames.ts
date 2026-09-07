@@ -65,7 +65,7 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
 // (grep, cat, ls, running tests to understand behaviour). bash CAN write, but the
 // prompt's read-only framing + the classification-only scope make that acceptable —
 // the alternative (no bash) left the Boss unable to check real files, which is worse.
-export const TASK_START_TOOLS: ToolName[] = ['read_file', 'bash', 'web_search', 'fetch_url', 'ledger', 'conclude']
+export const TASK_START_TOOLS: ToolName[] = ['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude']
 
 // Per-role iteration budgets. Implementer keeps the most headroom (real work happens
 // there); Planner/Boss are short bounded loops, not open-ended. Planner raised
@@ -273,7 +273,7 @@ export const ROLE_IDENTITY: Record<Role, string> = {
 // isPlannerDone for how the harness detects "no further work needed").
 export const ROLE_INSTRUCTIONS: Record<Role, string> = {
   boss:
-    'Your task is to classify the request from the user into exactly one of the three statuses below with an ' +
+    'Your task is to classify the user request into exactly one of the three statuses below with an ' +
     'appropriate status message:\n' +
     '- Status ANSWER; Message: The complete final answer — use only if you already know the answer with ' +
     'certainty and no project changes are required.\n' +

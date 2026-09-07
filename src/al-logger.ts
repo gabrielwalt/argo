@@ -185,15 +185,15 @@ export class TraceLogger {
     const optsStr = formatOptions(options)
     const truncatedQuery = query.length > 120 ? `${query.slice(0, 120)}…` : query
 
-    const metaParts: string[] = []
-    if (sessionId) metaParts.push(`**Session**: ${escapeMd(sessionId)}`)
-    if (frameId) metaParts.push(`**Frame**: ${escapeMd(frameId)}`)
-    if (jsonlFilename) metaParts.push(`**JSONL**: ${escapeMd(jsonlFilename)}`)
+    const metaLines: string[] = []
+    if (sessionId) metaLines.push(`- **Session**: ${escapeMd(sessionId)}`)
+    if (frameId) metaLines.push(`- **Frame**: ${escapeMd(frameId)}`)
+    if (jsonlFilename) metaLines.push(`- **JSONL**: ${escapeMd(jsonlFilename)}`)
 
     const lines: string[] = []
     lines.push(`# ${escapeMd(role.charAt(0).toUpperCase() + role.slice(1))} ${seq}`)
     lines.push(`- **Model**: ${escapeMd(model)}${optsStr ? ` ${optsStr}` : ''}`)
-    if (metaParts.length > 0) lines.push(`- ${metaParts.join(' | ')}`)
+    lines.push(...metaLines)
     lines.push('')
     lines.push(formatTools(tools))
     lines.push('')

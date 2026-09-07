@@ -993,7 +993,7 @@ export class Agent {
     // check pushed all the way to its own 10-iteration cap instead of 0.4 of it
     // (=4) — classification is expected to finish fast, and a mid-run steer at 4
     // was firing well before the model had a real chance to converge.
-    const isBossTaskStartCheckpoint = userMessage.startsWith('CHECKPOINT: task-start')
+    const isBossTaskStartCheckpoint = this.roleTag === 'boss'
     // PER-ROLE FIXED PROGRESS CHECKS (frames.ts's PROGRESS_CHECK_ITERATIONS/
     // PROGRESS_CHECK_MESSAGES). When this frame's role has an entry there (currently
     // Planner and Implementer only), its checkpoints are these EXACT per-call

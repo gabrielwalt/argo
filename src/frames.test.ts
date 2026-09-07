@@ -16,11 +16,11 @@ import {
   PROGRESS_CHECK_MESSAGES,
 } from './frames.js'
 
-test('TASK_START_TOOLS has bash for investigation but no direct write tools', () => {
+test('TASK_START_TOOLS is read-only — no bash, no direct write tools', () => {
   // bash is included so the Boss can grep, cat, ls, run tests to understand
   // behaviour. write_file/edit_file are excluded — the prompt's read-only framing
   // is the guard, not the tool set (bash can write, but the Boss is classifying).
-  assert.equal(TASK_START_TOOLS.includes('bash'), true)
+  assert.equal(TASK_START_TOOLS.includes('bash'), false)
   assert.equal(TASK_START_TOOLS.includes('write_file'), false)
   assert.equal(TASK_START_TOOLS.includes('edit_file'), false)
 })
@@ -40,8 +40,8 @@ test('TASK_START_TOOLS keeps ledger — the tool itself exposes no write action'
   assert.equal(TASK_START_TOOLS.includes('ledger'), true)
 })
 
-test('TASK_START_TOOLS includes bash for investigation plus read-only tools and conclude', () => {
-  assert.deepEqual([...TASK_START_TOOLS].sort(), ['bash', 'conclude', 'fetch_url', 'ledger', 'read_file', 'web_search'])
+test('TASK_START_TOOLS is strictly read-only tools plus conclude', () => {
+  assert.deepEqual([...TASK_START_TOOLS].sort(), ['conclude', 'fetch_url', 'ledger', 'read_file', 'web_search'])
 })
 
 test('ROLE_TOOLS.boss has no bash and no write_file — the Boss is strictly read-only outside the task-start checkpoint', () => {
