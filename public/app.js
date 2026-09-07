@@ -334,6 +334,14 @@ let traceStartTime = null
 // Latest iteration number of the CURRENT trace block — drives the collapsed
 // title while running (see addIterationSeparator()).
 let latestIteration = null
+// True once any per-agent conclude card (renderAgentConclusion) has rendered
+// during the CURRENT run — reset per run in startTraceBlock(). Every live run
+// is a dispatch run (see startTraceBlock's comment), so this is set on every
+// normal run; it exists so the harness's own untagged, top-level 'message'/
+// 'done' — which restates the exact same final answer for the (bypassed)
+// baseline-agent code path — doesn't ALSO render a redundant generic "Agent
+// concluded" card on top of the per-agent ones. See renderConclusionCard.
+let anyFrameConcludedThisRun = false
 
 // ── Collapsed "current activity" pacing ─────────────────────────
 // Trace items append the instant their SSE event arrives, so a fast run's
@@ -390,6 +398,15 @@ function startTraceBlock(model) {
   activeDispatcherFrameId = null
   lastObjectiveText = ''
   lastConclusionKey = ''
+  // Every live run goes through dispatch.ts's runDispatchLoop (server.ts's /chat
+  // never calls the baseline agent.chat() directly), which — on top of every
+  // per-frame conclude card rendered via handleFrameEvent/renderAgentConclusion —
+  // ALSO emits its own untagged, harness-level 'message'/'done' with the exact
+  // same final answer, for the (bypassed) baseline-agent code path to render its
+  // own generic "Agent concluded" card. See renderConclusionCard below, which
+  // this flag makes a no-op for the rest of the run once any per-agent conclude
+  // card has already shown that same result.
+  anyFrameConcludedThisRun = false
 
   const block = document.createElement('div')
   block.className = 'trace-block running'
@@ -435,10 +452,11 @@ function startTraceBlock(model) {
 function finalizeTraceBlock() {
   if (!currentTraceBlock) return
   const dur = traceStartTime ? ((Date.now() - traceStartTime) / 1000).toFixed(1) : ''
-  // Not "Agent trace" — this block is a plain run log, not a container that groups
-  // agents into one collapsed accordion. Each agent's own section (see
-  // getOrCreateRoleCard) renders directly beneath, always expanded, with its own
-  // prominent heading.
+  // Not "Agent trace" — this is the plain top-level (baseline/untagged-event) run
+  // log, not a container that groups agents together. Each spawned agent instead
+  // gets its OWN standalone, independently-collapsible accordion rendered directly
+  // in #messagesEl (see getOrCreateRoleCard) — a sibling of this block, never nested
+  // inside it.
   currentTraceBlock.title.textContent = 'Run log'
   currentTraceBlock.subtitle.textContent = ''
   currentTraceBlock.meta.textContent = `${traceToolCalls} tool${traceToolCalls !== 1 ? 's' : ''} · ${dur}s`
@@ -618,7 +636,7 @@ function handleEvent(event) {
       break
 
     case 'thought':
-      addTraceItem('thought', 'Thought', event.content, true)
+      addTopLevelTraceHtml(buildThoughtEl(event.content))
       surfaceActivity(summarize(event.content))
       break
 
@@ -786,7 +804,7 @@ function handleEventForSession(event) {
       break
 
     case 'thought':
-      addTraceItem('thought', 'Thought', event.content, true)
+      addTopLevelTraceHtml(buildThoughtEl(event.content))
       break
 
     case 'tool_call': {
@@ -1420,15 +1438,17 @@ function addTraceItem(className, label, body, collapsible, container) {
   return el
 }
 
-// ── Multi-agent architecture (config.agents) — nested role cards ─────────────────
+// ── Multi-agent architecture (config.agents) — per-agent accordions ──────────────
 // Every event a spawned frame produces (thought/tool_call/plan/done/...) arrives
 // tagged with __frameId/__role/__parentFrameId (see types.ts's FrameTag); an
 // untagged event is the top-level dispatch narrative, rendered exactly like the
-// single-loop baseline (unchanged code path below). A tagged event instead nests
-// inside a small collapsible "role card" for that one frame's turn — one flat,
-// chronological sequence inside the SAME top-level trace block, since dispatch
-// is strictly sequential (docs/subagents-plan.md's hard no-parallelism rule), so
-// execution order alone already shows which agent ran after which.
+// single-loop baseline (unchanged code path below). A tagged event instead goes
+// into its OWN standalone collapsible accordion for that one frame's turn — a
+// direct sibling of chat bubbles/conclude cards in #messagesEl's flat chronological
+// flow, since dispatch is strictly sequential (docs/subagents-plan.md's hard
+// no-parallelism rule), so execution order alone already shows which agent ran
+// after which. Each accordion is followed immediately by that frame's own conclude
+// card (see renderAgentConclusion) once it closes.
 //
 // Display names are a presentation-only layer over the plain functional role —
 // see frames.ts's ROLE_NAME for the same mapping, chosen for an actual functional
@@ -1439,8 +1459,11 @@ const ROLE_META = {
   implementer: { name: 'Implementer', title: 'Implementer Agent' },
 }
 
-// frameId -> { el, items, outcome, role }. Cleared per top-level run
-// (startTraceBlock) — see there for why stale entries can't leak across runs.
+// frameId -> { el, arrow, items, role, status }. Cleared per top-level
+// run (startTraceBlock) — see there for why stale entries can't leak across runs.
+// Unlike the old single "Run log" trace-block, each frame's record now owns its
+// OWN standalone accordion element, appended directly into #messagesEl rather
+// than nested inside any shared container — see getOrCreateRoleCard below.
 const roleCards = new Map()
 
 // Held 'objective' event awaiting the Dispatcher frame's card to close (see
@@ -1454,11 +1477,14 @@ let lastObjectiveText = ''
 
 // Gets the section for an already-known frameId (a RESUMED frame — the Planner's next
 // detail call reuses its existing section rather than creating a confusing duplicate),
-// or creates a fresh one. Each agent's turn gets its OWN always-visible section with a
-// prominent heading, rendered directly in the trace flow — not grouped into a single
-// collapsible "Agent trace" accordion, and not nested inside one either. `assignment`
-// (the frame's originating query/request) is deliberately NOT rendered here — it's
-// already shown as the user's chat message, and isn't readable in this compact form.
+// or creates a fresh one. Each agent's turn gets its OWN collapsible accordion,
+// rendered directly in #messagesEl (a sibling of chat bubbles/conclude cards) — not
+// nested inside any shared "Run log" block, and not inside another agent's accordion
+// either. Defaults to COLLAPSED: the conclude card rendered right after it (see
+// renderAgentConclusion) is the at-a-glance summary; the accordion itself is the
+// opt-in detail. `assignment` (the frame's originating query/request) is deliberately
+// NOT rendered here — it's already shown as the user's chat message, and isn't
+// readable in this compact form.
 function getOrCreateRoleCard(frameId, role, assignment) {
   const existing = roleCards.get(frameId)
   if (existing) {
@@ -1471,26 +1497,36 @@ function getOrCreateRoleCard(frameId, role, assignment) {
   const card = document.createElement('div')
   card.className = 'role-card active'
 
+  const toggle = document.createElement('div')
+  toggle.className = 'role-card-toggle'
+
+  const arrow = document.createElement('span')
+  arrow.className = 'role-card-arrow'
+  arrow.textContent = '▶'
+
   const heading = document.createElement('h3')
   heading.className = 'agent-heading'
   heading.textContent = meta.title
 
-  const outcome = document.createElement('span')
-  outcome.className = 'role-card-outcome'
-
-  const headRow = document.createElement('div')
-  headRow.className = 'role-card-head'
-  headRow.append(heading, outcome)
+  // No outcome/status element here — the conclude card rendered right after this
+  // accordion (see renderAgentConclusion) already carries the status badge and
+  // result; a second copy on the accordion's own toggle row would just duplicate it.
+  toggle.append(arrow, heading)
+  toggle.addEventListener('click', () => {
+    card.classList.toggle('open')
+    arrow.textContent = card.classList.contains('open') ? '▼' : '▶'
+  })
 
   const items = document.createElement('div')
   items.className = 'role-card-items'
 
-  card.append(headRow, items)
-  if (!currentTraceBlock) startTraceBlock(currentRunModel)
-  currentTraceBlock.items.appendChild(card)
+  // Collapsed by default (per-agent accordion, not always-expanded) — the
+  // conclude card that follows carries the at-a-glance result.
+  card.append(toggle, items)
+  messagesEl.appendChild(card)
   maybeAutoScroll()
 
-  const record = { el: card, items, outcome, role }
+  const record = { el: card, arrow, items, role, status: null }
   roleCards.set(frameId, record)
   return record
 }
@@ -1511,15 +1547,24 @@ function addRoleCardHtml(frameId, el) {
   maybeAutoScroll()
 }
 
-// Closes out a frame's card with its one-line outcome — a SYNTHESIS (short status +
-// summary), never the raw text again: the raw final answer already appeared as this
-// same frame's last nested item (its own 'thought'/'message'), so repeating it here
-// would just duplicate what expanding the card already shows.
-function closeRoleCard(frameId, outcomeText) {
+// Closes out a frame's accordion — no outcome/status text of its own to set
+// (see getOrCreateRoleCard: the conclude card rendered right after the
+// accordion, via renderAgentConclusion, is the one place that result shows).
+// Does NOT flush a held objective — see closeRoleCard below, the normal entry
+// point, which does; the 'done' case in handleFrameEvent uses this quiet
+// variant instead so it can render the conclude card in between (objective
+// card must land AFTER it, never before).
+function closeRoleCardQuiet(frameId) {
   const card = roleCards.get(frameId)
   if (!card) return
-  card.outcome.textContent = outcomeText
   card.el.classList.remove('active')
+}
+
+// Normal entry point: closes the accordion AND immediately flushes a held
+// objective once its Dispatcher frame has finished. Used by the 'error' path,
+// which has no conclude card of its own to sequence the flush after.
+function closeRoleCard(frameId) {
+  closeRoleCardQuiet(frameId)
   flushPendingObjectiveIfReady(frameId)
 }
 
@@ -1577,6 +1622,42 @@ function formatToolCall(tool, args) {
   }
 }
 
+// Builds the "Thinking" block for a 'thought' AgentEvent (msg.content — the
+// assistant's own textual reasoning/response, emitted alongside or instead of a
+// tool call — see agent.ts's emitAndLog({ type: 'thought', ... })). This is the
+// UI counterpart of the "#### Thinking" section in the Markdown trace log
+// (al-logger.ts's logResponse) — the SAME text must show up here, not just get
+// silently dropped whenever a turn has no tool call to hang it off of.
+// Whitespace-preserving (pre-wrap, via .trace-thought-body in styles.css) and
+// collapsible for long text, expanded by default (a thought is the actual
+// substance of the agent's turn, worth seeing without an extra click — unlike
+// a tool result, which defaults collapsed).
+function buildThoughtEl(content) {
+  const text = String(content ?? '')
+  const wrap = document.createElement('div')
+  wrap.className = 'trace-thought'
+  const label = document.createElement('strong')
+  label.textContent = 'Thinking'
+  const body = document.createElement('div')
+  body.className = 'trace-thought-body'
+  body.textContent = text
+  wrap.append(label, body)
+
+  if (text.length > 300) {
+    const btn = document.createElement('button')
+    btn.className = 'expand-btn'
+    let expanded = true
+    btn.textContent = '▲ Collapse'
+    btn.onclick = () => {
+      expanded = !expanded
+      body.classList.toggle('collapsed', !expanded)
+      btn.textContent = expanded ? '▲ Collapse' : '▼ Show all'
+    }
+    wrap.appendChild(btn)
+  }
+  return wrap
+}
+
 // Builds the optional "Thinking" (collapsible) and "Content" blocks that precede
 // a model response's tool calls, when the event carries them. Returns an array of
 // DOM elements (possibly empty) — used by both the top-level and per-frame paths.
@@ -1626,9 +1707,23 @@ function handleFrameEvent(event) {
       getOrCreateRoleCard(frameId, role, event.query)
       break
     case 'thought':
-      addRoleCardItem(frameId, 'thought', 'Thought', event.content, true)
+      // The model's own textual reasoning/response for this turn — must show up
+      // in the accordion exactly like it does in the Markdown trace log's
+      // "#### Thinking" section, not just be swallowed because there's no tool
+      // call to hang it off of. See buildThoughtEl.
+      addRoleCardHtml(frameId, buildThoughtEl(event.content))
       break
     case 'tool_call': {
+      // The 'conclude' call itself never renders as a trace item — the conclude
+      // card rendered outside/after the accordion (see renderAgentConclusion,
+      // wired from the 'done' case below) replaces it entirely. Capture its
+      // status now, though: 'done' carries only the message text, not the
+      // status keyword, so this is the only place that value is ever seen.
+      if (event.tool === 'conclude') {
+        const card = roleCards.get(frameId)
+        if (card) card.status = event.args?.status ?? event.args?.outcome ?? null
+        break
+      }
       for (const el of buildThinkingContentEls(event)) addRoleCardHtml(frameId, el)
       const wrap = document.createElement('div')
       wrap.innerHTML = formatToolCall(event.tool, event.args)
@@ -1636,6 +1731,9 @@ function handleFrameEvent(event) {
       break
     }
     case 'tool_result': {
+      // Paired with the tool_call filter above — the conclude call's "0ms"
+      // result is just as redundant with the conclude card as the call itself.
+      if (event.tool === 'conclude') break
       const isError = !!event.error
       const label = `Result${event.error ? ' · ERROR' : ''} · ${event.duration_ms}ms`
       const body = event.error ? `${event.error}\n${event.output}` : event.output
@@ -1656,14 +1754,23 @@ function handleFrameEvent(event) {
       // its 'done' outcome below; rendering it again here would duplicate it.
       break
     case 'done': {
-      closeRoleCard(frameId, summarize(event.content, 140))
+      const card = roleCards.get(frameId)
+      const status = card ? card.status : null
+      // Close the accordion's collapsed state WITHOUT flushing a held objective
+      // yet — closeRoleCardQuiet() skips that flush on purpose. Render this
+      // frame's conclude card FIRST, then flush: the Dispatcher's objective card
+      // must land right after its own "Dispatcher concluded" card (see
+      // renderObjective's comment), which means the flush has to happen after
+      // renderAgentConclusion appends to #messagesEl, not before.
+      closeRoleCardQuiet(frameId)
       const meta = ROLE_META[role] || { name: role }
-      renderConclusionCard(`${meta.name} concluded`, event.content)
+      renderAgentConclusion(frameId, meta.name, status, event.content)
+      flushPendingObjectiveIfReady(frameId)
       break
     }
     case 'error':
       addRoleCardItem(frameId, 'error-item', 'Error', event.message, false)
-      closeRoleCard(frameId, 'error')
+      closeRoleCard(frameId)
       break
     // iteration / token_usage / ollama_request: live-only telemetry with
     // nothing worth a per-frame UI element.
@@ -1738,6 +1845,16 @@ let lastConclusionKey = ''
 
 function renderConclusionCard(label, content) {
   if (content == null || content === '') return
+  // Every live run is a dispatch run (see startTraceBlock's comment) — the
+  // harness's own top-level 'message'/'done' restate the exact SAME final
+  // answer that a per-agent conclude card (renderAgentConclusion) already
+  // rendered for whichever frame actually produced it. Once that's happened
+  // this run, a generic "Agent concluded" card here would be a pure duplicate,
+  // not a second real conclusion — suppress it rather than render it and rely
+  // on lastConclusionKey (which only catches an EXACT byte-for-byte repeat,
+  // not this case: label differs ("Agent concluded" vs "Dispatcher concluded")
+  // and the text can differ too, e.g. after stripDuplicatedObjective).
+  if (anyFrameConcludedThisRun) return
   const key = `${label}\u0000${content}`
   if (key === lastConclusionKey) return
   lastConclusionKey = key
@@ -1749,6 +1866,42 @@ function renderConclusionCard(label, content) {
   // styles.css) apply the same way they do for a plain assistant bubble.
   el.className = 'message conclusion md'
   el.innerHTML = `<div class="conclusion-title">${escHtml(label)}</div><div class="conclusion-text">${renderMarkdown(text)}</div>`
+  el.querySelectorAll('a').forEach(a => a.setAttribute('target', '_blank'))
+  messagesEl.appendChild(el)
+  maybeAutoScroll()
+}
+
+// Per-frame conclude card — the multi-agent counterpart to renderConclusionCard
+// above, rendered directly in #messagesEl right after that frame's accordion
+// (see getOrCreateRoleCard/closeRoleCard) rather than nested inside it. Carries
+// the `conclude` tool call's full detail — status keyword AS A BADGE (SIMPLE,
+// SUCCESS, FAIL, ANSWER, ...) plus the message, markdown-rendered — replacing
+// both the (deliberately unrendered) 'conclude' tool_call and its "0ms"
+// tool_result inside the accordion. `role` is the short display name
+// (ROLE_META[...].name, e.g. "Dispatcher") used to build the "<Role> concluded"
+// heading; `status` may be null for a build that never captured one.
+// Same lastConclusionKey de-dup as renderConclusionCard — a harness that emits
+// the same frame's 'done' twice (e.g. across replay + live) shouldn't double the card.
+function renderAgentConclusion(frameId, role, status, content) {
+  if (content == null || content === '') return
+  const key = `${role}\u0000${status}\u0000${content}`
+  if (key === lastConclusionKey) return
+  lastConclusionKey = key
+  // Marks this run as having a per-agent conclude card — see the flag's own
+  // comment — so the harness's own top-level 'message'/'done' (dispatch.ts's
+  // untagged echo of the same final answer, for the bypassed baseline path)
+  // doesn't ALSO render a generic "Agent concluded" card underneath/on top of
+  // this one. Set even if the text below turns out to be empty after stripping
+  // a duplicated objective — a real per-agent conclusion happened either way.
+  anyFrameConcludedThisRun = true
+  const text = stripDuplicatedObjective(String(content))
+  if (!text.trim()) return
+  const statusClass = status ? `status-${String(status).toLowerCase()}` : ''
+  const el = document.createElement('div')
+  el.className = `message conclusion agent-conclusion md ${statusClass}`.trim()
+  el.innerHTML = `<div class="conclusion-title">${escHtml(role)} concluded`
+    + (status ? `<span class="status">${escHtml(String(status))}</span>` : '')
+    + `</div><div class="conclusion-text">${renderMarkdown(text)}</div>`
   el.querySelectorAll('a').forEach(a => a.setAttribute('target', '_blank'))
   messagesEl.appendChild(el)
   maybeAutoScroll()

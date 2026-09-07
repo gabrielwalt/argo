@@ -735,8 +735,56 @@ main {
   background: rgba(34, 197, 94, .06);
   white-space: normal;
 }
-.conclusion-title { font-weight: 600; color: var(--green); margin-bottom: 6px; }
+.conclusion-title { font-weight: 600; color: var(--green); margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
 .conclusion-text { white-space: normal; }
+
+/* Per-agent conclude card (renderAgentConclusion in app.js) — one accordion's
+   result, rendered right after it closes. Same card family as .message.conclusion
+   (the baseline's own "Agent concluded"), but distinguished from it visually via
+   .agent-conclusion, and further tinted PER STATUS keyword (SIMPLE/SUCCESS/FAIL/
+   ANSWER/...) so a failure reads red at a glance instead of the same green as a
+   success. Unrecognized/missing status keywords fall back to the base green. */
+.message.conclusion.agent-conclusion .status {
+  margin-left: 0;
+  background: rgba(34, 197, 94, .15);
+  color: var(--green);
+}
+.message.conclusion.agent-conclusion.status-fail,
+.message.conclusion.agent-conclusion.status-gave_up {
+  border-left-color: var(--red);
+  background: rgba(239, 68, 68, .06);
+}
+.message.conclusion.agent-conclusion.status-fail .conclusion-title,
+.message.conclusion.agent-conclusion.status-gave_up .conclusion-title { color: #fca5a5; }
+.message.conclusion.agent-conclusion.status-fail .status,
+.message.conclusion.agent-conclusion.status-gave_up .status {
+  background: rgba(239, 68, 68, .15);
+  color: #fca5a5;
+}
+.message.conclusion.agent-conclusion.status-objective,
+.message.conclusion.agent-conclusion.status-plan {
+  border-left-color: var(--purple);
+  background: rgba(139, 92, 246, .06);
+}
+.message.conclusion.agent-conclusion.status-objective .conclusion-title,
+.message.conclusion.agent-conclusion.status-plan .conclusion-title { color: #c4b5fd; }
+.message.conclusion.agent-conclusion.status-objective .status,
+.message.conclusion.agent-conclusion.status-plan .status {
+  background: rgba(139, 92, 246, .15);
+  color: #c4b5fd;
+}
+.message.conclusion.agent-conclusion.status-answer,
+.message.conclusion.agent-conclusion.status-simple {
+  border-left-color: var(--blue);
+  background: rgba(59, 130, 246, .06);
+}
+.message.conclusion.agent-conclusion.status-answer .conclusion-title,
+.message.conclusion.agent-conclusion.status-simple .conclusion-title { color: #93c5fd; }
+.message.conclusion.agent-conclusion.status-answer .status,
+.message.conclusion.agent-conclusion.status-simple .status {
+  background: rgba(59, 130, 246, .15);
+  color: #93c5fd;
+}
 
 .message.user {
   background: linear-gradient(135deg, rgba(91, 103, 245, 0.18), rgba(91, 103, 245, 0.08));
@@ -1040,22 +1088,33 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .trace-item.warning            { color: var(--yellow); background: rgba(234,179,8,.06); }
 
 /* Multi-agent architecture (config.agents) — one role's (agent's) turn, rendered
-   directly in the trace flow. NOT a collapsible accordion: always expanded, with
-   its own prominent heading (.agent-heading) so it's immediately clear which
-   agent produced the output beneath it. */
+   as its OWN standalone collapsible accordion, a direct sibling of chat bubbles
+   and conclude cards in #messagesEl (never nested inside a shared "Run log"
+   block, and never nested inside another agent's accordion). Defaults CLOSED —
+   see .role-card-items below — since the conclude card rendered right after it
+   (renderAgentConclusion in app.js) is the at-a-glance result; this accordion is
+   the opt-in trace detail. Same chrome family as .trace-block (toggle/arrow/
+   items) so it reads as the same interaction pattern. */
 .role-card {
   background: rgba(255,255,255,.02);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  animation: trace-in .12s ease-out;
+  border-radius: 8px;
+  align-self: stretch;
+  overflow: hidden;
+  animation: msg-in .2s ease-out;
+  flex-shrink: 0;
 }
-.role-card-head {
+.role-card-toggle {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
-  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+  transition: background .1s;
 }
+.role-card-toggle:hover { background: rgba(255,255,255,.03); }
+.role-card-arrow { color: var(--muted); font-size: 9px; flex-shrink: 0; font-family: var(--font-mono); }
 /* Prominent agent-name heading — bold, larger than the surrounding trace text,
    with a subtle background so each agent's section is unmistakable at a glance. */
 .agent-heading {
@@ -1067,13 +1126,14 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   font-family: inherit;
 }
 .role-card.active .agent-heading { color: var(--yellow); }
-.role-card-outcome { margin-left: auto; font-size: 10px; color: var(--muted); opacity: .8; text-align: right; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0; }
 .role-card-items {
-  display: flex;
+  display: none;
   flex-direction: column;
-  padding: 8px 10px 8px;
+  padding: 4px 10px 10px;
   gap: 5px;
+  border-top: 1px solid var(--border);
 }
+.role-card.open .role-card-items { display: flex; }
 
 /* A Dispatcher verdict or a replan — a cross-cutting relationship marker, not
    any one frame's own detail, so it sits directly in the trace flow rather than
@@ -1181,6 +1241,37 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .thinking-block .thinking-toggle { margin-bottom: 0; }
 .thinking-body { margin-top: 4px; font-style: italic; opacity: .75; }
 .content-block .trace-label { color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: .05em; }
+
+/* The model's own textual reasoning/response for a turn (the 'thought'
+   AgentEvent — see buildThoughtEl() in app.js), rendered directly in an agent's
+   accordion (or the top-level run) alongside its tool calls — the UI counterpart
+   of the Markdown trace log's "#### Thinking" section, so this text is never
+   silently dropped just because the turn also made a tool call. Expanded by
+   default (unlike .thinking-body/.tool-result, which default collapsed) since
+   this IS the substance of the turn; long text still gets a collapse toggle. */
+.trace-thought {
+  padding: 5px 10px;
+  border-radius: 5px;
+  background: var(--surface);
+  animation: trace-in .12s ease-out;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: #93c5fd;
+}
+.trace-thought > strong {
+  display: block;
+  margin-bottom: 3px;
+  font-weight: 700;
+}
+.trace-thought-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.4;
+  color: var(--text);
+  opacity: .85;
+}
+.trace-thought-body.collapsed { max-height: 60px; overflow: hidden; }
+.trace-thought .expand-btn { margin-top: 2px; }
 
 /* ── Git log panel ── */
 #git-panel { border-top: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; }
