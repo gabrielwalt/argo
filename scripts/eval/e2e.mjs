@@ -79,12 +79,12 @@ const TIMEOUT_S = Number(process.env.EVAL_TIMEOUT_S || 1800);
 const LOGS_DIR = process.env.ARGO_LOGS_DIR || path.join(os.homedir(), '.local/share/argo/logs');
 // Multi-agent's per-workspace ledger (.argo/ledger.jsonl — delegation/conclusion/
 // standup/injection entries, the authoritative record of WHICH frames ran and what
-// verdicts the Boss returned) lives INSIDE the workspace and is gitignored, so the
-// very next resetWs() (`git clean -fdx`) deletes it before it can be inspected. Saved
-// out here, per task/run, so a later qualitative pass over orchestration behavior
-// (which frames spawned, in what order, what the Boss decided) has something to
-// read — the JSONL logs alone can't answer "did the Boss escalate," only the ledger
-// records that.
+// verdicts the Dispatcher returned) lives INSIDE the workspace and is gitignored, so
+// the very next resetWs() (`git clean -fdx`) deletes it before it can be inspected.
+// Saved out here, per task/run, so a later qualitative pass over orchestration
+// behavior (which frames spawned, in what order, what the Dispatcher decided) has
+// something to read — the JSONL logs alone can't answer "did the Dispatcher
+// escalate," only the ledger records that.
 //
 // BATCH 1: keyed by runId, not taskId. At the new k=3 default, three runs of the same
 // task previously overwrote each other's ledger, diff and judgment, so two thirds of the
@@ -174,9 +174,9 @@ async function waitIdle(ws) {
 // "the newest file" — the multi-agent dispatch loop (src/dispatch.ts, the only
 // execution path now) means ONE /chat call produces MULTIPLE log files: the dispatch's
 // own top-level narrative (start/objective/message/done) PLUS one separate file per
-// spawned frame (Planner/Implementer/Boss each get their own real Agent.chat() log).
+// spawned frame (Planner/Implementer/Dispatcher each get their own real Agent.chat() log).
 // Taking only the alphabetically-last file silently picked up whichever frame happened
-// to write last (often a short Boss check, e.g. "it=2") and completely missed the real
+// to write last (often a short Dispatcher check, e.g. "it=2") and completely missed the real
 // Implementer/Planner work — a baseline-era assumption ("one /chat call, one log file")
 // that no longer holds.
 //
@@ -201,9 +201,9 @@ async function waitIdle(ws) {
 // metrics.mjs anchors each pattern to a named construction site in src/, self-checks them
 // against known samples at start-up, and counts every unmatched warning so a future
 // wording change surfaces as data rather than as a zero.
-//   frames   — how many separate Agent.chat() logs this run produced: 1 for the Boss
-//              task-start checkpoint alone (an ANSWER), or more whenever it spawned a
-//              Planner/Implementer frame
+//   frames   — how many separate Agent.chat() logs this run produced: 1 for the
+//              Dispatcher task-start checkpoint alone (an ANSWER), or more whenever
+//              it spawned a Planner/Implementer frame
 //   tok/s    — generation throughput; needs the harness to log Ollama eval_duration
 //              (token_usage.eval_duration_ms). "?" until that lands — see roadmap Phase 3(b).
 

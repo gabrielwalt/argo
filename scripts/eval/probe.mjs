@@ -11,7 +11,7 @@
  * Cheap (one turn per cell) so we can tune the role prompts and context budget without
  * slow end-to-end runs. The Implementer role is used as the probe target because it is
  * the one role every task case below actually exercises (write/edit/bash) — the harness
- * no longer has a single undifferentiated system prompt (see src/dispatch.ts's Boss/
+ * no longer has a single undifferentiated system prompt (see src/dispatch.ts's Dispatcher/
  * Planner/Implementer dispatch loop).
  *
  * The metric is NATIVE-TOOL-CALL RELIABILITY: PASS = the model emitted a native
@@ -55,7 +55,7 @@ function extractRoleEntry(src, tableName, role) {
   const afterColon = src.slice(roleStart + role.length + 1);
   // Stops at the next role key OR the table's own closing brace (the last role's
   // value has no following role key to bound it, only the literal's own `}`).
-  const stopIdx = afterColon.search(/\n\s*(?:boss|planner|implementer):|\n\}/);
+  const stopIdx = afterColon.search(/\n\s*(?:dispatcher|planner|implementer):|\n\}/);
   const segment = stopIdx === -1 ? afterColon : afterColon.slice(0, stopIdx);
   const parts = [...segment.matchAll(/'((?:[^'\\]|\\.)*)'/g)].map(m => m[1].replace(/\\'/g, "'"));
   if (parts.length === 0) throw new Error(`could not parse ${tableName}.${role} in src/frames.ts`);

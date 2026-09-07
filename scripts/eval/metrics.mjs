@@ -400,7 +400,10 @@ export function selfCheckCounters() {
   return { ok: failures.length === 0, failures };
 }
 
-const FRAME_SESSION_ID = /^(planner|implementer|tester|boss)-/;
+// Matches both the CURRENT frameId prefix (dispatcher-...) and the historical one
+// (boss-...) — old JSONL logs on disk still use "boss" and must keep parsing
+// correctly; only NEW frames are ever created as "dispatcher-...".
+const FRAME_SESSION_ID = /^(planner|implementer|tester|boss|dispatcher)-/;
 
 /**
  * WHERE CONTEXT GROWTH ACCELERATED, defined explicitly rather than eyeballed.

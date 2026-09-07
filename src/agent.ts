@@ -571,7 +571,7 @@ export class Agent {
     const numCtx = this.options.num_ctx ?? 65536
     const budget: EvictionBudget = { maxTokens: Math.floor(numCtx * 0.7) }
     const { messages, evictedEpisodeIds, tokenEstimateBefore, tokenEstimateAfter } = evict(this.history, this.episodes, budget)
-    if (evictedEpisodeIds.length === 0) return { newRunStart: currentRunStart, compacted: false }
+    if (evictedEpisodeIds.length === 0 && tokenEstimateBefore === tokenEstimateAfter) return { newRunStart: currentRunStart, compacted: false }
     this.history = messages
     this.lastCompactedAt = Date.now()
     if (this.frameId) {

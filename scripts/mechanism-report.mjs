@@ -113,8 +113,10 @@ const VERIFY_FAIL_ESCALATED_RE = /^Verification for "([^"]+)" has now FAILED \d+
 const VERIFY_PASS_RE = /^VERIFY PASSED for task "([^"]+)" \(`([^`]+)`\)/
 // agent.ts's role-frame session-id convention (frames.ts ids are `<role>-<rand>-<n>`),
 // same regex metrics.mjs uses internally (FRAME_SESSION_ID) — re-declared here rather
-// than imported since metrics.mjs does not export it.
-const ROLE_SESSION_RE = /^(planner|implementer|tester|boss)-/
+// than imported since metrics.mjs does not export it. Matches both the CURRENT
+// frameId prefix (dispatcher-...) and the historical one (boss-...), since old
+// JSONL logs on disk still use "boss".
+const ROLE_SESSION_RE = /^(planner|implementer|tester|boss|dispatcher)-/
 // dispatch.ts's own untagged narrative uses the browser/session id, which is always an
 // ISO-ish timestamp with `:`/`.` replaced by `-` (SessionLogger's own filename scheme,
 // logger.ts's constructor) — used only to LABEL a row 'dispatch' for readability; nothing
@@ -738,7 +740,7 @@ const BLIND_SPOTS = [
     verified: 'grep -rn "renderPinnedAnchor" src/*.ts — only the one definition line; genuinely dead code, not merely unlogged. Re-verified for THIS run of the tool, per the brief\'s instruction to check it has not gained a call site.',
   },
   {
-    mechanism: 'Boss task-start marker retry, non-schema path (dispatch.ts\'s plain resumeFrame(TASK_START_MARKER_RETRY_NUDGE) branch)',
+    mechanism: 'Dispatcher task-start marker retry, non-schema path (dispatch.ts\'s plain resumeFrame(TASK_START_MARKER_RETRY_NUDGE) branch)',
     src: 'src/dispatch.ts:~397-419 — when config.schemaControlPlane is OFF, an unparsed ANSWER/TRIVIAL/SIMPLE/OBJECTIVE marker is retried via a bare resumeFrame call with no event at all; only the schemaControlPlane-ON sibling branch (the schema-extraction rescue) emits a `warning`.',
     verified: 'Found by this tool\'s author, not in the original brief — confirmed against a real firing: /mnt/argo-data/logs/test-wind/2026-09-04T07-06-48_your-last-answer-didn-t-end-with-one-of.jsonl is exactly this retry (query text is TASK_START_MARKER_RETRY_NUDGE verbatim); no warning event marks it anywhere in that session\'s files. See MECHANISM-REPORT-NOTES.md.',
   },

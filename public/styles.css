@@ -1061,7 +1061,7 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 }
 .role-card.open .role-card-items { display: flex; }
 
-/* A Boss (Jason) verdict or a replan — a cross-cutting relationship marker, not
+/* A Dispatcher verdict or a replan — a cross-cutting relationship marker, not
    any one frame's own detail, so it sits directly in the trace flow rather than
    nested inside a role card. Always visible, never collapsed — this IS the
    "how the agents work together" narrative the multi-agent UI exists to surface. */

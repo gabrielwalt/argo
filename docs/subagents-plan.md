@@ -1,4 +1,4 @@
-# Multi-agent architecture: call frames, the ledger, structured eviction, and the Boss
+# Multi-agent architecture: call frames, the ledger, structured eviction, and the Dispatcher
 
 Status (current): IMPLEMENTED AND PERMANENT. This design shipped, was validated, and is now
 the ONLY execution path — the single-loop baseline and the `ARGO_AGENTS` toggle this
@@ -13,8 +13,10 @@ gone — read this document as the ARCHITECTURAL HISTORY of the call-frame/ledge
 design (which is current and accurate), not as a description of every mechanism still
 active today. `src/frames.ts`'s `ROLE_TOOLS`/`ROLE_MAX_ITERATIONS`/`ROLE_CONCLUDE_STATUSES`
 and `src/dispatch.ts`'s module header are the authoritative source for the CURRENT set of
-roles (Boss, Planner, Implementer) and the CURRENT flow (SIMPLE: Implementer only;
-OBJECTIVE: Planner → Implementer per task).
+roles (Dispatcher, Planner, Implementer) and the CURRENT flow (SIMPLE: Implementer only;
+OBJECTIVE: Planner → Implementer per task). (This role was originally named "Boss" — this
+document uses "Dispatcher" throughout to match the current name; the underlying
+responsibilities described are unchanged.)
 
 ## Why
 
@@ -42,13 +44,14 @@ research, not assumed:
   resident model (qwen3.6): there is no real parallelism to gain, only race conditions,
   ordering ambiguity, and GPU contention that slows everything down rather than speeding it
   up. This is an invariant, not a v1-only default — it rules out parallel Implementer
-  frames, a parallel/async Boss, and (if ever built) parallel Researcher sub-topics.
+  frames, a parallel/async Dispatcher, and (if ever built) parallel Researcher sub-topics.
   Everything here is one strictly sequential dispatch loop.
 - **The harness owns bookkeeping; a model is never required to remember a scheduled
   self-report.** Standups, status transitions, and episode records are harness-derived from
   structured trace data, not produced by asking a model to pause on a timer.
-- **The objective is immutable once set, and only the Boss writes it** — never the Planner,
-  never a routine replanning round. Changing it is a distinct, loud, ledger-logged act.
+- **The objective is immutable once set, and only the Dispatcher writes it** — never the
+  Planner, never a routine replanning round. Changing it is a distinct, loud, ledger-logged
+  act.
 
 ## Roles
 
@@ -59,29 +62,29 @@ models.
 | Role | Job | Tools | Fires when |
 |---|---|---|---|
 | **Orchestrator** | **Not an LLM** — the harness's dispatch loop (below) | none, it's code | Always running; owns the ledger |
-| **Planner** | Singleton, resumed not respawned. Turns the (Boss-authored, immutable) objective into a task graph; may leave parts open for a later round | `read_file`, `web_search`, `fetch_url`, `ledger`, `update_plan` | First dispatch, and every replanning round |
+| **Planner** | Singleton, resumed not respawned. Turns the (Dispatcher-authored, immutable) objective into a task graph; may leave parts open for a later round | `read_file`, `web_search`, `fetch_url`, `ledger`, `update_plan` | First dispatch, and every replanning round |
 | **Implementer** | Does the actual work against one scoped, ideally testable goal; can give up with an explanation | full tool set | One per task-graph node (or `frameGroup`) |
 | **Tester** | Runs after an Implementer concludes; verifies the specific claim; can resume the Implementer with a targeted follow-up or release it | `read_file`, `bash`, `ledger` — **no write/edit**, it directs fixes, never makes them | Every Implementer conclusion |
-| **Boss** | Macro oversight across the whole run: authors the objective, periodic/triggered health checks, final verification | `read_file`, `bash`, `web_search`, `fetch_url`, `ledger` — **no write/edit** | See "The Boss" below — deliberately *not* on every frame conclusion |
+| **Dispatcher** | Macro oversight across the whole run: authors the objective, periodic/triggered health checks, final verification | `read_file`, `bash`, `web_search`, `fetch_url`, `ledger` — **no write/edit** | See "The Dispatcher" below — deliberately *not* on every frame conclusion |
 | **Researcher** | Multi-source digging with per-claim source+confidence | — | **Deferred to v2**, see bottom |
 
 ### Resolved: the Orchestrator is not an agent
 
 Almost everything "Orchestrator" would do is a state-machine transition over ledger events
-("Tester released a failure → back to Planner," "Boss escalated → resume Planner with its
-diagnosis") — `if`/`switch` logic over data the ledger already has, not judgment. Writing
-it as code makes it free, instant, deterministic, and impossible to hallucinate — which
-matters especially here, since this layer is responsible for noticing when things have
+("Tester released a failure → back to Planner," "Dispatcher escalated → resume Planner
+with its diagnosis") — `if`/`switch` logic over data the ledger already has, not judgment.
+Writing it as code makes it free, instant, deterministic, and impossible to hallucinate —
+which matters especially here, since this layer is responsible for noticing when things have
 gone wrong. The one piece that looked like it needed judgment (is this question trivial or
 does it need grounding/delegation) has a cheap heuristic first, falling through to the
 Planner when the heuristic isn't confident — no dedicated persona needed. The real
-separation that matters is *reasoning* (Planner, Boss) vs. *control-flow enforcement*
+separation that matters is *reasoning* (Planner, Dispatcher) vs. *control-flow enforcement*
 (harness) — different kinds of thing, not two AI personalities.
 
 ## Call frames — the core mechanism
 
 ```ts
-type Role = 'planner' | 'implementer' | 'tester' | 'boss'
+type Role = 'planner' | 'implementer' | 'tester' | 'dispatcher'
 
 interface FrameSpawnRequest {
   role: Role
@@ -126,7 +129,7 @@ const ROLE_TOOLS: Record<Role, ToolName[]> = {
   planner:     ['read_file', 'web_search', 'fetch_url', 'ledger', 'update_plan'],
   implementer: ['read_file', 'write_file', 'edit_file', 'bash', 'fetch_url', 'web_search', 'ledger'],
   tester:      ['read_file', 'bash', 'ledger'],
-  boss:        ['read_file', 'bash', 'web_search', 'fetch_url', 'ledger'],
+  dispatcher:  ['read_file', 'bash', 'web_search', 'fetch_url', 'ledger'],
 }
 ```
 
@@ -149,15 +152,15 @@ The Planner sets `frameGroup` either because a step is too cheap to warrant its 
 Tester pass, or because it touches the same files/logic as another step and must not be
 isolated (isolating cross-cutting work is a real, sourced failure mode — Cognition reports
 **32.3% of observed multi-agent failures are inter-agent misalignment, failures that cannot
-occur in a single-agent system**). Same field, either reason. Tester and Boss both operate
-on the *frame*, once, regardless of how many steps were batched into it.
+occur in a single-agent system**). Same field, either reason. Tester and Dispatcher both
+operate on the *frame*, once, regardless of how many steps were batched into it.
 
 ### Persistent vs. ephemeral
 
 - **Persistent, resumed — the Planner only.** Never respawned fresh; a replanning round
   runs the eviction policy over its own history (below), then appends the new round as a
   follow-up turn, preserving its memory of the original reasoning.
-- **Ephemeral — Implementer, Tester, each Boss firing.** Spawned, concluded, done. An
+- **Ephemeral — Implementer, Tester, each Dispatcher firing.** Spawned, concluded, done. An
   Implementer's "done" is provisional until Tester releases it (frame freed) or resumes it
   with a targeted follow-up (same frame, no lost investigation) — never a fresh respawn for
   a retry within the same attempt.
@@ -166,7 +169,7 @@ on the *frame*, once, regardless of how many steps were batched into it.
 ## The dispatch loop — the Orchestrator, in full
 
 ```
-bossCheckpoint('task-start')            # Boss reads the raw user message, grounds it,
+dispatcherCheckpoint('task-start')      # Dispatcher reads the raw user message, grounds it,
                                           # writes the immutable `objective`
 actionEpisodesSinceStandup = 0
 
@@ -177,7 +180,7 @@ while not all task-graph steps done:
   group  = pick next ready group
   frame  = spawnFrame(group) or resumeFrame(existing frameId, next step's prompt)
   result = runToConclusion(frame)         # loop.ts's repeat detector runs every tool call
-                                            # inside this — see "Boss cadence" below for
+                                            # inside this — see "Dispatcher cadence" below for
                                             # what happens when it fires
 
   if frame.role == 'implementer':
@@ -187,14 +190,14 @@ while not all task-graph steps done:
 
   actionEpisodesSinceStandup += result.actionEpisodeCount
   if actionEpisodesSinceStandup >= STANDUP_INTERVAL:
-    bossVerdict = bossCheckpoint('standup'); actionEpisodesSinceStandup = 0
-    applyBossVerdict(bossVerdict)           # none | inject | restart | escalate
+    dispatcherVerdict = dispatcherCheckpoint('standup'); actionEpisodesSinceStandup = 0
+    applyDispatcherVerdict(dispatcherVerdict)  # none | inject | restart | escalate
 
   mark group's steps done with result
   if result.status in (failed, gave_up, killed):
     resumeFrame(plannerFrame, replanningPrompt(result))
 
-finalVerdict = bossCheckpoint('final')
+finalVerdict = dispatcherCheckpoint('final')
 if finalVerdict.action == 'escalate':
   resumeFrame(plannerFrame, finalVerdict.guidance); continue     # loop back, don't return yet
 else:
@@ -218,11 +221,11 @@ following two implemented, published mechanisms:
 - **LCM** ("Lossless Context Management," [arXiv:2605.04050](https://arxiv.org/abs/2605.04050))
   — a summary/eviction must never be the only copy; every original stays retrievable.
 
-**The pinned anchor**: `objective` (immutable, Boss-authored at `task-start`) + the current
-execution plan (mutable, Planner-authored). Always present, recited at the tail, **never**
-subject to eviction — small and structured by construction. This is a direct structural
-fix for the original failure that motivated this project: the 90-iteration run that quietly
-solved a different, more interesting problem than the one asked.
+**The pinned anchor**: `objective` (immutable, Dispatcher-authored at `task-start`) + the
+current execution plan (mutable, Planner-authored). Always present, recited at the tail,
+**never** subject to eviction — small and structured by construction. This is a direct
+structural fix for the original failure that motivated this project: the 90-iteration run
+that quietly solved a different, more interesting problem than the one asked.
 
 **The working history** — everything besides the anchor — is a graph of typed episodes,
 mapped onto Argo's actual tools:
@@ -272,10 +275,10 @@ is a deliberate, visible step, never automatic.
 
 - **`delegation`** — `{frameId, parentFrameId, from, to, prompt, contextGiven}`
 - **`conclusion`** — `{frameId, status, summary, filesTouched, filesWritten, confidence?, issues?}`
-- **`standup`** — `{frameId?, covered, summary, concern?}` — Boss's periodic macro check
-  (action-episode-paced, not iteration-paced — see "The Boss")
+- **`standup`** — `{frameId?, covered, summary, concern?}` — Dispatcher's periodic macro
+  check (action-episode-paced, not iteration-paced — see "The Dispatcher")
 - **`injection`** — `{targetFrameId, message, reason, injectedBy, expectsResponse?}` — every
-  correction, including the Boss's `ask()`, logged the same way, no exceptions
+  correction, including the Dispatcher's `ask()`, logged the same way, no exceptions
 - **`episode`** — `{frameId, episodeId, kind: exploratory|action, tool, argsSummary,
   dependsOn: [episodeId...], evictedAt?}` — written automatically per tool call, never
   deleted even once evicted from the live window
@@ -292,13 +295,13 @@ entries (per tool call), the action-episode counter that paces standups.
 - `getGoal()` — the immutable objective. `getAssignment()` — this frame's instructions.
 - `getConclusion(frameId)` / `getFrameTrail(frameId)` — a summary vs. a specific frame's
   full story (delegation, standups, injections, kill/restart reason, conclusion).
-- `getRecent(n)` — sliding window (Boss's standup input). `getPlan()` — the current,
+- `getRecent(n)` — sliding window (Dispatcher's standup input). `getPlan()` — the current,
   mutable plan.
 - `expand(episodeId)` — pull an evicted episode's original content back into context.
-- `ask(targetFrameId, question)` — Boss-only: inject a question, run the target frame one
-  turn to answer it, return that answer.
+- `ask(targetFrameId, question)` — Dispatcher-only: inject a question, run the target frame
+  one turn to answer it, return that answer.
 
-## The Boss
+## The Dispatcher
 
 **Deliberately not a single-shot call** — it needs to actually verify things (read files,
 run checks, hit the web), so it's a bounded call frame like Tester, with `read_file`/
@@ -317,10 +320,10 @@ pattern):
   - **`loop.ts`'s repeat detector, unchanged plumbing, changed response.** The cheap,
     proven, per-tool-call detection (rolling window, escalating severity count) keeps
     running exactly as it does today. What changes: hitting its threshold no longer injects
-    loop.ts's own canned steer text — it fires a Boss standup instead, carrying the
+    loop.ts's own canned steer text — it fires a Dispatcher standup instead, carrying the
     severity context in (this is the 3rd identical repeat; prior injections already
-    failed). The Boss's judgment replaces the canned ladder; one source of "what to do
-    about this," not two competing ones.
+    failed). The Dispatcher's judgment replaces the canned ladder; one source of "what to
+    do about this," not two competing ones.
 - **`final`** — before anything returns to the user. Independently verifies the objective
   was actually met (real state, not the chain's self-report). If unsatisfied, it doesn't
   fail the run — it resumes the Planner with what's missing, the *same* escalate action as
@@ -348,22 +351,22 @@ nothing is truly concurrent) — deserves the heaviest test coverage of anything
 ## Tester
 
 Unchanged from earlier design: fires on every Implementer conclusion specifically (not
-Planner, not Boss checkpoints), verifies the specific claim, can resume with a targeted
-follow-up or release (success or failure) back to the dispatch loop. No overlap with the
-Boss now that the Boss doesn't fire per-frame — Tester is the zoomed-in gate, Boss is the
-zoomed-out one.
+Planner, not Dispatcher checkpoints), verifies the specific claim, can resume with a
+targeted follow-up or release (success or failure) back to the dispatch loop. No overlap
+with the Dispatcher now that the Dispatcher doesn't fire per-frame — Tester is the
+zoomed-in gate, Dispatcher is the zoomed-out one.
 
 ## Known weaknesses and status
 
-- **Resolved — weak model policing strong model's work.** The Boss is qwen3.6, same
+- **Resolved — weak model policing strong model's work.** The Dispatcher is qwen3.6, same
   capability as what it reviews, now with real verification tools rather than just
   judgment — a stronger resolution than "use the same model" alone.
 - **Resolved — Ollama multi-model residency/reload trap.** Never applicable; no second
   resident model was ever needed.
 - **Resolved — KV-cache/prefix invalidation on every compaction.** CWL's incremental
   eviction is specifically reported to avoid this (the 20–70% cost reduction above).
-- **Resolved — concurrency bugs from an async Boss.** Removed by the hard no-parallelism
-  rule; nothing here is ever concurrent.
+- **Resolved — concurrency bugs from an async Dispatcher.** Removed by the hard
+  no-parallelism rule; nothing here is ever concurrent.
 - **Still open — coordination overhead on mid-size tasks.** Measured multi-agent research
   reports coordination overhead that can *exceed* real work (a 4-agent pipeline: ~950ms
   overhead vs. ~500ms processing) and ~3x token cost vs. single-agent. Mitigated by
@@ -374,32 +377,32 @@ zoomed-out one.
   after — building infrastructure faster than the ability to measure it violates this
   project's own rule.
 - **Resolved — a malformed task-start response corrupted the whole pipeline downstream.**
-  Real eval failure (2026-09, `sanity-pool`): the Boss's task-start checkpoint has `bash`
-  (needed for legitimate read-only verification) and, on this run, used it to actually
-  *fix the failing test itself* — writing the source file via a bash heredoc and running
-  the suite to green — then reported that as free prose with no ANSWER/TRIVIAL/OBJECTIVE
-  marker. `parseTaskStartVerdict`'s old fallback took the ENTIRE free-form completion
-  report as the "objective" verbatim; the Planner, handed an objective that was actually a
-  past-tense report of already-finished work, had nothing to plan and hallucinated an
-  entire unrelated project structure (`src/solution.js`, `jest.config.js`, a web search
-  for `site:/workspace ...`) trying to find something to do, burning all 15 iterations
-  with no output. The graph fell back to a single trivial step, so the task still
-  completed — but at 28 iterations / 6 frames / 95s for a fix that should have taken ~5.
-  Two fixes: (1) `parseTaskStartVerdict`'s fallback now returns empty text on no marker
-  found, so `runBossTaskStart` falls back to the ORIGINAL user message (always a valid
-  objective by construction) instead of the Boss's possibly-nonsensical free text: (2)
-  the task-start assignment now explicitly tells the Boss not to write/edit files at this
-  checkpoint even via bash, and that "I could just fix this" is precisely the signal to
-  answer TRIVIAL instead of doing it. Read-only bash (running the existing suite to see
-  it fail) is still fine and expected. Not a hard tool restriction — same reasoning as the
-  plan/act gate's own documented bash-bypass gap (`isProjectMutation`): bash is
-  intentionally general-purpose, and the project's own stated principle is to fix a
-  concrete failure mode with a real mechanism, not add a brittle command-parsing
-  restriction pre-emptively. Worth remeasuring if it recurs.
+  Real eval failure (2026-09, `sanity-pool`): the Dispatcher's task-start checkpoint has
+  `bash` (needed for legitimate read-only verification) and, on this run, used it to
+  actually *fix the failing test itself* — writing the source file via a bash heredoc and
+  running the suite to green — then reported that as free prose with no ANSWER/TRIVIAL/
+  OBJECTIVE marker. `parseTaskStartVerdict`'s old fallback took the ENTIRE free-form
+  completion report as the "objective" verbatim; the Planner, handed an objective that was
+  actually a past-tense report of already-finished work, had nothing to plan and
+  hallucinated an entire unrelated project structure (`src/solution.js`,
+  `jest.config.js`, a web search for `site:/workspace ...`) trying to find something to
+  do, burning all 15 iterations with no output. The graph fell back to a single trivial
+  step, so the task still completed — but at 28 iterations / 6 frames / 95s for a fix
+  that should have taken ~5. Two fixes: (1) `parseTaskStartVerdict`'s fallback now returns
+  empty text on no marker found, so `runDispatcherTaskStart` falls back to the ORIGINAL
+  user message (always a valid objective by construction) instead of the Dispatcher's
+  possibly-nonsensical free text: (2) the task-start assignment now explicitly tells the
+  Dispatcher not to write/edit files at this checkpoint even via bash, and that "I could
+  just fix this" is precisely the signal to answer TRIVIAL instead of doing it. Read-only
+  bash (running the existing suite to see it fail) is still fine and expected. Not a hard
+  tool restriction — same reasoning as the plan/act gate's own documented bash-bypass gap
+  (`isProjectMutation`): bash is intentionally general-purpose, and the project's own
+  stated principle is to fix a concrete failure mode with a real mechanism, not add a
+  brittle command-parsing restriction pre-emptively. Worth remeasuring if it recurs.
 - **Resolved (harness-level, after the prompt fix above proved insufficient) — the
-  Boss fixing the file itself at task-start, again.** The prompt fix above was tried
+  Dispatcher fixing the file itself at task-start, again.** The prompt fix above was tried
   first and immediately re-failed on a DIFFERENT eval task (`race-semaphore`): the
-  Boss again rewrote the source file via a bash heredoc during task-start, despite
+  Dispatcher again rewrote the source file via a bash heredoc during task-start, despite
   being explicitly told not to. This is exactly the lesson this project already
   states elsewhere ("fix a basic failure mode in the harness, not with more prompt
   text") — a prompt line cannot reliably stop a capable, over-eager model that has
@@ -410,13 +413,13 @@ zoomed-out one.
   re-fixing, then self-verifying the fix 20x in a loop for flakiness) took ~26
   minutes, compounding with Tester/standup/final's own from-scratch re-verification
   into a 30-minute TIMEOUT on a task the single-loop baseline solves in 13 iterations
-  / 39s. **Real fix**: `runBossTaskStart` (dispatch.ts) now snapshots `git status
+  / 39s. **Real fix**: `runDispatcherTaskStart` (dispatch.ts) now snapshots `git status
   --short` before and after the task-start frame runs. If the workspace is dirty
   afterward — an unambiguous, model-cooperation-free signal — the harness overrides
-  whatever the Boss said with a new `'preempted'` mode: the single synthetic step is
-  marked done immediately, owned by the Boss's own frameId (it did the real work,
-  just under the wrong role), no Implementer/Tester/Planner frame ever spawns, and
-  dispatch falls straight through to Jason's own independent final check — which
+  whatever the Dispatcher said with a new `'preempted'` mode: the single synthetic step
+  is marked done immediately, owned by the Dispatcher's own frameId (it did the real
+  work, just under the wrong role), no Implementer/Tester/Planner frame ever spawns, and
+  dispatch falls straight through to the Dispatcher's own independent final check — which
   still catches it if the unsanctioned fix was actually wrong. This is the same
   "detect via git diff, don't trust a text convention" pattern already used
   elsewhere in this project (autoCommit's own dirty-check). The prompt instruction
@@ -425,8 +428,8 @@ zoomed-out one.
 - **Still open, now the central empirical question, not a hypothesis — the Planner has
   NEVER converged on a real task graph on a genuinely large task.** Overnight session
   (2026-09-03, folded into `docs/eval-log.md`'s overnight entry, Finding 7): across every large-task attempt this
-  project has measured (`bigproj-deps` x2, `bigproj-effort` x2 — 4-for-4), Tiphys hit its
-  iteration budget with zero JSON graph output every single time; the fail-open default
+  project has measured (`bigproj-deps` x2, `bigproj-effort` x2 — 4-for-4), the Planner hit
+  its iteration budget with zero JSON graph output every single time; the fail-open default
   (one big Implementer frame absorbs the whole objective) did 100% of the real work on
   every large task run so far. A real, separate confusing-advice bug was found and fixed
   (`src/agent.ts`'s stall-checkpoint was telling a stalled Planner to call `update_plan`
@@ -441,7 +444,7 @@ zoomed-out one.
   format it as fenced JSON, all within one budget — may simply be asking too much of one
   frame) or a genuinely larger/more-tangled task than bigproj's 11 files/827 LOC ever
   provides, regardless of how hard the FEATURE being asked for is within it.**
-- **Resolved — the Boss's OWN checkpoints (standup, final) could stall blank and be
+- **Resolved — the Dispatcher's OWN checkpoints (standup, final) could stall blank and be
   silently read as "nothing wrong."** Found immediately after the Finding-7 fix above,
   by the very re-run meant to confirm it (2026-09-03, folded into `docs/eval-log.md`'s
   overnight entry, Finding 8) — more severe than Finding 7's framing, since it's not "the Planner's decomposition
@@ -449,19 +452,20 @@ zoomed-out one.
   run: the Implementer honestly self-reported failure (3 of 6 new tests still red at its
   60-iter cap); an independent Tester frame verified this precisely, itemizing the exact
   3 root causes and concluding "the conclusion of failure is CORRECT" — the Tester did
-  its job well. But both the Boss standup AND Boss final checkpoints then hit their OWN
-  15-iteration caps with a completely empty answer (`"Reached maximum iterations (15)
-  without a final answer."`, recorded `status:"success"`) — and `parseBossVerdict`'s
-  fail-open default (`action:'none'`) cannot distinguish that from "the Boss reviewed
-  the Tester's clear FAIL and had nothing to add," so the run proceeded as if everything
-  were fine, with the Tester's correct FAIL verdict sitting unread. The deterministic
-  `npm test` check is what actually caught this — not the harness, and only partially
-  the quality judge (which scored the CODE's completeness at 9/10 without weighting the
-  actual test outcome enough) — exactly why this project's eval design always runs the
-  deterministic check first and treats the judge as a second, non-replacing signal.
-  **Fix** (`runBoss`, dispatch.ts): after `spawnFrame`, compare
-  `agent.getIterationCount()` against `ROLE_MAX_ITERATIONS.boss` — the SAME
-  harness-level, model-independent idiom `runBossTaskStart`'s own `hitCap` check
+  its job well. But both the Dispatcher standup AND Dispatcher final checkpoints then hit
+  their OWN 15-iteration caps with a completely empty answer (`"Reached maximum
+  iterations (15) without a final answer."`, recorded `status:"success"`) — and
+  `parseDispatcherVerdict`'s fail-open default (`action:'none'`) cannot distinguish that
+  from "the Dispatcher reviewed the Tester's clear FAIL and had nothing to add," so the
+  run proceeded as if everything were fine, with the Tester's correct FAIL verdict
+  sitting unread. The deterministic `npm test` check is what actually caught this — not
+  the harness, and only partially the quality judge (which scored the CODE's
+  completeness at 9/10 without weighting the actual test outcome enough) — exactly why
+  this project's eval design always runs the deterministic check first and treats the
+  judge as a second, non-replacing signal.
+  **Fix** (`runDispatcher`, dispatch.ts): after `spawnFrame`, compare
+  `agent.getIterationCount()` against `ROLE_MAX_ITERATIONS.dispatcher` — the SAME
+  harness-level, model-independent idiom `runDispatcherTaskStart`'s own `hitCap` check
   already uses (this file's task-start section above). A `'none'` verdict alongside a
   hit cap is overridden to `action:'escalate'`, forcing a replan/re-verify instead of
   silently passing through as "all clear." Both existing `'escalate'` handlers
@@ -481,7 +485,7 @@ zoomed-out one.
   break a lone frame — the plain single-loop baseline FAILED outright (60-iter cap, suite
   still red, 815s) while Argo's multi-agent harness PASSED (1616s) and so did Hermes
   (256s). The win comes from the harness's OTHER structural advantages (independent
-  Tester verification, Boss checkpoints, the Finding-6 diff-size guard), not from
+  Tester verification, Dispatcher checkpoints, the Finding-6 diff-size guard), not from
   Planner decomposition (still unproven per the finding above) — and it costs real time:
   multi-agent was 2-6x slower than Hermes on both large tasks measured. n=1; full numbers
   in `docs/eval-log.md`'s 2026-09-03 (overnight) entry.
@@ -490,8 +494,8 @@ zoomed-out one.
 
 **Build all at once, cut hard to keep it debuggable:**
 
-- **In v1**: Orchestrator (harness code), Planner, Implementer, Tester, Boss (all three
-  checkpoints, all four actions, both standup triggers), the full ledger, CWL episode
+- **In v1**: Orchestrator (harness code), Planner, Implementer, Tester, Dispatcher (all
+  three checkpoints, all four actions, both standup triggers), the full ledger, CWL episode
   eviction + pinned anchor, `frameGroup`, strictly sequential dispatch.
 - **Deferred to v2, cleanly separable**: the Researcher role entirely (map-reduce reading,
   source/confidence scoring, `.argo/reports/`, the grounding-guard extension to cover it),
@@ -509,10 +513,10 @@ entry types + JSONL + API), `src/eviction.ts` (episode typing + eviction pass + 
 anchor).
 
 **Modified**: `src/agent.ts` (the dispatch loop above; frame-runner extracted from the
-existing loop), `src/critic.ts` (Tester's verdict shape + Boss's three checkpoint prompts +
-the `action` field — reuse its existing JSON-coercion plumbing, don't write a second
-parser), `src/tasks.ts` (`StepInput` → `TaskStep` with `role`/`dependsOn`/`frameGroup`),
-`src/config.ts` (`ARGO_AGENTS` flag).
+existing loop), `src/critic.ts` (Tester's verdict shape + Dispatcher's three checkpoint
+prompts + the `action` field — reuse its existing JSON-coercion plumbing, don't write a
+second parser), `src/tasks.ts` (`StepInput` → `TaskStep` with `role`/`dependsOn`/
+`frameGroup`), `src/config.ts` (`ARGO_AGENTS` flag).
 
 ## Open questions carried forward
 
@@ -522,9 +526,9 @@ parser), `src/tasks.ts` (`StepInput` → `TaskStep` with `role`/`dependsOn`/`fra
   tune against real frames.
 - Whether `expand()` gets used often enough to matter, or whether the graduated eviction
   levels already cover most real need for it.
-- Whether an `objective` revision (task-start Boss writing it, or the rare later change)
-  should ever require more than a ledger log — e.g. surfacing to the user — given how
-  load-bearing "immutable until deliberately changed" is to the whole design's anti-drift
-  guarantee.
+- Whether an `objective` revision (task-start Dispatcher writing it, or the rare later
+  change) should ever require more than a ledger log — e.g. surfacing to the user — given
+  how load-bearing "immutable until deliberately changed" is to the whole design's
+  anti-drift guarantee.
 - Test coverage priority: the `ask()` interleaving mechanic is the most novel/fragile piece
   here and should get the heaviest testing before trusting it in the dispatch loop.

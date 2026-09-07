@@ -4,7 +4,7 @@
 > single-loop architecture with a set of independently toggleable mechanisms (`ARGO_TASKS`,
 > `ARGO_MEMORY`, `ARGO_GROUNDING`, `ARGO_CRITIC`, `ARGO_LAYOUT`, `ARGO_AGENTS`, the
 > `update_plan` tool, the plan/act gate, "no tool call = done", the Tester agent). All of
-> that has been removed. The current, permanent architecture is: a Boss/Planner/Implementer
+> that has been removed. The current, permanent architecture is: a Dispatcher/Planner/Implementer
 > dispatch loop (`src/dispatch.ts`, always on — there is no single-loop baseline any more),
 > `conclude(status, message)` as the only way any frame ends its turn, deterministic context
 > eviction with no LLM summarization step (`src/eviction.ts`), and the loop-recovery ladder
@@ -14,7 +14,7 @@
 > existed and were measured, not as a description of the current harness.
 
 Argo runs a **local** language model (currently `qwen3.6`) inside a multi-agent dispatch loop:
-each role-scoped frame (Boss, Planner, Implementer) thinks, calls tools (read/edit files, run
+each role-scoped frame (Dispatcher, Planner, Implementer) thinks, calls tools (read/edit files, run
 commands, fetch pages), sees the results, and repeats until it calls `conclude`. On its own a
 small local model drifts, loops, forgets the goal, and claims work is done when it isn't. The
 **harness** is the scaffolding around that loop that keeps it on track. This document explains
@@ -180,21 +180,21 @@ reduces context less than it theoretically could).
 ## 9. Multi-agent mode  *(optional — `ARGO_AGENTS`, off by code default)*
 
 **What it does.** Everything in sections 1-8 describes the single-loop harness — one `Agent`
-instance running the whole task. `ARGO_AGENTS` switches to a Boss/Planner/Implementer/Tester
+instance running the whole task. `ARGO_AGENTS` switches to a Dispatcher/Planner/Implementer/Tester
 architecture (`src/dispatch.ts`) instead: a harness-code Orchestrator that never itself calls the
-model, routing each task through a Boss that classifies it (ANSWER / TRIVIAL / SIMPLE / OBJECTIVE)
+model, routing each task through a Dispatcher that classifies it (ANSWER / TRIVIAL / SIMPLE / OBJECTIVE)
 and — for anything beyond a trivial fix — delegates to dedicated Planner/Implementer/Tester call
 frames, each its own scoped `Agent`. Hard invariant: exactly one LLM call runs at a time (one GPU,
 one resident model), so this is sequencing, not real parallelism.
 
 **Why.** Built to prevent the single-loop harness from either doing real work without planning
 (when multiple frames are clearly going to be needed) or running away in an endless loop with no
-independent check on its own progress — a second set of "eyes" (Tester, Boss standups) that a lone
+independent check on its own progress — a second set of "eyes" (Tester, Dispatcher standups) that a lone
 loop structurally cannot have on itself.
 
 **Status.** This is a substantial architecture, not a small flag — full design, the task-start
 router, standup/escalation triggers, and every harness-level guard (iteration caps, the diff-size
-guard on Boss self-attempts) live in `docs/subagents-plan.md`. Comparative eval results (vs. the
+guard on Dispatcher self-attempts) live in `docs/subagents-plan.md`. Comparative eval results (vs. the
 single-loop baseline and vs. Hermes) are in `docs/eval-log.md` and `docs/roadmap.md`.
 
 ## Task verification — all the systems

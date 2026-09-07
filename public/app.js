@@ -562,10 +562,10 @@ function finishReplay() {
 }
 
 function handleEvent(event) {
-  // Multi-agent architecture (config.agents): a tagged event belongs to one frame's
+  // Multi-agent architecture: a tagged event belongs to one frame's
   // turn, not the top-level run — route it into that frame's role card instead of
   // the switch below. Also nudges the status bar to name the active role, the
-  // "boss-level" glance the multi-agent UI is built around.
+  // "dispatcher-level" glance the multi-agent UI is built around.
   if (event.__frameId) {
     // token_usage is handled HERE, before the routing below, and deliberately not
     // inside handleFrameEvent: in multi-agent mode the baseline agent is bypassed
@@ -1385,7 +1385,7 @@ function addTraceItem(className, label, body, collapsible, container) {
 // see frames.ts's ROLE_NAME for the same mapping, chosen for an actual functional
 // match rather than flavor alone.
 const ROLE_META = {
-  boss:        { name: 'Boss',         title: 'Boss',        icon: '⚖️' },
+  dispatcher:  { name: 'Dispatcher',  title: 'Dispatcher',  icon: '⚖️' },
   planner:     { name: 'Planner',     title: 'Planner',     icon: '🧭' },
   implementer: { name: 'Implementer', title: 'Implementer', icon: '🔨' },
 }
@@ -1523,7 +1523,7 @@ function handleFrameEvent(event) {
 // rather than one frame's turn. Rendered as a message-level card (splits the trace
 // above/below), the same pattern the old task-graph/boss_verdict/replan narrative
 // events used before the dispatch loop settled on its current, simpler shape
-// (Boss/Planner/Implementer only — no task graph, no injected corrections).
+// (Dispatcher/Planner/Implementer only — no task graph, no injected corrections).
 
 function renderObjective(event) {
   const el = document.createElement('div')
