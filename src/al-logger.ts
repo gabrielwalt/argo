@@ -1,11 +1,15 @@
 // AL-LOGGER: a NEW, ADDITIVE XML-based log format for Argo agent frames. Runs
-// ALONGSIDE the existing JSONL/markdown SessionLogger (logger.ts) — never replaces
-// it, never reads its state, and a failure here must never affect the existing
+// ALONGSIDE the existing JSONL SessionLogger (logger.ts) — never replaces it,
+// never reads its state, and a failure here must never affect the existing
 // logging path (every public method below is fire-and-forget: internal errors are
-// swallowed into the write queue, not thrown back into agent.ts's hot path).
+// swallowed into the write queue, not thrown back into agent.ts's hot path). The
+// `sessionId`/`frameId`/`jsonlFilename` constructor params and each turn/response's
+// `jsonl_seq` attribute are pure cross-references INTO that JSONL log — never read
+// back FROM it, keeping the "never reads its state" guarantee above intact.
 //
 // One XML file per agent frame (one per SessionLogger-equivalent run), written
-// incrementally turn-by-turn into the SAME LOGS_DIR the existing logger uses, named
+// incrementally turn-by-turn into LOGS_DIR's `al/` subfolder (AL_DIR, below) —
+// alongside but never mixed into the existing logger's `.jsonl` files, named
 // `{TIMESTAMP}_{ITERATION}_{AGENTNAME}.xml` — deliberately NOT the same sequence
 // counter as logger.ts's `logFileSeq` (that would couple two independently-evolving
 // files' numbering to each other for no reason); this file keeps its own counter,
@@ -20,6 +24,14 @@ import fs from 'fs/promises'
 import path from 'path'
 import type { AgentEvent, ModelOptions } from './types.js'
 import { LOGS_DIR } from './logger.js'
+
+// XML traces live in their own subfolder, separate from the JSONL/meta files
+// logger.ts writes directly into LOGS_DIR — keeps the top-level logs directory
+// listing (listLogs()/listSessions(), which glob LOGS_DIR for `.jsonl`) from ever
+// having to account for `.xml` files, and gives the al-logger format room to grow
+// its own directory structure independently. append() below creates this on
+// demand via `fs.mkdir(path.dirname(this.filepath), { recursive: true })`.
+const AL_DIR = path.join(LOGS_DIR, 'al')
 
 // Shared-shape sequence counter, kept separate from logger.ts's logFileSeq (see file
 // doc comment above) — but same pattern (module-level counter + reset hook) so tests
@@ -44,10 +56,10 @@ export function escapeXml(input: unknown): string {
     .replace(/'/g, '&apos;')
 }
 
-// Renders the `<al-model>` line's trailing option string — same fields/order as
-// logger.ts's toMarkdown() options table, so the two logs describe the same run
-// identically, but flattened to a single space-joined string here instead of a
-// markdown table cell.
+// Renders the `<al-model>` line's trailing option string — same fields/order
+// logger.ts's own meta/options rendering used, so the two logs describe the same
+// run identically, but flattened to a single space-joined string here instead of
+// a table cell.
 function formatOptions(options: ModelOptions): string {
   const parts = [
     options.temperature != null ? `temp=${options.temperature}` : null,
@@ -125,6 +137,14 @@ export class AlLogger {
   // never called for it (e.g. the run aborts mid-turn).
   private inTurn = false
   private headerWritten = false
+  // Latest JSONL `__seq` forwarded via logEvent() (agent.ts's emitAndLog calls this
+  // for every event, seq included) — read by beginTurn()/logResponse() so each
+  // <al-turn>/<al-response> can carry the exact JSONL line it corresponds to,
+  // without every call site needing to thread the seq through explicitly. Starts
+  // at 0 (no JSONL event logged yet); a turn opened before any event exists (never
+  // happens in practice — 'message'/'start' are logged before the first beginTurn)
+  // would simply carry jsonl_seq="0".
+  private lastSeq = 0
 
   constructor(
     query: string,
@@ -132,14 +152,22 @@ export class AlLogger {
     options: ModelOptions,
     role: string,
     tools: AlToolDef[],
+    sessionId?: string,
+    frameId?: string,
+    jsonlFilename?: string,
   ) {
     const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
     const seq = String(++alLogSeq).padStart(4, '0')
-    this.filepath = path.join(LOGS_DIR, `${ts}_${seq}_${role}.xml`)
+    this.filepath = path.join(AL_DIR, `${ts}_${seq}_${role}.xml`)
 
     const optsStr = formatOptions(options)
+    const runAttrs = [
+      sessionId ? ` session_id="${escapeXml(sessionId)}"` : '',
+      frameId ? ` frame_id="${escapeXml(frameId)}"` : '',
+      jsonlFilename ? ` jsonl_file="${escapeXml(jsonlFilename)}"` : '',
+    ].join('')
     this.append(
-      '<al-run>\n'
+      `<al-run${runAttrs}>\n`
       + `<al-query>${escapeXml(query)}</al-query>\n`
       + `<al-model>${escapeXml(model)}${optsStr ? ` ${optsStr}` : ''}</al-model>\n`
       + `<al-iteration>${seq} ${escapeXml(role)}</al-iteration>\n`
@@ -169,7 +197,7 @@ export class AlLogger {
     this.lastMessageCount = totalMessages
 
     const lines: string[] = []
-    lines.push(`<al-turn number="${String(this.turnNumber).padStart(4, '0')}">`)
+    lines.push(`<al-turn number="${String(this.turnNumber).padStart(4, '0')}" jsonl_seq="${this.lastSeq}">`)
     lines.push('  <al-call>')
     if (collapsed && collapsed.length > 0) {
       lines.push('    <al-context-modifications>')
@@ -194,7 +222,7 @@ export class AlLogger {
   /** Called when the Ollama response for the current turn arrives. */
   logResponse(response: AlResponse) {
     const lines: string[] = []
-    lines.push('  <al-response>')
+    lines.push(`  <al-response jsonl_seq="${this.lastSeq}">`)
     lines.push(`    <al-thinking>${escapeXml(response.thinking ?? '')}</al-thinking>`)
     lines.push(`    <al-content>${escapeXml(response.content ?? '')}</al-content>`)
     if (response.toolCalls && response.toolCalls.length > 0) {
@@ -257,7 +285,12 @@ export class AlLogger {
    * silent no-op so this can safely be wired to every emitAndLog call site without
    * needing a parallel filter at each call site.
    */
-  logEvent(event: AgentEvent) {
+  logEvent(event: AgentEvent, seq?: number) {
+    // Track the latest JSONL seq regardless of whether this event renders
+    // anything here — beginTurn()/logResponse() read lastSeq lazily, so even an
+    // event this logger has no rendering for (renderEvent() returns null for it)
+    // must still advance the cross-reference forward to the next turn/response.
+    if (seq != null) this.lastSeq = seq
     const body = this.renderEvent(event)
     if (body === null) return
     this.append(`<al-events>\n${body}\n</al-events>\n\n`)

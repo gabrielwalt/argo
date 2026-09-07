@@ -192,7 +192,7 @@ export function parseFrameRole(frameId: string): Role | null {
 const HISTORY_FILENAME_RE = /^history-(.+)\.json$/
 
 // Extracts the id portion of a `history-<id>.json` filename, or null for anything
-// else LOGS_DIR holds (the baseline's bare `history.json`, `.jsonl`/`.md` run logs,
+// else LOGS_DIR holds (the baseline's bare `history.json`, `.jsonl` run logs,
 // `sessions-registry.json`, `current-session.txt`, `compaction-*.json`, ...).
 export function frameIdFromHistoryFilename(filename: string): string | null {
   const m = HISTORY_FILENAME_RE.exec(filename)

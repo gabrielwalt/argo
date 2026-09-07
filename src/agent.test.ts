@@ -1039,14 +1039,13 @@ test('loop ON: an intervening bash call invalidates the cached replay (FIX 1) �
   }
 })
 
-// ── FIX 4 (/shared/argo-review/REPORT.md defect 4): logger.ts's tool_result case
-// derived status from event.error alone, so a replay (rejected: true, replayed:
-// true, error: undefined) rendered identically to a real fast execution in the
-// human-readable markdown transcript. Exercised end to end here (not in
-// logger.test.ts, which this scoop does not own) via a real Agent run whose
-// SessionLogger.flush() writes the .md file this asserts against.
+// ── FIX 4 (/shared/argo-review/REPORT.md defect 4): a replay (rejected: true,
+// replayed: true, error: undefined) must stay distinguishable from a real fast
+// execution in the persisted log. Markdown rendering (toMarkdown()) was removed;
+// JSONL is now the sole persisted trace, so this asserts against the raw
+// tool_result event recorded in the .jsonl file rather than a rendered .md line.
 
-test('loop ON: a replay is rendered as REPLAYED in the human-readable markdown log (FIX 4)', async () => {
+test('loop ON: a replay is recorded as replayed:true (not error) in the JSONL log (FIX 4)', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-loop-replay-logger-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, readCall, finalAnswer]))
@@ -1061,10 +1060,12 @@ test('loop ON: a replay is rendered as REPLAYED in the human-readable markdown l
     )
 
     const files = await fs.readdir(LOGS_DIR)
-    const mdFile = files.find(f => f.endsWith('.md') && f.includes('argo-loop-replay-logger-case'))
-    assert.ok(mdFile, 'expected a markdown log file for this run')
-    const md = await fs.readFile(path.join(LOGS_DIR, mdFile as string), 'utf-8')
-    assert.match(md, /REPLAYED/)
+    const jsonlFile = files.find(f => f.endsWith('.jsonl') && f.includes('argo-loop-replay-logger-case'))
+    assert.ok(jsonlFile, 'expected a jsonl log file for this run')
+    const jsonl = await fs.readFile(path.join(LOGS_DIR, jsonlFile as string), 'utf-8')
+    const replayedLine = jsonl.trim().split('\n').find(l => l.includes('"replayed":true'))
+    assert.ok(replayedLine, 'expected a tool_result line with replayed:true in the jsonl')
+    assert.doesNotMatch(replayedLine as string, /"error":"/, 'a replay must not also carry a real error string')
   } finally {
     await cleanupSession(sessionId, 'argo-loop-replay-logger-case')
   }

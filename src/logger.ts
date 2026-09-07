@@ -70,38 +70,6 @@ interface LogEntryJson {
   event: AgentEvent
 }
 
-// Collapses whitespace (including embedded newlines) to single spaces and trims, so two
-// pieces of content that differ only in formatting still compare equal — a thought and a
-// final answer built from the same model turn can carry different trailing whitespace or
-// paragraph breaks despite being the same text.
-function normalizeForCompare(text: string): string {
-  return text.replace(/\s+/g, ' ').trim()
-}
-
-// A single-line, length-bounded rendering of `text` for a markdown TABLE CELL — never the
-// full body, which belongs under its own heading further down and is what made the header
-// table unreadable (a ~450-word prompt printed before any real activity). Two things a
-// table cell cannot survive: an embedded newline (breaks the row) and an unescaped `|`
-// (breaks the column count) — both are handled here, not left to the caller.
-function excerptForTable(text: string, maxLen = 110): string {
-  const oneLine = normalizeForCompare(text)
-  const truncated = oneLine.length > maxLen ? `${oneLine.slice(0, maxLen).trimEnd()}…` : oneLine
-  return truncated.replace(/\|/g, '\\|')
-}
-
-// True when `thoughtText` is the SAME content as `finalText`, or the leading part of it —
-// the shape a model's last thought takes when it reasons its way to an answer and then
-// repeats that exact reasoning as the final answer verbatim. Deliberately one-directional:
-// a final answer that is a prefix of a LONGER thought is NOT this pattern (the thought then
-// carries information the final answer dropped, so it must stay). An empty thought never
-// counts as a match — every string "starts with" the empty string, which would otherwise
-// suppress a thought whenever the final answer happened to be empty too.
-function isThoughtDuplicateOfFinal(thoughtText: string, finalText: string): boolean {
-  const t = normalizeForCompare(thoughtText)
-  if (!t) return false
-  return normalizeForCompare(finalText).startsWith(t)
-}
-
 let logFileSeq = 0
 
 export class SessionLogger {
@@ -193,10 +161,6 @@ export class SessionLogger {
     } else {
       await fs.writeFile(file, this.metaEntry() + '\n' + existing, 'utf-8')
     }
-
-    // Markdown: human-readable trace (unchanged)
-    const md = this.toMarkdown()
-    await fs.writeFile(path.join(LOGS_DIR, `${this.filename}.md`), md, 'utf-8')
   }
 
   /** Read the JSONL file and return parsed events, skipping malformed lines. */
@@ -217,285 +181,6 @@ export class SessionLogger {
     } catch {
       return []
     }
-  }
-
-  private toMarkdown(): string {
-    const lines: string[] = []
-    const dur = ((Date.now() - this.startTs) / 1000).toFixed(1)
-
-    lines.push(`# Agent Trace`)
-    lines.push(``)
-    lines.push(`| | |`)
-    lines.push(`|---|---|`)
-    const opts = this.meta.options
-    const optsStr = [
-      opts.temperature != null ? `temp=${opts.temperature}` : null,
-      opts.top_p != null ? `top_p=${opts.top_p}` : null,
-      opts.top_k != null ? `top_k=${opts.top_k}` : null,
-      opts.num_ctx != null ? `ctx=${opts.num_ctx}` : null,
-    ].filter(Boolean).join(' ') || 'defaults'
-
-    // Short excerpt only — the full query is rendered once, in full, under `## 💬 User`
-    // below (the `message`/role:'user' event carries the identical string). Printing it
-    // twice put a several-hundred-word prompt in front of every real trace line; the table
-    // is for scanning, the heading below is where the reader actually reads it.
-    lines.push(`| **Query** | ${excerptForTable(this.meta.query)} |`)
-    lines.push(`| **Model** | ${this.meta.model} |`)
-    lines.push(`| **Options** | \`${optsStr}\` |`)
-    lines.push(`| **Started** | ${this.meta.startedAt} |`)
-    lines.push(`| **Duration** | ${dur}s |`)
-    lines.push(`| **Tool calls** | ${this.meta.toolCalls} |`)
-    lines.push(`| **Status** | ${this.meta.status} |`)
-    lines.push(``)
-    lines.push(`---`)
-    lines.push(``)
-
-    let currentIter = 0
-    // Set only by the 'thought' case below, for exactly the thought that was the
-    // IMMEDIATELY PRECEDING entry — read here, before it can be cleared, so the
-    // 'message' case can tell "the model's last thought WAS its final answer" apart from
-    // "a thought happened earlier in the run" (which must never be touched: only the
-    // trailing duplicate is redundant, every earlier thought is genuinely distinct
-    // reasoning). Cleared for every event type except 'thought' itself, so a tool call or
-    // any other event between a thought and a later message correctly breaks the link.
-    let pendingThought: { start: number; text: string } | null = null
-    // Set whenever the '## ✅ Final Answer' heading is rendered, so the terminal 'done'
-    // event (below) can tell whether its own content is that same text arriving a third
-    // time, or the ONLY place the run's outcome text appears (an aborted run emits 'done'
-    // with no preceding 'message' at all — see that case for why this must stay null then).
-    let lastAssistantContent: string | null = null
-
-    for (const { ts, event } of this.entries) {
-      const time = ts.slice(11, 23)
-      const priorThought = pendingThought
-      if (event.type !== 'thought') pendingThought = null
-
-      switch (event.type) {
-        case 'start':
-          lines.push(`*Run started · \`${event.model}\`*`)
-          lines.push(``)
-          break
-
-        case 'system_prompt':
-          lines.push(event.content)
-          lines.push(``)
-          break
-
-        case 'message':
-          if (event.role === 'user') {
-            lines.push(`## 💬 User`)
-            lines.push(``)
-            lines.push(event.content)
-            lines.push(``)
-          } else {
-            // If the entry immediately before this one was a thought that IS this same
-            // final answer (verbatim, or the leading part of it — see
-            // isThoughtDuplicateOfFinal), drop that thought block rather than rendering
-            // the same text twice in a row: '## ✅ Final Answer' is the artifact a reader
-            // is looking for, and a thought that only restated the answer carries nothing
-            // a reasoning trace needs beyond what the heading below already shows. Any
-            // OTHER thought — one from an earlier iteration, or one that reasoned toward
-            // but did not simply repeat the answer — is untouched; only the trailing,
-            // provably-identical case is removed.
-            if (priorThought && isThoughtDuplicateOfFinal(priorThought.text, event.content)) {
-              lines.length = priorThought.start
-            }
-            lines.push(`## ✅ Final Answer`)
-            lines.push(``)
-            lines.push(event.content)
-            lines.push(``)
-            lastAssistantContent = event.content
-          }
-          break
-
-        case 'iteration':
-          currentIter = event.current
-          lines.push(`---`)
-          lines.push(``)
-          break
-
-        case 'ollama_request':
-          lines.push(`*Ollama request · iter \`${event.iteration}\` · ${event.message_count} messages · \`${event.model}\`*`)
-          lines.push(``)
-          break
-
-        case 'token_usage': {
-          const pct = Math.round(event.prompt_tokens / event.num_ctx * 100)
-          lines.push(`*Context usage · **${event.prompt_tokens.toLocaleString()}** / ${event.num_ctx.toLocaleString()} ctx (${pct}%)*`)
-          lines.push(``)
-          break
-        }
-
-        case 'thought':
-          pendingThought = { start: lines.length, text: event.content }
-          lines.push(`**💭 Thought** \`${time}\``)
-          lines.push(``)
-          lines.push(`> ${event.content.replace(/\n/g, '\n> ')}`)
-          lines.push(``)
-          break
-
-        case 'tool_call':
-          lines.push(`**🔧 \`${event.tool}\`** \`${time}\``)
-          lines.push(``)
-          lines.push(`\`\`\`json`)
-          lines.push(JSON.stringify(event.args, null, 2))
-          lines.push(`\`\`\``)
-          lines.push(``)
-          break
-
-        case 'tool_result':
-          // event.replayed (H20 loop-guard redesign) is the ONE rejected case that
-          // isn't a failure at all — replayToolCall (agent.ts) emits `rejected:
-          // true, error: undefined` for it, which is otherwise indistinguishable
-          // from a real fast (0ms-reporting) execution in this log. Render it
-          // explicitly rather than let a human transcript reader mistake a served
-          // cache for a genuine re-run (/shared/argo-review/REPORT.md defect 4).
-          const status = event.replayed ? 'REPLAYED' : event.error ? `ERROR · ${event.error}` : `${event.duration_ms}ms`
-          lines.push(`**📥 Result** \`${status}\``)
-          lines.push(``)
-          lines.push(`\`\`\``)
-          lines.push((event.output || '').slice(0, 2000))
-          if ((event.output || '').length > 2000) lines.push(`... [truncated]`)
-          lines.push(`\`\`\``)
-          lines.push(``)
-          break
-
-        case 'git_commit':
-          lines.push(`**🔀 Committed** \`${event.hash}\` — ${event.message}`)
-          lines.push(``)
-          break
-
-        case 'done':
-          // An aborted run emits only 'done' (see agent.ts's abort branch) — no
-          // 'message' event precedes it — so lastAssistantContent is null in that case
-          // and this is sometimes the only place the outcome appears at all, not just a
-          // duplicate of 'message'; the content must survive there. Everywhere else
-          // 'done' carries the SAME text '## ✅ Final Answer' just rendered, so only the
-          // marker (plus how long the whole run took) is worth keeping — the text itself
-          // would be a third copy of something the reader already read twice.
-          if (lastAssistantContent != null && normalizeForCompare(event.content) === normalizeForCompare(lastAssistantContent)) {
-            lines.push(`*Run finished* · ${dur}s`)
-          } else {
-            lines.push(`*Run finished* — ${event.content}`)
-          }
-          lines.push(``)
-          break
-
-        case 'error':
-          lines.push(`**⚠️ Error**`)
-          lines.push(``)
-          lines.push(`> ${event.message}`)
-          lines.push(``)
-          break
-
-        case 'warning':
-          lines.push(`**⚡ Warning** ${event.message}`)
-          lines.push(``)
-          break
-
-        case 'compact_start':
-          lines.push(`**📦 Compacting context** \`${time}\` — ${event.messageCount} messages, ${(event.contextUsagePct * 100).toFixed(0)}% context (incl. generation reserve)`)
-          lines.push(``)
-          break
-
-        case 'compact_progress':
-          lines.push(`*…still compacting* \`${time}\` — ${event.step} (${Math.round(event.elapsedMs / 1000)}s / ${Math.round(event.timeoutMs / 1000)}s)`)
-          lines.push(``)
-          break
-
-        case 'compact':
-          lines.push(`**📦 Context compacted** \`${time}\` — ${event.messagesBefore} → ${event.messagesAfter} messages, was ${(event.contextUsagePct * 100).toFixed(0)}% context, validation pass ${event.validated ? 'ran' : 'skipped (nothing to fold in)'}`)
-          lines.push(``)
-          lines.push(`${event.rangeDescription}`)
-          lines.push(``)
-          lines.push(`\`\`\``)
-          lines.push(event.summary)
-          lines.push(`\`\`\``)
-          lines.push(``)
-          if (event.activeWorkingStateSummary) {
-            lines.push(`*Active working state (unvalidated, single-pass summary of the current run's own progress):*`)
-            lines.push(``)
-            lines.push(`\`\`\``)
-            lines.push(event.activeWorkingStateSummary)
-            lines.push(`\`\`\``)
-            lines.push(``)
-          }
-          break
-
-        case 'plan':
-          lines.push(`**📋 ${event.revision === 1 ? 'Plan' : `Plan · revision ${event.revision}`}** \`${time}\``)
-          lines.push(``)
-          lines.push(`> **Objective:** ${event.objective}`)
-          if (event.steps.length) {
-            lines.push(`>`)
-            for (const s of event.steps) lines.push(`> - ${s}`)
-          }
-          lines.push(``)
-          break
-
-        case 'critic':
-          lines.push(`**🔎 Critic · ${event.checkpoint}** \`${time}\` — verdict \`${event.verdict}\`${event.gamed_oracle ? ' · ⚠️ ORACLE TAMPER' : ''}`)
-          lines.push(``)
-          if (event.issues.length) {
-            for (const iss of event.issues) lines.push(`> - ${iss}`)
-            lines.push(``)
-          }
-          if (event.guidance) {
-            lines.push(`> ${event.guidance.replace(/\n/g, '\n> ')}`)
-            lines.push(``)
-          }
-          break
-
-        case 'tasks': {
-          const label = event.action === 'planned' ? 'Task plan'
-            : event.action === 'replanned' ? 'Task plan · re-planned'
-            : 'Task advanced'
-          lines.push(`**🗂 ${label}** \`${time}\` — ${event.done}/${event.total} done${event.current ? ` · current: ${event.current}` : ' · all tasks complete'}`)
-          lines.push(``)
-          break
-        }
-
-        // ── Multi-agent architecture (config.agents) — harness-level narrative
-        // events, always untagged (see types.ts's FrameTag doc).
-        case 'objective':
-          lines.push(`**🎯 Objective** \`${time}\` — ${event.text}`)
-          lines.push(``)
-          break
-
-        case 'task_graph': {
-          lines.push(`**📋 Task graph · revision ${event.revision}** \`${time}\``)
-          lines.push(``)
-          for (const s of event.steps) {
-            const deps = s.dependsOn.length ? ` (after ${s.dependsOn.join(', ')})` : ''
-            lines.push(`> - [${s.role}] ${s.prompt}${deps}`)
-          }
-          lines.push(``)
-          break
-        }
-
-        case 'boss_verdict':
-          lines.push(`**⚖️ Boss · ${event.action}** \`${time}\`${event.targetFrameId ? ` — target ${event.targetFrameId}` : ''}`)
-          lines.push(``)
-          lines.push(`> ${event.message.replace(/\n/g, '\n> ')}`)
-          lines.push(``)
-          break
-
-        case 'replan':
-          lines.push(`**🔄 Replanning** \`${time}\` — ${event.reason}`)
-          lines.push(``)
-          break
-
-        default: {
-          // Compile-time guard: a new AgentEvent variant without a case above
-          // fails the build here instead of silently vanishing from the .md
-          // trace while still appearing in the .jsonl.
-          const _exhaustive: never = event
-          void _exhaustive
-        }
-      }
-    }
-
-    return lines.join('\n')
   }
 
   getFilename() { return this.filename }
@@ -521,13 +206,10 @@ export async function listLogs(): Promise<LogMeta[]> {
   return metas
 }
 
-export async function readLog(filename: string): Promise<{ jsonl: string; md: string } | null> {
+export async function readLog(filename: string): Promise<{ jsonl: string } | null> {
   try {
-    const [jsonl, md] = await Promise.all([
-      fs.readFile(path.join(LOGS_DIR, `${filename}.jsonl`), 'utf-8'),
-      fs.readFile(path.join(LOGS_DIR, `${filename}.md`), 'utf-8'),
-    ])
-    return { jsonl, md }
+    const jsonl = await fs.readFile(path.join(LOGS_DIR, `${filename}.jsonl`), 'utf-8')
+    return { jsonl }
   } catch {
     return null
   }
@@ -589,7 +271,7 @@ export async function deleteAllLogs(): Promise<void> {
     const files = await fs.readdir(LOGS_DIR)
     await Promise.all(
       files
-        .filter(f => f.endsWith('.jsonl') || f.endsWith('.md') || f.startsWith('history') || f === 'current-session.txt' || f === 'sessions-registry.json')
+        .filter(f => f.endsWith('.jsonl') || f.startsWith('history') || f === 'current-session.txt' || f === 'sessions-registry.json')
         .map(f => fs.unlink(path.join(LOGS_DIR, f)).catch(() => {}))
     )
   } catch { /* dir may not exist */ }
@@ -600,10 +282,9 @@ export async function deleteSession(sessionId: string): Promise<void> {
   const session = sessions.find(s => s.id === sessionId)
   if (!session) return
   await Promise.all([
-    ...session.runs.flatMap(run => [
+    ...session.runs.map(run =>
       fs.unlink(path.join(LOGS_DIR, `${run.filename}.jsonl`)).catch(() => {}),
-      fs.unlink(path.join(LOGS_DIR, `${run.filename}.md`)).catch(() => {}),
-    ]),
+    ),
     fs.unlink(path.join(LOGS_DIR, `history-${sessionId}.json`)).catch(() => {}),
     unregisterSession(sessionId),
   ])

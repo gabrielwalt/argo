@@ -996,8 +996,8 @@ export class Agent {
   // compactHistory exactly as the automatic 66.7%-threshold path does: the most
   // recent message and a bounded antecedent survive verbatim, only older
   // material gets folded into CompactionState. Writes its own tiny run-shaped
-  // log (JSONL/MD pair) so the manual trigger is traceable the same way an
-  // automatic compaction is — see Phase 7's logging audit.
+  // JSONL log so the manual trigger is traceable the same way an automatic
+  // compaction is — see Phase 7's logging audit.
   async compactNow(): Promise<{ compacted: boolean }> {
     if (this.history.length === 0) return { compacted: false }
     const logger = new SessionLogger('Manual context compaction', this.model, this.options, this.sessionId)
@@ -1800,7 +1800,16 @@ export class Agent {
     const alTools = this.allowedTools
       ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
       : toolDefinitions
-    this.alLogger = new AlLogger(userMessage, this.model, this.options, this.roleTag ?? 'agent', alTools)
+    // sessionId/frameId/jsonl filename are cross-reference IDs only (see al-logger.ts's
+    // <al-run> header) — they let a reader of the XML trace jump straight to the
+    // matching JSONL log (logger.getFilename()) and, from there, to the session/frame
+    // this run belongs to. this.sessionId is always a string (never undefined) but an
+    // empty one means "no session yet", which the header should omit rather than
+    // render as `session_id=""`.
+    this.alLogger = new AlLogger(
+      userMessage, this.model, this.options, this.roleTag ?? 'agent', alTools,
+      this.sessionId || undefined, this.frameId ?? undefined, logger.getFilename(),
+    )
     // Each chat() call gets its OWN al-logger file (a fresh header + turn numbering
     // from 1), even on a resumed frame — so "new" for turn 1 of THIS file always
     // means "everything chatCall() is about to send", matching what that file's own
@@ -1813,12 +1822,16 @@ export class Agent {
       // first await, so getSeq() already reflects this event) so the SSE stream
       // carries the same per-run seq the JSONL persists — this is what lets the
       // UI dedupe replayed-vs-live events at the reconnect boundary.
-      this.emit(event, logger.getSeq())
+      const seq = logger.getSeq()
+      this.emit(event, seq)
       // NEW, ADDITIVE XML trace: forward harness-level events (eviction/compact,
-      // warning, error) to the al-logger too. logEvent() is a no-op for any
-      // AgentEvent variant it doesn't render (see its own switch), so this is safe
-      // to call unconditionally for every event without a parallel filter here.
-      this.alLogger?.logEvent(event)
+      // warning, error) to the al-logger too, along with the JSONL seq this event
+      // was just written at — logEvent() stores it so the NEXT <al-turn>/<al-response>
+      // it renders carries a jsonl_seq cross-reference. logEvent() is a no-op
+      // (render-wise) for any AgentEvent variant it doesn't render (see its own
+      // switch), so this is safe to call unconditionally for every event without a
+      // parallel filter here.
+      this.alLogger?.logEvent(event, seq)
     }
 
     this.pushCtx({ role: 'user', content: userMessage })
@@ -2858,9 +2871,9 @@ export class Agent {
   }
 
   // Wraps bash() with the same tool_call/tool_result tracing the main loop
-  // uses, so autoCommit's own commands show up in the JSONL/Markdown trace
-  // instead of being invisible — this is what let the phantom/orphaned/
-  // mislabeled commit bugs go unnoticed in real session logs.
+  // uses, so autoCommit's own commands show up in the JSONL trace instead of
+  // being invisible — this is what let the phantom/orphaned/mislabeled commit
+  // bugs go unnoticed in real session logs.
   private async tracedBash(command: string, emitAndLog: (e: AgentEvent) => void) {
     emitAndLog({ type: 'tool_call', tool: 'bash', args: { command, cwd: '/workspace' } })
     const start = Date.now()

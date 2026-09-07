@@ -4,10 +4,10 @@ import fs from 'fs/promises'
 import { SessionLogger, readLog, readLogEvents, LOGS_DIR } from './logger.js'
 import type { AgentEvent } from './types.js'
 
-// Every AgentEvent variant must produce non-empty, type-specific Markdown —
-// otherwise a new event type can silently vanish from the persisted .md
-// trace while still appearing in the .jsonl (see logger.ts's toMarkdown()
-// switch and its compile-time `never` exhaustiveness guard).
+// Every AgentEvent variant must still round-trip through the JSONL log intact —
+// markdown rendering (toMarkdown()) was removed; JSONL is now the ONLY persisted
+// trace format, so these checks now assert against readLog()/readLogEvents()
+// instead of a rendered .md file.
 const sampleEvents: AgentEvent[] = [
   { type: 'start', model: 'test-model', query: 'do the thing', options: {} },
   { type: 'message', role: 'user', content: 'USER_CONTENT_MARKER' },
@@ -38,12 +38,11 @@ const writtenFilenames: string[] = []
 after(async () => {
   await Promise.all(writtenFilenames.flatMap(f => [
     fs.unlink(`${LOGS_DIR}/${f}.jsonl`).catch(() => {}),
-    fs.unlink(`${LOGS_DIR}/${f}.md`).catch(() => {}),
   ]))
 })
 
 for (const event of sampleEvents) {
-  test(`toMarkdown() renders a non-empty, type-specific case for '${event.type}'`, async () => {
+  test(`JSONL round-trips a '${event.type}' event with its distinctive fields intact`, async () => {
     const logger = new SessionLogger(`logger-test-${event.type}`, 'test-model', {})
     logger.log(event)
     await logger.flush()
@@ -52,20 +51,25 @@ for (const event of sampleEvents) {
 
     const log = await readLog(filename)
     assert.ok(log, 'expected the flushed log to be readable')
-    assert.ok(log!.md.length > 0, `expected non-empty markdown for '${event.type}'`)
+    assert.ok(log!.jsonl.length > 0, `expected non-empty jsonl for '${event.type}'`)
 
     // Every event above carries a distinctive value somewhere in its fields —
-    // assert at least one of them made it into the rendered Markdown, so this
-    // catches a case that renders *something* generic but drops the content.
+    // assert at least one of them made it into the persisted jsonl, catching a
+    // serialization bug that silently drops a field for a given event type.
     const distinctiveValues = Object.values(event).filter((v): v is string =>
       typeof v === 'string' && v !== event.type
     )
     if (distinctiveValues.length > 0) {
       assert.ok(
-        distinctiveValues.some(v => log!.md.includes(v)),
-        `expected markdown for '${event.type}' to include one of ${JSON.stringify(distinctiveValues)}\ngot:\n${log!.md}`
+        distinctiveValues.some(v => log!.jsonl.includes(v)),
+        `expected jsonl for '${event.type}' to include one of ${JSON.stringify(distinctiveValues)}\ngot:\n${log!.jsonl}`
       )
     }
+
+    const replayed = await readLogEvents(filename)
+    assert.ok(replayed, 'expected readLogEvents to return events')
+    assert.equal(replayed!.length, 1)
+    assert.equal(replayed![0].type, event.type)
   })
 }
 
@@ -97,119 +101,20 @@ test('readLogEvents attaches the per-run __seq to each event and skips the meta 
   assert.ok(first.type === 'message' && first.content === 'FIRST_MARKER', 'event content must survive intact')
 })
 
-// ── Rendering dedupe (readability fix — .md ONLY, the .jsonl is never touched) ────────
-// SessionLogger emits the same text through several events by design (the query as both
-// `__meta__.query` and a `message`/role:'user' event; a model's final turn as its last
-// `thought`, its `message`/role:'assistant', and `done`) — real logs showed this printing
-// the same content two or three times before any of it was read. Every test below checks
-// a specific dedupe rule against the rendered .md while confirming the underlying .jsonl
-// (via readLogEvents) still carries every event untouched.
-test('toMarkdown collapses a trailing thought that is byte-identical to the final answer', async () => {
-  const logger = new SessionLogger('logger-test-dedupe-identical', 'test-model', {})
-  logger.log({ type: 'thought', content: 'IDENTICAL_ANSWER_MARKER' })
-  logger.log({ type: 'message', role: 'assistant', content: 'IDENTICAL_ANSWER_MARKER' })
-  logger.log({ type: 'done', content: 'IDENTICAL_ANSWER_MARKER' })
+// readLog() no longer reads or returns a `.md` file — JSONL is the sole persisted
+// format now (see logger.ts's flush(), which used to also write toMarkdown()'s
+// output). This guards against that regressing back in.
+test('readLog returns only { jsonl }, with no markdown field', async () => {
+  const logger = new SessionLogger('logger-test-jsonl-only', 'test-model', {})
+  logger.log({ type: 'message', role: 'user', content: 'ONLY_JSONL_MARKER' })
   await logger.flush()
   const filename = logger.getFilename()
   writtenFilenames.push(filename)
 
   const log = await readLog(filename)
   assert.ok(log)
-  assert.equal(log!.md.includes('💭 Thought'), false, 'the duplicate thought block must be dropped')
-  assert.equal((log!.md.match(/IDENTICAL_ANSWER_MARKER/g) ?? []).length, 1, 'the text must survive exactly once, under Final Answer')
-  assert.ok(log!.md.includes('## ✅ Final Answer'))
-  assert.ok(log!.md.includes('*Run finished* ·'), 'done must not repeat the content a third time')
+  assert.deepEqual(Object.keys(log!), ['jsonl'])
+  assert.ok(log!.jsonl.includes('ONLY_JSONL_MARKER'))
 
-  const events = await readLogEvents(filename)
-  assert.deepEqual(events!.map(e => e.type), ['thought', 'message', 'done'], 'the jsonl record is untouched regardless of what the .md renders')
-})
-
-test('toMarkdown collapses a trailing thought that is a PREFIX of a longer final answer', async () => {
-  const logger = new SessionLogger('logger-test-dedupe-prefix', 'test-model', {})
-  logger.log({ type: 'thought', content: 'PREFIX_REASONING_MARKER' })
-  logger.log({ type: 'message', role: 'assistant', content: 'PREFIX_REASONING_MARKER plus a formatted verdict line TAIL_MARKER' })
-  await logger.flush()
-  const filename = logger.getFilename()
-  writtenFilenames.push(filename)
-
-  const log = await readLog(filename)
-  assert.ok(log)
-  assert.equal(log!.md.includes('💭 Thought'), false, 'a thought that is the leading part of the final answer is still a duplicate')
-  assert.equal((log!.md.match(/PREFIX_REASONING_MARKER/g) ?? []).length, 1)
-  assert.ok(log!.md.includes('TAIL_MARKER'), 'the extra content beyond the thought must survive — only the OVERLAP is redundant')
-})
-
-test('toMarkdown keeps a thought that is genuinely different from the final answer', async () => {
-  const logger = new SessionLogger('logger-test-dedupe-different', 'test-model', {})
-  logger.log({ type: 'thought', content: 'DIFFERENT_THOUGHT_MARKER exploring approach A' })
-  logger.log({ type: 'message', role: 'assistant', content: 'DIFFERENT_FINAL_MARKER after switching to approach B' })
-  await logger.flush()
-  const filename = logger.getFilename()
-  writtenFilenames.push(filename)
-
-  const log = await readLog(filename)
-  assert.ok(log)
-  assert.ok(log!.md.includes('💭 Thought'), 'a genuinely distinct thought must never be suppressed — only the trailing, provably-identical case is')
-  assert.ok(log!.md.includes('DIFFERENT_THOUGHT_MARKER'))
-  assert.ok(log!.md.includes('DIFFERENT_FINAL_MARKER'))
-})
-
-test('toMarkdown treats a whitespace-only difference as the same duplicate case', async () => {
-  const logger = new SessionLogger('logger-test-dedupe-whitespace', 'test-model', {})
-  logger.log({ type: 'thought', content: 'WS_MARKER   spread\n\nacross   lines' })
-  logger.log({ type: 'message', role: 'assistant', content: 'WS_MARKER spread across lines' })
-  await logger.flush()
-  const filename = logger.getFilename()
-  writtenFilenames.push(filename)
-
-  const log = await readLog(filename)
-  assert.ok(log)
-  assert.equal(log!.md.includes('💭 Thought'), false, 'normalised whitespace must still compare equal')
-  assert.equal((log!.md.match(/WS_MARKER/g) ?? []).length, 1)
-})
-
-test('toMarkdown never suppresses a thought against an empty final answer', async () => {
-  const logger = new SessionLogger('logger-test-dedupe-empty-final', 'test-model', {})
-  logger.log({ type: 'thought', content: 'SHOULD_SURVIVE_MARKER' })
-  logger.log({ type: 'message', role: 'assistant', content: '' })
-  await logger.flush()
-  const filename = logger.getFilename()
-  writtenFilenames.push(filename)
-
-  const log = await readLog(filename)
-  assert.ok(log)
-  assert.ok(log!.md.includes('💭 Thought'), 'an empty final answer "starts with" nothing real — a non-empty thought must not be dropped against it')
-  assert.ok(log!.md.includes('SHOULD_SURVIVE_MARKER'))
-})
-
-test('toMarkdown preserves done content when there is no preceding final-answer message (an aborted run)', async () => {
-  const logger = new SessionLogger('logger-test-dedupe-abort', 'test-model', {})
-  logger.log({ type: 'thought', content: 'ABORT_THOUGHT_MARKER' })
-  logger.log({ type: 'done', content: 'Stopped.' })
-  await logger.flush()
-  const filename = logger.getFilename()
-  writtenFilenames.push(filename)
-
-  const log = await readLog(filename)
-  assert.ok(log)
-  assert.ok(log!.md.includes('💭 Thought'), 'nothing to compare an aborted run\'s thought against, so it must stay')
-  assert.ok(log!.md.includes('*Run finished* — Stopped.'), 'the ONLY place this outcome text appears must not be dropped')
-})
-
-test('the header table Query cell is a short single-line excerpt; the full query still appears once under User', async () => {
-  const longQuery = `Line one of the request.\nLine two, with a literal | pipe character in it.\n${'x'.repeat(300)}`
-  const logger = new SessionLogger(longQuery, 'test-model', {})
-  logger.log({ type: 'message', role: 'user', content: longQuery })
-  await logger.flush()
-  const filename = logger.getFilename()
-  writtenFilenames.push(filename)
-
-  const log = await readLog(filename)
-  assert.ok(log)
-  const queryLine = log!.md.split('\n').find(l => l.startsWith('| **Query** |'))
-  assert.ok(queryLine, 'expected a Query row in the header table')
-  assert.ok(queryLine!.length < 200, `expected a short excerpt, got ${queryLine!.length} chars: ${queryLine}`)
-  assert.ok(queryLine!.includes('\\|'), 'a literal | inside the excerpt must be escaped, or it breaks the table')
-  assert.ok(log!.md.includes(longQuery), 'the full, untruncated query must still appear once, under ## 💬 User')
-  assert.ok(log!.md.includes('## 💬 User'))
+  await assert.rejects(fs.access(`${LOGS_DIR}/${filename}.md`), 'flush() must not write a .md file anymore')
 })
