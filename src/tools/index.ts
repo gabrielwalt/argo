@@ -64,9 +64,10 @@ export const toolDefinitions = [
         properties: {
           command: { type: 'string', description: 'The bash command to run' },
           cwd: { type: 'string', description: 'Working directory, any absolute path. Default cwd is /workspace.' },
-          timeout_ms: { type: 'number', description: 'Override the default kill timeout in milliseconds, for a command you know legitimately needs more time. Capped at 180000 (3 minutes).' },
+          timeout_ms: { type: 'integer', minimum: 1, maximum: 300000, description: 'Override the default kill timeout in milliseconds, for a command you know legitimately needs more time. Capped at 300000 (5 minutes).' },
         },
         required: ['command'],
+        additionalProperties: false,
       },
     },
   },
@@ -74,17 +75,19 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'read_file',
-      description: 'Read or search files in the container. Use path to read one file, or paths to read several files in one call. For large files, use offset/limit to read the relevant line range instead of relying on truncated whole-file output. If you do not know where relevant content is, use pattern to search the entire file for an exact literal substring and get matching line numbers, then read around those lines with offset/limit. Any absolute path works; project files are under /workspace. Whole-file reads are capped at 8000 characters per file and may omit the middle.',
+      description: 'Read or search files in the container. Use path to read one file, or paths to read several files in one call. For large files, use offset/limit to read the relevant line range instead of relying on truncated whole-file output. If you do not know where relevant content is, use pattern to search the entire file for an exact literal substring and get matching line numbers, then read around those lines with offset/limit — or set context to also see lines of surrounding code with each match, saving a follow-up call. Any absolute path works; project files are under /workspace. Whole-file reads are capped at 8000 characters per file and may omit the middle.',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Absolute path to one file, e.g. /workspace/src/app.ts or /tmp/output.txt.' },
-          paths: { type: 'array', items: { type: 'string' }, description: 'Absolute paths to multiple files. Each file is returned in a labeled section; missing files produce inline errors without failing the whole call. When set, path, offset, limit, and pattern are ignored.' },
-          offset: { type: 'number', description: '1-based first line to return. Use with limit to page through a large file. Ignored when pattern is set.' },
-          limit: { type: 'number', description: 'Number of lines to return from offset. If omitted, reads to the end, subject to the 8000-character cap. Ignored when pattern is set.' },
+          path: { type: 'string', description: 'Absolute path to one file, e.g. /workspace/src/app.ts or /tmp/output.txt. Required unless paths is set instead.' },
+          paths: { type: 'array', items: { type: 'string' }, maxItems: 10, description: 'Absolute paths to multiple files (max 10). Each file is returned in a labeled section; missing files produce inline errors without failing the whole call. When set, path, offset, limit, and pattern are ignored.' },
+          offset: { type: 'integer', minimum: 1, description: '1-based first line to return. Use with limit to page through a large file. Ignored when pattern is set.' },
+          limit: { type: 'integer', minimum: 1, description: 'Number of lines to return from offset. If omitted, reads to the end, subject to the 8000-character cap. Ignored when pattern is set.' },
           pattern: { type: 'string', description: 'Search the entire file for this exact literal substring and return matching line numbers instead of file content. Not a regex. When set, offset and limit are ignored.' },
+          context: { type: 'integer', minimum: 0, maximum: 20, description: 'When pattern is set, show this many lines of context around each match (default 0 = line numbers only). Saves a follow-up read_file call for most symbol lookups.' },
         },
-        required: [],
+        required: ['path'],
+        additionalProperties: false,
       },
     },
   },
@@ -100,6 +103,7 @@ export const toolDefinitions = [
           content: { type: 'string', description: 'Complete file contents to write.' },
         },
         required: ['path', 'content'],
+        additionalProperties: false,
       },
     },
   },
@@ -117,6 +121,7 @@ export const toolDefinitions = [
           replace_all: { type: 'boolean', description: 'Replace every occurrence of old_string. Default false.' },
         },
         required: ['path', 'old_string', 'new_string'],
+        additionalProperties: false,
       },
     },
   },
@@ -131,6 +136,7 @@ export const toolDefinitions = [
           url: { type: 'string', description: 'Absolute URL to fetch.' },
         },
         required: ['url'],
+        additionalProperties: false,
       },
     },
   },
@@ -143,9 +149,10 @@ export const toolDefinitions = [
         type: 'object',
         properties: {
           query: { type: 'string', description: 'Search query.' },
-          max_results: { type: 'number', description: 'Maximum number of results to return. Default 5, maximum 10.' },
+          max_results: { type: 'integer', minimum: 1, maximum: 10, description: 'Number of results (default 5, max 10)' },
         },
         required: ['query'],
+        additionalProperties: false,
       },
     },
   },
@@ -153,7 +160,7 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'browser_fetch',
-      description: 'Open a webpage in Chromium with Playwright, execute JavaScript, and return the rendered page text. Use this when client-side rendering or browser execution is required; otherwise prefer fetch_url.',
+      description: 'Open a webpage in Chromium with Playwright, execute JavaScript, and return its rendered text only. Does not provide visual inspection, screenshots, or interaction — use bash with Playwright scripts for those. Use for client-rendered content that fetch_url cannot handle.',
       parameters: {
         type: 'object',
         properties: {
@@ -161,6 +168,7 @@ export const toolDefinitions = [
           wait_for: { type: 'string', description: 'Optional CSS selector to wait for before extracting the rendered text.' },
         },
         required: ['url'],
+        additionalProperties: false,
       },
     },
   },
@@ -176,6 +184,7 @@ export const toolDefinitions = [
           message: { type: 'string', description: 'Final result, answer, summary, assignment, or explanation for this session.' },
         },
         required: ['status', 'message'],
+        additionalProperties: false,
       },
     },
   },
@@ -198,6 +207,7 @@ export const toolDefinitions = [
           scope: { type: 'string', enum: ['frame', 'task'], description: 'Optional get_recent filter: restrict standup entries to frame- or task-level records.' },
         },
         required: ['action'],
+        additionalProperties: false,
       },
     },
   },
@@ -218,7 +228,7 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
       if (!args.path || typeof args.path !== 'string') {
         return { output: '', error: 'read_file requires either a "path" string or a "paths" array.' }
       }
-      return readFile(args.path as string, args.offset as number | undefined, args.limit as number | undefined, args.pattern as string | undefined)
+      return readFile(args.path as string, args.offset as number | undefined, args.limit as number | undefined, args.pattern as string | undefined, args.context as number | undefined)
     }
     case 'write_file':
       return writeFile(args.path as string, args.content as string)

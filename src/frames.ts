@@ -24,8 +24,16 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
   // Deliberately NO update_plan. The harness owns the plan; the Implementer's job is
   // to execute it, not define or refine it.
   implementer: ['read_file', 'write_file', 'edit_file', 'bash', 'fetch_url', 'web_search', 'browser_fetch', 'ledger', 'conclude'],
-  // Deliberately no write_file/edit_file — the Boss verifies, it never fixes.
-  boss: ['read_file', 'bash', 'web_search', 'fetch_url', 'ledger', 'conclude'],
+  // Deliberately no write_file/edit_file, and (2026 review) no bash either — the
+  // Boss is strictly read-only: it classifies the request, it never executes
+  // commands. The tool definitions sent to Ollama are filtered by ROLE_TOOLS
+  // (agent.ts's chatCall/chat), so removing bash here means the Boss's OWN default
+  // role tool set never even offers it as a schema, not just "the prompt says don't
+  // use it." TASK_START_TOOLS (below) is a SEPARATE, deliberately different tool set
+  // used only for the task-start classification checkpoint — it keeps bash for
+  // investigation for reasons recorded in its own comment; this change does not
+  // touch it.
+  boss: ['read_file', 'web_search', 'fetch_url', 'ledger', 'conclude'],
 }
 
 // The task-start checkpoint's tool set (dispatch.ts's runBossTaskStart) — deliberately
@@ -161,6 +169,74 @@ export function concludeStatusError(role: Role, invalidStatus: string): string {
   return `Invalid conclude status "${invalidStatus}". For your role (${ROLE_NAME[role]}), ` +
     `the valid status keywords are: ${valid.join(', ')}. ` +
     `Call conclude again with status set to one of these keywords and your message in the message parameter.`
+}
+
+// DYNAMIC conclude.status ENUM. agent.ts's runtime check (chat()'s conclude handler,
+// using ROLE_CONCLUDE_STATUSES/concludeStatusError above) has always REJECTED an
+// invalid status with a corrective error — but until now the SCHEMA offered to
+// Ollama for every role advertised only `{ type: 'string' }`, with the valid
+// keywords mentioned solely in the tool description's prose. A model that never
+// reads (or forgets) that prose has no structural signal for which keywords are
+// legal; putting the same list ROLE_CONCLUDE_STATUSES already enforces into the
+// schema's `enum` lets a tool-calling model see and validate against it directly,
+// the same way the ledger tool's `action` parameter already gives its own enum.
+//
+// Generic over the tool-definition SHAPE (rather than importing tools/index.ts's
+// concrete type, which would create a needless frames.ts -> tools/index.ts type
+// dependency beyond what's already there) — T is inferred at the call site from
+// whatever array agent.ts passes in, so this stays a pure, narrowly-scoped patch:
+// find the tool named 'conclude', return every OTHER tool untouched (by reference —
+// no wasted clone), and return a new object only for 'conclude' itself with its
+// `status` property's `enum` set. Returns the input array unchanged (same
+// reference) when role is null/undefined (the unrestricted baseline has no
+// ROLE_CONCLUDE_STATUSES entry to patch in with) or when no 'conclude' tool is in
+// the array at all (a role-filtered list that doesn't include it, though every
+// current role does).
+interface ConcludeLikeTool {
+  type: 'function'
+  function: {
+    name: string
+    description: string
+    parameters: {
+      type: string
+      // Index signature (not a fixed {type,description,enum?} shape) deliberately —
+      // this must structurally match every tool in tools/index.ts's toolDefinitions,
+      // several of which put extra JSON-Schema keywords (minimum/maximum/items/
+      // maxItems) on OTHER properties this function never touches. Widening to
+      // `Record<string, unknown>` sidesteps having to enumerate every keyword this
+      // helper doesn't care about, while `status` below (the only property actually
+      // read/written) still gets a real, narrow type.
+      properties: Record<string, unknown> & { status?: { type: string; description: string; enum?: string[] } }
+      required: string[]
+    }
+  }
+}
+
+export function withConcludeStatusEnum<T extends ConcludeLikeTool>(tools: readonly T[], role?: Role | null): T[] {
+  if (!role) return tools as T[]
+  const statuses = ROLE_CONCLUDE_STATUSES[role]
+  if (!statuses) return tools as T[]
+  return tools.map(t => {
+    if (t.function.name !== 'conclude') return t
+    // The patched result is only ever a reshaped copy of a tool that already
+    // satisfied ConcludeLikeTool (t itself), so it is safe to assert back to T here —
+    // same pattern as the two early `as T[]` returns above, just per-element. TS
+    // cannot verify a generic-shaped object literal against an arbitrary T on its
+    // own, which is exactly why the assertion (not a plain return) is needed.
+    return {
+      ...t,
+      function: {
+        ...t.function,
+        parameters: {
+          ...t.function.parameters,
+          properties: {
+            ...t.function.parameters.properties,
+            status: { ...t.function.parameters.properties.status, enum: statuses },
+          },
+        },
+      },
+    } as T
+  })
 }
 
 const ROLE_SYSTEM_SUFFIX: Record<Role, string> = {

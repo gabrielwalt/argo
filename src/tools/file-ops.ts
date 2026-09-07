@@ -188,16 +188,28 @@ const MAX_PATTERN_MATCHES = 50
 // Whole-file search removes that class outright. When offset/limit were supplied they are named
 // as ignored rather than dropped in silence, because silently discarding an argument teaches the
 // model nothing about the tool's actual shape.
-function searchLines(content: string, pattern: string, windowIgnored: boolean): ToolResult {
+//
+// CONTEXT LINES (opt-in, default 0). The block comment above ("Matches are returned as
+// `<1-based line number>: <line text>`, with no surrounding context lines") recorded a
+// deliberate choice against folding context into every match, reasoning that a dedicated
+// offset/limit follow-up already shows context perfectly well — but that follow-up is a
+// second read_file call and a second turn, for what is very often exactly the same
+// "show me the lines around this symbol" need a plain grep -C already serves in one shot.
+// `context` (0 by default, so every existing caller that never passes it gets byte-identical
+// output to before) lets a caller opt into that second call's result inline. Context windows
+// around adjacent matches are MERGED, not repeated — two matches four lines apart with
+// context:3 produce one contiguous, deduplicated block instead of the same shared lines twice,
+// which would otherwise both bloat output and make the truncation/count math misleading.
+function searchLines(content: string, pattern: string, windowIgnored: boolean, context = 0): ToolResult {
   const lines = splitLines(content)
   const totalLines = lines.length
   const note = windowIgnored ? ' (offset/limit ignored: a search always covers the whole file)' : ''
   let totalMatches = 0
-  const shown: string[] = []
+  const matchLineIdx: number[] = []  // 0-based indices of every match, up to MAX_PATTERN_MATCHES
   for (let i = 0; i < totalLines; i++) {
     if (lines[i].includes(pattern)) {
       totalMatches++
-      if (shown.length < MAX_PATTERN_MATCHES) shown.push(`${i + 1}: ${lines[i]}`)
+      if (matchLineIdx.length < MAX_PATTERN_MATCHES) matchLineIdx.push(i)
     }
   }
   if (totalMatches === 0) {
@@ -206,14 +218,41 @@ function searchLines(content: string, pattern: string, windowIgnored: boolean): 
     // error makes the model retry the identical call, wasting the turn this exists to save.
     return { output: `[pattern ${JSON.stringify(pattern)} matched 0 times in ${totalLines} lines${note}; try a shorter or different substring]` }
   }
-  const countNote = shown.length < totalMatches
-    ? `${totalMatches} times (showing first ${shown.length})`
+  const countNote = matchLineIdx.length < totalMatches
+    ? `${totalMatches} times (showing first ${matchLineIdx.length})`
     : `${totalMatches} time${totalMatches === 1 ? '' : 's'}`
-  const marker = `[pattern ${JSON.stringify(pattern)} matched ${countNote} in ${totalLines} lines${note}; use offset/limit to read near a line number]`
-  return { output: `${marker}\n${truncateOutput(shown.join('\n'), 8000)}` }
+  let shownText: string
+  if (context > 0) {
+    // Build merged [start, end] (0-based, inclusive) ranges around each match, then render
+    // each range as a contiguous run of numbered lines, marking the actual match line(s)
+    // distinctly (>) from pure context lines so the reader can still tell them apart.
+    const ranges: Array<[number, number]> = []
+    for (const idx of matchLineIdx) {
+      const start = Math.max(0, idx - context)
+      const end = Math.min(totalLines - 1, idx + context)
+      const last = ranges[ranges.length - 1]
+      if (last && start <= last[1] + 1) {
+        last[1] = Math.max(last[1], end)  // overlaps/touches the previous range — extend it
+      } else {
+        ranges.push([start, end])
+      }
+    }
+    const matchSet = new Set(matchLineIdx)
+    const blocks = ranges.map(([start, end]) => {
+      const body = []
+      for (let i = start; i <= end; i++) body.push(`${matchSet.has(i) ? '>' : ' '}${i + 1}: ${lines[i]}`)
+      return body.join('\n')
+    })
+    shownText = blocks.join('\n--\n')
+  } else {
+    shownText = matchLineIdx.map(i => `${i + 1}: ${lines[i]}`).join('\n')
+  }
+  const contextNote = context > 0 ? `; ${context} line(s) of context shown around each match, marked with >` : ''
+  const marker = `[pattern ${JSON.stringify(pattern)} matched ${countNote} in ${totalLines} lines${note}${contextNote}; use offset/limit to read near a line number]`
+  return { output: `${marker}\n${truncateOutput(shownText, 8000)}` }
 }
 
-export async function readFile(filePath: string, offset?: number, limit?: number, pattern?: string): Promise<ToolResult> {
+export async function readFile(filePath: string, offset?: number, limit?: number, pattern?: string, context?: number): Promise<ToolResult> {
   try {
     const abs = await safePath(filePath)
     const content = await fs.readFile(abs, 'utf-8')
@@ -228,7 +267,8 @@ export async function readFile(filePath: string, offset?: number, limit?: number
       // Whole-file search; offset/limit are reported as ignored rather than applied.
       // See searchLines' header for the measured reason (six of seven live searches
       // returned false negatives when a carried-over window scoped them).
-      return searchLines(content, pattern, offset !== undefined || limit !== undefined)
+      const ctx = context === undefined || !Number.isFinite(context) ? 0 : Math.min(20, Math.max(0, Math.floor(context)))
+      return searchLines(content, pattern, offset !== undefined || limit !== undefined, ctx)
     }
     if (offset === undefined && limit === undefined) {
       return { output: truncateOutput(content, 8000) }

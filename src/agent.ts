@@ -9,7 +9,7 @@ import { truncateOutput } from './tools/truncate.js'
 import { SessionLogger, LOGS_DIR } from './logger.js'
 import { TraceLogger } from './al-logger.js'
 import type { AgentEvent, ToolName, ModelOptions, Role } from './types.js'
-import { PROGRESS_CHECK_ITERATIONS, PROGRESS_CHECK_MESSAGES, ROLE_CONCLUDE_STATUSES, concludeStatusError } from './frames.js'
+import { PROGRESS_CHECK_ITERATIONS, PROGRESS_CHECK_MESSAGES, ROLE_CONCLUDE_STATUSES, concludeStatusError, withConcludeStatusEnum } from './frames.js'
 import {
   createLoopState, noteMutation, noteBashExecution, evaluateCall, normalizeCallKey, recordResult, type LoopState,
   // H21 closes the unbounded-retry hole where a call the role gate refuses is
@@ -794,9 +794,18 @@ export class Agent {
     // MULTI-AGENT ARCHITECTURE: a role-scoped frame only offers Ollama the tools in
     // this.allowedTools (frames.ts's ROLE_TOOLS); null (baseline, and every existing
     // caller) offers the full set unchanged.
-    const offeredTools = this.allowedTools
-      ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
-      : toolDefinitions
+    //
+    // DYNAMIC conclude.status ENUM (frames.ts's withConcludeStatusEnum): patched in
+    // here, AFTER role-filtering, so the enum reflects this frame's own role even
+    // though the base `conclude` tool definition in tools/index.ts stays role-
+    // agnostic (every role shares one static array; only the SENT copy differs).
+    // A no-op (returns the same array) for the unrestricted baseline (roleTag null).
+    const offeredTools = withConcludeStatusEnum(
+      this.allowedTools
+        ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
+        : toolDefinitions,
+      this.roleTag,
+    )
     // TIMEOUT ABORT — STREAMING: the Ollama JS client only tracks a request in
     // `ongoingStreamedRequests` (what its own abort() walks and cancels) when the
     // request is STREAMED — a stream:false call's underlying fetch has no abort
@@ -910,13 +919,17 @@ export class Agent {
     const logger = new SessionLogger(userMessage, this.model, this.options, this.sessionId)
     // NEW, ADDITIVE Markdown trace (al-logger.ts) — see the field doc comment above.
     // The tool set offered is computed the SAME way chatCall() computes offeredTools
-    // (this.allowedTools ? filter : the full set) since that filtering only depends
-    // on state already set before chat() runs (dispatch.ts's spawnFrame calls
-    // setAllowedTools before chat()), not on anything chatCall() itself derives per
-    // call — so recomputing it here for the header is equivalent, not a guess.
-    const alTools = this.allowedTools
-      ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
-      : toolDefinitions
+    // (this.allowedTools ? filter : the full set, then withConcludeStatusEnum) since
+    // that filtering only depends on state already set before chat() runs (dispatch.ts's
+    // spawnFrame calls setAllowedTools/setRole before chat()), not on anything
+    // chatCall() itself derives per call — so recomputing it here for the header is
+    // equivalent, not a guess.
+    const alTools = withConcludeStatusEnum(
+      this.allowedTools
+        ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
+        : toolDefinitions,
+      this.roleTag,
+    )
     // sessionId/frameId/jsonl filename are cross-reference IDs only (see al-logger.ts's
     // header) — they let a reader of the trace jump straight to the matching JSONL
     // log (logger.getFilename()) and, from there, to the session/frame this run

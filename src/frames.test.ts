@@ -43,11 +43,15 @@ test('TASK_START_TOOLS includes bash for investigation plus read-only tools and 
   assert.deepEqual([...TASK_START_TOOLS].sort(), ['bash', 'conclude', 'fetch_url', 'ledger', 'read_file', 'web_search'])
 })
 
-test('ROLE_TOOLS.boss has bash but no write_file — the Boss verifies, never fixes directly', () => {
-  // The classification-only restriction applies to task-start ALONE (dispatch.ts
-  // passes TASK_START_TOOLS as a one-off override to spawnFrame there). This test
-  // guards ROLE_TOOLS.boss's own default contents.
-  assert.equal(ROLE_TOOLS.boss.includes('bash'), true)
+test('ROLE_TOOLS.boss has no bash and no write_file — the Boss is strictly read-only outside the task-start checkpoint', () => {
+  // 2026 review: ROLE_TOOLS.boss's own default contents (as opposed to
+  // TASK_START_TOOLS above, the SEPARATE, deliberately different one-off override
+  // dispatch.ts passes for the task-start classification checkpoint alone) no
+  // longer includes bash — the Boss classifies the request, it never executes
+  // commands, and the tool definitions sent to Ollama are filtered by this table,
+  // so removing bash here means the Boss's own role tool set never offers it as a
+  // schema at all.
+  assert.equal(ROLE_TOOLS.boss.includes('bash'), false)
   assert.equal(ROLE_TOOLS.boss.includes('write_file'), false)
 })
 
