@@ -320,7 +320,9 @@ export async function writeFile(filePath: string, content: string): Promise<Tool
     const abs = await safePath(filePath)
     await fs.mkdir(path.dirname(abs), { recursive: true })
     await fs.writeFile(abs, content, 'utf-8')
-    return { output: `Written: ${filePath}` }
+    const lines = content.split('\n').length
+    const bytes = Buffer.byteLength(content, 'utf-8')
+    return { output: `Wrote ${filePath} successfully (${lines} line${lines !== 1 ? 's' : ''}, ${bytes.toLocaleString()} bytes).\nThe file now contains exactly the content supplied in this call.` }
   } catch (err) {
     return { output: '', error: String(err) }
   }
@@ -372,7 +374,9 @@ export async function editFile(filePath: string, oldString: string, newString: s
       : content.slice(0, matchIndex) + newString + content.slice(matchIndex + oldString.length)
     await fs.writeFile(abs, updated, 'utf-8')
     const n = replaceAll ? occurrences : 1
-    return { output: truncateOutput(`Edited ${filePath} — replaced ${n} occurrence${n === 1 ? '' : 's'}. Updated region:\n${editedRegion(updated, newString, matchIndex)}`, 4000) }
+    const lines = updated.split('\n').length
+    const bytes = Buffer.byteLength(updated, 'utf-8')
+    return { output: truncateOutput(`Edited ${filePath} successfully — replaced ${n} occurrence${n === 1 ? '' : 's'} (${lines} line${lines !== 1 ? 's' : ''}, ${bytes.toLocaleString()} bytes now).\nThe file now reflects this edit exactly. Updated region:\n${editedRegion(updated, newString, matchIndex)}`, 4000) }
   } catch (err) {
     return { output: '', error: String(err) }
   }
