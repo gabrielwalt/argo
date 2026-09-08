@@ -80,16 +80,15 @@ export function buildFallbackCommitMessage(changedFiles: string[]): string {
   return `Agent: update ${changedFiles.length} files`
 }
 
-// Deterministic context editing (see collapseOldToolResults, called from chatCall):
-// the most recent N tool results are kept verbatim in this.history; older ones
-// longer than M chars are collapsed to a short restorable stub, IN PLACE — same
-// mutation pattern as eviction (compactHistory), so this.history always matches
-// exactly what the model sees. This keeps the LIVE window small over long runs —
-// which is what keeps small local models emitting native tool calls — and makes
-// the (much rarer) deterministic eviction pass fire less often. Not exported:
-// nothing outside this file (including tests) references either constant.
-const KEEP_RECENT_TOOL_RESULTS = 4
-const TOOL_RESULT_COLLAPSE_OVER = 600
+// Deterministic context editing (see chatCall): the most recent N tool results are
+// kept verbatim in the context sent to the model; older ones longer than M chars are
+// collapsed to a short restorable stub. This keeps the LIVE window small over long
+// runs — which is what keeps small local models emitting native tool calls — and
+// makes the (much rarer) deterministic eviction pass fire less often. Non-destructive:
+// this.history keeps the full results for the JSONL log; only what is SENT to the
+// model shrinks.
+export const KEEP_RECENT_TOOL_RESULTS = 4
+export const TOOL_RESULT_COLLAPSE_OVER = 600
 
 // Short human-readable summary of a call's key arguments — included in the loop
 // detection warning so the reader can verify WHICH call was repeated, not just that
@@ -720,56 +719,6 @@ export class Agent {
     return { newRunStart: currentRunStart, compacted: true }
   }
 
-  // Collapse older tool results in this.history IN PLACE. Keeps the most recent
-  // KEEP_RECENT_TOOL_RESULTS tool messages verbatim; anything older AND longer
-  // than TOOL_RESULT_COLLAPSE_OVER gets replaced with a short stub + first 200
-  // chars. Same in-place mutation pattern as eviction (compactHistory) — both
-  // permanently modify this.history so it always matches what the model sees.
-  // Also writes collapse markers to the ledger (same as eviction markers) so
-  // the Dispatcher's persistent-frame reload stays compact.
-  private collapseOldToolResults(): void {
-    const toolPos: number[] = []
-    this.history.forEach((m, i) => { if (m.role === 'tool') toolPos.push(i) })
-    const collapseSet = new Set(toolPos.slice(0, Math.max(0, toolPos.length - KEEP_RECENT_TOOL_RESULTS)))
-
-    for (const i of collapseSet) {
-      const m = this.history[i]
-      const c = m.content
-      if (typeof c !== 'string' || c.length <= TOOL_RESULT_COLLAPSE_OVER) continue
-      // Already shortened by a previous collapse pass or by eviction — skip so we
-      // never produce a stub-of-a-stub (eviction.ts's evict() makes the matching
-      // check for '[collapsed' on its own pass).
-      if (c.startsWith('[collapsed') || c.startsWith('[evicted')) continue
-
-      // this.historyMsgIds is parallel to this.history (same index i); when this
-      // message has a real ledger id, point the model at ledger `expand` instead
-      // of the old "re-read the file or re-run the command" advice, which cannot
-      // help for a command whose real-world effect (a mutation, a network fetch)
-      // isn't safely repeatable.
-      const msgId = this.msgIdAt(i)
-      // "msg_id" here MUST match the `ledger` tool's actual expand
-      // parameter name (tools/index.ts's `args.msg_id`) — see eviction.ts's
-      // own stub for the identical rationale.
-      const recovery = msgId ? `; msg_id "${msgId}" to recover` : ''
-      const stub = `[collapsed — ${c.length} chars${recovery}]\n${c.slice(0, 200).replace(/\s+/g, ' ')}…`
-      m.content = stub
-
-      // Write collapse marker to ledger (same as eviction markers) so a later
-      // reload (ledger.ts's readFrame, last-write-wins per id) sees the compact
-      // stub instead of re-expanding the full original content.
-      if (msgId) {
-        recordMessage(config.workspacePath || '/workspace', this.frameId, {
-          id: msgId,
-          role: 'tool',
-          content: stub,
-          evicted: true,  // reuse the same flag — collapsed and evicted are both "shortened"
-        }).catch(err => {
-          console.error('[ledger] recordMessage (collapse marker) failed (continuing):', err)
-        })
-      }
-    }
-  }
-
   // Issues one main per-iteration chat call (system prompt + full history) with
   // the standard timeout. Extracted only so chatWithRetry can re-issue the
   // *identical* request on retry without duplicating the argument literal.
@@ -780,20 +729,50 @@ export class Agent {
     // tool outputs verbatim; older large ones are collapsed to a short, restorable
     // stub so the LIVE window it sees stays small over long runs — which is what
     // keeps small local models emitting native tool calls (measured: native-call
-    // reliability falls as context grows). Collapse now modifies this.history IN
-    // PLACE, same pattern as eviction (compactHistory) — there's no longer a
-    // "full version in memory, shortened version sent to model" split; the JSONL
-    // log and ledger still saw the full content when it was first recorded (this
-    // only shortens the LIVE window from here on), and this is what keeps the
-    // window small over many turns, which makes the (rarer) deterministic
-    // eviction pass fire less.
-    this.collapseOldToolResults()
+    // reliability falls as context grows). NON-destructive: this.history keeps the
+    // full results (the JSONL log still sees everything); only what is SENT to the
+    // model shrinks. This is the cheapest way to hold the window small over many
+    // turns, and it makes the (rarer) deterministic eviction pass fire less.
+    const toolPos: number[] = []
+    this.history.forEach((m, i) => { if (m.role === 'tool') toolPos.push(i) })
+    const collapse = new Set(toolPos.slice(0, Math.max(0, toolPos.length - KEEP_RECENT_TOOL_RESULTS)))
     // The frame's opening [system]/[user]/[system] messages (ROLE_IDENTITY,
     // userMessage, ROLE_INSTRUCTIONS — see chat()) are already IN this.history by
     // the time chatCall runs, pushed there directly instead of being assembled
-    // into a separate leading system-role message here — so messages is just
-    // this.history's own entries, in order, with nothing else prepended.
-    const messages: Message[] = [...this.history]
+    // into a separate leading system-role message here — so messages starts
+    // empty and the walk below carries them through like any other history entry.
+    const messages: Message[] = []
+    // NEW, ADDITIVE Markdown trace (al-logger.ts): collect the collapsed-message detail
+    // (original vs. sent length) as this.history is walked below, in the SAME pass
+    // that decides collapsing — rather than recomputing it separately — so this can
+    // never drift out of sync with what was actually sent this turn.
+    const alCollapsed: Array<{ index: number; originalChars: number; sentChars: number; role: string }> = []
+    this.history.forEach((m, i) => {
+      // Every assistant message pushed to this.history now carries real content —
+      // either the model's own reasoning/response, or a dedicated "<Tool> called:"
+      // description pushed just before its tool result (see formatToolCallContent
+      // and the tool-call loop below) — so the old defensive filter that dropped
+      // an empty assistant message with no tool_calls from the outbound `messages`
+      // array is no longer needed; nothing pushed here is ever empty.
+      const c = m.content
+      if (collapse.has(i) && typeof c === 'string' && c.length > TOOL_RESULT_COLLAPSE_OVER) {
+        // this.historyMsgIds is parallel to this.history (same index i); when this
+        // message has a real ledger id, point the model at ledger `expand` instead
+        // of the old "re-read the file or re-run the command" advice, which cannot
+        // help for a command whose real-world effect (a mutation, a network fetch)
+        // isn't safely repeatable.
+        const msgId = this.msgIdAt(i)
+        // "msg_id" here MUST match the `ledger` tool's actual expand
+        // parameter name (tools/index.ts's `args.msg_id`) — see eviction.ts's
+        // own stub for the identical rationale.
+        const recovery = msgId ? `; msg_id "${msgId}" to recover` : ''
+        const stub = `[collapsed — ${c.length} chars${recovery}]\n${c.slice(0, 200).replace(/\s+/g, ' ')}…`
+        messages.push({ role: 'tool', content: stub })
+        alCollapsed.push({ index: i, originalChars: c.length, sentChars: stub.length, role: m.role })
+      } else {
+        messages.push(m)
+      }
+    })
     // NEW, ADDITIVE Markdown trace: open this turn's `## Turn` section BEFORE the
     // Ollama call — "new" messages are exactly this.history's tail since the
     // previous call (alLastMessageCount), turn 1 of a run being the whole starting
@@ -803,7 +782,7 @@ export class Agent {
     {
       const newSlice = this.history.slice(this.alLastMessageCount)
       const newAlMessages = newSlice.map(m => ({ role: String(m.role), content: typeof m.content === 'string' ? m.content : String(m.content ?? '') }))
-      this.traceLogger?.beginTurn(messages.length, newAlMessages)
+      this.traceLogger?.beginTurn(messages.length, newAlMessages, alCollapsed.length > 0 ? alCollapsed : undefined)
       this.alLastMessageCount = this.history.length
     }
     // Recitation (Manus todo.md pattern): keep the objective at the very tail of
@@ -1021,11 +1000,7 @@ export class Agent {
       // identity, BEFORE the user request, so project-specific instructions are
       // available when classifying. Always shown, even when the files don't exist
       // (the agent should know they're absent rather than wonder).
-      // INJECTED CONTEXT — project awareness injected BEFORE the user request
-      // so the agent already knows the workspace state when it reads the task.
       const ws = config.workspacePath || '/workspace'
-
-      // Dispatcher gets AGENTS.md and MEMORY.md (project-specific instructions).
       if (this.roleTag === 'dispatcher') {
         for (const file of ['AGENTS.md', 'MEMORY.md']) {
           let content: string
@@ -1043,18 +1018,6 @@ export class Agent {
           this.pushCtx({ role: 'tool', content })
         }
       }
-
-      // All agents get a project file listing.
-      try {
-        const lsResult = await bash('ls -la /workspace/', ws)
-        const lsContent = (lsResult.output && lsResult.output !== NO_OUTPUT) ? lsResult.output : '(empty workspace)'
-        this.pushCtx({
-          role: 'assistant',
-          content: formatToolCallContent('bash', { command: 'ls -la /workspace/' }),
-          tool_calls: [{ function: { name: 'bash', arguments: { command: 'ls -la /workspace/' } } }],
-        } as Message)
-        this.pushCtx({ role: 'tool', content: lsContent })
-      } catch { /* injected context is best-effort */ }
     }
     this.pushCtx({ role: 'user', content: userMessage })
     // Captured IMMEDIATELY after the [user] push, before the [system] instructions
@@ -1063,6 +1026,18 @@ export class Agent {
     if (!resume) {
       const instructions = ROLE_INSTRUCTIONS[this.roleTag] ?? ''
       if (instructions) this.pushCtx({ role: 'system', content: instructions })
+
+      // All agents get a project file listing after the instructions.
+      try {
+        const lsResult = await bash('ls -la /workspace/', config.workspacePath || '/workspace')
+        const lsContent = (lsResult.output && lsResult.output !== NO_OUTPUT) ? lsResult.output : '(empty workspace)'
+        this.pushCtx({
+          role: 'assistant',
+          content: formatToolCallContent('bash', { command: 'ls -la /workspace/' }),
+          tool_calls: [{ function: { name: 'bash', arguments: { command: 'ls -la /workspace/' } } }],
+        } as Message)
+        this.pushCtx({ role: 'tool', content: lsContent })
+      } catch { /* injected context is best-effort — never abort a run for it */ }
     }
     this.phase = 'running'
     // The index of the message that started this run — compactHistory() always

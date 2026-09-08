@@ -239,15 +239,15 @@ test('opening messages: role-tagged frame sends [system identity, user assignmen
   try {
     const answer = await agent.chat('fix the off-by-one bug')
     assert.equal(answer, 'Final answer.')
-    // Opening messages include: [system] identity, injected context (ls -la),
-    // [user] assignment, [system] instructions. Find by content, not position.
+    // The first 3 messages are always: [system] identity, [user] assignment,
+    // [system] instructions. Additional injected context (find .) may follow.
     assert.ok(captured.length >= 3)
     assert.equal(captured[0].role, 'system')
     assert.ok(captured[0].content.includes('IMPLEMENTER'))
-    const userMsg = captured.find(m => m.role === 'user' && m.content === 'fix the off-by-one bug')
-    assert.ok(userMsg, 'user assignment message must be present')
-    const instrMsg = captured.find(m => m.role === 'system' && m.content.includes('VERIFICATION'))
-    assert.ok(instrMsg, 'system instructions message must be present')
+    assert.equal(captured[1].role, 'user')
+    assert.equal(captured[1].content, 'fix the off-by-one bug')
+    assert.equal(captured[2].role, 'system')
+    assert.ok(captured[2].content.includes('VERIFICATION'))
   } finally {
     await cleanupDispatchSession(sessionId)
   }
@@ -271,13 +271,14 @@ test('opening messages: an Agent with no explicit setRole() call defaults to the
   agent.setSessionId(sessionId)
   try {
     await agent.chat('argo default-role case')
-    // Opening messages include: [system] identity, injected context, [user]
-    // assignment, [system] instructions. Find by content, not position.
+    // The first 3 messages are always: [system] identity, [user] assignment,
+    // [system] instructions. Additional injected context may follow.
     assert.ok(captured.length >= 3)
     assert.equal(captured[0].role, 'system')
     assert.ok(captured[0].content.includes('IMPLEMENTER'))
-    const userMsg = captured.find(m => m.role === 'user' && m.content === 'argo default-role case')
-    assert.ok(userMsg, 'user assignment message must be present')
+    assert.equal(captured[1].role, 'user')
+    assert.equal(captured[1].content, 'argo default-role case')
+    assert.equal(captured[2].role, 'system')
   } finally {
     await cleanupDispatchSession(sessionId)
   }

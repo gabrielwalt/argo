@@ -353,10 +353,10 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
     'The .argo/ folder is harness bookkeeping — ignore its contents. Use the `ledger` tool to retrieve past ' +
     'messages that may have been evicted or collapsed from your context.',
   implementer:
-    'The workspace file listing is already in your context. Prefer the simplest coherent change that fully ' +
-    'satisfies the assignment and preserves unrelated behavior. Avoid unnecessary abstractions, dependencies ' +
-    'or indirection. When finished, call `conclude` with status SUCCESS and a description of what you ' +
-    'implemented and verified, or status FAIL with what you tried and why it failed.\n\n' +
+    'Before editing, inspect the relevant existing implementation and tests. Prefer the simplest coherent ' +
+    'change that fully satisfies the assignment and preserves unrelated behavior. Avoid unnecessary ' +
+    'abstractions, dependencies or indirection. When finished, call `conclude` with status SUCCESS and a ' +
+    'description of what you implemented and verified, or status FAIL with what you tried and why it failed.\n\n' +
     'VERIFICATION\n' +
     'Before concluding, verify the result against the assignment and any supplied original-request ' +
     'constraints. Do not claim success without concrete evidence that the changed behavior works; run relevant ' +
