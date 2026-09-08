@@ -27,11 +27,8 @@
 //    the Planner's next detail call, which always sees the prior Implementer's own
 //    conclusion (including any failure) and can act on it however it judges best.
 
-import { promises as fs } from 'fs'
-import path from 'path'
 import { Agent } from './agent.js'
 import { config } from './config.js'
-import { SessionLogger } from './logger.js'
 import type { AgentEvent, FrameSpawnRequest, FrameResult, FrameStatus, ModelOptions, Role, ToolName } from './types.js'
 import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, buildAssignment, capSummary, parseTaskStartVerdict, TASK_START_TOOLS, type TaskStartVerdict } from './frames.js'
 import * as ledger from './ledger.js'
@@ -71,17 +68,27 @@ const MAX_IMPLEMENTER_CAP_RETRIES = 2
 // makes "no two LLM calls ever run concurrently" hold in the first place.
 let currentModel: string | undefined
 let currentOptions: ModelOptions | undefined
-// VERBATIM REQUEST THREADING (frames.ts, see renderVerbatimRequestBlock). The CURRENT
-// dispatch run's raw user message, captured once at the top of runDispatchLoop from
-// the exact same `userMessage` runDispatcherTaskStart paraphrases into an OBJECTIVE
-// line — never recomputed per frame, so every frame of one run quotes byte-identical
-// text (load-bearing for the prefix-cache argument: see buildAssignment's placement
-// comment in frames.ts).
-let currentVerbatimRequest: string | undefined
+
+// PER-FRAME LEDGER REGISTRY COORDINATES (ledger.ts's registerFrame/sessions.json).
+// currentSessionId identifies the whole session this run belongs to (server.ts's
+// own session concept — falls back to a freshly minted id when the caller doesn't
+// have one yet, e.g. a standalone/test invocation with no session tracking at
+// all). currentRunIndex is which run WITHIN that session this is — 0 for a
+// session's first runDispatchLoop call, incremented once per call for the SAME
+// session id, so a multi-turn session's frames land in successive `runs` entries
+// rather than all piling into run 0. Both captured once at the top of
+// runDispatchLoop, same module-level-state rationale as currentModel/
+// currentOptions above.
+let currentSessionId = ''
+let currentRunIndex = 0
+// Tracks the last sessionId a run index was allocated for, so a NEW session starts
+// back at run 0 instead of continuing whatever count a previous, different session
+// left off at.
+let lastRunIndexSessionId: string | null = null
 
 // THE ORIGINAL USER QUERY (dispatch.ts's own runDispatchLoop's `userMessage` param),
 // captured once at the top of runDispatchLoop and read by every spawnFrame call
-// below — same module-level-state rationale as currentModel/currentVerbatimRequest
+// below — same module-level-state rationale as currentModel/currentOptions
 // above (safe only because server.ts's `isBusy` guard prevents two concurrent
 // runDispatchLoop calls). This is NOT the same text as a frame's own `assignment`
 // (buildAssignment's output, e.g. a Dispatcher task-start checkpoint or an
@@ -92,122 +99,47 @@ let currentVerbatimRequest: string | undefined
 // construction in spawnFrame below.
 let currentUserQuery: string = ''
 
-// PERSISTENT DISPATCHER MEMORY ACROSS MULTI-TURN CALLS. Every runDispatchLoop call
-// spawns a completely FRESH Dispatcher frame (spawnFrame, below) — the Dispatcher has
-// no conversation history of its own across turns, so a follow-up prompt like "now
-// add tests for that" is classified with zero awareness of what "that" refers to.
-// This is the harness-owned fix: a small, bounded record of recent turns, kept BOTH
-// in this module's own memory (so a same-process second /chat sees it immediately)
-// AND persisted to /workspace/.argo/turn-history.json (so it survives a container
-// restart) — the same durability pattern ledger.ts already uses for its own
-// state.json (append/rewrite a small JSON file under .argo/, not a database).
+// PERSISTENT DISPATCHER FRAME — THE THREE-TIER CONTEXT MODEL'S TOP TIER. The
+// Dispatcher keeps FULL context across the entire user conversation (every prompt
+// in a session), unlike the Planner (fresh between user prompts, resumed within one)
+// or the Implementer (fresh per planned task) — see docs/architecture.md's "Context
+// Memory" section for the full three-tier model.
 //
-// Deliberately NOT the Dispatcher's own raw conversation (that would mean keeping a
-// whole Agent/history resident across runs, defeating "fresh Agent each turn" and
-// quietly reintroducing unbounded per-turn memory growth) — just a short digest per
-// turn, injected as plain text ahead of the buildTaskStartAssignment prompt (see
-// runDispatcherTaskStart below and buildTurnHistoryBlock's own comment).
-export interface TurnDigest {
-  userMessage: string
-  mode: string
-  objective: string
-  outcome: string
-  timestamp: number
-}
-
-// Bounded — "last 10 turns", not a growing log. Exported (pure) so the trim
-// behavior itself is directly testable without touching fs or this module's own
-// mutable turnHistory binding.
-export const TURN_HISTORY_MAX = 10
-
-export function boundTurnHistory(history: TurnDigest[], max: number = TURN_HISTORY_MAX): TurnDigest[] {
-  return history.length > max ? history.slice(history.length - max) : history
-}
-
-// The module-level store itself — same pattern as liveFrames/currentModel above:
-// safe as plain module state only because server.ts's `isBusy` guard already
-// prevents a second /chat from starting a new runDispatchLoop while one is in
-// flight. Loaded fresh at the top of every runDispatchLoop (loadTurnHistory) so a
-// restarted worker process picks the disk copy back up rather than starting empty.
-let turnHistory: TurnDigest[] = []
-
-function turnHistoryFile(rootDir: string): string {
-  return path.join(rootDir, '.argo', 'turn-history.json')
-}
-
-async function loadTurnHistory(): Promise<void> {
-  try {
-    const raw = await fs.readFile(turnHistoryFile(root()), 'utf-8')
-    const parsed = JSON.parse(raw)
-    turnHistory = Array.isArray(parsed) ? boundTurnHistory(parsed as TurnDigest[]) : []
-  } catch {
-    // No file yet (first turn ever in this workspace) or unreadable/corrupt — fails
-    // open to an empty history, exactly like ledger.ts's own readState()/readAll().
-    turnHistory = []
-  }
-}
-
-async function persistTurnHistory(): Promise<void> {
-  try {
-    const dir = path.join(root(), '.argo')
-    await fs.mkdir(dir, { recursive: true })
-    const file = turnHistoryFile(root())
-    const tmp = `${file}.tmp`
-    await fs.writeFile(tmp, JSON.stringify(turnHistory, null, 2))
-    await fs.rename(tmp, file) // atomic swap, same convention as ledger.ts's writeState()
-  } catch (err) {
-    // Harness bookkeeping, never something that should be able to abort a run —
-    // same fail-open stance as ledger.ts's ensureGitignored().
-    console.error('[dispatch] persistTurnHistory failed (continuing):', err)
-  }
-}
-
-function recordTurnDigest(digest: TurnDigest): void {
-  turnHistory = boundTurnHistory([...turnHistory, digest])
-}
-
-// Set by runDispatchLoopBody right after the Dispatcher classifies
-// (runDispatcherTaskStart), read by runDispatchLoop's own wrapper once the body
-// settles (success, abort, or error) to build this turn's digest —
-// runDispatchLoopBody only returns the final answer STRING, so this is how the
-// wrapper learns which mode/objective produced it without threading an extra return
-// value through every call site. Reset to null at the top of every runDispatchLoop,
-// same lifecycle as currentVerbatimRequest.
-let lastTaskStartVerdict: { mode: string; text: string } | null = null
-
-// The exact text prepended to the Dispatcher's task-start assignment, BEFORE the
-// buildTaskStartAssignment output. Empty on the very first turn of a session (no
-// history yet), so the prompt a fresh workspace sees is byte-identical to before this
-// feature existed. Pure and exported so the exact injected text is directly testable
-// without spawning a real frame.
-export function buildTurnHistoryBlock(history: TurnDigest[]): string {
-  if (history.length === 0) return ''
-  const lines = history.map((d, i) => {
-    const userExcerpt = d.userMessage.length > 80 ? `${d.userMessage.slice(0, 80)}…` : d.userMessage
-    const outcomeExcerpt = d.outcome.length > 100 ? `${d.outcome.slice(0, 100)}…` : d.outcome
-    return `${i + 1}. User: "${userExcerpt}" \u2192 ${d.mode.toUpperCase()} \u2192 ${outcomeExcerpt}`
-  }).join('\n')
-  return (
-    'Previous turns in this session (most recent last):\n' +
-    `${lines}\n\n` +
-    'The user\u2019s new request follows. If it builds on or references previous work, incorporate that ' +
-    'context into your objective so the Planner and Implementer understand the broader situation without ' +
-    'needing to rediscover it.\n\n'
-  )
-}
+// Mechanically: ONE frameId per session, minted the first time this session's
+// Dispatcher runs and reused for every subsequent run of the SAME session (see
+// runDispatchLoop below, where currentSessionId is captured). Every run —
+// including the first — passes this frameId to spawnFrame as
+// FrameSpawnRequest.persistentFrameId (types.ts), which preloads a brand-new Agent
+// instance's history from that frameId's ledger file (Agent.loadHistory) before
+// calling chat() — see spawnFrame below for the mechanism. On the session's FIRST
+// run there is no ledger file yet, so the preload reads back an empty array and
+// loadHistory([]) is a harmless no-op — functionally identical to the old
+// fresh-Agent-with-no-history behavior, just routed through the same one
+// mechanism rather than a special case. Every run's own per-run state (loopState,
+// iteration counters, editedPaths, ...) always starts fresh regardless — see
+// agent.ts's chat() non-resume reset — only the CONTEXT carries forward. Every
+// message either run pushes still lands in the SAME ledger file (agent.ts's
+// pushCtx keys purely off frameId), so the ledger simply keeps growing across the
+// whole session — there is no separate digest/summary to keep in sync with it any
+// more.
+let dispatcherFrameId: string | null = null
+// The session this dispatcherFrameId belongs to — a NEW session (a different
+// sessionId, e.g. after /reset) must mint a fresh dispatcherFrameId rather than
+// resuming a previous session's accumulated history.
+let dispatcherFrameSessionId: string | null = null
 
 // Matches Agent's own constructor param exactly (agent.ts), so a tagged emit can be
 // handed straight to `new Agent(...)` — the optional `seq` is what the SSE/JSONL replay
 // dedup logic (server.ts, app.js) keys on.
 type Emit = (e: AgentEvent, seq?: number) => void
 
-// STOP BUTTON (server.ts's POST /stop). The baseline Agent's own .abort() only affects
-// the ONE shared instance server.ts constructs at module scope — every frame here is a
-// SEPARATE Agent instance, so that call alone does nothing for a dispatch run. Track
-// whichever frame is currently mid-chat() and abort THAT one too; the dispatch loop
-// itself also checks stopRequested between frames (a frame stopping mid-chat only ends
-// that one frame's turn, not the whole run) and unwinds via DispatchAborted, mirroring
-// the baseline loop's own "Stopped." return convention exactly.
+// STOP BUTTON (server.ts's POST /stop). The shared module-level Agent's own .abort()
+// only affects the ONE shared instance server.ts constructs at module scope — every
+// frame here is a SEPARATE Agent instance, so that call alone does nothing for a
+// dispatch run. Track whichever frame is currently mid-chat() and abort THAT one too;
+// the dispatch loop itself also checks stopRequested between frames (a frame stopping
+// mid-chat only ends that one frame's turn, not the whole run) and unwinds via
+// DispatchAborted, mirroring Agent.chat()'s own "Stopped." return convention exactly.
 let stopRequested = false
 let activeFrameAgent: Agent | null = null
 
@@ -222,11 +154,12 @@ function checkAborted(): void {
   if (stopRequested) throw new DispatchAborted()
 }
 
-// LIVE FRAME REGISTRY (context viewer backend). GET /context always read the baseline
-// single-loop Agent, which /chat bypasses entirely — so the real per-frame contexts
-// this Map records were never reachable from the API otherwise. A module-level Map,
-// same pattern as stopRequested/activeFrameAgent above — deliberately not a class,
-// this module already holds its run state as plain module-level bindings.
+// LIVE FRAME REGISTRY (context viewer backend). GET /context used to only read the
+// shared module-level Agent, which /chat bypasses entirely — so the real per-frame
+// contexts this Map records were never reachable from the API otherwise. A
+// module-level Map, same pattern as stopRequested/activeFrameAgent above —
+// deliberately not a class, this module already holds its run state as plain
+// module-level bindings.
 //
 // Retention: cleared at the START of runDispatchLoop, not the end, so the LAST run's
 // frames stay fully inspectable (server.ts's GET /frames, GET /context?frame=) right
@@ -273,31 +206,16 @@ export function getActiveFrameId(): string | null {
 // them). FrameResult (types.ts) is off-limits to edit for this task, so the FULL,
 // uncapped `finalAnswer` text is carried as a dispatch-local extension of it rather
 // than a new field on that shared type. `summary` stays exactly what it always was —
-// capSummary's 2000-char-capped text, kept for ledger storage/display where a cap is
-// appropriate. `rawSummary` is the untruncated finalAnswer that every control-flow
-// decision below (isPlannerDone/isPlannerGiveUp, the next Implementer assignment,
+// capSummary's 2000-char-capped text, kept for display where a cap is appropriate.
+// `rawSummary` is the untruncated finalAnswer that every control-flow decision below
+// (isPlannerDone/isPlannerGiveUp, the next Implementer assignment,
 // parseImplementerResult, and every prompt built from any of their text) must read
 // instead — a phrase a model puts at the END of a long message, or a fix assignment
 // that runs past 2000 characters, must never be silently cut off before the harness
 // gets to look at it. Still structurally a FrameResult (extends, doesn't replace), so
-// it flows through every existing FrameResult-typed call unchanged; the ONE place that
-// would leak the extra field somewhere it shouldn't (ledger.jsonl, which has no
-// rawSummary column) strips it back out before writing — see toLedgerResult, used by
-// both spawnFrame and resumeFrame below.
+// it flows through every existing FrameResult-typed call unchanged.
 export interface FrameResultRaw extends FrameResult {
   rawSummary: string
-}
-
-function toLedgerResult(result: FrameResultRaw): FrameResult {
-  return {
-    frameId: result.frameId,
-    status: result.status,
-    summary: result.summary,
-    filesTouched: result.filesTouched,
-    filesWritten: result.filesWritten,
-    ...(result.confidence !== undefined ? { confidence: result.confidence } : {}),
-    ...(result.issues ? { issues: result.issues } : {}),
-  }
 }
 
 // Exported so ctrlplane.test.ts can build a fixture (a fake Agent + a FrameResult) without
@@ -336,15 +254,11 @@ function tagEmit(emit: Emit, frameId: string, role: Role, parentFrameId: string 
 // able to request for itself.
 async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: ToolName[]): Promise<SpawnedFrame> {
   checkAborted()
-  const frameId = ledger.newId(req.role)
-  await ledger.recordDelegation(root(), {
-    frameId,
-    parentFrameId: req.parentFrameId,
-    from: 'harness',
-    to: req.role,
-    prompt: req.assignment,
-    contextGiven: req.dependsOn,
-  })
+  // PERSISTENT FRAME (req.persistentFrameId, see types.ts): reuse the given frameId
+  // instead of minting a new one, and treat it as already registered in
+  // sessions.json from a previous run — see the isPersistent branch below.
+  const isPersistent = !!req.persistentFrameId
+  const frameId = req.persistentFrameId ?? ledger.newId(req.role)
 
   const agent = new Agent(tagEmit(emit, frameId, req.role, req.parentFrameId), currentModel)
   agent.setUserQuery(currentUserQuery) // TraceLogger header title — see currentUserQuery's own comment above
@@ -358,7 +272,62 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
   agent.setMaxIterations(req.maxIterations ?? ROLE_MAX_ITERATIONS[req.role])
   agent.setSessionId(frameId) // isolates history/eviction-state files per frame
 
-  const assignment = await buildAssignment(root(), req, currentVerbatimRequest)
+  // PERSISTENT FRAME PRELOAD: this is a BRAND-NEW Agent instance (so every per-run
+  // counter/flag starts fresh, same as any other frame — see agent.ts's chat()
+  // non-resume reset), but its CONTEXT should carry forward. Reading the existing
+  // ledger file and loading it as plain {role, content} pairs (Agent.loadHistory)
+  // gives the fresh Agent the prior conversation as READ-ONLY history without
+  // reviving any of the old Agent instance's run-scoped state (loopState,
+  // iteration counters, editedPaths, ...) — those all still start at their normal
+  // zero/empty defaults for this run. A first-ever run for this frameId (no ledger
+  // file yet) reads back an empty array, so loadHistory([]) is a harmless no-op —
+  // byte-identical to the pre-existing fresh-Agent behavior.
+  //
+  // ledger.readFrame() ALREADY returns the eviction-aware, deduplicated view (last
+  // entry per id wins — see that function's own comment): if a message was ever
+  // evicted, this is the compact stub, not the full original that would otherwise
+  // silently re-expand the context right back to the size eviction just fought to
+  // bring down. That guarantee is exactly what a persistent-frame reload needs, but
+  // it is not the whole story here — this preload ALSO filters to user messages and
+  // tool_call-free assistant messages only, the SAME filter agent.ts's own
+  // getChatHistory() applies (server.ts's /resume/:sessionId route now just
+  // switches the ledger's currentSessionId pointer — this preload, run the next
+  // time the Dispatcher frame for that session spawns, is what actually restores
+  // its context). Two independent reasons, not just precedent: (1) a raw ledger file also holds
+  // system messages (this frame's own opening identity/instructions, which the
+  // fresh chat() call below re-pushes itself — replaying them here would duplicate
+  // them) and tool/tool-result entries; (2) Ollama's chat API expects a strict
+  // assistant/tool alternation, and an assistant message's `tool_calls` array is
+  // never persisted to the ledger (ledger.ts's LedgerMessage has no such field) —
+  // replaying a `tool_calls`-bearing assistant turn without its calls, followed by
+  // orphaned tool-result entries with no matching call, would desync that
+  // alternation. A plain text summary of "what was asked, what was answered" is
+  // exactly what the Dispatcher needs across turns; it does not need its own past
+  // tool-call mechanics replayed back into a fresh run. (Eviction markers are only
+  // ever written for role:'tool' entries — agent.ts's compactHistory — so this
+  // filter's own tool-role exclusion already keeps a persistent Dispatcher reload
+  // compact today; the eviction-aware dedup in readFrame() is what protects every
+  // OTHER consumer of the ledger — the `ledger` tool's own `messages` action, disk-
+  // frame reconstruction — that doesn't apply this same narrower filter.)
+  if (isPersistent) {
+    const previous = await ledger.readFrame(root(), frameId)
+    const chatOnly = previous.filter(m => m.role === 'user' || m.role === 'assistant')
+      .filter(m => !!m.content)
+    agent.loadHistory(chatOnly.map(m => ({ role: m.role, content: m.content })))
+  }
+
+  // PER-FRAME LEDGER REGISTRY: record this frame's identity (role/parentage) in
+  // sessions.json BEFORE it runs — same "visible while executing" rationale as
+  // liveFrames.set below. currentSessionId/currentRunIndex are this run's own
+  // registry coordinates, captured once at the top of runDispatchLoop. Skipped for
+  // a persistent frame's SUBSEQUENT runs — it was already registered on the run
+  // that first minted this frameId; re-registering here would just append a
+  // duplicate entry to this run's frame list under the same frameId.
+  if (!isPersistent) {
+    await ledger.registerFrame(root(), currentSessionId, currentRunIndex, { frameId, role: req.role, parentFrameId: req.parentFrameId })
+  }
+
+  const assignment = await buildAssignment(root(), req)
   const startedAt = Date.now()
   // Registered BEFORE chat() runs (not after) — GET /frames/GET /context?frame= must
   // be able to see a frame while it is still executing, not just once it concludes.
@@ -370,19 +339,57 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
   activeFrameId = null
   checkAborted()
   const result = deriveFrameResult(frameId, finalAnswer, agent)
-  await ledger.recordConclusion(root(), toLedgerResult(result)) // never persist the uncapped rawSummary
+  // PERSISTENT FRAME: append a CLEAN assistant entry with the frame's actual final
+  // answer to its own ledger file — see recordCleanAnswer's own comment for why
+  // this is necessary (agent.ts's pushCtx never records one on its own). Only when
+  // the frame actually concluded ('ok') — a cap-hit/error/abort's "final answer" is
+  // agent.ts's own harness-generated notice text (e.g. "Reached maximum iterations
+  // (20) without a final answer."), not a real reply, and must never be replayed
+  // back into a later run as if the Dispatcher had said it.
+  if (isPersistent && agent.getLastRunOutcome() === 'ok') await recordCleanAnswer(frameId, finalAnswer)
   return { agent, result }
 }
 
+// THE MISSING HALF OF THE LEDGER. agent.ts's pushCtx faithfully records every
+// message THIS Agent instance pushes onto its own in-memory history — but the
+// `conclude` tool handler (agent.ts's chat()) never pushes the answer text itself
+// as an assistant message; it only pushes the tool_call/tool_result pair for the
+// `conclude` call (whose ledger `content` is the call's flattened label/"Concluded.",
+// never the answer) and separately EMITS (not pushCtx's, so never ledger-recorded)
+// a `type: 'message', role: 'assistant'` event carrying the real answer text — that
+// event previously only reached the top-level SessionLogger JSONL (now removed
+// entirely — logger.ts's surviving readLog/readLogEvents/listLogs only ever
+// replay OLD pre-removal session logs, and never read a per-frame ledger file
+// either way). For a normal,
+// one-shot frame this is harmless: nothing ever reads that frame's ledger back into
+// a later Agent. For a PERSISTENT frame it is not: spawnFrame's own preload (above)
+// reads this exact ledger file back into the NEXT run's fresh Agent, so without this,
+// every past turn's user question would reload with no matching answer at all.
+//
+// This is the harness-level fix: once a persistent frame's chat() call returns,
+// append one ordinary assistant LedgerMessage recording its own final answer —
+// exactly the shape spawnFrame's preload filter already expects (role 'assistant',
+// non-empty content, no tool_calls to desync). Fire-and-forget is deliberately NOT
+// used here (unlike agent.ts's own pushCtx) — a persistent frame's very next run
+// depends on this write having landed, so it must be awaited.
+async function recordCleanAnswer(frameId: string, answer: string): Promise<void> {
+  if (!answer) return // e.g. "Stopped." on an aborted run — nothing worth replaying back
+  try {
+    await ledger.recordMessage(root(), frameId, { id: ledger.newId('msg'), role: 'assistant', content: answer })
+  } catch (err) {
+    // Harness bookkeeping, never something that should be able to abort a run —
+    // same fail-open stance as every other ledger call site in this codebase.
+    console.error('[dispatch] recordCleanAnswer failed (continuing):', err)
+  }
+}
+
 // Resumes an EXISTING frame (same Agent instance, same history) with a follow-up
-// message — used for the Planner's per-task detail calls. Writes a NEW conclusion
-// entry for the same frameId (the ledger is append-only; the latest conclusion for a
-// frameId is authoritative — same convention as episode eviction records).
+// message — used for the Planner's per-task detail calls.
 // The { resume: true } flag is load-bearing. Without it chat() clears the frame's
-// editedPaths, episodes, and iteration counter (agent.ts's per-run reset), so "same
-// Agent instance, same history" would be true of the transcript and false of every
-// piece of run state derived from it — a resumed frame would restart at ITER 1 with
-// no memory of what it had edited.
+// editedPaths and iteration counter (agent.ts's per-run reset), so "same Agent
+// instance, same history" would be true of the transcript and false of every piece
+// of run state derived from it — a resumed frame would restart at ITER 1 with no
+// memory of what it had edited.
 async function resumeFrame(frameId: string, agent: Agent, followUp: string): Promise<FrameResultRaw> {
   checkAborted()
   activeFrameAgent = agent
@@ -392,7 +399,14 @@ async function resumeFrame(frameId: string, agent: Agent, followUp: string): Pro
   activeFrameId = null
   checkAborted()
   const result = deriveFrameResult(frameId, finalAnswer, agent)
-  await ledger.recordConclusion(root(), toLedgerResult(result)) // never persist the uncapped rawSummary
+  // PERSISTENT FRAME: same gap, same fix, same 'ok'-only guard as spawnFrame's own
+  // end-of-chat call — see recordCleanAnswer's comment. The only resumeFrame call
+  // site that can ever land on the persistent Dispatcher frame is
+  // runDispatcherTaskStart's own marker-retry resume (this frameId then equals
+  // dispatcherFrameId); every other resumeFrame call site (the Planner's per-task
+  // detail resumes) never runs on a persistent frame, so this check is a no-op for
+  // them.
+  if (frameId === dispatcherFrameId && agent.getLastRunOutcome() === 'ok') await recordCleanAnswer(frameId, finalAnswer)
   return result
 }
 
@@ -511,26 +525,22 @@ export const TASK_START_CAP_FAILURE_MESSAGE =
   'Could not classify the request within the iteration budget. Please try rephrasing or simplifying your request.'
 
 // Dispatcher, checkpoint task-start: a THREE-way router. Never re-fires within one
-// dispatch — the objective is set exactly once per task by construction
-// (setObjective's own immutability guard is the backstop if this were ever called
-// twice).
-// The task-start checkpoint's own assignment text (distinct from frames.ts's
-// buildAssignment, which wraps EVERY frame's assignment with the verbatim-request
-// block — this IS the assignment passed to that wrapper for the task-start
-// Dispatcher specifically), and this frame's [user] message (message 2 of the
-// frame's opening messages; see agent.ts's chat()). A bare passthrough of the raw
-// user text — no tagging, no wrapping — since the classification rules themselves
-// now live entirely in frames.ts's ROLE_INSTRUCTIONS.dispatcher as a separate
-// [system] message (see that constant's own comment below).
+// dispatch — the objective is emitted exactly once per task by construction
+// (runDispatchLoopBody emits `objective` at most once per branch).
+// The task-start checkpoint's own assignment text (this IS the assignment passed to
+// frames.ts's buildAssignment for the task-start Dispatcher specifically), and this
+// frame's [user] message (message 2 of the frame's opening messages; see agent.ts's
+// chat()). A bare passthrough of the raw user text — no tagging, no wrapping — since
+// the classification rules themselves now live entirely in frames.ts's
+// ROLE_INSTRUCTIONS.dispatcher as a separate [system] message (see that constant's
+// own comment below).
 // The classification rules themselves (the three status keywords, READ-ONLY
 // framing, grounding/fidelity instructions) now live in frames.ts's
 // ROLE_INSTRUCTIONS.dispatcher — sent as its OWN separate [system] message
-// (message 3), never duplicated here. What's left here is the raw user text (still
-// tagged, for unmistakable boundaries against the CHECKPOINT marker/turn-history
-// text riding alongside it) plus per-call, DYNAMIC content a static role-wide
-// constant can't express: the CHECKPOINT marker the retry/resume plumbing keys on,
-// the verbatim-threading note (config-flag-dependent), and the iteration budget (a
-// number, not a rule).
+// (message 3), never duplicated here. What's left here is the raw user text
+// verbatim — prior-turn context now comes from the persistent Dispatcher frame's
+// own preloaded ledger history (see dispatcherFrameId's comment above), not from
+// any text prepended here.
 export function buildTaskStartAssignment(userMessage: string): string {
   return userMessage
 }
@@ -544,10 +554,14 @@ async function runDispatcherTaskStart(userMessage: string, emit: Emit): Promise<
     // larger TASK_START_HARD_CAP (20) — see that constant's comment for why the two
     // are deliberately split.
     maxIterations: TASK_START_HARD_CAP,
-    // MULTI-TURN MEMORY: buildTurnHistoryBlock's text is prepended AHEAD of the
-    // buildTaskStartAssignment output. Empty string (first turn / no history yet)
-    // makes this a no-op concatenation.
-    assignment: buildTurnHistoryBlock(turnHistory) + buildTaskStartAssignment(userMessage),
+    assignment: buildTaskStartAssignment(userMessage),
+    // PERSISTENT DISPATCHER FRAME: see dispatcherFrameId's own comment above —
+    // always set by this point (minted at the top of runDispatchLoop). spawnFrame
+    // preloads this frame's full accumulated ledger history (empty on a session's
+    // first run) into the fresh Agent it constructs, so the Dispatcher classifies
+    // this turn with the entire session's prior context already in view, no
+    // separate digest/summary needed.
+    persistentFrameId: dispatcherFrameId ?? undefined,
   }
   // TASK_START_TOOLS (frames.ts), not ROLE_TOOLS.dispatcher — this checkpoint is
   // read-only classification, see that constant's comment for why and the incident
@@ -620,12 +634,8 @@ export class PlanningFailed extends Error {}
 // classified objective straight to one Implementer. The OBJECTIVE path's per-task
 // Implementer assignment is the Planner's OWN `conclude` answer, unwrapped — see
 // buildNextTaskPrompt and runDispatchLoopBody below.
-export function buildImplementerAssignment(objective: string, iteration = 1): string {
-  return (
-    `CHECKPOINT: iteration-${iteration}\n` +
-    'Your task is to implement the following objective:\n' +
-    `<argo-objective>\n${objective}\n</argo-objective>`
-  )
+export function buildImplementerAssignment(objective: string): string {
+  return objective
 }
 
 // The Planner's FIRST call — VERBATIM; every word of this string reaches the model
@@ -801,9 +811,7 @@ export function buildImplementerCapFollowUp(assignment: string, lastStatus: stri
 // callers still have the plain task description available for completedTasks/
 // buildImplementerCapFollowUp.
 export function appendImplementerResultFormat(assignment: string): string {
-  return `${assignment}\n\nWhen you are done, call \`conclude\` with the appropriate status:\n`
-    + '- Status SUCCESS, message: description of what you implemented and how you verified it.\n'
-    + '- Status FAIL, message: description of what you tried, what failed, and why.'
+  return assignment
 }
 
 export interface ImplementerResult {
@@ -917,35 +925,38 @@ export async function runDispatchLoop(
   // inspectable right up until this line runs for the NEXT one.
   liveFrames.clear()
   activeFrameId = null
-  // See the module-level currentVerbatimRequest declaration above. Deliberately the
-  // SAME raw userMessage runDispatcherTaskStart is about to paraphrase, captured
-  // before that paraphrase happens.
-  currentVerbatimRequest = config.verbatimRequest ? userMessage : undefined
-  // See the module-level currentUserQuery declaration above — captured unconditionally
-  // (unlike currentVerbatimRequest, which is feature-flagged), since every frame's
-  // TraceLogger header wants the real user request regardless of the verbatim-request
-  // threading setting.
+  // See the module-level currentUserQuery declaration above — captured unconditionally,
+  // since every frame's TraceLogger header wants the real user request.
   currentUserQuery = userMessage
   const model = currentModel ?? config.model
-  // PERSISTENT DISPATCHER MEMORY: reload the durable turn-history store fresh for
-  // every run (picks up a disk copy written by a prior process, e.g. after a
-  // container restart) and reset this run's own captured verdict — see both
-  // declarations above for the full lifecycle.
-  await loadTurnHistory()
-  lastTaskStartVerdict = null
+  // See currentSessionId/currentRunIndex's own comment above. Falls back to a
+  // freshly minted id when the caller has no session concept at all (rare — every
+  // production call site through server.ts always has one), so registerFrame
+  // always has SOME stable session id to key off, never a blank string.
+  currentSessionId = overrides?.sessionId || ledger.newId('session')
+  currentRunIndex = currentSessionId === lastRunIndexSessionId ? currentRunIndex + 1 : 0
+  lastRunIndexSessionId = currentSessionId
 
-  // The dispatch run's own top-level narrative (start/objective/message/done) gets a
-  // REAL persisted log — a SessionLogger exactly like agent.ts's baseline chat()
-  // creates, under the SAME sessionId server.ts already tracks for the UI's session
-  // dropdown/history (passed in via overrides.sessionId). Every event, tagged or not,
-  // gets logged here, and every event's seq now comes from this ONE top-level logger
-  // (the frame's own `seq` argument is ignored for ordering purposes; the frame log
-  // keeps its own independent counter for its own file). Per-frame JSONL logs stay —
-  // they remain the per-agent analytical copy used by GET /context?frame=.
-  const logger = new SessionLogger(userMessage, model, currentOptions ?? {}, overrides?.sessionId)
+  // PERSISTENT DISPATCHER FRAME: mint dispatcherFrameId once per session — see its
+  // own comment above. A different sessionId than the one this id was last minted
+  // for (a genuinely new session, e.g. after /reset) starts a fresh persistent
+  // frame rather than resuming a previous session's accumulated history; the SAME
+  // sessionId across runs reuses the existing id, which is what lets spawnFrame's
+  // persistentFrameId preload find and extend the right ledger file.
+  if (dispatcherFrameSessionId !== currentSessionId) {
+    dispatcherFrameId = `dispatcher-${currentSessionId}`
+    dispatcherFrameSessionId = currentSessionId
+  }
+
+  // The dispatch run's own top-level narrative (start/objective/message/done) is no
+  // longer persisted to a separate run-level JSONL log (SessionLogger removed) —
+  // each frame's own ledger file (ledger.ts, under .argo/frames/) is the durable
+  // record now. `emit` just assigns a frame-local seq (for the SSE stream's
+  // replay/live-dedup mechanism) and forwards to rawEmit.
+  let seq = 0
   const emit: Emit = (event) => {
-    logger.log(event)
-    rawEmit(event, logger.getSeq())
+    seq++
+    rawEmit(event, seq)
   }
 
   // Top-level lifecycle events, UNTAGGED (no frame owns them) — mirrors agent.ts's own
@@ -955,27 +966,10 @@ export async function runDispatchLoop(
   emit({ type: 'message', role: 'user', content: userMessage })
   emit({ type: 'start', model, query: userMessage, options: currentOptions ?? {} })
 
-  // MULTI-TURN MEMORY: a short digest of THIS turn, recorded once the run settles
-  // (success, abort, or error) — see TurnDigest's own comment. Built from
-  // `lastTaskStartVerdict` (set by runDispatchLoopBody right after the Dispatcher
-  // classifies; still null if classification itself never completed).
-  const recordDigest = async (outcome: string) => {
-    recordTurnDigest({
-      userMessage: userMessage.slice(0, 200),
-      mode: lastTaskStartVerdict?.mode ?? 'unknown',
-      objective: (lastTaskStartVerdict?.text ?? '').slice(0, 200),
-      outcome: outcome.slice(0, 300),
-      timestamp: Date.now(),
-    })
-    await persistTurnHistory()
-  }
-
   try {
     const finalAnswer = await runDispatchLoopBody(userMessage, emit)
     emit({ type: 'message', role: 'assistant', content: finalAnswer })
     emit({ type: 'done', content: finalAnswer })
-    await logger.flush()
-    await recordDigest(finalAnswer)
     return finalAnswer
   } catch (err) {
     if (err instanceof DispatchAborted) {
@@ -983,8 +977,6 @@ export async function runDispatchLoop(
       // stop path exactly (done only, no assistant chat bubble for "Stopped.").
       const stopped = 'Stopped.'
       emit({ type: 'done', content: stopped })
-      await logger.flush()
-      await recordDigest('stopped')
       return stopped
     }
     // Planning that could not produce a usable decision is a REPORTED failure, not an
@@ -993,14 +985,10 @@ export async function runDispatchLoop(
     // the returned text so the user/eval sees why nothing ran.
     if (err instanceof PlanningFailed) {
       emit({ type: 'error', message: err.message })
-      await logger.flush()
-      await recordDigest('failed')
       return err.message
     }
     const message = `Unexpected error: ${err instanceof Error ? err.message : String(err)}`
     emit({ type: 'error', message })
-    await logger.flush()
-    await recordDigest('failed')
     return message
   }
 }
@@ -1109,7 +1097,7 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
     // What's actually given to the Implementer — the Planner's task text PLUS the
     // SUCCESS:/FAIL: sign-off convention. nextAssignment itself stays the plain task
     // text, used for completedTasks/buildImplementerCapFollowUp.
-    const implementerAssignment = appendImplementerResultFormat(`CHECKPOINT: iteration-1\n${nextAssignment}`)
+    const implementerAssignment = appendImplementerResultFormat(nextAssignment)
 
     // Implementer FAIL is NOT retried here — the failing task's own conclusion simply
     // becomes what the Planner sees on its next detail call (via plannerFollowUp
@@ -1160,22 +1148,31 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
 
   const doneSummary = completedTasks.map(t => `- ${t.prompt}: ${t.conclusion}`).join('\n')
 
-  // Dispatcher conclusion: spawn a Dispatcher frame at the END of the run to
-  // summarize the entire objective, what the Planner and Implementers concluded,
-  // and the overall outcome. Uses the same TASK_START_TOOLS (read-only) and
-  // TASK_START_HARD_CAP as the classification checkpoint.
+  // Dispatcher conclusion: resume the SAME persistent Dispatcher frame that
+  // classified this turn (dispatcherFrameId — see its own comment above), not a
+  // separate one-off Dispatcher frame. This is the mechanism, not a special case:
+  // spawnFrame's persistentFrameId preloads a fresh Agent from the frame's
+  // accumulated ledger history (which by now already includes this turn's own
+  // classification exchange, appended by runDispatcherTaskStart's own spawnFrame
+  // call above), so the conclusion becomes part of the Dispatcher's persistent,
+  // whole-session context exactly like the classification that preceded it. Uses
+  // the same TASK_START_TOOLS (read-only) and TASK_START_HARD_CAP as the
+  // classification checkpoint. dispatcherFrameId is always set by this point —
+  // runDispatcherTaskStart (dispatch loop's very first call) always sets it before
+  // runObjectiveViaPlanner can ever run.
   const conclusionReq: FrameSpawnRequest = {
     role: 'dispatcher',
     parentFrameId: null,
     maxIterations: TASK_START_HARD_CAP,
     assignment: buildDispatcherConclusionAssignment(objective, plannerConclusionText, completedTasks),
+    persistentFrameId: dispatcherFrameId ?? undefined,
   }
   const conclusionFrame = await spawnFrame(conclusionReq, emit, TASK_START_TOOLS)
   commitAgent = conclusionFrame.agent
 
-  // Mirrors the baseline loop's own end-of-run auto-commit (agent.ts), opt-in via the
-  // same config.autoCommit flag. Reuses whichever frame's Agent instance most recently
-  // did real work purely as a vehicle — autoCommit() only needs git + a model to write
+  // Mirrors Agent.chat()'s own per-frame end-of-run auto-commit (agent.ts), opt-in via
+  // the same config.autoCommit flag. Reuses whichever frame's Agent instance most
+  // recently did real work purely as a vehicle — autoCommit() only needs git + a model to write
   // the message, it doesn't care which role's instance runs it. commitAgent is only
   // null here if NO frame ever spawned, which can't happen once past the Planner spawn
   // above.
@@ -1191,19 +1188,16 @@ async function runDispatchLoopBody(userMessage: string, emit: Emit): Promise<str
   await ledger.ensureGitignored(root())
 
   const taskStart = await runDispatcherTaskStart(userMessage, emit)
-  lastTaskStartVerdict = { mode: taskStart.mode, text: taskStart.text }
 
   // ANSWER: the Dispatcher already knows, verified it himself — no Planner/
   // Implementer frame ever spawns. The whole point of this mode is zero further
   // iteration.
   if (taskStart.mode === 'answer') {
-    await ledger.setObjective(root(), taskStart.text)
     emit({ type: 'objective', text: taskStart.text })
     return taskStart.text
   }
 
   const objective = taskStart.text
-  await ledger.setObjective(root(), objective)
   emit({ type: 'objective', text: objective })
 
   // SIMPLE: tries ONE well-scoped Implementer — no Planner ceremony up front. If the

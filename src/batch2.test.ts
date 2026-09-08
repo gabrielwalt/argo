@@ -52,6 +52,15 @@ function warningEvents(events: AgentEvent[]): Array<Extract<AgentEvent, { type: 
   return events.filter((e): e is Extract<AgentEvent, { type: 'warning' }> => e.type === 'warning')
 }
 
+// Every real Agent instance (dispatch.ts's spawnFrame) always calls
+// setAllowedTools() before chat() runs — an un-configured Agent now offers NO
+// tools at all, not "every tool". The generic H13/H16 mechanics tests below use
+// the Implementer's tool superset as a stand-in "give it everything it needs"
+// role, same as agent.test.ts/dispatch.test.ts's own helpers of this name.
+function grantFullTools(agent: Agent): void {
+  agent.setAllowedTools(ROLE_TOOLS.implementer)
+}
+
 // ── H13 — a cap-hit must report `partial`, never `success` ────────────────────────
 
 // A frame that never stops calling tools: `budget + 2` DISTINCT read_file calls, so the
@@ -105,6 +114,7 @@ test('H13: a frame that concludes normally still derives success (no over-correc
   const sessionId = `test-h13-ok-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([finalAnswer]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     const answer = await agent.chat('argo h13 ok case')
     assert.equal(answer, 'Final answer.')
@@ -148,6 +158,7 @@ test('H16: loop-recovery warnings carry action.level (L0/L1/L2) instead of only 
     same, same, same, same, same, same, same, finalAnswer,
   ]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     await agent.chat('argo h16 level case')
     const levels = warningEvents(events)

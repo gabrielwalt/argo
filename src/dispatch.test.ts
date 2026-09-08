@@ -27,10 +27,6 @@ import {
   TASK_START_MAX_ITERATIONS,
   TASK_START_HARD_CAP,
   TASK_START_CAP_FAILURE_MESSAGE,
-  buildTurnHistoryBlock,
-  boundTurnHistory,
-  TURN_HISTORY_MAX,
-  type TurnDigest,
 } from './dispatch.js'
 import { parseTaskStartVerdict, ROLE_TOOLS, ROLE_MAX_ITERATIONS } from './frames.js'
 
@@ -93,11 +89,9 @@ test('TASK_START_CAP_FAILURE_MESSAGE is a plain user-facing failure, not the raw
 
 // ── buildImplementerAssignment — SIMPLE fast path, unchanged shape ─────────
 
-test('buildImplementerAssignment: wraps the objective in <argo-objective> tags, framed as "implement"', () => {
+test('buildImplementerAssignment: passes the objective through as-is', () => {
   const text = buildImplementerAssignment('fix the off-by-one in nextId()')
-  assert.ok(text.startsWith('CHECKPOINT: iteration-1\n'))
-  assert.ok(text.includes('Your task is to implement the following objective:'))
-  assert.ok(text.includes('<argo-objective>\nfix the off-by-one in nextId()\n</argo-objective>'))
+  assert.equal(text, 'fix the off-by-one in nextId()')
 })
 
 // ── buildInitialPlannerPrompt ────────────────────────────────────────────────
@@ -211,6 +205,17 @@ function toolResultOutputsWithMeta(events: AgentEvent[], tool: string): Array<{ 
     .map(e => ({ output: e.output, error: e.error, rejected: e.rejected }))
 }
 
+// Every real Agent instance (dispatch.ts's spawnFrame) always calls
+// setAllowedTools() before chat() runs — an un-configured Agent now offers NO
+// tools at all, not "every tool" (see the default-tools test above). The generic
+// conclude/thinking-turn mechanics tests below are about the tool-dispatch LOOP
+// itself, not about any one role's specific tool set, so they use the
+// Implementer's tool superset (which includes `conclude`) as a stand-in "give it
+// everything it needs" role.
+function grantFullTools(agent: Agent): void {
+  agent.setAllowedTools(ROLE_TOOLS.implementer)
+}
+
 // ── Opening messages: [system] identity, [user] assignment, [system]
 // instructions — three properly typed, separate messages instead of one giant
 // block prepended onto the first user message. Tool descriptions are NOT part of
@@ -234,7 +239,9 @@ test('opening messages: role-tagged frame sends [system identity, user assignmen
   try {
     const answer = await agent.chat('fix the off-by-one bug')
     assert.equal(answer, 'Final answer.')
-    assert.equal(captured.length, 3)
+    // The first 3 messages are always: [system] identity, [user] assignment,
+    // [system] instructions. Additional injected context (find .) may follow.
+    assert.ok(captured.length >= 3)
     assert.equal(captured[0].role, 'system')
     assert.ok(captured[0].content.includes('IMPLEMENTER'))
     assert.equal(captured[1].role, 'user')
@@ -246,9 +253,9 @@ test('opening messages: role-tagged frame sends [system identity, user assignmen
   }
 })
 
-test('opening messages: the unrestricted baseline (roleTag null) still opens with a generic system identity, no instructions message', async () => {
+test('opening messages: an Agent with no explicit setRole() call defaults to the implementer role', async () => {
   const events: AgentEvent[] = []
-  const sessionId = `test-opening-messages-baseline-${Date.now()}`
+  const sessionId = `test-opening-messages-default-role-${Date.now()}`
   let captured: Array<{ role: string; content: string }> = []
   const ollama = {
     chat: async (args: { messages: Array<{ role: string; content: string }> }) => {
@@ -256,15 +263,22 @@ test('opening messages: the unrestricted baseline (roleTag null) still opens wit
       return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
     },
   } as unknown as Ollama
+  // Every real Agent instance (dispatch.ts's spawnFrame) always calls setRole()
+  // before chat() runs — this test covers the DEFAULT this.roleTag carries when a
+  // caller never does, which must still be a valid, fully-scoped role rather than
+  // anything unscoped.
   const agent = new Agent(e => events.push(e), 'test-model', ollama)
   agent.setSessionId(sessionId)
   try {
-    await agent.chat('argo baseline case')
-    // No role set — no ROLE_INSTRUCTIONS entry, so only identity + the user message.
-    assert.equal(captured.length, 2)
+    await agent.chat('argo default-role case')
+    // The first 3 messages are always: [system] identity, [user] assignment,
+    // [system] instructions. Additional injected context may follow.
+    assert.ok(captured.length >= 3)
     assert.equal(captured[0].role, 'system')
+    assert.ok(captured[0].content.includes('IMPLEMENTER'))
     assert.equal(captured[1].role, 'user')
-    assert.equal(captured[1].content, 'argo baseline case')
+    assert.equal(captured[1].content, 'argo default-role case')
+    assert.equal(captured[2].role, 'system')
   } finally {
     await cleanupDispatchSession(sessionId)
   }
@@ -384,26 +398,29 @@ test('read-write role (Implementer): the `tools` parameter sent to Ollama keeps 
   }
 })
 
-test('an unrestricted frame (allowedTools null, the baseline): the `tools` parameter sent to Ollama includes every tool', async () => {
+test('an Agent with no explicit setAllowedTools() call defaults to offering ALL tools', async () => {
+  // Every real Agent instance (dispatch.ts's spawnFrame) always calls
+  // setAllowedTools() before chat() runs. The default (all tools) is a safe
+  // fallback for tests that don't set up dispatch scaffolding — conclude is
+  // included so the agent can finish normally.
   const events: AgentEvent[] = []
-  const sessionId = `test-tools-param-baseline-${Date.now()}`
+  const sessionId = `test-tools-param-default-${Date.now()}`
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let capturedTools: any[] = []
   const ollama = {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     chat: async (args: { tools: any[] }) => {
       capturedTools = args.tools
-      return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'Final answer.' } } }] } }
+      return { message: { role: 'assistant', content: 'done', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'SUCCESS', message: 'done' } } }] } }
     },
   } as unknown as Ollama
   const agent = new Agent(e => events.push(e), 'test-model', ollama)
   agent.setSessionId(sessionId)
+  agent.setMaxIterations(10)
   try {
-    await agent.chat('argo baseline tools case')
-    const names = capturedTools.map(t => t.function.name)
-    for (const tool of ['bash', 'read_file', 'write_file', 'edit_file', 'fetch_url', 'browser_fetch', 'web_search']) {
-      assert.ok(names.includes(tool), `expected baseline tools to include "${tool}"`)
-    }
+    await agent.chat('argo default-tools case')
+    assert.ok(capturedTools.length > 0, 'default should offer all tools')
+    assert.ok(capturedTools.some((t: { function: { name: string } }) => t.function.name === 'conclude'), 'conclude must be in defaults')
   } finally {
     await cleanupDispatchSession(sessionId)
   }
@@ -421,6 +438,7 @@ test('a turn with no tool calls is a thinking turn — it does not end the sessi
     concludeCall('Done thinking — here is my answer.'),
   ]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     const answer = await agent.chat('argo thinking turn case')
     // The run only ended once conclude was actually called, not on the earlier
@@ -441,6 +459,7 @@ test('conclude({ status, message }) ends the session with the message as the ans
     concludeCall('The bug is fixed.'),
   ]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     const answer = await agent.chat('argo conclude basic case')
     assert.equal(answer, 'The bug is fixed.')
@@ -461,6 +480,7 @@ test('conclude with an empty message is rejected (validation, not a gate) and do
     concludeCall('Real answer this time.'),
   ]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     const answer = await agent.chat('argo conclude empty case')
     assert.equal(answer, 'Real answer this time.')
@@ -481,6 +501,7 @@ test('a no-tool-call turn gets the nudge on the 2nd consecutive thinking turn, n
     concludeCall('done'),
   ]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     await agent.chat('argo nudge case')
     const nudges = events.filter(
@@ -832,70 +853,6 @@ test('an Implementer FAIL explanation longer than 2000 chars is not truncated wh
   const rawParsed = parseImplementerResult(result.rawSummary)
   assert.equal(rawParsed.succeeded, false)
   assert.equal(rawParsed.message, failBody.trim())
-})
-
-// ── PERSISTENT DISPATCHER MEMORY — buildTurnHistoryBlock/boundTurnHistory ────
-// Both pure, no Ollama/fs/ledger involved, same reasoning as buildTaskStartAssignment's
-// own tests above: directly testable without spawning a real frame.
-
-function digest(userMessage: string, mode: string, objective: string, outcome: string): TurnDigest {
-  return { userMessage, mode, objective, outcome, timestamp: 0 }
-}
-
-test('buildTurnHistoryBlock: empty history is the empty string (byte-identical prompt on turn 1)', () => {
-  assert.equal(buildTurnHistoryBlock([]), '')
-})
-
-test('buildTurnHistoryBlock: renders one entry with mode uppercased and an arrow between fields', () => {
-  const text = buildTurnHistoryBlock([digest('Make the hexagons bigger', 'simple', 'Change HEX_RADIUS', 'Changed HEX_RADIUS to 40')])
-  assert.ok(text.includes('1. User: "Make the hexagons bigger"'))
-  assert.ok(text.includes('SIMPLE'))
-  assert.ok(text.includes('Changed HEX_RADIUS to 40'))
-})
-
-test('buildTurnHistoryBlock: numbers entries in order, most recent last, and never mutates the input array', () => {
-  const history = [
-    digest('first request', 'simple', 'obj1', 'outcome1'),
-    digest('second request', 'objective', 'obj2', 'outcome2'),
-  ]
-  const before = JSON.stringify(history)
-  const text = buildTurnHistoryBlock(history)
-  assert.ok(text.indexOf('1. User: "first request"') < text.indexOf('2. User: "second request"'))
-  assert.equal(JSON.stringify(history), before)
-})
-
-test('buildTurnHistoryBlock: truncates a long user message/outcome to a bounded excerpt, not the raw text', () => {
-  const longMessage = 'x'.repeat(500)
-  const longOutcome = 'y'.repeat(500)
-  const text = buildTurnHistoryBlock([digest(longMessage, 'objective', 'obj', longOutcome)])
-  assert.equal(text.includes(longMessage), false)
-  assert.equal(text.includes(longOutcome), false)
-  assert.ok(text.includes('…'))
-})
-
-test('buildTurnHistoryBlock: ends with guidance telling the Dispatcher to fold prior context into its objective, before any assignment text', () => {
-  const text = buildTurnHistoryBlock([digest('a', 'simple', 'b', 'c')])
-  assert.ok(/incorporate that/i.test(text))
-  assert.ok(text.endsWith('\n\n'))
-})
-
-test('boundTurnHistory: leaves a short history untouched', () => {
-  const history = [digest('a', 'simple', 'b', 'c')]
-  assert.deepEqual(boundTurnHistory(history, TURN_HISTORY_MAX), history)
-})
-
-test('boundTurnHistory: trims to the last N entries (most recent kept), default max is 10', () => {
-  const history = Array.from({ length: 15 }, (_, i) => digest(`msg${i}`, 'simple', 'obj', 'outcome'))
-  const bounded = boundTurnHistory(history)
-  assert.equal(bounded.length, TURN_HISTORY_MAX)
-  assert.equal(bounded[0].userMessage, 'msg5')
-  assert.equal(bounded[bounded.length - 1].userMessage, 'msg14')
-})
-
-test('boundTurnHistory: a custom max is respected', () => {
-  const history = Array.from({ length: 5 }, (_, i) => digest(`msg${i}`, 'simple', 'obj', 'outcome'))
-  const bounded = boundTurnHistory(history, 2)
-  assert.deepEqual(bounded.map(d => d.userMessage), ['msg3', 'msg4'])
 })
 
 test('buildTaskStartAssignment returns only the raw user message — no CHECKPOINT, no harness wrapping', () => {

@@ -39,11 +39,11 @@ test('TASK_START_TOOLS keeps investigation and grounding tools', () => {
 })
 
 test('TASK_START_TOOLS keeps ledger — the tool itself exposes no write action', () => {
-  // Read-only by construction: get_goal/get_recent/get_conclusion/get_frame_trail/
-  // expand are the only actions the ledger TOOL accepts (tools/index.ts) — the
-  // harness's own ledger.setObjective/recordDelegation calls are separate direct
-  // module calls, never reachable through this tool. Keeping it is what lets the
-  // read-only checkpoint still "look up prior work instead of assuming."
+  // Read-only by construction: messages/expand are the only actions the ledger
+  // TOOL accepts (tools/index.ts) — the harness's own ledger.recordMessage calls
+  // are separate direct calls from agent.ts's pushCtx, never reachable through
+  // this tool. Keeping it is what lets the read-only checkpoint still "look up
+  // prior work instead of assuming."
   assert.equal(TASK_START_TOOLS.includes('ledger'), true)
 })
 

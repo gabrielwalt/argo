@@ -60,11 +60,11 @@ export const ROLE_TOOLS: Record<Role, ToolName[]> = {
 // DESCRIPTION is patched by agent.ts's chatCall to the read-only variant
 // (patchBashForReadOnly, below) so the schema itself never invites a write, unlike
 // the read-write default every tool definition carries in tools/index.ts.
-// `ledger` stays: the TOOL only exposes read actions (get_goal/get_plan/get_recent/
-// get_conclusion/get_frame_trail/expand — see tools/index.ts's ledger case); the
-// harness's OWN ledger.setObjective/recordDelegation calls are direct module calls
-// from dispatch.ts, never reachable through this tool, so including it does not
-// reopen a write path. `read_file` covers investigation (it gained a `pattern` search
+// `ledger` stays: the TOOL only exposes read actions (messages/expand — see
+// tools/index.ts's ledger case); the harness's OWN ledger.recordMessage calls are
+// direct module calls from agent.ts's pushCtx, never reachable through this tool,
+// so including it does not reopen a write path. `read_file` covers investigation
+// (it gained a `pattern` search
 // param plus offset/limit line paging specifically so a role without bash can still
 // find a symbol); `web_search`/`fetch_url` cover the checkpoint's own "ground it"
 // instruction. `conclude` is how this checkpoint now delivers its ANSWER/SIMPLE/
@@ -140,13 +140,13 @@ export const ROLE_MAX_ITERATIONS: Record<Role, number> = {
 // PER-ROLE PROGRESS-CHECK ESCALATION. Distinct from the generic fraction-of-
 // maxIterations stall/progress mechanism already in agent.ts (the `stallCheckpoints`
 // local in chat(), scaled 0.4/0.65/0.85 of a run's own budget) — that mechanism stays
-// exactly as it is for every role NOT listed here (Dispatcher, the unrestricted
-// baseline). Planner/Implementer instead get FIXED, ABSOLUTE per-call iteration
-// thresholds with role-specific wording, because the numbers involved don't fall out
-// of the generic fractions and neither role is well served by the generic table's
-// coarser rungs. agent.ts reads these keyed by the frame's role (Agent.setRole,
-// called by dispatch.ts's spawnFrame alongside setAllowedTools/setMaxIterations/etc.)
-// and, when a role has an entry here, replaces the generic mechanism for that one
+// exactly as it is for every role NOT listed here (currently just Dispatcher).
+// Planner/Implementer instead get FIXED, ABSOLUTE per-call iteration thresholds with
+// role-specific wording, because the numbers involved don't fall out of the generic
+// fractions and neither role is well served by the generic table's coarser rungs.
+// agent.ts reads these keyed by the frame's role (Agent.setRole, called by
+// dispatch.ts's spawnFrame alongside setAllowedTools/setMaxIterations/etc.) and,
+// when a role has an entry here, replaces the generic mechanism for that one
 // frame's checkpoints with these exact iteration numbers and exact message text —
 // unconditionally: these are fixed checkpoints on a countdown to a hard cap, not a
 // stall detector, so they fire every time regardless of how much real progress is
@@ -228,10 +228,10 @@ export function concludeStatusError(role: Role, invalidStatus: string): string {
 // find the tool named 'conclude', return every OTHER tool untouched (by reference —
 // no wasted clone), and return a new object only for 'conclude' itself with its
 // `status` property's `enum` set. Returns the input array unchanged (same
-// reference) when role is null/undefined (the unrestricted baseline has no
-// ROLE_CONCLUDE_STATUSES entry to patch in with) or when no 'conclude' tool is in
-// the array at all (a role-filtered list that doesn't include it, though every
-// current role does).
+// reference) when role is null/undefined (defensive — every production caller
+// always passes a real role now, since Agent.roleTag is never null) or when no
+// 'conclude' tool is in the array at all (a role-filtered list that doesn't
+// include it, though every current role does).
 interface ConcludeLikeTool {
   type: 'function'
   function: {
@@ -315,7 +315,7 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
   dispatcher:
     'Your task is to classify the user request into exactly one of the three statuses below with an ' +
     'appropriate status message:\n' +
-    '- Status ANSWER; Message: The complete final answer — use only if you already know the answer with ' +
+    '- Status ANSWER; Message: The complete final answer — Use only if you already know the answer with ' +
     'certainty and no project changes are required.\n' +
     '- Status SIMPLE; Message: A concrete, verifiable objective — Use for a well-scoped change that can be ' +
     'handled by a single Implementer agent. This covers everything from trivial fixes to single-function ' +
@@ -331,7 +331,9 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
     'When reformulating the request as an objective, preserve every material requirement and constraint. ' +
     'Clarify wording, but do not silently narrow, broaden, or reinterpret the requested outcome.\n\n' +
     'Do not implement anything. The project is READ-ONLY: you may inspect files to understand the codebase, ' +
-    'but you must not modify anything.',
+    'but you must not modify anything.\n\n' +
+    'The .argo/ folder is harness bookkeeping — ignore its contents. Use the `ledger` tool to retrieve past ' +
+    'messages that may have been evicted or collapsed from your context.',
   planner:
     'Your job happens in two phases:\n' +
     '1. Given the objective, determine the most effective implementation strategy and call `conclude` with an ' +
@@ -347,12 +349,14 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
     'files/interfaces/constraints, what is in scope vs out of scope, and testing expectations.\n\n' +
     'SCOPE\n' +
     'The project is READ-ONLY for you. Inspect files as needed but never write or edit anything. You reason ' +
-    'about the plan; you do not produce artifacts.',
+    'about the plan; you do not produce artifacts.\n\n' +
+    'The .argo/ folder is harness bookkeeping — ignore its contents. Use the `ledger` tool to retrieve past ' +
+    'messages that may have been evicted or collapsed from your context.',
   implementer:
     'Before editing, inspect the relevant existing implementation and tests. Prefer the simplest coherent ' +
     'change that fully satisfies the assignment and preserves unrelated behavior. Avoid unnecessary ' +
-    'abstractions, dependencies or indirection. When finished, end the session by calling `conclude` with the ' +
-    'appropriate outcome.\n\n' +
+    'abstractions, dependencies or indirection. When finished, call `conclude` with status SUCCESS and a ' +
+    'description of what you implemented and verified, or status FAIL with what you tried and why it failed.\n\n' +
     'VERIFICATION\n' +
     'Before concluding, verify the result against the assignment and any supplied original-request ' +
     'constraints. Do not claim success without concrete evidence that the changed behavior works; run relevant ' +
@@ -360,67 +364,17 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
     'PRECISION\n' +
     'Never reconstruct exact identifiers, paths, URLs, flags, or package names from memory; copy them from ' +
     'observed project or tool output, or inspect the source again.\n\n' +
-    'FAILURE\n' +
-    'If you cannot complete the assignment within reasonable effort, report that explicitly. State what you ' +
-    'tried, what failed, and why it cannot be completed as scoped rather than repeatedly pursuing the same ' +
-    'unsuccessful approach.',
+    'CONCLUSION\n' +
+    'When concluding, provide a concise but complete handoff of the work performed: what you changed, how you implemented it, ' +
+    'how you verified it, and any important unexpected findings, deviations, limitations, or remaining issues. Include the details ' +
+    'another agent would need to understand the resulting project state without repeating your investigation.\n' +
+    'If you could not complete the assignment within reasonable effort, state what you tried, what failed, what remains incomplete, ' +
+    'and why it cannot be completed as scoped rather than repeatedly pursuing the same unsuccessful approach.\n\n' +
+    'The .argo/ folder is harness bookkeeping — don\'t touch it and ignore its contents. Use the `ledger` tool to retrieve past ' +
+    'messages that may have been evicted or collapsed from your context.',
 }
 
 const SUMMARY_CHAR_CAP = 2000
-
-// VERBATIM REQUEST THREADING. Argo's Dispatcher task-start checkpoint paraphrases the
-// user's raw message into one `OBJECTIVE:` line, and the paraphrase used to be the
-// ONLY thing any downstream frame (Planner/Implementer) ever saw. Traced twice in
-// eval: a paraphrase dropped a pointer to seeded test files, causing the Planner to
-// invent a target file; a paraphrase dropped a "do NOT modify existing tests"
-// constraint that sat at the end of the message, causing the Implementer to ship
-// against its own invented verification.
-//
-// The fix: dispatch.ts's spawnFrame attaches the run's raw user message to EVERY
-// frame's assignment via buildAssignment below, unconditionally and by construction —
-// never replacing the objective (setObjective's immutability guard is untouched; the
-// objective still exists and still matters as the harness's stable restatement of the
-// work), only sitting alongside it as a second, unparaphrased source of truth.
-//
-// Cap rationale: 4000 chars, half of the 8000-char whole-file-read cap agent.ts's
-// read_file tool uses for a single read ONCE per frame. This block is different:
-// it repeats in EVERY frame's assignment for the whole run, and a per-frame cost
-// multiplies by frame count in a way a single file read doesn't. Truncation is head-and-tail,
-// not a plain head cut: both traced failures had their load-bearing detail (a seed-file
-// pointer, a "do NOT modify tests" clause) at DIFFERENT positions in the raw message —
-// one mid-message, one at the very end — so a head-only cut would have preserved one
-// failure mode's fix and reproduced the other. An explicit marker names exactly how
-// much was dropped, rather than silently splicing two halves together.
-export const VERBATIM_REQUEST_CHAR_CAP = 4000
-// Exported alongside the cap (rather than kept private) so verbatim.test.ts can assert
-// the truncation arithmetic exactly, not just "it got shorter" — a silently wrong
-// dropped-chars count in the marker would be worse than no count at all.
-export const VERBATIM_REQUEST_HEAD_CHARS = 2800
-export const VERBATIM_REQUEST_TAIL_CHARS = 1000
-
-// Pure and exported so the truncation behavior is directly testable (verbatim.test.ts)
-// without needing a pathological live request.
-export function capVerbatimRequest(text: string): string {
-  if (text.length <= VERBATIM_REQUEST_CHAR_CAP) return text
-  const dropped = text.length - VERBATIM_REQUEST_HEAD_CHARS - VERBATIM_REQUEST_TAIL_CHARS
-  const head = text.slice(0, VERBATIM_REQUEST_HEAD_CHARS)
-  const tail = text.slice(text.length - VERBATIM_REQUEST_TAIL_CHARS)
-  return `${head}\n\n...[${dropped} chars truncated — original request exceeded the ${VERBATIM_REQUEST_CHAR_CAP}-char cap]...\n\n${tail}`
-}
-
-// Bracketed-label convention, matching the existing `[CURRENT PLAN — ...]` (agent.ts)
-// and `[OBJECTIVE — immutable, set once by the Dispatcher; never redefine it]`
-// (eviction.ts) blocks, not a novel format — the same recitation shape a frame
-// already sees elsewhere in this codebase, so it reads as one more instance of a
-// known convention rather than a new kind of thing to parse. "Authoritative" and
-// "governs" are the operative words: this is not one more piece of context to weigh
-// against the others, it is the tie-breaker when the objective/plan/step prompt
-// below it turns out to have paraphrased something away.
-export function renderVerbatimRequestBlock(userMessage: string): string {
-  const text = capVerbatimRequest(userMessage)
-  return '[ORIGINAL USER REQUEST — global intent and constraints. The current assignment defines this agent\'s '
-    + `scope. Use the original request to resolve intent, not to expand the assigned scope.]\n${text}`
-}
 
 // Caps a frame's own final-answer text before it's stored as a ledger conclusion's
 // `summary` — keeps dependency hand-offs small by construction (buildAssignment below
@@ -430,30 +384,19 @@ export function capSummary(s: string): string {
 }
 
 // The concrete mechanism for "only relevant content is shared": a dependency
-// contributes its capped conclusion summary + file pointers, NEVER its raw episode
-// graph or transcript. If a frame needs more, it calls `ledger` with action
-// "getFrameTrail" itself — explicit, on-demand, never automatic.
+// contributes its capped conclusion summary + file pointers, NEVER its raw
+// transcript. If a frame needs more of ITS OWN history, it calls `ledger` with
+// action "messages" itself — explicit, on-demand, never automatic, and scoped to
+// that frame's own ledger file only (ledger.ts's readFrame) — there is no
+// cross-agent ledger visibility any more.
 //
-// `verbatimRequest` (see the block comment above renderVerbatimRequestBlock) is the
-// run's raw user message, passed by dispatch.ts's spawnFrame — the ONE call site that
-// builds every frame's assignment — so attaching it here makes it apply to every role
-// by construction, not by each dispatch.ts call site remembering to add it.
-// undefined/empty is a no-op (`filter(Boolean)` below drops it).
-//
-// Placement is deliberately FIRST in the array, ahead of dependency summaries and the
-// step-specific assignment. Ollama's prefix cache on this machine is aggressive and
-// cheap to lose: every turn re-sends the whole message array, so cache reuse is decided
-// by whether the HEAD of that array is byte-stable; measured directly on this box for
-// this change: 34ms warm vs 1445ms cold for an identical prefix, and 1416ms — i.e. no
-// better than cold — for the SAME tokens with one mutated LEADING token. This block is
-// the one piece of a frame's assignment that is identical across every frame of the
-// SAME dispatch run — putting it at the head maximizes how much of the assignment
-// message's own prefix is byte-identical across sibling frames of one run, rather than
-// burying an immutable block after content that already varies frame to frame, where it
-// could never anchor a cache hit at all.
-export async function buildAssignment(root: string, req: FrameSpawnRequest, verbatimRequest?: string): Promise<string> {
-  const verbatimBlock = verbatimRequest ? renderVerbatimRequestBlock(verbatimRequest) : ''
-  return [verbatimBlock, req.assignment].filter(Boolean).join('\n\n')
+// A frame's assignment is exactly its own objective/task text — the Dispatcher's
+// paraphrase (for the Dispatcher itself) or the Planner/Implementer's assigned step.
+// No verbatim copy of the original user request is prepended here: only the
+// Dispatcher frame sees the raw user message (it's the one classifying it), and
+// downstream frames (Planner/Implementer) get scoped to their own assignment only.
+export async function buildAssignment(root: string, req: FrameSpawnRequest): Promise<string> {
+  return req.assignment
 }
 
 // ── Dispatcher task-start verdict parsing ──────────────────────────────────────────
