@@ -1,19 +1,14 @@
-// TRACE LOGGER: a NEW, ADDITIVE Markdown-based log format for Argo agent frames. Runs
-// ALONGSIDE the existing JSONL SessionLogger (logger.ts) — never replaces it,
-// never reads its state, and a failure here must never affect the existing
-// logging path (every public method below is fire-and-forget: internal errors are
-// swallowed into the write queue, not thrown back into agent.ts's hot path). The
-// `sessionId`/`frameId`/`jsonlFilename` constructor params and each turn/response's
-// `jsonl_seq` cross-reference are pure pointers INTO that JSONL log — never read
-// back FROM it, keeping the "never reads its state" guarantee above intact.
+// TRACE LOGGER: a Markdown-based log format for Argo agent frames — the harness's
+// narrative trace, complementary to the ledger (ledger.ts), which is the durable
+// per-frame message record. A failure here must never affect the real run (every
+// public method below is fire-and-forget: internal errors are swallowed into the
+// write queue, not thrown back into agent.ts's hot path).
 //
-// One Markdown file per agent frame (one per SessionLogger-equivalent run), written
-// incrementally turn-by-turn into LOGS_DIR's `traces/` subfolder (AL_DIR, below) —
-// alongside but never mixed into the existing logger's `.jsonl` files, named
-// `{TIMESTAMP}_{ITERATION}_{AGENTNAME}.md` — deliberately NOT the same sequence
-// counter as logger.ts's `logFileSeq` (that would couple two independently-evolving
-// files' numbering to each other for no reason); this file keeps its own counter,
-// `alLogSeq`, reset only by tests via resetAlLogSeq().
+// One Markdown file per agent frame (one per chat() run), written incrementally
+// turn-by-turn directly into LOGS_DIR (AL_DIR, below) — alongside the (now mostly
+// empty, writer-removed) `.jsonl` files and other log artifacts, named
+// `{TIMESTAMP}_{ITERATION}_{AGENTNAME}.md`. This file keeps its own sequence
+// counter, `alLogSeq`, reset only by tests via resetAlLogSeq().
 //
 // The output is heading-based Markdown: content is escaped (escapeMd) only where it
 // would otherwise be misread as document structure (a line starting with `#` reading
@@ -26,18 +21,13 @@ import path from 'path'
 import type { AgentEvent, ModelOptions } from './types.js'
 import { LOGS_DIR } from './logger.js'
 
-// Markdown traces live in their own subfolder, separate from the JSONL/meta files
-// logger.ts writes directly into LOGS_DIR — keeps the top-level logs directory
-// listing (listLogs()/listSessions(), which glob LOGS_DIR for `.jsonl`) from ever
-// having to account for `.md` trace files, and gives this format room to grow its
-// own directory structure independently. append() below creates this on demand via
-// `fs.mkdir(path.dirname(this.filepath), { recursive: true })`.
-const AL_DIR = path.join(LOGS_DIR, 'traces')
+// Markdown traces live directly in LOGS_DIR (no `traces/` subfolder) — same
+// directory as everything else logger.ts manages. append() below creates this on
+// demand via `fs.mkdir(path.dirname(this.filepath), { recursive: true })`, though
+// LOGS_DIR itself is expected to already exist by the time any run gets here.
+const AL_DIR = LOGS_DIR
 
-// Shared-shape sequence counter, kept separate from logger.ts's logFileSeq (see file
-// doc comment above) — but same pattern (module-level counter + reset hook) so tests
-// can isolate runs from each other the same way logger.test.ts already does for
-// SessionLogger.
+// Module-level counter + reset hook so tests can isolate runs from each other.
 let alLogSeq = 0
 export function resetAlLogSeq() { alLogSeq = 0 }
 
@@ -225,11 +215,11 @@ export class TraceLogger {
   // never called for it (e.g. the run aborts mid-turn).
   private inTurn = false
   private headerWritten = false
-  // Latest JSONL `__seq` forwarded via logEvent() (agent.ts's emitAndLog calls this
-  // for every event, seq included) — read by beginTurn()/logResponse() so each
-  // turn/response heading can carry the exact JSONL line it corresponds to, without
+  // Latest per-run `__seq` forwarded via logEvent() (agent.ts's emitAndLog calls
+  // this for every event, seq included) — read by beginTurn()/logResponse() so
+  // each turn/response heading can carry the exact seq it corresponds to, without
   // every call site needing to thread the seq through explicitly. Starts at 0 (no
-  // JSONL event logged yet); a turn opened before any event exists (never happens in
+  // event logged yet); a turn opened before any event exists (never happens in
   // practice — 'message'/'start' are logged before the first beginTurn) would simply
   // carry seq=0.
   private lastSeq = 0
@@ -242,7 +232,6 @@ export class TraceLogger {
     tools: AlToolDef[],
     sessionId?: string,
     frameId?: string,
-    jsonlFilename?: string,
   ) {
     const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
     const seq = String(++alLogSeq).padStart(4, '0')
@@ -254,7 +243,6 @@ export class TraceLogger {
     const metaLines: string[] = []
     if (sessionId) metaLines.push(`- **Session**: ${escapeMd(sessionId)}`)
     if (frameId) metaLines.push(`- **Frame**: ${escapeMd(frameId)}`)
-    if (jsonlFilename) metaLines.push(`- **JSONL**: ${escapeMd(jsonlFilename)}`)
 
     const lines: string[] = []
     lines.push(`# ${escapeMd(role.charAt(0).toUpperCase() + role.slice(1))} ${seq}`)
@@ -276,9 +264,10 @@ export class TraceLogger {
    * (or ALL of them, on turn 1).
    *
    * `totalMessages` is the full history length AS SENT to the model this turn
-   * (matches SessionLogger's `ollama_request.message_count` semantics — i.e.
-   * including whatever this call is about to add, if the caller counts that way;
-   * agent.ts passes messages.length from chatCall's already-built `messages` array).
+   * (matches the harness's own `ollama_request.message_count` event semantics —
+   * i.e. including whatever this call is about to add, if the caller counts that
+   * way; agent.ts passes messages.length from chatCall's already-built `messages`
+   * array).
    * `newMessages` are exactly the messages this turn is presenting for the first
    * time — turn 1: everything; later turns: the tail added since the last beginTurn.
    */
@@ -374,10 +363,10 @@ export class TraceLogger {
    * a parallel filter at each call site.
    */
   logEvent(event: AgentEvent, seq?: number) {
-    // Track the latest JSONL seq regardless of whether this event renders anything
-    // here — beginTurn()/logResponse() read lastSeq lazily, so even an event this
-    // logger has no rendering for (renderEvent() returns null for it) must still
-    // advance the cross-reference forward to the next turn/response.
+    // Track the latest per-run seq regardless of whether this event renders
+    // anything here — beginTurn()/logResponse() read lastSeq lazily, so even an
+    // event this logger has no rendering for (renderEvent() returns null for it)
+    // must still advance the cross-reference forward to the next turn/response.
     if (seq != null) this.lastSeq = seq
     const body = this.renderEvent(event)
     if (body === null) return

@@ -14,9 +14,10 @@ import { readFile as fsReadFile, writeFile as fsWriteFile, mkdir as fsMkdir, rea
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 
-// .argo/ already holds harness bookkeeping (src/ledger.ts's ledger.jsonl/state.json)
-// and is already added to the workspace .gitignore (ensureGitignored) — the natural
-// home for one more small bookkeeping file, not a project deliverable.
+// .argo/ already holds harness bookkeeping (src/ledger.ts's per-frame ledger files
+// under frames/, plus sessions.json) and is already added to the workspace
+// .gitignore (ensureGitignored) — the natural home for one more small bookkeeping
+// file, not a project deliverable.
 const WORKSPACE_ID_REL = path.join('.argo', 'workspace-id')
 
 export interface WorkspaceIdentityIO {
@@ -83,43 +84,26 @@ export async function workspaceHasContent(root: string, io?: WorkspaceIdentityIO
   }
 }
 
-// ── Session pointer (SESSION_ID_FILE content) ──────────────────────
-
-// What current-session.txt holds. workspaceId is null for two distinct reasons that
-// the caller must NOT conflate: (a) a legacy plain-text file written before this
-// change, which never recorded identity at all, or (b) a file this code wrote for
-// a workspace where ensureWorkspaceId itself returned null (read-only/unwritable).
-// Both mean "no proof of provenance," which is exactly the case decideSessionResume
-// falls back to the emptiness heuristic for.
+// ── Session pointer ──────────────────────────────────────────────
+// The current-session pointer used to be a small standalone text file
+// (SESSION_ID_FILE, logs/current-session.txt) living OUTSIDE the workspace this
+// module establishes identity for — which was the actual root cause of the
+// stale-session bug this module exists to fix: a pointer stored elsewhere can
+// never be told apart from a stale one just by looking at the folder it claims to
+// describe. It now lives on the ledger's own registry instead
+// (.argo/sessions.json's currentSessionId field, ledger.ts's setCurrentSession/
+// getCurrentSession) — INSIDE the workspace, so it travels with the workspace's
+// own content by construction and the workspaceId-mismatch case below can no
+// longer actually occur for a ledger-sourced pointer. decideSessionResume is kept
+// pointer-format-agnostic (a plain {sessionId, workspaceId} value, not tied to any
+// one file's parsing) specifically so it still protects against the ledger's own
+// equivalent of the original bug: a `rm -rf *` leaves dotfiles (.git, .argo, and
+// so the whole ledger) behind, so a previously recorded sessionId can survive
+// even though the user emptied the folder's real content — see
+// workspaceHasContent's own fallback branch below for that case.
 export interface SessionPointer {
   sessionId: string
   workspaceId: string | null
-}
-
-// Back-compat: today's file is a single bare session id with no structure at all
-// (`server.ts`'s original SESSION_ID_FILE writes). Try the new JSON shape first;
-// anything that isn't valid JSON with a string sessionId is treated as that legacy
-// bare id — the only shape this file held before this change, so it's the only
-// fallback meaning that can't silently misparse a real file into garbage.
-export function parseSessionPointer(raw: string): SessionPointer | null {
-  const trimmed = raw.trim()
-  if (trimmed === '') return null
-  try {
-    const parsed = JSON.parse(trimmed) as { sessionId?: unknown; workspaceId?: unknown }
-    if (typeof parsed.sessionId === 'string' && parsed.sessionId !== '') {
-      return {
-        sessionId: parsed.sessionId,
-        workspaceId: typeof parsed.workspaceId === 'string' ? parsed.workspaceId : null,
-      }
-    }
-    return null
-  } catch {
-    return { sessionId: trimmed, workspaceId: null }
-  }
-}
-
-export function formatSessionPointer(pointer: SessionPointer): string {
-  return JSON.stringify({ sessionId: pointer.sessionId, workspaceId: pointer.workspaceId })
 }
 
 export type SessionResumeReason =

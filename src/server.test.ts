@@ -85,7 +85,7 @@ test('parseFrameRole: recognises all three frame roles from a real frameId shape
   assert.equal(parseFrameRole('implementer-mtmm1gcc-3'), 'implementer')
 })
 
-test('parseFrameRole: the baseline agent\'s own session id (ISO-derived, hyphenated) is not a frame', () => {
+test('parseFrameRole: the shared `agent` instance\'s own session id (ISO-derived, hyphenated) is not a frame', () => {
   assert.equal(parseFrameRole('2026-09-04T07-03-37'), null)
 })
 
@@ -99,7 +99,7 @@ test('frameIdFromHistoryFilename: extracts the id from history-<id>.json', () =>
   assert.equal(frameIdFromHistoryFilename('history-implementer-mtmm1gcc-3.json'), 'implementer-mtmm1gcc-3')
 })
 
-test('frameIdFromHistoryFilename: null for the baseline\'s bare history.json', () => {
+test('frameIdFromHistoryFilename: null for the shared `agent` instance\'s bare history.json', () => {
   assert.equal(frameIdFromHistoryFilename('history.json'), null)
 })
 
@@ -187,11 +187,10 @@ test('chooseActiveFrame: falls back to the most recently started live frame when
 // above: real leftover frame history files in this dev LOGS_DIR make exact-count
 // assertions unreliable, so these check SHAPE/invariants, not specific contents).
 
-test('GET /frames reports baselineBypassed=true (the dispatch loop is the only execution path) and returns a well-shaped list', async () => {
+test('GET /frames returns a well-shaped list (the dispatch loop is the only execution path)', async () => {
   const resp = await fetch(`${baseUrl}/frames`, { headers: authHeaders() })
   assert.equal(resp.status, 200)
-  const body = await resp.json() as { baselineBypassed: boolean; active: string | null; frames: FrameSummary[] }
-  assert.equal(body.baselineBypassed, true)
+  const body = await resp.json() as { active: string | null; frames: FrameSummary[] }
   assert.ok(Array.isArray(body.frames))
   for (const f of body.frames) {
     assert.ok(['planner', 'implementer', 'dispatcher'].includes(f.role))
@@ -210,7 +209,6 @@ test('GET /context with no frame param keeps the pre-existing shape plus the add
   assert.equal(body.frameId, null)
   assert.equal(body.role, null)
   assert.equal(body.live, false)
-  assert.equal(body.baselineBypassed, true)
 })
 
 test('GET /context?frame=<unknown> is a 404 with an error body', async () => {

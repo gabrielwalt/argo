@@ -5,8 +5,6 @@ import {
   readWorkspaceId,
   ensureWorkspaceId,
   workspaceHasContent,
-  parseSessionPointer,
-  formatSessionPointer,
   decideSessionResume,
   type WorkspaceIdentityIO,
 } from './workspace-identity.js'
@@ -116,48 +114,11 @@ test('workspaceHasContent: false for a genuinely empty directory', async () => {
   assert.equal(await workspaceHasContent('/ws', io), false)
 })
 
-// ── parseSessionPointer / formatSessionPointer ─────────────────────
-
-test('parseSessionPointer: legacy bare session id (today\'s file shape)', () => {
-  assert.deepEqual(parseSessionPointer('2026-09-04T07-03-37'), {
-    sessionId: '2026-09-04T07-03-37',
-    workspaceId: null,
-  })
-})
-
-test('parseSessionPointer: legacy file with surrounding whitespace', () => {
-  assert.deepEqual(parseSessionPointer('  2026-09-04T07-03-37  \n'), {
-    sessionId: '2026-09-04T07-03-37',
-    workspaceId: null,
-  })
-})
-
-test('parseSessionPointer: empty file yields null (nothing recorded)', () => {
-  assert.equal(parseSessionPointer(''), null)
-  assert.equal(parseSessionPointer('   \n'), null)
-})
-
-test('parseSessionPointer: new JSON shape round-trips through formatSessionPointer', () => {
-  const pointer = { sessionId: 's1', workspaceId: 'w1' }
-  const raw = formatSessionPointer(pointer)
-  assert.deepEqual(parseSessionPointer(raw), pointer)
-})
-
-test('parseSessionPointer: JSON without a usable sessionId is treated as no pointer', () => {
-  assert.equal(parseSessionPointer('{"workspaceId":"w1"}'), null)
-  assert.equal(parseSessionPointer('{"sessionId":""}'), null)
-})
-
-test('parseSessionPointer: malformed JSON-looking content falls back to legacy (whole trimmed string as session id)', () => {
-  // Not valid JSON, so it's handled exactly as any other legacy bare-text file —
-  // this is deliberately permissive rather than throwing on a corrupt file.
-  assert.deepEqual(parseSessionPointer('{not json'), {
-    sessionId: '{not json',
-    workspaceId: null,
-  })
-})
-
 // ── decideSessionResume ─────────────────────────────────────────────
+// The pointer this feeds decideSessionResume is now built directly from the
+// ledger's registry (ledger.ts's getCurrentSession), not parsed from any file —
+// see workspace-identity.ts's own SessionPointer comment. decideSessionResume
+// itself stays pointer-format-agnostic, so these tests are unchanged.
 
 test('decideSessionResume: no pointer at all -> fresh', () => {
   assert.deepEqual(decideSessionResume(null, 'w1', true), { resume: false, reason: 'no-pointer' })

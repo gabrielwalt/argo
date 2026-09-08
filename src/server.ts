@@ -9,12 +9,18 @@ import { promises as fs } from 'fs'
 import type { Dirent } from 'fs'
 import { config } from './config.js'
 import { Agent } from './agent.js'
-import { listLogs, readLog, readLogEvents, listSessions, deleteAllLogs, deleteSession, getSessionMessages, registerSession, LOGS_DIR } from './logger.js'
+// LEGACY (pre-ledger) session log replay only — readLog/readLogEvents are the
+// only survivors of logger.ts's old writer actually used here (listLogs has no
+// caller in this file); every other session-tracking concern (current session
+// pointer, registry, resume) now lives on the ledger (ledger.ts) — see the
+// imports below.
+import { readLog, readLogEvents, LOGS_DIR } from './logger.js'
+import * as ledger from './ledger.js'
 import type { AgentEvent, ModelOptions, Role } from './types.js'
 import { checkEnvironment, logEnvironment, type EnvCheck } from './health.js'
 import { installAuth } from './auth.js'
 import { runDispatchLoop, abortDispatch, listLiveFrames, getLiveFrame, getActiveFrameId, type LiveFrame } from './dispatch.js'
-import { ensureWorkspaceId, workspaceHasContent, parseSessionPointer, formatSessionPointer, decideSessionResume, type SessionResumeReason } from './workspace-identity.js'
+import { ensureWorkspaceId, workspaceHasContent, decideSessionResume, type SessionResumeReason } from './workspace-identity.js'
 
 const execAsync = promisify(exec)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -58,7 +64,12 @@ function emitEvent(event: AgentEvent, seq?: number) {
 
 const agent = new Agent(emitEvent)
 
-const SESSION_ID_FILE = path.join(LOGS_DIR, 'current-session.txt')
+// The workspace root the ledger reads/writes .argo/ under — same fallback
+// dispatch.ts's own root() uses (config.workspacePath is '' in standalone dev
+// mode before a folder is mounted).
+function ledgerRoot(): string {
+  return config.workspacePath || '/workspace'
+}
 
 function makeSessionId(): string {
   return new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
@@ -80,12 +91,22 @@ let currentWorkspaceId: string | null = null
 // so they don't update this — only the startup-time choice needs to be visible.
 let startupSessionInfo: { resumed: boolean; reason: SessionResumeReason; previousSessionId?: string } | null = null
 
-// Every write site that used to persist a bare session id now persists it together
-// with the workspace content id it was written under, so a later restart can tell
-// whether the recorded session still belongs to this folder (decideSessionResume in
-// workspace-identity.ts). Fire-and-forget, matching the previous bare-write sites.
+// THE CURRENT-SESSION POINTER now lives on the ledger's own registry
+// (.argo/sessions.json's currentSessionId field, ledger.ts's setCurrentSession/
+// getCurrentSession) — INSIDE the mounted workspace, unlike the old
+// logs/current-session.txt file, which lived alongside this repo's own code
+// (LOGS_DIR) and so survived a workspace content swap untouched. That was the
+// actual root cause workspace-identity.ts's workspaceId-tagged pointer worked
+// around: a pointer stored outside the workspace can never be told apart from a
+// stale one. Stored inside .argo/ instead, the pointer now travels with the
+// workspace's own content by construction — decideSessionResume's
+// workspaceHasContent fallback (the "someone ran `rm -rf *`, which skips
+// dotfiles, so .argo/ survives but the real content didn't" case) still applies
+// and is still checked below; only the workspaceId-mismatch branch is now moot; see
+// startServer() (docs/architecture.md's session-resume section, if any, may still
+// reference the old current-session.txt file — the registry field replaces it 1:1).
 function writeSessionPointer(sessionId: string): Promise<void> {
-  return fs.writeFile(SESSION_ID_FILE, formatSessionPointer({ sessionId, workspaceId: currentWorkspaceId }), 'utf-8').catch(() => {})
+  return ledger.setCurrentSession(ledgerRoot(), sessionId).catch(() => {})
 }
 
 // SSE — streams all agent events to connected browsers
@@ -130,8 +151,8 @@ app.post('/chat', async (req, res) => {
 
   try {
     // The dispatch loop drives Planner/Implementer/Dispatcher as scoped Agent instances of
-    // its own, sharing this same emit path — `agent` (the shared baseline instance
-    // above) is never used to run a turn; it stays only as the vehicle for
+    // its own, sharing this same emit path — `agent` (the shared module-level
+    // instance above) is never used to run a turn; it stays only as the vehicle for
     // /history, /context, /reset, session persistence, etc. Per-request overrides
     // (model/options/maxIterations/autoCommit) above still apply to `agent` even
     // though this route never calls `agent.chat()` directly, since some of those
@@ -156,21 +177,21 @@ app.get('/history', (req, res) => {
 // ── Frame context (context viewer backend) ─────────────────────────
 // /shared/argo-ui/CONTEXT-VIEWER-CONTRACT.md is the authoritative shape for GET
 // /frames and GET /context?frame=<id>. The root cause this exists for: GET /context
-// below always read the baseline single-loop `agent`, which /chat never actually
+// used to only read the shared module-level `agent`, which /chat never actually
 // runs a turn on (dispatch.ts's runDispatchLoop drives scoped Agent instances of
 // its own instead) — so the real per-frame contexts were simply never reachable
 // from the API. GET /context with no `frame` param keeps its pre-existing
-// shape/meaning for backward compatibility — a deployed frontend against a new
-// backend must keep working, since the two halves of this feature land separately.
+// shape/meaning for backward compatibility.
 
 const FRAME_ROLES: readonly Role[] = ['planner', 'implementer', 'dispatcher']
 
 // frameId format is `${role}-${base36 timestamp}-${counter}` (ledger.ts's newId) —
-// none of the four role names contain a hyphen, so the segment before the first
-// hyphen is reliable. Returns null for anything else, in particular the baseline
-// agent's own session ids (ISO-derived timestamps like `2026-09-04T07-03-37`, whose
-// first segment is never one of these four words) — this is what lets the disk scan
-// below tell a frame's history file apart from the baseline's own history-<id>.json.
+// none of the role names contain a hyphen, so the segment before the first hyphen
+// is reliable. Returns null for anything else, in particular the shared `agent`
+// instance's own session ids (ISO-derived timestamps like `2026-09-04T07-03-37`,
+// whose first segment is never one of these role words) — this is what lets the
+// disk scan below tell a frame's history file apart from that instance's own
+// history-<id>.json.
 export function parseFrameRole(frameId: string): Role | null {
   const cut = frameId.indexOf('-')
   const prefix = cut === -1 ? frameId : frameId.slice(0, cut)
@@ -180,8 +201,9 @@ export function parseFrameRole(frameId: string): Role | null {
 const HISTORY_FILENAME_RE = /^history-(.+)\.json$/
 
 // Extracts the id portion of a `history-<id>.json` filename, or null for anything
-// else LOGS_DIR holds (the baseline's bare `history.json`, `.jsonl` run logs,
-// `sessions-registry.json`, `current-session.txt`, `compaction-*.json`, ...).
+// else LOGS_DIR holds (the shared `agent` instance's own bare `history.json`,
+// `.jsonl` run logs, `sessions-registry.json`, `current-session.txt`,
+// `compaction-*.json`, ...).
 export function frameIdFromHistoryFilename(filename: string): string | null {
   const m = HISTORY_FILENAME_RE.exec(filename)
   return m ? m[1] : null
@@ -275,6 +297,15 @@ export function chooseActiveFrame(liveActiveFrameId: string | null, liveFrames: 
 // history broadly rather than one session's. Accepted limitation, documented in
 // FRAME-CONTEXT-BACKEND.md — the alternative (showing nothing for a resumed
 // session after a restart) is worse for the "post-run inspection" this exists for.
+//
+// LEGACY SOURCE, POST-LEDGER-MIGRATION: Agent.loadHistory no longer writes
+// history-<frameId>.json as a side effect (session tracking has moved to the
+// ledger, .argo/frames/<frameId>.jsonl — see ledger.ts) — so this only ever
+// recovers a frame from BEFORE that migration. A frame spawned after it that
+// isn't in the live registry any more (process restarted) has no disk-recovery
+// path here at all; reading it back would mean reading .argo/frames/<frameId>.jsonl
+// via ledger.readFrame instead, which this function does not yet do (Phase 2, not
+// this change — see GET /logs' own comment for the same framing on session replay).
 async function scanDiskFrames(excludeIds: Set<string>): Promise<FrameSummary[]> {
   let files: string[]
   try {
@@ -287,7 +318,7 @@ async function scanDiskFrames(excludeIds: Set<string>): Promise<FrameSummary[]> 
     const frameId = frameIdFromHistoryFilename(f)
     if (!frameId || excludeIds.has(frameId)) continue
     const role = parseFrameRole(frameId)
-    if (!role) continue // not a frame history file (e.g. the baseline's own history-<sessionId>.json)
+    if (!role) continue // not a frame history file (e.g. the shared `agent` instance's own history-<sessionId>.json)
     try {
       const raw = JSON.parse(await fs.readFile(path.join(LOGS_DIR, f), 'utf-8'))
       const { messageCount, totalChars } = buildDiskContextMessages(raw)
@@ -325,24 +356,19 @@ app.get('/frames', async (req, res) => {
   const liveSummaries = listLiveFrames().map(liveFrameSummary)
   const diskOnly = await scanDiskFrames(new Set(liveSummaries.map(f => f.frameId)))
   res.json({
-    // Always true — the dispatch loop (Dispatcher/Planner/Implementer) is the only
-    // execution path now; there is no single-loop baseline mode to bypass. Kept as
-    // a field (rather than removed) for compatibility with any existing frontend
-    // that reads it.
-    baselineBypassed: true,
     active: chooseActiveFrame(getActiveFrameId(), liveSummaries),
     frames: mergeFrameSummaries(liveSummaries, diskOnly),
   })
 })
 
-// GET /context — baseline agent by default; ?frame=<frameId> for a specific
-// dispatch frame (live from its Agent instance, or reconstructed from disk).
+// GET /context — the shared `agent` instance's own context by default (used for
+// /history-style session bookkeeping, not a live dispatch frame); ?frame=<frameId>
+// for a specific dispatch frame (live from its Agent instance, or reconstructed
+// from disk).
 app.get('/context', async (req, res) => {
   const frameId = typeof req.query.frame === 'string' ? req.query.frame : null
   if (frameId === null) {
-    // Unchanged shape/meaning (backward compat: an old frontend against a new
-    // backend keeps working) plus the three additive fields plus baselineBypassed.
-    res.json({ ...agent.getContext(), frameId: null, role: null, live: false, baselineBypassed: true })
+    res.json({ ...agent.getContext(), frameId: null, role: null, live: false })
     return
   }
 
@@ -353,7 +379,7 @@ app.get('/context', async (req, res) => {
   }
 
   // Disk recovery: the frame's Agent is gone (a prior run, or a process restart),
-  // but LOGS_DIR/history-<frameId>.json survives exactly like a baseline session's
+  // but LOGS_DIR/history-<frameId>.json survives exactly like a regular session's
   // history does — reconstruct the same shape from it rather than 404ing just
   // because nothing is currently held in memory. Post-run inspection is the
   // primary use of this whole feature.
@@ -380,25 +406,12 @@ app.get('/context', async (req, res) => {
 
 app.post('/stop', (_req, res) => {
   agent.abort()
-  // agent.abort() alone only reaches the shared baseline instance above — every
-  // frame a dispatch run spawns is a separate Agent, so it needs its own stop path
-  // (see dispatch.ts's abortDispatch). Harmless to call unconditionally: a no-op
-  // when no dispatch run is in flight.
+  // agent.abort() alone only reaches the shared module-level instance above —
+  // every frame a dispatch run spawns is a separate Agent, so it needs its own
+  // stop path (see dispatch.ts's abortDispatch). Harmless to call unconditionally:
+  // a no-op when no dispatch run is in flight.
   abortDispatch()
   res.json({ ok: true })
-})
-
-// Manually trigger compaction (only between turns — compaction only makes
-// sense on settled history, not mid-run)
-app.post('/compact-now', async (_req, res) => {
-  if (isBusy) { res.status(409).json({ error: 'Agent is busy' }); return }
-  isBusy = true
-  try {
-    const result = await agent.compactNow()
-    res.json(result)
-  } finally {
-    isBusy = false
-  }
 })
 
 // Reset session
@@ -407,8 +420,12 @@ app.post('/reset', (req, res) => {
   agent.reset()
   currentSessionId = makeSessionId()
   agent.setSessionId(currentSessionId)
+  // No separate "register an empty session" call any more — the ledger's registry
+  // (ledger.ts's registerFrame, called from dispatch.ts) only gains a session
+  // entry once that session's first frame actually spawns; an id with no frames
+  // yet simply isn't listed by GET /logs until then, same as the old registry's
+  // own registerSession existed only to cover that same brief gap.
   writeSessionPointer(currentSessionId)
-  registerSession(currentSessionId).catch(() => {})
   res.json({ ok: true })
 })
 
@@ -619,22 +636,55 @@ app.post('/api/workspace', express.json(), async (req, res) => {
   res.json({ ok: true, workspacePath: absPath })
 })
 
-// List all session logs
+// List all session logs. FORMAT NOTE (UI): this used to return logger.ts's
+// SessionGroup[] (`{id, startedAt, runs: LogMeta[]}`, one LogMeta per JSONL run
+// file, carrying model/options/filename/etc — see app.js's replaySessionRuns,
+// the one consumer). The ledger's registry has no equivalent per-run file
+// metadata (a frame's own ledger file has no model/options/filename fields at
+// all — see types.ts's SessionRegistry) — `runs` below is therefore always `[]`
+// for a session recorded purely by the ledger. This keeps the response shape
+// array-of-`{id, startedAt, runs}` compatible with the one existing consumer
+// (`sessions.find(s => s.id === ...)`, then iterating `.runs`), which simply
+// finds nothing to replay for a ledger-only session — the UI reading per-frame
+// ledger content directly is Phase 2, not this change.
 app.get('/logs', async (req, res) => {
-  const sessions = await listSessions()
+  const registry = await ledger.getRegistry(ledgerRoot())
+  const sessions = registry.sessions.map(s => ({
+    id: s.id,
+    startedAt: s.runs[0]?.startedAt ?? s.id,
+    runs: [] as unknown[],
+  }))
   res.json(sessions)
 })
 
-// Delete a single session's log files
+// Delete a single session's log files — both this session's own frame files
+// under .argo/frames/ + its entry in .argo/sessions.json (ledger.deleteSession),
+// and any legacy history-*.json left over from a pre-ledger session with this id.
 app.delete('/logs/:sessionId', async (req, res) => {
-  await deleteSession(req.params.sessionId)
+  const sessionId = req.params.sessionId
+  await Promise.all([
+    ledger.deleteSession(ledgerRoot(), sessionId),
+    fs.unlink(path.join(LOGS_DIR, `history-${sessionId}.json`)).catch(() => {}),
+  ])
   res.json({ ok: true })
 })
 
-// Delete all logs and reset
+// Delete all logs and reset — clears .argo/frames/ and resets .argo/sessions.json
+// (ledger.resetAllSessions), plus (backward compat) any legacy JSONL/history/
+// registry/pointer files still under LOGS_DIR from before session tracking moved
+// to the ledger.
 app.delete('/logs', async (req, res) => {
   if (isBusy) { res.status(409).json({ error: 'Agent is busy' }); return }
-  await deleteAllLogs()
+  await Promise.all([
+    ledger.resetAllSessions(ledgerRoot()),
+    fs.readdir(LOGS_DIR).then(files =>
+      Promise.all(
+        files
+          .filter(f => f.endsWith('.jsonl') || f.startsWith('history') || f === 'current-session.txt' || f === 'sessions-registry.json')
+          .map(f => fs.unlink(path.join(LOGS_DIR, f)).catch(() => {})),
+      ),
+    ).catch(() => {}),
+  ])
   agent.reset()
   currentSessionId = makeSessionId()
   agent.setSessionId(currentSessionId)
@@ -642,26 +692,30 @@ app.delete('/logs', async (req, res) => {
   res.json({ ok: true })
 })
 
-// Resume a past session
+// Resume a past session — switches the ledger's currentSessionId pointer. The
+// persistent Dispatcher frame (dispatch.ts's dispatcherFrameId) loads its history
+// from its own ledger file keyed on the session id, so there is no separate
+// "load history into the shared agent" step needed any more (contrast the old
+// history-<sessionId>.json / getSessionMessages fallback this replaces) — the
+// shared module-level `agent` instance was never what a dispatch run's context
+// came from anyway (see its own comment above). getChatHistory() on it is
+// therefore always empty right after a switch; this is expected, not a fidelity
+// loss, since /chat never runs a turn on that instance in the first place.
 app.post('/resume/:sessionId', async (req, res) => {
   if (isBusy) { res.status(409).json({ error: 'Agent is busy' }); return }
-  // Save current session history before switching
-  await agent.saveHistory()
-  // Switch session
   currentSessionId = req.params.sessionId
   agent.setSessionId(currentSessionId)
-  writeSessionPointer(currentSessionId)
-  // Load per-session history file if it exists (full fidelity with tool calls),
-  // otherwise reconstruct from log events (user+assistant messages only)
-  await agent.loadPersistedHistory()
-  if (agent.getChatHistory().length === 0) {
-    const messages = await getSessionMessages(req.params.sessionId)
-    if (messages.length > 0) agent.loadHistory(messages)
-  }
+  await writeSessionPointer(currentSessionId)
   res.json({ ok: true, count: agent.getChatHistory().length })
 })
 
-// Get structured events from a log file for replay (returns JSON event array)
+// LEGACY. Get structured events from an old (pre-ledger) JSONL run-log file for
+// replay (returns JSON event array). Nothing in this codebase writes a new
+// `.jsonl` run log any more — this only ever serves a file that already existed
+// on disk from before the migration to the ledger. A session recorded purely by
+// the ledger has no `.jsonl` file at all, so GET /logs' own `runs` is always `[]`
+// for it and this route is simply never called for it (see GET /logs' own
+// comment) — replaying a NEW session's history from the ledger is Phase 2.
 app.get('/logs/:filename', async (req, res) => {
   const filename = req.params.filename
   if (path.basename(filename) !== filename) { res.status(400).json({ error: 'Invalid filename' }); return }
@@ -769,23 +823,25 @@ app.get('/file', async (req, res) => {
 })
 
 export async function startServer() {
-  // Initialize session ID before loading history so historyFile points to the right file
-  await fs.mkdir(path.dirname(SESSION_ID_FILE), { recursive: true })
-
   // Content identity of the mounted workspace (workspace-identity.ts). Null in
   // standalone dev mode before a folder is mounted (config.workspacePath === ''), or
   // if the workspace turns out to be unwritable — ensureWorkspaceId fails open rather
   // than blocking startup over a bookkeeping file.
   currentWorkspaceId = config.workspacePath ? await ensureWorkspaceId(config.workspacePath) : null
 
-  let rawPointer = ''
-  try {
-    rawPointer = await fs.readFile(SESSION_ID_FILE, 'utf-8')
-  } catch {
-    // No pointer file yet — parseSessionPointer('') returns null below, handled the
-    // same as any other "nothing recorded to resume" case.
-  }
-  const pointer = parseSessionPointer(rawPointer)
+  // The current-session pointer now lives on the ledger's own registry, INSIDE
+  // the mounted workspace (.argo/sessions.json's currentSessionId — see
+  // writeSessionPointer's own comment above for why this makes the old
+  // workspaceId-tagged pointer's mismatch case structurally impossible: the
+  // registry travels with the workspace's content by construction, unlike the old
+  // logs/current-session.txt file, which lived outside it). What's left to guard
+  // against is the ledger's own equivalent of the reported bug: a `rm -rf *`
+  // leaves .argo/ (dotfiles) behind, so a previously recorded sessionId can
+  // survive even though the user emptied the folder's real content —
+  // decideSessionResume's workspaceHasContent fallback still covers exactly that
+  // case, treated the same way a legacy (workspaceId: null) pointer always was.
+  const previousSessionId = config.workspacePath ? await ledger.getCurrentSession(config.workspacePath) : null
+  const pointer = previousSessionId ? { sessionId: previousSessionId, workspaceId: null } : null
 
   if (!config.workspacePath) {
     // No workspace mounted yet at all (standalone dev mode before POST
@@ -797,14 +853,8 @@ export async function startServer() {
       await writeSessionPointer(currentSessionId)
     }
   } else {
-    // THE FIX: resume the persisted session only if it's provably this workspace's
-    // — see decideSessionResume's own comment for the full reasoning, in particular
-    // why a legacy pointer (no recorded workspace id, the state of every session
-    // written before this change) falls back to a content check rather than an
-    // unconditional resume OR an unconditional reset.
     const hasContent = await workspaceHasContent(config.workspacePath)
     const decision = decideSessionResume(pointer, currentWorkspaceId, hasContent)
-    const previousSessionId = pointer?.sessionId
     if (decision.resume && pointer) {
       currentSessionId = pointer.sessionId
       console.log(`[session] Resuming session ${currentSessionId} (${decision.reason})`)
@@ -812,7 +862,7 @@ export async function startServer() {
       currentSessionId = makeSessionId()
       // Visible-on-purpose: a silent reset here would be the same class of defect as
       // the silent resume this fix removes. Nothing is deleted — the previous
-      // session's run logs/history stay on disk, reachable via listSessions()/
+      // session's frame ledger files stay on disk, reachable via GET /logs/
       // POST /resume/:sessionId — only the "current" pointer moves.
       console.log(`[session] Starting fresh session ${currentSessionId} — ${decision.reason}${previousSessionId ? ` (previous session ${previousSessionId} left on disk, still reachable via past sessions)` : ''}`)
     }
@@ -821,10 +871,6 @@ export async function startServer() {
   }
 
   agent.setSessionId(currentSessionId)
-  await Promise.all([
-    agent.loadPersistedHistory(),
-    registerSession(currentSessionId),
-  ])
   app.listen(config.port, () => {
     console.log(`Agent running at http://localhost:${config.port}`)
   })
