@@ -396,7 +396,11 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
     'EFFICIENCY\n' +
     'Use each tool call to obtain new information or advance the task. Do not repeat or perform an ' +
     'equivalent inspection when the current context already establishes the fact. Treat successful tool ' +
-    'results as authoritative unless something may have changed since. After a successful write or edit, ' +
+    'results as authoritative unless something may have changed since. ' +
+    'When a file already exists and needs a correction, prefer edit_file for targeted changes ' +
+    'over write_file for a full rewrite. Reserve write_file for genuinely new files or cases ' +
+    'where the majority of the file needs to change.\n' +
+    'After a successful write or edit, ' +
     'do not re-read the file merely to confirm it. Before acting, identify what you need to establish; ' +
     'once the relevant project state is understood, form a coherent implementation approach and execute ' +
     'it without unnecessary steps.\n\n' +

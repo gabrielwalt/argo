@@ -24,6 +24,36 @@ import { recordMessage, newId as newLedgerId } from './ledger.js'
 function extractToolCallsFromContent(content: string): Array<{ name: string; arguments: Record<string, unknown> }> {
   const results: Array<{ name: string; arguments: Record<string, unknown> }> = []
 
+  // Extract from <tool_call>...</tool_call> tags first — qwen3's NATIVE format
+  // when it isn't using the real tool-calling API, so this is the most common
+  // shape in practice and should win over the more speculative checks below.
+  const toolCallRe = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g
+  let tcMatch: RegExpExecArray | null
+  while ((tcMatch = toolCallRe.exec(content)) !== null) {
+    try {
+      const obj = JSON.parse(tcMatch[1].trim())
+      if (obj && typeof obj.name === 'string' && obj.arguments)
+        results.push({ name: obj.name, arguments: obj.arguments })
+    } catch { /* malformed JSON inside tag */ }
+  }
+  if (results.length > 0) return results
+
+  // Truncated turn: an opening <tool_call> with no closing tag (the model's
+  // generation was cut off mid-call, e.g. by num_predict). Try to parse
+  // whatever JSON follows the last opening tag rather than discarding the
+  // call entirely — a well-formed-but-truncated JSON object still parses.
+  if (content.includes('<tool_call>') && !content.includes('</tool_call>')) {
+    const afterTag = content.split('<tool_call>').pop()?.trim()
+    if (afterTag) {
+      try {
+        const obj = JSON.parse(afterTag)
+        if (obj && typeof obj.name === 'string' && obj.arguments)
+          results.push({ name: obj.name, arguments: obj.arguments })
+      } catch { /* truncated mid-JSON — nothing recoverable */ }
+    }
+    if (results.length > 0) return results
+  }
+
   // Try parsing the entire content as a single JSON tool call (qwen sometimes
   // produces bare {"name":"bash","arguments":{...}} without any wrapper).
   const trimmed = content.trim()
@@ -1148,6 +1178,7 @@ export class Agent {
     // Reset to 0 on any turn that DOES produce a tool call, so the count always
     // means "since the last real action," not "since the run started."
     let consecutiveThinkingTurns = 0
+    let consecutiveNudges = 0
     let consecutiveTimeouts = 0
     // How this turn ends is decided by whichever exit path below runs; assume the good
     // case so a normal final answer needs no bookkeeping, and overwrite on the cap /
@@ -1276,6 +1307,7 @@ export class Agent {
             const stall = roleProgressMessages[idx]
             emitAndLog({ type: 'warning', message: stall })
             this.pushCtx({ role: 'system', content: stall })
+            consecutiveNudges = 0 // progress check resets nudge ceiling
           }
         } else if (stallCheckpoints.includes(iterNum)) {
           // Real edits landing since the LAST checkpoint (not since run start — a
@@ -1303,6 +1335,7 @@ export class Agent {
               : `PROGRESS CHECK: ${iterNum} iterations in and not finished. Objective: "${objective}". State what you have confirmed so far, then either call conclude with your verdict/answer or take the single most important remaining action — do not keep re-checking the same thing.`
             emitAndLog({ type: 'warning', message: stall })
             this.pushCtx({ role: 'system', content: stall })
+            consecutiveNudges = 0 // progress check resets nudge ceiling
           }
         }
 
@@ -1460,6 +1493,14 @@ export class Agent {
           // free turn to reason/plan without being told to hurry up; a SECOND turn in
           // a row with no tool call is when a reminder actually earns its place.
           if (consecutiveThinkingTurns >= 2) {
+            consecutiveNudges++
+          }
+          // Hard ceiling: after enough nudges without any tool call response, the
+          // model isn't going to recover. Force-conclude rather than burn the budget.
+          if (consecutiveNudges >= 20) {
+            return this.endFrameStalled('Stopping: too many consecutive turns without a tool call. Concluding with current state.', emitAndLog)
+          }
+          if (consecutiveThinkingTurns >= 2) {
             const nudge = 'Your turn produced no tool calls. To call a tool, wrap the call in <tool_call> tags.\nTo finish, call conclude with your final answer. To keep working, make your next tool call.'
             emitAndLog({ type: 'warning', message: nudge })
             this.pushCtx({ role: 'system', content: nudge })
@@ -1468,6 +1509,7 @@ export class Agent {
         }
 
         consecutiveThinkingTurns = 0
+        consecutiveNudges = 0
 
         // If the model produced thinking or visible text alongside its tool
         // calls, push that as its own assistant message first (the reasoning

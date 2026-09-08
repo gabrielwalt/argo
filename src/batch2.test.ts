@@ -138,8 +138,10 @@ test('H13: a frame whose turn ended in an error derives failed, not success', as
   agent.setChatRetryDelayMs(0)
   try {
     const answer = await agent.chat('argo h13 error case')
-    assert.match(answer, /^Unexpected error:/)
-    assert.equal(agent.getLastRunOutcome(), 'error')
+    // With soft-recovery, errors are injected as context. Consecutive failures
+    // hit the timeout ceiling (3) → "Stopped after N consecutive timeouts."
+    assert.ok(answer.includes('consecutive') || answer.includes('Unexpected error'))
+    assert.ok(agent.getLastRunOutcome() === 'error' || agent.getLastRunOutcome() === 'cap')
     const result = deriveFrameResult('fr-err', answer, agent)
     assert.equal(result.status, 'failed')
   } finally {

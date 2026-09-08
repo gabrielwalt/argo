@@ -1,8 +1,13 @@
 import fs from 'fs/promises'
 import path from 'path'
+import os from 'os'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
 import { config } from '../config.js'
 import type { ToolResult } from '../types.js'
 import { truncateOutput } from './truncate.js'
+
+const execFileAsync = promisify(execFile)
 
 // path.resolve() is purely lexical — it does not follow symlinks. A symlink
 // created inside /workspace pointing elsewhere (trivially doable via the
@@ -328,6 +333,75 @@ export async function writeFile(filePath: string, content: string): Promise<Tool
   }
 }
 
+// Extensions whose syntax quickLint knows how to check. Kept intentionally
+// narrow — anything not listed here is skipped entirely (treated as "no
+// error"), not guessed at.
+const LINT_EXTENSIONS = new Set(['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.json', '.html', '.htm', '.css'])
+
+// Fast, conservative syntax-only check run after a successful edit_file write,
+// so a clear syntax error introduced by the edit can be caught and reverted
+// automatically instead of leaving the file broken for the next tool call to
+// discover indirectly (a failing test run, a broken build). Returns null when
+// the file's extension isn't one we know how to check, or when it looks fine.
+// Deliberately narrow: only catches unambiguous syntax errors (unparseable
+// JS/TS, invalid JSON, unbalanced tags/braces) — never style or lint
+// findings, which would make this a nagging false-positive machine instead of
+// a safety net.
+async function quickLint(filePath: string, content: string): Promise<string | null> {
+  const ext = path.extname(filePath).toLowerCase()
+  if (!LINT_EXTENSIONS.has(ext)) return null
+  try {
+    if (ext === '.json') {
+      try {
+        JSON.parse(content)
+      } catch (err) {
+        return `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`
+      }
+      return null
+    }
+    if (ext === '.js' || ext === '.jsx' || ext === '.mjs' || ext === '.cjs' || ext === '.ts' || ext === '.tsx') {
+      // node --check is syntax-only (no execution) and understands modern JS;
+      // it does not understand TS-only syntax (types, `as`, etc.) so a .ts/.tsx
+      // file with type annotations will legitimately fail this check — skip
+      // those two extensions rather than produce false positives on valid TS.
+      if (ext === '.ts' || ext === '.tsx') return null
+      const tmpFile = path.join(os.tmpdir(), `argo-lint-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`)
+      try {
+        await fs.writeFile(tmpFile, content, 'utf-8')
+        await execFileAsync('node', ['--check', tmpFile], { timeout: 3000 })
+        return null
+      } catch (err) {
+        const stderr = (err as { stderr?: string })?.stderr
+        const message = stderr?.trim() || (err instanceof Error ? err.message : String(err))
+        return message.split('\n').slice(0, 3).join('\n')
+      } finally {
+        await fs.unlink(tmpFile).catch(() => { /* best effort cleanup */ })
+      }
+    }
+    if (ext === '.html' || ext === '.htm') {
+      const openScript = (content.match(/<script\b[^>]*>/gi) ?? []).length
+      const closeScript = (content.match(/<\/script\s*>/gi) ?? []).length
+      if (openScript !== closeScript) return `Unbalanced <script> tags: ${openScript} opening vs ${closeScript} closing.`
+      const openStyle = (content.match(/<style\b[^>]*>/gi) ?? []).length
+      const closeStyle = (content.match(/<\/style\s*>/gi) ?? []).length
+      if (openStyle !== closeStyle) return `Unbalanced <style> tags: ${openStyle} opening vs ${closeStyle} closing.`
+      return null
+    }
+    if (ext === '.css') {
+      const open = (content.match(/{/g) ?? []).length
+      const close = (content.match(/}/g) ?? []).length
+      if (open !== close) return `Unbalanced braces: ${open} '{' vs ${close} '}'.`
+      return null
+    }
+    return null
+  } catch {
+    // quickLint must never itself break the edit path — any unexpected
+    // failure here (e.g. node not on PATH) is treated as "can't tell," not
+    // as a syntax error.
+    return null
+  }
+}
+
 // A few lines of context around the edited region, line-numbered, so the caller
 // can confirm the change landed where expected WITHOUT re-reading the file —
 // the "did my edit apply? let me look again…" round trip is the loop this
@@ -339,6 +413,41 @@ function editedRegion(updated: string, newString: string, matchIndex: number): s
   const from = Math.max(0, startLine - 2)
   const to = Math.min(lines.length, startLine + newLineCount + 2)
   return lines.slice(from, to).map((l, i) => `${from + i + 1}: ${l}`).join('\n')
+}
+
+// Finds a contiguous run of lines in `content` whose PER-LINE trimmed text
+// exactly matches oldString's per-line trimmed text — the bounded fallback
+// for the common near-miss where old_string is right except for leading/
+// trailing whitespace or indentation on one or more lines. Returns the
+// [startIndex, endIndex) byte range of the actual (unnormalized) match in
+// `content`, or null if no such run exists or more than one does (ambiguous
+// matches are refused here just like the exact-match path refuses them).
+// Deliberately bounded to whitespace-per-line only — never edit distance or
+// any other approximate matching.
+function findWhitespaceInsensitiveMatch(content: string, oldString: string): { start: number; end: number } | null {
+  const oldLines = oldString.split('\n')
+  const normalizedOldLines = oldLines.map(l => l.trim())
+  const contentLines = content.split('\n')
+  // Byte offset of the start of each line in `content`, for reconstructing a
+  // real [start,end) range once a matching run of lines is found.
+  const lineStarts: number[] = [0]
+  for (const line of contentLines.slice(0, -1)) lineStarts.push(lineStarts[lineStarts.length - 1] + line.length + 1)
+
+  const matches: Array<{ start: number; end: number }> = []
+  for (let i = 0; i + normalizedOldLines.length <= contentLines.length; i++) {
+    let ok = true
+    for (let j = 0; j < normalizedOldLines.length; j++) {
+      if (contentLines[i + j].trim() !== normalizedOldLines[j]) { ok = false; break }
+    }
+    if (ok) {
+      const start = lineStarts[i]
+      const lastLineIdx = i + normalizedOldLines.length - 1
+      const end = lineStarts[lastLineIdx] + contentLines[lastLineIdx].length
+      matches.push({ start, end })
+    }
+  }
+  if (matches.length !== 1) return null
+  return matches[0]
 }
 
 // Exact-string replace that always reports what it did — the point is the
@@ -361,17 +470,52 @@ export async function editFile(filePath: string, oldString: string, newString: s
     if (oldString === newString) {
       return { output: '', error: 'old_string and new_string are identical — nothing to change.' }
     }
-    const matchIndex = content.indexOf(oldString)
+    let matchIndex = content.indexOf(oldString)
+    let effectiveOldLength = oldString.length
     if (matchIndex === -1) {
-      return { output: '', error: `old_string not found in ${filePath}; the file was NOT modified. It must match exactly, including whitespace and indentation — read the current file and copy the target text verbatim.` }
+      // Bounded whitespace-insensitive fallback before giving up — rescues the
+      // single most common near-miss (indentation/trailing-space drift)
+      // without doing any real fuzzy/edit-distance matching. Only takes effect
+      // when it finds EXACTLY one candidate run of lines; anything else falls
+      // through to the diagnostic error below.
+      const wsMatch = findWhitespaceInsensitiveMatch(content, oldString)
+      if (wsMatch) {
+        matchIndex = wsMatch.start
+        effectiveOldLength = wsMatch.end - wsMatch.start
+      } else {
+        // Actionable diagnostics: point at lines that partially match instead
+        // of just repeating "not found."
+        const searchStr = oldString.slice(0, 40).trim()
+        const lines = content.split('\n')
+        const candidates: number[] = []
+        if (searchStr) {
+          for (let i = 0; i < lines.length; i++) {
+            if (lines[i].includes(searchStr)) candidates.push(i + 1)
+          }
+        }
+        const hint = candidates.length > 0
+          ? ` Closest matches found at line${candidates.length > 1 ? 's' : ''}: ${candidates.slice(0, 5).join(', ')}. Use read_file with offset/limit to see the exact text.`
+          : ' No similar text found — the content may have changed since you last read the file.'
+        return { output: '', error: `old_string not found in ${filePath}; the file was NOT modified.${hint}` }
+      }
     }
-    const occurrences = content.split(oldString).length - 1
+    const matchedOld = content.slice(matchIndex, matchIndex + effectiveOldLength)
+    const occurrences = content.split(matchedOld).length - 1
     if (occurrences > 1 && !replaceAll) {
       return { output: '', error: `old_string matches ${occurrences} places in ${filePath}; the file was NOT modified. Include surrounding context to target a single one, or pass replace_all: true to change all ${occurrences}.` }
     }
     const updated = replaceAll
-      ? content.split(oldString).join(newString)
-      : content.slice(0, matchIndex) + newString + content.slice(matchIndex + oldString.length)
+      ? content.split(matchedOld).join(newString)
+      : content.slice(0, matchIndex) + newString + content.slice(matchIndex + effectiveOldLength)
+
+    // Fast, conservative syntax check on the WOULD-BE content, before
+    // committing it to disk — only reverts on a clear syntax error, never on
+    // style/lint findings (quickLint doesn't produce those at all).
+    const lintError = await quickLint(abs, updated)
+    if (lintError) {
+      return { output: '', error: `Edit would introduce a syntax error — not applied.\nError: ${lintError}\nThe file is unchanged. Fix the error in your new_string and try again.` }
+    }
+
     await fs.writeFile(abs, updated, 'utf-8')
     const n = replaceAll ? occurrences : 1
     const lines = updated.split('\n').length
