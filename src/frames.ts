@@ -331,6 +331,11 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
     'or executed, so downstream agents receive the project context they need without having to rediscover it.\n\n' +
     'Do not implement anything. The project is READ-ONLY for you: inspect it as needed to understand the ' +
     'request and codebase, but do not intentionally modify project files.\n\n' +
+    'EFFICIENCY\n' +
+    'Use each tool call to obtain new information or advance the task. Do not repeat or perform an ' +
+    'equivalent inspection when the current context already establishes the fact. Treat successful tool ' +
+    'results as authoritative unless something may have changed since. Plan your approach before acting ' +
+    'and execute in the minimum number of steps.\n\n' +
     'The .argo/ folder is harness bookkeeping — ignore its contents. Use the `ledger` tool to recover past ' +
     'messages that may have been evicted or collapsed from your context.',
   planner:
@@ -361,6 +366,11 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
     'SCOPE\n' +
     'The project is READ-ONLY for you. Inspect files as needed to understand the codebase and ground the ' +
     'plan, but do not implement or modify anything.\n\n' +
+    'EFFICIENCY\n' +
+    'Use each tool call to obtain new information or advance the task. Do not repeat or perform an ' +
+    'equivalent inspection when the current context already establishes the fact. Treat successful tool ' +
+    'results as authoritative unless something may have changed since. Plan your approach before acting ' +
+    'and execute in the minimum number of steps.\n\n' +
     'The .argo/ folder is harness bookkeeping — ignore its contents. Use the `ledger` tool to recover past ' +
     'messages that may have been evicted or collapsed from your context.',
   implementer:
@@ -383,6 +393,12 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
     'If you cannot complete the assignment within reasonable effort, state what you tried, what failed, what ' +
     'remains incomplete, and why it cannot be completed as scoped rather than repeatedly pursuing the same ' +
     'unsuccessful approach.\n\n' +
+    'EFFICIENCY\n' +
+    'Use each tool call to obtain new information or advance the task. Do not repeat or perform an ' +
+    'equivalent inspection when the current context already establishes the fact. Treat successful tool ' +
+    'results as authoritative unless something may have changed since. After a successful write or edit, ' +
+    'do not re-read the file merely to confirm it. Plan your complete implementation before making your ' +
+    'first tool call, then execute in the minimum number of steps.\n\n' +
     'The .argo/ folder is harness bookkeeping — do not touch or inspect its contents. Use the `ledger` tool ' +
     'to recover past messages that may have been evicted or collapsed from your context.',
 }
