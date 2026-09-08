@@ -1853,8 +1853,16 @@ function renderAgentConclusion(frameId, role, status, content) {
   const roleLabelHtml = agentColor
     ? `<span class="conclude-role-label" style="color:${agentColor}"><span class="conclude-role-dot" style="background:${agentColor}"></span>${escHtml(role)}</span>`
     : escHtml(role)
-  el.innerHTML = `<div class="conclusion-title">${roleLabelHtml} concluded`
-    + (status ? `<span class="status">${escHtml(String(status))}</span>` : '')
+  // Apply agent color to the whole card (border, title, status badge)
+  // instead of the per-status CSS colors (blue/purple/red/green).
+  if (agentColor) {
+    el.style.borderLeftColor = agentColor
+    el.style.background = `${agentColor}11`
+  }
+  const titleColor = agentColor ? ` style="color:${agentColor}"` : ''
+  const statusColor = agentColor ? ` style="background:${agentColor}22; color:${agentColor}"` : ''
+  el.innerHTML = `<div class="conclusion-title"${titleColor}>${roleLabelHtml} concluded`
+    + (status ? `<span class="status"${statusColor}>${escHtml(String(status))}</span>` : '')
     + metaHtml
     + `</div><div class="conclusion-text">${renderMarkdown(text)}</div>`
   el.querySelectorAll('a').forEach(a => a.setAttribute('target', '_blank'))
