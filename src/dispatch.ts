@@ -30,7 +30,7 @@
 import { Agent } from './agent.js'
 import { config } from './config.js'
 import type { AgentEvent, FrameSpawnRequest, FrameResult, FrameStatus, ModelOptions, Role, ToolName } from './types.js'
-import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, buildAssignment, capSummary, parseTaskStartVerdict, TASK_START_TOOLS, type TaskStartVerdict } from './frames.js'
+import { ROLE_TOOLS, ROLE_MAX_ITERATIONS, ROLE_NAME, buildAssignment, capSummary, parseTaskStartVerdict, TASK_START_TOOLS, type TaskStartVerdict } from './frames.js'
 import * as ledger from './ledger.js'
 
 // The workspace root — config.workspacePath (NOT a literal '/workspace') because
@@ -309,10 +309,21 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
   // compact today; the eviction-aware dedup in readFrame() is what protects every
   // OTHER consumer of the ledger — the `ledger` tool's own `messages` action, disk-
   // frame reconstruction — that doesn't apply this same narrower filter.)
+  //
+  // Since agent.ts's tool-call restructure (each tool call now gets its OWN
+  // dedicated "<Tool> called:" assistant message — see formatToolCallContent —
+  // rather than an empty-content assistant message carrying `tool_calls`), a
+  // literal `role === 'assistant'` no longer implies "the model's own
+  // conversational reply": a call-description turn is also role 'assistant' with
+  // non-empty content, and reloading it here would replay tool-call mechanics
+  // exactly as unwanted as before, just under a different shape. agent.ts's
+  // pushCtx tags every such turn with uiMeta.toolName (LedgerMessage's own
+  // `toolName` field) specifically so this filter can still tell the two apart —
+  // excluded here the same way tool/tool-result entries always were.
   if (isPersistent) {
     const previous = await ledger.readFrame(root(), frameId)
     const chatOnly = previous.filter(m => m.role === 'user' || m.role === 'assistant')
-      .filter(m => !!m.content)
+      .filter(m => !!m.content && !m.toolName)
     agent.loadHistory(chatOnly.map(m => ({ role: m.role, content: m.content })))
   }
 
@@ -347,6 +358,17 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
   // (20) without a final answer."), not a real reply, and must never be replayed
   // back into a later run as if the Dispatcher had said it.
   if (isPersistent && agent.getLastRunOutcome() === 'ok') await recordCleanAnswer(frameId, finalAnswer)
+  // PARENT VISIBILITY: every frame's conclusion is also appended to the persistent
+  // Dispatcher's own ledger (never to a frame's OWN ledger — the conclude tool
+  // call, and recordCleanAnswer above for a persistent frame, already put it
+  // there) — see recordConclusionToParent's own comment for why. Skipped when
+  // dispatcherFrameId is unset (should not happen once runDispatchLoop's very
+  // first call has run — see dispatcherFrameId's own comment — but this frame
+  // could theoretically spawn before that, e.g. under test) and when THIS frame
+  // IS the Dispatcher (its own conclusion is already in its own ledger).
+  if (dispatcherFrameId && frameId !== dispatcherFrameId) {
+    await recordConclusionToParent(dispatcherFrameId, req.role, finalAnswer)
+  }
   return { agent, result }
 }
 
@@ -383,6 +405,41 @@ async function recordCleanAnswer(frameId: string, answer: string): Promise<void>
   }
 }
 
+// PARENT VISIBILITY: a sub-agent's conclusion never automatically reaches its
+// PARENT's own context — the Dispatcher only sees its own persistent ledger,
+// the Planner only sees its own; a spawned Planner/Implementer frame's answer
+// otherwise only ever lives (a) in that frame's OWN ledger and (b) in whatever
+// text the caller happens to thread through as the next prompt (spawnFrame's
+// callers already do this for the IMMEDIATE next step — e.g. buildNextTaskPrompt
+// feeding an Implementer's conclusion to the Planner's very next resume — but that
+// is transient framing text, not a durable record in the parent's own ledger
+// file). This appends a plain `role: 'tool'` entry (never 'assistant' — this is a
+// report ABOUT a sub-agent, not the parent's own reply) to the PARENT frame's
+// ledger, bracket-prefixed with the sub-agent's role so a later reload can tell
+// who said it. `role: 'tool'` deliberately mirrors how agent.ts's own tool
+// results are recorded — informational content the parent frame is told about,
+// not something the parent produced or said.
+//
+// Fire-and-forget is deliberately NOT used here (unlike agent.ts's own pushCtx) —
+// same stance as recordCleanAnswer just above: whether a persistent frame's NEXT
+// resume sees this sub-agent's report depends on the write having actually
+// landed first.
+async function recordConclusionToParent(parentFrameId: string, role: Role, finalAnswer: string): Promise<void> {
+  if (!finalAnswer) return // e.g. "Stopped." on an aborted run — nothing worth reporting up
+  try {
+    const roleName = ROLE_NAME[role] || role
+    await ledger.recordMessage(root(), parentFrameId, {
+      id: ledger.newId('msg'),
+      role: 'tool',
+      content: `[${roleName} concluded]\n${finalAnswer}`,
+    })
+  } catch (err) {
+    // Harness bookkeeping, never something that should be able to abort a run —
+    // same fail-open stance as every other ledger call site in this codebase.
+    console.error('[dispatch] recordConclusionToParent failed (continuing):', err)
+  }
+}
+
 // Resumes an EXISTING frame (same Agent instance, same history) with a follow-up
 // message — used for the Planner's per-task detail calls.
 // The { resume: true } flag is load-bearing. Without it chat() clears the frame's
@@ -390,6 +447,20 @@ async function recordCleanAnswer(frameId: string, answer: string): Promise<void>
 // instance, same history" would be true of the transcript and false of every piece
 // of run state derived from it — a resumed frame would restart at ITER 1 with no
 // memory of what it had edited.
+// NOTE on parent visibility: unlike spawnFrame (below), resumeFrame does NOT
+// call recordConclusionToParent. Both of its current call sites resume a frame
+// as its OWN caller — runDispatcherTaskStart's marker-retry resumes the
+// Dispatcher frame with itself, and runObjectiveViaPlanner's per-round detail
+// call resumes the Planner frame with itself — so every resumeFrame call today
+// is a SELF-conclusion (the same frame progressing its own turn), never a
+// child's conclusion a parent needs to be told about. "Don't record
+// self-conclusions" (see recordConclusionToParent's own doc comment) applies to
+// both, which is exactly why this function has no such call: adding one keyed
+// on `frameId !== dispatcherFrameId` would have wrongly recorded every one of
+// the Planner's own mid-loop detail answers into the Dispatcher's ledger, none
+// of which are a sub-agent's conclusion — that visibility already happens
+// explicitly, once per Implementer, via runObjectiveViaPlanner's own
+// recordConclusionToParent(dispatcherFrameId, 'implementer', ...) call below.
 async function resumeFrame(frameId: string, agent: Agent, followUp: string): Promise<FrameResultRaw> {
   checkAborted()
   activeFrameAgent = agent
@@ -1113,6 +1184,20 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
       emit,
     )
     commitAgent = implFrame.agent
+    // PARENT VISIBILITY, Planner side: spawnFrame's own hook (see its call to
+    // recordConclusionToParent) already appended this Implementer's conclusion to
+    // the DISPATCHER's ledger; the Planner is this Implementer's actual immediate
+    // parent (parentFrameId: plannerFrameId, just above) and needs its OWN durable
+    // record too, not just the transient plannerFollowUp text threaded through
+    // below (buildNextTaskPrompt/buildImplementerCapFollowUp) — that text is what
+    // the Planner's NEXT resumeFrame call actually reads as its live prompt, but a
+    // resumed frame's PRELOAD (spawnFrame's isPersistent branch) only ever replays
+    // from the ledger FILE, and the Planner frame itself is not persistent across
+    // separate dispatch runs the way the Dispatcher is — this call is what makes
+    // the Planner's own ledger file carry the full "what each Implementer
+    // reported" history, independent of whatever framing text happened to
+    // accompany it turn to turn.
+    await recordConclusionToParent(plannerFrameId, 'implementer', implFrame.result.rawSummary)
     const taskEntry: { prompt: string; conclusion: string } = {
       prompt: nextAssignment, conclusion: implFrame.result.rawSummary,
     }

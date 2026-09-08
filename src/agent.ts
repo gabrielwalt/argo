@@ -104,55 +104,67 @@ function summarizeCall(name: string, args: Record<string, unknown>): string {
   return json.length > 80 ? `${json.slice(0, 80)}…` : json
 }
 
-// Primary args are capped uniformly at MAX_LABEL_ARG_CHARS (not just bash) — a
-// long read_file/fetch_url/web_search argument used to pass through unbounded,
-// the exact same "one line stays cheap" property buildToolLabel promises above
-// only actually held for bash. When an arg is cut, the "… (truncated)" suffix
-// makes the cut itself visible instead of looking like the argument just ended.
-const MAX_LABEL_ARG_CHARS = 128
-
-function capLabelArg(name: string, value: string): string {
-  if (value.length <= MAX_LABEL_ARG_CHARS) return `[${name}: ${value}]`
-  return `[${name}: ${value.slice(0, MAX_LABEL_ARG_CHARS)}… (truncated)]`
+// Human-readable display names for each tool, used by formatToolCallContent
+// below to build the dedicated assistant message that now precedes every tool
+// result in the live context (see agent.ts's chat() tool-call loop).
+const TOOL_DISPLAY_NAMES: Record<string, string> = {
+  bash: 'Bash',
+  read_file: 'Read File',
+  write_file: 'Write File',
+  edit_file: 'Edit File',
+  fetch_url: 'Fetch URL',
+  web_search: 'Web Search',
+  browser_fetch: 'Browser Fetch',
+  ledger: 'Ledger',
+  conclude: 'Conclude',
 }
 
-// One-line `[tool_name: primary_arg]` label prefixed onto a tool result's content
-// so the model can identify which call produced a given `[tool]` message without
-// walking back to the preceding assistant message's tool_calls. Deliberately terse
-// (one line) since this prefixes EVERY tool result in the live window. The recovery
-// msg_id is NOT included here — it only appears in eviction/collapse stubs where
-// it's actually needed for the `ledger expand` recovery path.
-function buildToolLabel(name: string, args: Record<string, unknown>): string {
+// Builds the CONTENT of the dedicated assistant message that now precedes every
+// tool result (replacing the old buildToolLabel, which prefixed a terse
+// `[tool_name: primary_arg]` label onto the tool RESULT instead). The model — and
+// the context viewer — now sees "<Display Name> called:\n<readable params>" as
+// its own assistant turn, with the following [tool] message left clean.
+function formatToolCallContent(name: string, args: Record<string, unknown>): string {
+  const displayName = TOOL_DISPLAY_NAMES[name] || name
+  let params: string
   switch (name) {
-    case 'bash': {
-      if (typeof args.command === 'string') return capLabelArg('bash', args.command)
+    case 'bash':
+      params = typeof args.command === 'string' ? args.command : JSON.stringify(args)
       break
-    }
-    case 'read_file': {
-      if (Array.isArray(args.paths)) return capLabelArg('read_file', (args.paths as unknown[]).join(', '))
-      if (typeof args.path === 'string') return capLabelArg('read_file', args.path)
+    case 'read_file':
+      params = typeof args.path === 'string' ? args.path : ''
+      if (typeof args.offset === 'number') params += ` (offset: ${args.offset}, limit: ${args.limit ?? 'end'})`
+      if (typeof args.pattern === 'string') params += ` (pattern: "${args.pattern}")`
       break
-    }
     case 'write_file':
-    case 'edit_file': {
-      if (typeof args.path === 'string') return capLabelArg(name, args.path)
+      params = typeof args.path === 'string' ? args.path : ''
+      if (typeof args.content === 'string') params += `\n(${args.content.length} chars)`
       break
-    }
+    case 'edit_file':
+      params = typeof args.path === 'string' ? args.path : ''
+      break
     case 'fetch_url':
-    case 'browser_fetch': {
-      if (typeof args.url === 'string') return capLabelArg(name, args.url)
+    case 'browser_fetch':
+      params = typeof args.url === 'string' ? args.url : ''
+      break
+    case 'web_search':
+      params = typeof args.query === 'string' ? args.query : ''
+      break
+    case 'ledger':
+      params = typeof args.action === 'string' ? args.action : ''
+      if (typeof args.msg_id === 'string') params += ` ${args.msg_id}`
+      if (typeof args.n === 'number') params += ` (n=${args.n})`
+      break
+    case 'conclude': {
+      const status = typeof args.status === 'string' ? args.status : ''
+      const msg = typeof args.message === 'string' ? args.message : ''
+      params = `status: ${status}\n${msg.length > 200 ? msg.slice(0, 200) + '…' : msg}`
       break
     }
-    case 'web_search': {
-      if (typeof args.query === 'string') return capLabelArg('web_search', args.query)
-      break
-    }
-    case 'ledger': {
-      if (typeof args.action === 'string') return capLabelArg('ledger', args.action)
-      break
-    }
+    default:
+      params = JSON.stringify(args)
   }
-  return `[${name}]`
+  return `${displayName} called:\n${params}`
 }
 
 // A "project mutation" is an edit_file/write_file targeting the git-tracked
@@ -472,10 +484,10 @@ export class Agent {
   // Every pushed message gets a LOCAL id (historyMsgIds, parallel to this.history),
   // so collapse/eviction stubs always have something to point at. `id`, when
   // supplied by the caller, is used verbatim instead of minting a fresh one — this
-  // is what lets a REAL tool result's label (buildToolLabel, computed before
-  // pushCtx runs so it can be embedded in the content itself) name the EXACT id
-  // this call then also records under, rather than two different ids for the same
-  // message. The ledger write is fire-and-forget (never awaited, never allowed to
+  // is what lets a REAL tool result's id (minted by the caller before pushCtx runs,
+  // so it can be referenced elsewhere — e.g. eviction/collapse recovery hints) name
+  // the EXACT id this call then also records under, rather than two different ids
+  // for the same message. The ledger write is fire-and-forget (never awaited, never allowed to
   // throw into the caller) — harness bookkeeping must never block or fail the run,
   // same stance as every other ledger call site in this codebase.
   //
@@ -506,8 +518,8 @@ export class Agent {
   }
 
   // The ledger message id assigned to this.history[index] by pushCtx, if any —
-  // what buildToolLabel/chatCall's collapse stub/compactHistory's eviction stub use
-  // to point the model at ledger `expand` for recovery. undefined for a message
+  // what chatCall's collapse stub/compactHistory's eviction stub use to point the
+  // model at ledger `expand` for recovery. undefined for a message
   // pushed before this.historyMsgIds existed (never happens in practice — pushCtx
   // always assigns one) or for an out-of-range index.
   private msgIdAt(index: number): string | undefined {
@@ -527,10 +539,17 @@ export class Agent {
   private rejectToolCall(name: ToolName, args: Record<string, unknown>, reason: string, emitAndLog: (e: AgentEvent) => void): void {
     emitAndLog({ type: 'tool_call', tool: name, args })
     emitAndLog({ type: 'tool_result', tool: name, output: '', error: reason, duration_ms: 0, rejected: true })
-    // Same tool label as a real executed result (buildToolLabel) — the model
-    // should be able to identify a rejected call the same way it identifies a
-    // real one, not just see a floating "Error: ...".
-    this.pushCtx({ role: 'tool', content: `${buildToolLabel(name, args)}\nError: ${reason}` })
+    // Same dedicated assistant "<Tool> called:" message a real executed call gets
+    // (formatToolCallContent) — the model should be able to identify a rejected
+    // call the same way it identifies a real one, not just see a floating
+    // "Error: ...". The tool result itself stays clean (no prefix). uiMeta's
+    // toolName marks this as a call-description turn (not the model's own
+    // conversational reply) — dispatch.ts's persistent-frame preload and
+    // getChatHistory() both key off its presence to exclude these from the
+    // "clean chat" view, the same way they used to key off msg.tool_calls before
+    // this restructure removed that field from what's actually pushed.
+    this.pushCtx({ role: 'assistant', content: formatToolCallContent(name, args) }, undefined, { toolName: name })
+    this.pushCtx({ role: 'tool', content: `Error: ${reason}` })
   }
 
   // H21. Wraps rejectToolCall for the role gate, which `continue`s straight past the
@@ -603,10 +622,13 @@ export class Agent {
     emitAndLog({ type: 'tool_call', tool: name, args })
     emitAndLog({ type: 'tool_result', tool: name, output: cached.output, error: cached.error, duration_ms: 0, rejected: true, replayed: true })
     const body = cached.error ? `Error: ${cached.error}\n${cached.output}` : cached.output
-    // buildToolLabel identifies WHICH call this is a replay of, same as a real
-    // executed result — `label` here is the separate loop-recovery message
-    // (action.message, e.g. "L1: ..."), not a tool label.
-    this.pushCtx({ role: 'tool', content: `${buildToolLabel(name, args)}\n${label}\n\n[Previous result, reproduced verbatim — nothing has changed]\n${body}` })
+    // Dedicated assistant "<Tool> called:" message identifies WHICH call this is a
+    // replay of, same as a real executed result (formatToolCallContent) — `label`
+    // here is the separate loop-recovery message (action.message, e.g. "L1: ..."),
+    // not a tool label. toolName in uiMeta marks it as a call-description turn —
+    // see rejectToolCall's identical comment for why that matters.
+    this.pushCtx({ role: 'assistant', content: formatToolCallContent(name, args) }, undefined, { toolName: name })
+    this.pushCtx({ role: 'tool', content: `${label}\n\n[Previous result, reproduced verbatim — nothing has changed]\n${body}` })
   }
 
   // Lets the user force an eviction pass between turns (server.ts's POST
@@ -726,15 +748,12 @@ export class Agent {
     // never drift out of sync with what was actually sent this turn.
     const alCollapsed: Array<{ index: number; originalChars: number; sentChars: number; role: string }> = []
     this.history.forEach((m, i) => {
-      // Defensive filter at send time: an assistant message with no content AND
-      // no tool_calls carries nothing observable for the model and is dropped
-      // from what's actually sent. this.history itself is left untouched (it
-      // still needs these entries — Ollama's chat API expects strict
-      // assistant/tool alternation, and the tool_calls field lives on the
-      // assistant message the following tool result attaches to), so the JSONL
-      // log/context viewer/al-logger trace all still see the full picture; only
-      // the outbound `messages` array shrinks.
-      if (m.role === 'assistant' && !m.content && !((m as { tool_calls?: unknown[] }).tool_calls?.length)) return
+      // Every assistant message pushed to this.history now carries real content —
+      // either the model's own reasoning/response, or a dedicated "<Tool> called:"
+      // description pushed just before its tool result (see formatToolCallContent
+      // and the tool-call loop below) — so the old defensive filter that dropped
+      // an empty assistant message with no tool_calls from the outbound `messages`
+      // array is no longer needed; nothing pushed here is ever empty.
       const c = m.content
       if (collapse.has(i) && typeof c === 'string' && c.length > TOOL_RESULT_COLLAPSE_OVER) {
         // this.historyMsgIds is parallel to this.history (same index i); when this
@@ -992,7 +1011,8 @@ export class Agent {
             content = '(file not found)'
           }
           this.pushCtx({
-            role: 'assistant', content: '',
+            role: 'assistant',
+            content: formatToolCallContent('read_file', { path: `/workspace/${file}` }),
             tool_calls: [{ function: { name: 'read_file', arguments: { path: `/workspace/${file}` } } }],
           } as Message)
           this.pushCtx({ role: 'tool', content })
@@ -1012,7 +1032,8 @@ export class Agent {
         const lsResult = await bash('ls -la /workspace/', config.workspacePath || '/workspace')
         const lsContent = (lsResult.output && lsResult.output !== NO_OUTPUT) ? lsResult.output : '(empty workspace)'
         this.pushCtx({
-          role: 'assistant', content: '',
+          role: 'assistant',
+          content: formatToolCallContent('bash', { command: 'ls -la /workspace/' }),
           tool_calls: [{ function: { name: 'bash', arguments: { command: 'ls -la /workspace/' } } }],
         } as Message)
         this.pushCtx({ role: 'tool', content: lsContent })
@@ -1292,10 +1313,13 @@ export class Agent {
         const msg = response.message
 
         // Assistant-message UI metadata for THIS turn's response — attached to
-        // whichever pushCtx call below actually records `msg` (the thinking-turn
-        // branch's `if (msg.content) this.pushCtx(msg)`, or the hasCalls branch's
-        // `this.pushCtx(msg)` right before running tool calls). Never attached to
-        // a tool-role or system/user pushCtx call — those get their own uiMeta
+        // whichever pushCtx call below actually records the model's own
+        // content/thinking (the thinking-turn branch's
+        // `if (msg.content) this.pushCtx(msg, ...)`, or the hasCalls branch's
+        // `this.pushCtx({ role: 'assistant', content: msg.content ?? '' }, ...)`
+        // pushed ahead of the per-call tool messages). Never attached to a
+        // tool-role pushCtx call, nor to the dedicated per-call "<Tool> called:"
+        // assistant messages (formatToolCallContent) — those get their own uiMeta
         // (toolName/toolArgs/durationMs/error) or none at all.
         const assistantUiMeta: Omit<LedgerMessage, 'id' | 'role' | 'content'> = {
           thinking: msg.thinking,
@@ -1332,12 +1356,11 @@ export class Agent {
           // assistant message — thinking models occasionally emit exactly this)
           // adds nothing for a later turn to read and, left in history, is what
           // produced the empty "#### Content"/"#### Thinking" sections al-logger.ts
-          // used to render for it. Deliberately NOT applied to the hasCalls branch
-          // below: a message WITH tool_calls must always be pushed even when its
-          // own content is empty, since the tool-result messages pushed right after
-          // it need a parent assistant turn to attach to — Ollama's chat API
-          // expects a strict assistant/tool alternation, and dropping that parent
-          // would desync it.
+          // used to render for it. The hasCalls branch below has its own separate
+          // parent-turn requirement — every tool call gets its OWN dedicated
+          // "<Tool> called:" assistant message (formatToolCallContent), which is
+          // never empty, so Ollama's strict assistant/tool alternation is preserved
+          // there regardless of whether the model's own content was empty.
           if (msg.content) this.pushCtx(msg, undefined, assistantUiMeta)
           consecutiveThinkingTurns++
           // Only nudge from the 2nd consecutive thinking turn on — the model gets one
@@ -1352,7 +1375,17 @@ export class Agent {
         }
 
         consecutiveThinkingTurns = 0
-        this.pushCtx(msg, undefined, assistantUiMeta)
+
+        // If the model produced thinking or visible text alongside its tool
+        // calls, push that as its own assistant message first (the reasoning
+        // step) — distinct from the dedicated "<Tool> called:" message pushed
+        // for EACH tool call below. The raw `msg` (with its native tool_calls
+        // field) is deliberately NOT pushed to this.history any more: it's used
+        // below only to derive callsToRun for dispatch, and is replaced in
+        // history by the explicit per-call assistant messages that follow.
+        if (msg.content || msg.thinking) {
+          this.pushCtx({ role: 'assistant', content: msg.content ?? '' }, undefined, assistantUiMeta)
+        }
 
         const callsToRun = nativeCalls.length > 0
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1468,6 +1501,16 @@ export class Agent {
 
           emitAndLog({ type: 'tool_call', tool: name, args })
 
+          // Dedicated assistant message describing this tool call — pushed BEFORE
+          // execution so the context reads as "assistant decides to call X" then
+          // "tool returns Y", matching the shape a genuine chat transcript would
+          // have instead of an invisible empty assistant turn (see the module's
+          // formatToolCallContent doc comment for the full rationale). toolName in
+          // uiMeta marks it as a call-description turn, not the model's own
+          // conversational reply — see rejectToolCall's identical comment for why
+          // dispatch.ts's preload / getChatHistory() need to tell the two apart.
+          this.pushCtx({ role: 'assistant', content: formatToolCallContent(name, args) }, undefined, { toolName: name })
+
           const start = Date.now()
           // The `ledger` tool needs to know WHICH FRAME is calling it, so it reads
           // only that frame's own file — never something the model supplies itself
@@ -1505,28 +1548,28 @@ export class Agent {
           // `#### New messages` (beginTurn reads it straight off this.history), so a
           // separate "Tool Results" section would only duplicate it.
 
-          // The message id is minted HERE, before pushCtx, purely so buildToolLabel
-          // can put it in the label the model actually sees (`[bash: ... | msg-xxx]`)
-          // — pushCtx is then told to use this SAME id (rather than minting its own)
-          // so the label and the ledger record agree. Intentionally NOT minted for
-          // `ledger` calls (query-only bookkeeping), so those keep an unlabelled tool
-          // result, same as before this change. This is also what getRunState()'s
-          // toolResults counts — a REAL executed tool result, never a rejection,
-          // replay, or nudge.
+          // The message id is minted HERE, before pushCtx, so it's available for the
+          // recovery hint an eviction/collapse stub embeds later (see chatCall's
+          // collapse stub / compactHistory's eviction stub, both keyed off
+          // this.historyMsgIds, which pushCtx below populates using this exact id).
+          // Intentionally NOT minted for `ledger` calls (query-only bookkeeping), so
+          // those keep no recovery id, same as before this change. This is also what
+          // getRunState()'s toolResults counts — a REAL executed tool result, never a
+          // rejection, replay, or nudge.
           const msgId = name !== 'ledger' ? newLedgerId('msg') : undefined
           if (msgId) this.toolResultCount++
 
-          // Label the result with the call that produced it (tool name + primary
-          // arg + message id) — see buildToolLabel's comment above. Only for a REAL
-          // executed result; rejectToolCall/replayToolCall label their own pushCtx
-          // calls separately, and this path never runs for `conclude` (intercepted
-          // earlier, above this executeTool call).
-          const toolLabel = buildToolLabel(name, args)
+          // Clean tool result — no `[tool: args]` prefix any more. The preceding
+          // dedicated assistant message (pushed above, before execution) already
+          // identifies which call produced this result; rejectToolCall/
+          // replayToolCall push their own identical assistant+tool pair for a
+          // blocked/replayed call, and this path never runs for `conclude`
+          // (intercepted earlier, above this executeTool call).
           this.pushCtx({
             role: 'tool',
             content: result.error
-              ? `${toolLabel}\nError: ${result.error}\n${result.output}`
-              : `${toolLabel}\n${result.output}`,
+              ? `Error: ${result.error}\n${result.output}`
+              : result.output,
           }, msgId, { toolName: name, toolArgs: args, durationMs: duration_ms, error: !!result.error })
           if (name === 'edit_file' || name === 'write_file') {
             const p = typeof args.path === 'string' ? args.path : ''
@@ -1610,7 +1653,20 @@ export class Agent {
         if (msg.role === 'user') return !!msg.content
         if (msg.role === 'assistant') {
           const hasToolCalls = ((msg as { tool_calls?: unknown[] }).tool_calls?.length ?? 0) > 0
-          return !hasToolCalls && !!msg.content
+          if (hasToolCalls || !msg.content) return false
+          // A dedicated "<Tool> called:" description (formatToolCallContent,
+          // pushed just before every tool result — see the chat() tool-call loop
+          // and rejectToolCall/replayToolCall) is harness bookkeeping, not the
+          // model's own conversational reply, and must be excluded from "clean"
+          // chat history the same way an empty tool_calls-bearing assistant
+          // message always was before this restructure. this.history holds plain
+          // Message objects with no uiMeta field to check (that only reaches the
+          // ledger file — see pushCtx), so recognize these by their distinctive
+          // content shape instead: every TOOL_DISPLAY_NAMES value followed by
+          // " called:\n" is reserved for exactly this purpose and a real reply
+          // never produces it verbatim.
+          const isToolCallDescription = Object.values(TOOL_DISPLAY_NAMES).some(n => typeof msg.content === 'string' && msg.content.startsWith(`${n} called:\n`))
+          return !isToolCallDescription
         }
         return false
       })
@@ -1631,10 +1687,11 @@ export class Agent {
   } {
     const MAX = 4000
     let totalChars = 0
+    // Every assistant message in this.history now carries real content — either
+    // the model's own reasoning/response, or a dedicated "<Tool> called:"
+    // description (formatToolCallContent) pushed just before its tool result —
+    // so there's no longer an empty-assistant-message case to filter out here.
     const messages = this.history
-      // Skip empty assistant messages (tool-call structural parents with no
-      // visible content — needed for Ollama alternation but nothing to show).
-      .filter(m => !(m.role === 'assistant' && !m.content))
       .map(m => {
         const full = typeof m.content === 'string' ? m.content : String(m.content ?? '')
         totalChars += full.length
