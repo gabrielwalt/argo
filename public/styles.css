@@ -1149,6 +1149,7 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   font-family: inherit;
 }
 .role-card.active .agent-heading { color: var(--yellow); }
+.role-card-status { margin-left: auto; font-size: 11px; font-family: var(--font-mono); white-space: nowrap; }
 .role-card-items {
   display: none;
   flex-direction: column;

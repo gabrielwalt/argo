@@ -1366,10 +1366,12 @@ function getOrCreateRoleCard(frameId, role, assignment) {
   heading.textContent = meta.title
   heading.style.color = AGENT_COLORS[role] || 'var(--text)'
 
-  // No outcome/status element here — the conclude card rendered right after this
-  // accordion (see renderAgentConclusion) already carries the status badge and
-  // result; a second copy on the accordion's own toggle row would just duplicate it.
-  toggle.append(arrow, heading)
+  // Live status: iteration count + elapsed timer, shown on the toggle row
+  // while the agent is running. Updated by handleFrameEvent's 'iteration' case.
+  const statusSpan = document.createElement('span')
+  statusSpan.className = 'role-card-status'
+  statusSpan.style.color = 'var(--muted)'
+  toggle.append(arrow, heading, statusSpan)
   toggle.addEventListener('click', () => {
     card.classList.toggle('open')
     arrow.textContent = card.classList.contains('open') ? '▼' : '▶'
@@ -1388,7 +1390,13 @@ function getOrCreateRoleCard(frameId, role, assignment) {
   // iteration-counter/timing annotations (see handleFrameEvent's 'iteration'/
   // 'token_usage' cases) and the conclude card's "N iterations · Ts" meta line
   // (see renderAgentConclusion).
-  const record = { el: card, arrow, items, role, status: null, iterations: 0, startTime: Date.now(), lastOllamaMs: null }
+  const record = { el: card, arrow, items, role, status: null, iterations: 0, startTime: Date.now(), lastOllamaMs: null, statusSpan, runTimerId: null }
+  // Start a live elapsed-time counter on the accordion heading
+  record.runTimerId = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - record.startTime) / 1000)
+    const iterText = record.iterations > 0 ? `iteration ${record.iterations} · ` : ''
+    statusSpan.textContent = `${iterText}${elapsed}s…`
+  }, 1000)
   roleCards.set(frameId, record)
   return record
 }
@@ -1468,6 +1476,13 @@ function closeRoleCardQuiet(frameId) {
   const card = roleCards.get(frameId)
   if (!card) return
   if (card.iterTimerId) { clearInterval(card.iterTimerId); card.iterTimerId = null }
+  if (card.runTimerId) { clearInterval(card.runTimerId); card.runTimerId = null }
+  // Show final stats on the accordion heading
+  if (card.statusSpan) {
+    const iters = card.iterations
+    const duration = fmtDuration(Date.now() - card.startTime)
+    card.statusSpan.textContent = `${iters} iteration${iters !== 1 ? 's' : ''} · ${duration}`
+  }
   card.el.classList.remove('active')
 }
 
@@ -1839,9 +1854,7 @@ function renderAgentConclusion(frameId, role, status, content) {
   // has no record left (frameId not in roleCards) — should not normally happen,
   // since this is called right after closeRoleCardQuiet() on the SAME frameId.
   const card = roleCards.get(frameId)
-  const metaHtml = card
-    ? `<span class="conclude-meta">${card.iterations} iteration${card.iterations !== 1 ? 's' : ''} · ${fmtDuration(Date.now() - card.startTime)}</span>`
-    : ''
+  const metaHtml = '' // iterations + timing now shown on the accordion heading
   // Agent color on the role label only, keyed off the frame's actual role
   // (card.role, e.g. "dispatcher") rather than the display name passed in.
   // Deliberately layered alongside — not replacing — the existing
