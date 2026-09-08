@@ -150,8 +150,9 @@ export interface LedgerMessage {
   modelOptions?: ModelOptions   // sampling options — set on the first message of a frame
   // True ONLY on a follow-up "eviction marker" entry appended AFTER a message's
   // original entry (ledger.ts's recordMessage, called from agent.ts's
-  // compactHistory once eviction stubs a message in the live in-memory history) —
-  // never on the original entry itself, and never on a `messages`/`expand` result
+  // manageContext once it collapses or evicts a message in the live in-memory
+  // history) — never on the original entry itself, and never on a
+  // `messages`/`expand` result
   // (see ledger.ts's readFrame/expand for how the two entries that can share one
   // `id` are told apart). Its own `content` IS the stub text
   // (`[evicted — N chars; msg_id "..." to recover]`), not the original.

@@ -253,10 +253,11 @@ export class TraceLogger {
    * Called right before a new Ollama request is issued for this turn. Opens a new
    * `## Turn N` section (closing the previous one first, if still open) and writes
    * the `### Call` block: the messages newly added to history since the previous
-   * turn (or ALL of them, on turn 1). Collapse and eviction now both modify
-   * this.history IN PLACE (agent.ts's collapseOldToolResults/compactHistory), so
-   * a shortened tool result just shows up as a shorter entry in `newMessages` —
-   * there's no separate "context modifications" detail to log here any more.
+   * turn (or ALL of them, on turn 1). Collapse and eviction are now both done by
+   * a single pass (agent.ts's manageContext), which modifies this.history IN
+   * PLACE, so a shortened tool result just shows up as a shorter entry in
+   * `newMessages` — there's no separate "context modifications" detail to log
+   * here any more.
    *
    * `totalMessages` is the full history length AS SENT to the model this turn
    * (matches the harness's own `ollama_request.message_count` event semantics —

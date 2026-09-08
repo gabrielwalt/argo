@@ -319,8 +319,8 @@ export class Agent {
   // The ledger message id for each entry of this.history, PARALLEL to it (same
   // index) — assigned by pushCtx for EVERY message (tool-role rejections/replays/
   // nudges included), so collapse/eviction stubs always have something to point
-  // at. This is what lets chatCall's collapse stub and compactHistory's eviction
-  // stub reference a real recoverable ledger id instead of the old episodeId.
+  // at. This is what lets manageContext's collapse/evict stubs reference a real
+  // recoverable ledger id instead of the old episodeId.
   private historyMsgIds: (string | undefined)[] = []
   // Count of REAL executed tool results this run (never a rejection/replay/nudge,
   // and never `ledger` itself) — what getRunState() reports as toolResults, mirroring
@@ -511,7 +511,7 @@ export class Agent {
   }
 
   // The ledger message id assigned to this.history[index] by pushCtx, if any —
-  // what chatCall's collapse stub/compactHistory's eviction stub use to point the
+  // what manageContext's collapse/evict stubs use to point the
   // model at ledger `expand` for recovery. undefined for a message
   // pushed before this.historyMsgIds existed (never happens in practice — pushCtx
   // always assigns one) or for an out-of-range index.
@@ -854,19 +854,16 @@ export class Agent {
   // *identical* request on retry without duplicating the argument literal.
   // Return type is intentionally inferred (Promise<ChatResponse>) to avoid
   // importing the ollama response type.
-  private chatCall() {
-    // Deterministic context editing (Tier-0, no LLM): the model only needs recent
-    // tool outputs verbatim; older large ones are collapsed to a short, restorable
-    // stub so the LIVE window it sees stays small over long runs — which is what
-    // keeps small local models emitting native tool calls (measured: native-call
-    // reliability falls as context grows). Collapse now modifies this.history IN
-    // PLACE, same pattern as eviction (compactHistory) — there's no longer a
-    // "full version in memory, shortened version sent to model" split; the JSONL
-    // log and ledger still saw the full content when it was first recorded (this
-    // only shortens the LIVE window from here on), and this is what keeps the
-    // window small over many turns, which makes the (rarer) deterministic
-    // eviction pass fire less.
-    this.collapseOldToolResults()
+  private chatCall(emitAndLog: (e: AgentEvent) => void) {
+    // UNIFIED CONTEXT MANAGEMENT (Tier-0, no LLM) — see manageContext's own header
+    // comment for the full algorithm. Runs before EVERY chat call (not just once
+    // per iteration — chatWithRetry calls chatCall up to twice), same as the old
+    // collapseOldToolResults did, so this.history always matches exactly what is
+    // about to be sent whether this is the first attempt or the retry. It is its
+    // own no-op below CONTEXT_TRIGGER_PCT (60%) of num_ctx, so calling it
+    // unconditionally here (rather than gating on a pre-computed usage estimate)
+    // is cheap and always safe.
+    this.manageContext(0, emitAndLog)
     // The frame's opening [system]/[user]/[system] messages (ROLE_IDENTITY,
     // userMessage, ROLE_INSTRUCTIONS — see chat()) are already IN this.history by
     // the time chatCall runs, pushed there directly instead of being assembled
@@ -977,7 +974,7 @@ export class Agent {
   private async chatWithRetry(emitAndLog: (e: AgentEvent) => void) {
     const isTimeout = (e: unknown) => e instanceof Error && e.message.includes('did not respond within')
     try {
-      return await this.chatCall()
+      return await this.chatCall(emitAndLog)
     } catch (err) {
       this.ollamaRetryCount++
       const msg = err instanceof Error ? err.message : String(err)
@@ -985,7 +982,7 @@ export class Agent {
       await new Promise(resolve => setTimeout(resolve, this.chatRetryDelayMs))
       if (this.aborted) return null
       try {
-        return await this.chatCall()
+        return await this.chatCall(emitAndLog)
       } catch (retryErr) {
         // Only soft-recover on timeouts — other errors (malformed response, etc.) are
         // still fatal and rethrown to chat()'s outer catch as before.
@@ -1460,7 +1457,7 @@ export class Agent {
           // free turn to reason/plan without being told to hurry up; a SECOND turn in
           // a row with no tool call is when a reminder actually earns its place.
           if (consecutiveThinkingTurns >= 2) {
-            const nudge = 'Your turn produced no tool calls. To call a tool, wrap the call in <tool_call> tags, e.g.:\n<tool_call>\n{"name": "bash", "arguments": {"command": "ls"}}\n</tool_call>\nTo finish, call conclude with your final answer. To keep working, make your next tool call.'
+            const nudge = 'Your turn produced no tool calls. To call a tool, wrap the call in <tool_call> tags.\nTo finish, call conclude with your final answer. To keep working, make your next tool call.'
             emitAndLog({ type: 'warning', message: nudge })
             this.pushCtx({ role: 'system', content: nudge })
           }
@@ -1643,9 +1640,9 @@ export class Agent {
           // separate "Tool Results" section would only duplicate it.
 
           // The message id is minted HERE, before pushCtx, so it's available for the
-          // recovery hint an eviction/collapse stub embeds later (see chatCall's
-          // collapse stub / compactHistory's eviction stub, both keyed off
-          // this.historyMsgIds, which pushCtx below populates using this exact id).
+          // recovery hint an eviction/collapse stub embeds later (see manageContext's
+          // collapse/evict stubs, both keyed off this.historyMsgIds, which pushCtx
+          // below populates using this exact id).
           // Intentionally NOT minted for `ledger` calls (query-only bookkeeping), so
           // those keep no recovery id, same as before this change. This is also what
           // getRunState()'s toolResults counts — a REAL executed tool result, never a

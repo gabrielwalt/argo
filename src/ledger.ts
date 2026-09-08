@@ -6,8 +6,9 @@
 // entries live in — there is no frameId/taskId/agent/ts field on the entry itself
 // any more (see types.ts's LedgerMessage). The file itself is append-only, so
 // "chronological order" always means append order — but a message that is later
-// EVICTED from the live in-memory history (agent.ts's compactHistory) gets a
-// SECOND entry appended sharing its original `id`, marked `evicted: true`, whose
+// EVICTED (or collapsed) from the live in-memory history (agent.ts's
+// manageContext) gets a SECOND entry appended sharing its original `id`, marked
+// `evicted: true`, whose
 // content is the short recovery stub rather than the original. readFrame (below)
 // is the deduplicated, last-write-wins-per-id view built from that raw log — what
 // every consumer other than `expand` actually wants; `expand` alone reads the raw
@@ -138,11 +139,11 @@ async function readFrameRaw(root: string, frameId: string): Promise<LedgerMessag
 
 // Read one frame's messages as they should be REPLAYED — the eviction-aware view.
 // Most entries have exactly one line in the file and pass through unchanged. A
-// message that was later evicted (agent.ts's compactHistory, once eviction stubs it
-// out of the live in-memory history) has TWO lines sharing the same `id`: the
-// original (full content) followed by an eviction-marker entry (`evicted: true`,
-// content is the short recovery stub) appended once eviction actually runs — see
-// that call site's own comment. Deduplicating by id, LAST entry wins, is exactly
+// message that was later collapsed or evicted (agent.ts's manageContext, once it
+// stubs a message out of the live in-memory history) has TWO lines sharing the
+// same `id`: the original (full content) followed by an eviction-marker entry
+// (`evicted: true`, content is the short recovery stub) appended once that pass
+// actually runs — see that call site's own comment. Deduplicating by id, LAST entry wins, is exactly
 // what makes the stub replace the original here: an evicted message's marker entry
 // was appended strictly after its original, so it is later in append order and
 // wins the dedup. A message that was NEVER evicted has only the one entry, which

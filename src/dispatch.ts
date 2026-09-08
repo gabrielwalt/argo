@@ -303,12 +303,13 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
   // orphaned tool-result entries with no matching call, would desync that
   // alternation. A plain text summary of "what was asked, what was answered" is
   // exactly what the Dispatcher needs across turns; it does not need its own past
-  // tool-call mechanics replayed back into a fresh run. (Eviction markers are only
-  // ever written for role:'tool' entries — agent.ts's compactHistory — so this
-  // filter's own tool-role exclusion already keeps a persistent Dispatcher reload
-  // compact today; the eviction-aware dedup in readFrame() is what protects every
-  // OTHER consumer of the ledger — the `ledger` tool's own `messages` action, disk-
-  // frame reconstruction — that doesn't apply this same narrower filter.)
+  // tool-call mechanics replayed back into a fresh run. (Eviction/collapse markers
+  // can now be written for role:'assistant' entries too, not just role:'tool' —
+  // agent.ts's manageContext shortens both — but this filter's own tool-role/
+  // tool_calls exclusion above already drops every candidate entry regardless;
+  // the eviction-aware dedup in readFrame() is what protects every OTHER consumer
+  // of the ledger — the `ledger` tool's own `messages` action, disk-frame
+  // reconstruction — that doesn't apply this same narrower filter.)
   //
   // Since agent.ts's tool-call restructure (each tool call now gets its OWN
   // dedicated "<Tool> called:" assistant message — see formatToolCallContent —
