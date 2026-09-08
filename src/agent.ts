@@ -23,7 +23,21 @@ import { recordMessage, newId as newLedgerId } from './ledger.js'
 // instead of using the native tool-calling API (common with smaller models).
 function extractToolCallsFromContent(content: string): Array<{ name: string; arguments: Record<string, unknown> }> {
   const results: Array<{ name: string; arguments: Record<string, unknown> }> = []
-  // Match ```json ... ``` blocks
+
+  // Try parsing the entire content as a single JSON tool call (qwen sometimes
+  // produces bare {"name":"bash","arguments":{...}} without any wrapper).
+  const trimmed = content.trim()
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const obj = JSON.parse(trimmed)
+      if (obj && typeof obj.name === 'string' && obj.arguments && typeof obj.arguments === 'object') {
+        results.push({ name: obj.name, arguments: obj.arguments })
+        return results
+      }
+    } catch { /* not valid JSON */ }
+  }
+
+  // Match ```json ... ``` code blocks
   const blockRe = /```(?:json)?\s*\n([\s\S]*?)\n```/g
   let m: RegExpExecArray | null
   while ((m = blockRe.exec(content)) !== null) {
