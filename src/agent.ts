@@ -991,8 +991,11 @@ export class Agent {
           } catch {
             content = '(file not found)'
           }
-          this.pushCtx({ role: 'assistant', content: '' })
-          this.pushCtx({ role: 'tool', content: `[read_file: ${file}]\n${content}` })
+          this.pushCtx({
+            role: 'assistant', content: '',
+            tool_calls: [{ function: { name: 'read_file', arguments: { path: `/workspace/${file}` } } }],
+          } as Message)
+          this.pushCtx({ role: 'tool', content })
         }
       }
     }
@@ -1008,8 +1011,11 @@ export class Agent {
       try {
         const lsResult = await bash('ls -la /workspace/', config.workspacePath || '/workspace')
         const lsContent = (lsResult.output && lsResult.output !== NO_OUTPUT) ? lsResult.output : '(empty workspace)'
-        this.pushCtx({ role: 'assistant', content: '' })
-        this.pushCtx({ role: 'tool', content: `[bash: ls -la /workspace/]\n${lsContent}` })
+        this.pushCtx({
+          role: 'assistant', content: '',
+          tool_calls: [{ function: { name: 'bash', arguments: { command: 'ls -la /workspace/' } } }],
+        } as Message)
+        this.pushCtx({ role: 'tool', content: lsContent })
       } catch { /* injected context is best-effort — never abort a run for it */ }
     }
     this.phase = 'running'
