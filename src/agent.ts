@@ -108,64 +108,34 @@ function summarizeCall(name: string, args: Record<string, unknown>): string {
 // Human-readable display names for each tool, used by formatToolCallContent
 // below to build the dedicated assistant message that now precedes every tool
 // result in the live context (see agent.ts's chat() tool-call loop).
-const TOOL_DISPLAY_NAMES: Record<string, string> = {
-  bash: 'Bash',
-  read_file: 'Read File',
-  write_file: 'Write File',
-  edit_file: 'Edit File',
-  fetch_url: 'Fetch URL',
-  web_search: 'Web Search',
-  browser_fetch: 'Browser Fetch',
-  ledger: 'Ledger',
-  conclude: 'Conclude',
-}
-
 // Builds the CONTENT of the dedicated assistant message that now precedes every
 // tool result (replacing the old buildToolLabel, which prefixed a terse
 // `[tool_name: primary_arg]` label onto the tool RESULT instead). The model — and
 // the context viewer — now sees "<Display Name> called:\n<readable params>" as
 // its own assistant turn, with the following [tool] message left clean.
+// Produces the exact tool call as the model would have issued it — raw JSON,
+// not a prettified format. The model sees this as its own prior action and
+// should recognize the format as identical to what it produces.
 function formatToolCallContent(name: string, args: Record<string, unknown>): string {
-  const displayName = TOOL_DISPLAY_NAMES[name] || name
-  let params: string
-  switch (name) {
-    case 'bash':
-      params = typeof args.command === 'string' ? args.command : JSON.stringify(args)
-      break
-    case 'read_file':
-      params = typeof args.path === 'string' ? args.path : ''
-      if (typeof args.offset === 'number') params += ` (offset: ${args.offset}, limit: ${args.limit ?? 'end'})`
-      if (typeof args.pattern === 'string') params += ` (pattern: "${args.pattern}")`
-      break
-    case 'write_file':
-      params = typeof args.path === 'string' ? args.path : ''
-      if (typeof args.content === 'string') params += `\n(${args.content.length} chars)`
-      break
-    case 'edit_file':
-      params = typeof args.path === 'string' ? args.path : ''
-      break
-    case 'fetch_url':
-    case 'browser_fetch':
-      params = typeof args.url === 'string' ? args.url : ''
-      break
-    case 'web_search':
-      params = typeof args.query === 'string' ? args.query : ''
-      break
-    case 'ledger':
-      params = typeof args.action === 'string' ? args.action : ''
-      if (typeof args.msg_id === 'string') params += ` ${args.msg_id}`
-      if (typeof args.n === 'number') params += ` (n=${args.n})`
-      break
-    case 'conclude': {
-      const status = typeof args.status === 'string' ? args.status : ''
-      const msg = typeof args.message === 'string' ? args.message : ''
-      params = `status: ${status}\n${msg.length > 200 ? msg.slice(0, 200) + '…' : msg}`
-      break
-    }
-    default:
-      params = JSON.stringify(args)
+  // For write_file, omit the full content (too large) — show path + char count
+  if (name === 'write_file' && typeof args.content === 'string') {
+    const truncated = { ...args, content: `(${args.content.length} chars)` }
+    return JSON.stringify({ name, arguments: truncated })
   }
-  return `${displayName} called:\n${params}`
+  // For edit_file, truncate old_string/new_string if long
+  if (name === 'edit_file') {
+    const truncated = { ...args }
+    for (const key of ['old_string', 'new_string'] as const) {
+      const v = truncated[key]
+      if (typeof v === 'string' && v.length > 200) truncated[key] = v.slice(0, 200) + '…'
+    }
+    return JSON.stringify({ name, arguments: truncated })
+  }
+  // For conclude, truncate long messages
+  if (name === 'conclude' && typeof args.message === 'string' && args.message.length > 200) {
+    return JSON.stringify({ name, arguments: { ...args, message: args.message.slice(0, 200) + '…' } })
+  }
+  return JSON.stringify({ name, arguments: args })
 }
 
 // A "project mutation" is an edit_file/write_file targeting the git-tracked
@@ -1690,10 +1660,12 @@ export class Agent {
           // message always was before this restructure. this.history holds plain
           // Message objects with no uiMeta field to check (that only reaches the
           // ledger file — see pushCtx), so recognize these by their distinctive
-          // content shape instead: every TOOL_DISPLAY_NAMES value followed by
-          // " called:\n" is reserved for exactly this purpose and a real reply
-          // never produces it verbatim.
-          const isToolCallDescription = Object.values(TOOL_DISPLAY_NAMES).some(n => typeof msg.content === 'string' && msg.content.startsWith(`${n} called:\n`))
+          // content shape instead: a JSON object with a `name` field (the raw
+          // tool call format formatToolCallContent produces).
+          let isToolCallDescription = false
+          if (typeof msg.content === 'string' && msg.content.startsWith('{')) {
+            try { isToolCallDescription = !!JSON.parse(msg.content).name } catch { /* not JSON */ }
+          }
           return !isToolCallDescription
         }
         return false
