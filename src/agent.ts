@@ -1124,12 +1124,13 @@ export class Agent {
 
       // All agents get a project file listing after instructions.
       try {
-        const lsResult = await bash('ls -la /workspace/', ws)
+        const listCmd = 'fd . -t f -d 2 -E .git -E .argo | head -100'
+        const lsResult = await bash(listCmd, ws)
         const lsContent = (lsResult.output && lsResult.output !== NO_OUTPUT) ? lsResult.output : '(empty workspace)'
         this.pushCtx({
           role: 'assistant',
-          content: formatToolCallContent('bash', { command: 'ls -la /workspace/' }),
-          tool_calls: [{ function: { name: 'bash', arguments: { command: 'ls -la /workspace/' } } }],
+          content: formatToolCallContent('bash', { command: listCmd }),
+          tool_calls: [{ function: { name: 'bash', arguments: { command: listCmd } } }],
         } as Message)
         this.pushCtx({ role: 'tool', content: lsContent })
       } catch { /* injected context is best-effort */ }
