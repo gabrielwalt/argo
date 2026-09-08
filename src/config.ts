@@ -52,11 +52,4 @@ export const config = {
   // flags above) so uncommitted changes stay visible in the Changes view until the user
   // (or an explicit toggle) decides to commit them. See Agent.autoCommit() in agent.ts.
   autoCommit:       ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_AUTOCOMMIT ?? '').trim().toLowerCase()),
-  // VERBATIM REQUEST THREADING (frames.ts buildAssignment, dispatch.ts spawnFrame). ON
-  // by default (env ARGO_VERBATIM_REQUEST=0/false/off to disable). When on, the run's
-  // raw user message threads, verbatim and capped (4000 chars, head-and-tail), into
-  // EVERY spawned frame's assignment, alongside (never replacing) the Dispatcher's
-  // OBJECTIVE paraphrase — see frames.ts's renderVerbatimRequestBlock for the full rationale
-  // (traced eval failures where the paraphrase alone dropped load-bearing detail).
-  verbatimRequest:  !['0', 'false', 'no', 'off'].includes((process.env.ARGO_VERBATIM_REQUEST ?? '').trim().toLowerCase()),
 }

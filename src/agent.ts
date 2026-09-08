@@ -6,9 +6,8 @@ import { config } from './config.js'
 import { toolDefinitions, executeTool, BASH_DESCRIPTION_READONLY } from './tools/index.js'
 import { bash, NO_OUTPUT } from './tools/bash.js'
 import { truncateOutput } from './tools/truncate.js'
-import { SessionLogger, LOGS_DIR } from './logger.js'
 import { TraceLogger } from './al-logger.js'
-import type { AgentEvent, ToolName, ModelOptions, Role } from './types.js'
+import type { AgentEvent, ToolName, ModelOptions, Role, LedgerMessage } from './types.js'
 import { PROGRESS_CHECK_ITERATIONS, PROGRESS_CHECK_MESSAGES, ROLE_CONCLUDE_STATUSES, ROLE_IDENTITY, ROLE_INSTRUCTIONS, concludeStatusError, withConcludeStatusEnum, patchBashForReadOnly } from './frames.js'
 import {
   createLoopState, noteMutation, noteBashExecution, evaluateCall, normalizeCallKey, recordResult, type LoopState,
@@ -17,8 +16,8 @@ import {
   // tool-call loop below). See loop.ts's H21 header note for the evidence.
   noteGateRejection, gateEscalationMessage, gateStopMessage, type GateReason,
 } from './loop.js'
-import { classifyTool, inferDependencies, evict, type EpisodeMeta, type EvictionBudget } from './eviction.js'
-import { recordEpisode, markEpisodeEvicted, newId as newLedgerId } from './ledger.js'
+import { evict, type EvictionBudget } from './eviction.js'
+import { recordMessage, newId as newLedgerId } from './ledger.js'
 
 // Parses tool calls that a model wrote as JSON code blocks in its text content
 // instead of using the native tool-calling API (common with smaller models).
@@ -103,6 +102,57 @@ function summarizeCall(name: string, args: Record<string, unknown>): string {
   }
   const json = JSON.stringify(args)
   return json.length > 80 ? `${json.slice(0, 80)}…` : json
+}
+
+// Primary args are capped uniformly at MAX_LABEL_ARG_CHARS (not just bash) — a
+// long read_file/fetch_url/web_search argument used to pass through unbounded,
+// the exact same "one line stays cheap" property buildToolLabel promises above
+// only actually held for bash. When an arg is cut, the "… (truncated)" suffix
+// makes the cut itself visible instead of looking like the argument just ended.
+const MAX_LABEL_ARG_CHARS = 128
+
+function capLabelArg(name: string, value: string): string {
+  if (value.length <= MAX_LABEL_ARG_CHARS) return `[${name}: ${value}]`
+  return `[${name}: ${value.slice(0, MAX_LABEL_ARG_CHARS)}… (truncated)]`
+}
+
+// One-line `[tool_name: primary_arg]` label prefixed onto a tool result's content
+// so the model can identify which call produced a given `[tool]` message without
+// walking back to the preceding assistant message's tool_calls. Deliberately terse
+// (one line) since this prefixes EVERY tool result in the live window. The recovery
+// msg_id is NOT included here — it only appears in eviction/collapse stubs where
+// it's actually needed for the `ledger expand` recovery path.
+function buildToolLabel(name: string, args: Record<string, unknown>): string {
+  switch (name) {
+    case 'bash': {
+      if (typeof args.command === 'string') return capLabelArg('bash', args.command)
+      break
+    }
+    case 'read_file': {
+      if (Array.isArray(args.paths)) return capLabelArg('read_file', (args.paths as unknown[]).join(', '))
+      if (typeof args.path === 'string') return capLabelArg('read_file', args.path)
+      break
+    }
+    case 'write_file':
+    case 'edit_file': {
+      if (typeof args.path === 'string') return capLabelArg(name, args.path)
+      break
+    }
+    case 'fetch_url':
+    case 'browser_fetch': {
+      if (typeof args.url === 'string') return capLabelArg(name, args.url)
+      break
+    }
+    case 'web_search': {
+      if (typeof args.query === 'string') return capLabelArg('web_search', args.query)
+      break
+    }
+    case 'ledger': {
+      if (typeof args.action === 'string') return capLabelArg('ledger', args.action)
+      break
+    }
+  }
+  return `[${name}]`
 }
 
 // A "project mutation" is an edit_file/write_file targeting the git-tracked
@@ -216,13 +266,14 @@ export class Agent {
   private ollamaRetryCount = 0
   // MULTI-AGENT ARCHITECTURE. A call frame is one scoped Agent instance:
   // allowedTools restricts which tools are offered to Ollama AND accepted by the
-  // tool-dispatch loop (null = unrestricted, the baseline behavior); frameId
-  // correlates this instance's episodes/tool calls to a ledger frame (null when not
-  // running as part of a dispatch — episode recording to the ledger is a no-op
-  // then). episodes is the CWL episode graph (see eviction.ts) for THIS instance's
-  // own history, reset per run.
-  private allowedTools: ToolName[] | null = null
-  private frameId: string | null = null
+  // tool-dispatch loop — always set via setAllowedTools before a frame's chat() runs
+  // (dispatch.ts's spawnFrame, alongside setRole/setFrameId/etc). frameId correlates
+  // this instance's messages to its own ledger file (ledger.ts) — always set via
+  // setFrameId before a frame runs; there is no non-dispatch execution path any
+  // more. There is no separate taskId any more — each frame's ledger file IS its
+  // own scope, so a frameId alone is already as precise as scoping ever needs to be.
+  private allowedTools: ToolName[] = toolDefinitions.map(t => t.function.name as ToolName)
+  private frameId: string = ''
   // The ORIGINAL user query for this run (dispatch.ts's runDispatchLoop's own
   // `userMessage` param), threaded down through setUserQuery() — distinct from
   // chat()'s own `userMessage` parameter, which for a dispatched frame is the
@@ -230,22 +281,24 @@ export class Agent {
   // human actually typed. Used only for the TraceLogger header's `# Run:` title, so
   // a reader of the trace sees the human's real request rather than the internal
   // checkpoint prompt. Empty string (never set) falls back to chat()'s own
-  // userMessage in that header, matching the pre-existing baseline behavior for the
-  // unrestricted (non-dispatched) Agent, which never calls setUserQuery.
+  // userMessage in that header.
   private userQuery = ''
   // Which ROLE (Planner/Implementer/Dispatcher) this frame is, set by dispatch.ts's
   // spawnFrame alongside setAllowedTools/setMaxIterations/etc (frames.ts's
-  // ROLE_TOOLS/ROLE_MAX_ITERATIONS are the same per-role tables this mirrors). null
-  // for the unrestricted baseline, which never sets it. Drives which progress-check
-  // thresholds/messages chat() uses (frames.ts's PROGRESS_CHECK_ITERATIONS/
-  // PROGRESS_CHECK_MESSAGES) AND which ROLE_IDENTITY/ROLE_INSTRUCTIONS strings open
-  // this frame's history (see chat()) — every other role-shaped decision in this
-  // file already goes through allowedTools.
-  private roleTag: Role | null = null
-  // NEW, ADDITIVE Markdown trace (al-logger.ts) — runs alongside SessionLogger, never
-  // replacing it. Created fresh at the top of chat() (mirroring SessionLogger's own
-  // per-call construction) and used by chatCall()/the tool-dispatch loop below via
-  // this field, since chatCall() doesn't otherwise have a way to receive it (it's
+  // ROLE_TOOLS/ROLE_MAX_ITERATIONS are the same per-role tables this mirrors).
+  // Defaults to 'implementer' (a safe, fully-scoped role) so an Agent constructed
+  // but never explicitly assigned a role still behaves like a normal frame rather
+  // than something unscoped. Drives which progress-check thresholds/messages
+  // chat() uses (frames.ts's PROGRESS_CHECK_ITERATIONS/PROGRESS_CHECK_MESSAGES) AND
+  // which ROLE_IDENTITY/ROLE_INSTRUCTIONS strings open this frame's history (see
+  // chat()) — every other role-shaped decision in this file already goes through
+  // allowedTools.
+  private roleTag: Role = 'implementer'
+  // Markdown trace (al-logger.ts) — the harness's only remaining side-channel
+  // narrative log now that SessionLogger/JSONL run-logging has been removed (the
+  // ledger, ledger.ts, is the durable record of every message). Created fresh at
+  // the top of chat() and used by chatCall()/the tool-dispatch loop below via this
+  // field, since chatCall() doesn't otherwise have a way to receive it (it's
   // private and its signature is unchanged — see al-logger integration notes at each
   // call site). null only in the narrow window before chat()'s first line runs;
   // every call site below guards with `this.traceLogger?.` for that reason, and
@@ -258,12 +311,18 @@ export class Agent {
   // run) alongside the other per-run state, so turn 1 of every run reports its
   // entire starting history as new, matching a resumed frame's own history depth.
   private alLastMessageCount = 0
-  private episodes: EpisodeMeta[] = []
+  // The ledger message id for each entry of this.history, PARALLEL to it (same
+  // index) — assigned by pushCtx for EVERY message (tool-role rejections/replays/
+  // nudges included), so collapse/eviction stubs always have something to point
+  // at. This is what lets chatCall's collapse stub and compactHistory's eviction
+  // stub reference a real recoverable ledger id instead of the old episodeId.
+  private historyMsgIds: (string | undefined)[] = []
+  // Count of REAL executed tool results this run (never a rejection/replay/nudge,
+  // and never `ledger` itself) — what getRunState() reports as toolResults, mirroring
+  // the old CWL "episode count" semantics test coverage still pins.
+  private toolResultCount = 0
   private lastCommandOutput = ''
   private actionTrace: string[] = []
-  private get historyFile(): string {
-    return path.join(LOGS_DIR, this.sessionId ? `history-${this.sessionId}.json` : 'history.json')
-  }
 
   // ollama is injectable only so tests can drive the loop deterministically
   // without a live model; production always uses the default client.
@@ -274,36 +333,6 @@ export class Agent {
   ) {
     this.model = model ?? config.model
     this.ollama = ollama ?? new Ollama({ host: config.ollamaHost })
-  }
-
-  // Load full Ollama message history from disk for the current session.
-  async loadPersistedHistory(): Promise<void> {
-    this.history = []  // always reset before loading
-    try {
-      const raw = await fs.readFile(this.historyFile, 'utf-8')
-      const saved = JSON.parse(raw)
-      if (Array.isArray(saved) && saved.length > 0) {
-        this.history = saved
-        console.log(`[history] Restored ${saved.length} messages from ${this.historyFile}`)
-      }
-    } catch {
-      // No history file — clean start
-    }
-  }
-
-  async saveHistory(): Promise<void> {
-    if (this.history.length > 0) await this.persistHistory()
-  }
-
-  private async persistHistory(): Promise<void> {
-    try {
-      await fs.mkdir(path.dirname(this.historyFile), { recursive: true })
-      const tmp = `${this.historyFile}.tmp`
-      await fs.writeFile(tmp, JSON.stringify(this.history))
-      await fs.rename(tmp, this.historyFile)
-    } catch (err) {
-      console.error('[history] Failed to save:', err)
-    }
   }
 
   setModel(model: string) {
@@ -337,13 +366,13 @@ export class Agent {
     this.autoCommitEnabled = on
   }
 
-  // MULTI-AGENT ARCHITECTURE. null restores unrestricted (baseline) tool access —
-  // see frames.ts's ROLE_TOOLS for the per-role sets dispatch.ts passes.
-  setAllowedTools(tools: ToolName[] | null) {
+  // MULTI-AGENT ARCHITECTURE. See frames.ts's ROLE_TOOLS for the per-role sets
+  // dispatch.ts's spawnFrame passes here.
+  setAllowedTools(tools: ToolName[]) {
     this.allowedTools = tools
   }
 
-  setFrameId(id: string | null) {
+  setFrameId(id: string) {
     this.frameId = id
   }
 
@@ -357,7 +386,7 @@ export class Agent {
   // same spawn site as setAllowedTools/setMaxIterations. Also what chat() uses to look
   // up this frame's ROLE_IDENTITY/ROLE_INSTRUCTIONS (frames.ts) for its opening
   // system/user/system messages — see chat()'s own comment.
-  setRole(role: Role | null) {
+  setRole(role: Role) {
     this.roleTag = role
   }
 
@@ -395,14 +424,14 @@ export class Agent {
   // presence/counts rather than handing out the live objects, so nothing external can
   // mutate this instance's run state.
   getRunState(): {
-    episodes: number
+    toolResults: number
     editedPaths: string[]
     iterationCount: number
     loopMutationCount: number
     hadTrouble: boolean
   } {
     return {
-      episodes: this.episodes.length,
+      toolResults: this.toolResultCount,
       editedPaths: [...this.editedPaths],
       iterationCount: this.lastIterationCount,
       loopMutationCount: this.loopState.mutationCount,
@@ -431,11 +460,58 @@ export class Agent {
   private chatRetryDelayMs = config.chatRetryDelayMs
   setChatRetryDelayMs(ms: number) { this.chatRetryDelayMs = Math.max(0, Math.trunc(ms)) }
 
-  // Push a message into the live context and record when it entered, so the
-  // context viewer can show per-message timestamps. Same semantics as history.push.
-  private pushCtx(m: Message): void {
+  // Push a message into the live context, record when it entered (so the context
+  // viewer can show per-message timestamps), and record it into the persistent
+  // ledger too (ledger.ts's recordMessage), into THIS frame's own file
+  // (config.workspacePath/.argo/frames/<frameId>.jsonl) — there is no cross-frame
+  // ledger any more; the frame's file IS its scope, by construction. The ledger
+  // becomes a superset of the frame's own live context: literally every message
+  // ever pushed here this frame's whole life, kept forever (append-only JSONL) —
+  // see ledger.ts's own header comment.
+  //
+  // Every pushed message gets a LOCAL id (historyMsgIds, parallel to this.history),
+  // so collapse/eviction stubs always have something to point at. `id`, when
+  // supplied by the caller, is used verbatim instead of minting a fresh one — this
+  // is what lets a REAL tool result's label (buildToolLabel, computed before
+  // pushCtx runs so it can be embedded in the content itself) name the EXACT id
+  // this call then also records under, rather than two different ids for the same
+  // message. The ledger write is fire-and-forget (never awaited, never allowed to
+  // throw into the caller) — harness bookkeeping must never block or fail the run,
+  // same stance as every other ledger call site in this codebase.
+  //
+  // `uiMeta` carries the UI-only metadata that never reaches the model (thinking,
+  // tool name/args/duration/error, token/duration counts — see types.ts's
+  // LedgerMessage) — passed in explicitly by callers below rather than derived
+  // here, since a plain assistant/system/user message pushCtx call has none of it,
+  // a tool-result push has toolName/toolArgs/durationMs/error, and the
+  // post-response assistant push has thinking/promptTokens/generatedTokens/
+  // totalDurationMs. Kept as a separate parameter (not folded into Message, which
+  // is the `ollama` package's own type and isn't ours to extend) purely so pushCtx
+  // stays the ONE call site that talks to ledger.recordMessage.
+  private pushCtx(m: Message, id?: string, uiMeta?: Omit<LedgerMessage, 'id' | 'role' | 'content'>): void {
     this.history.push(m)
     this.historyTs.set(m, Date.now())
+    const msgId = id ?? newLedgerId('msg')
+    this.historyMsgIds.push(msgId)
+    const role = m.role === 'system' || m.role === 'user' || m.role === 'assistant' || m.role === 'tool' ? m.role : 'tool'
+    const content = typeof m.content === 'string' ? m.content : String(m.content ?? '')
+    recordMessage(config.workspacePath || '/workspace', this.frameId, {
+      id: msgId,
+      role,
+      content,
+      ...uiMeta,
+    }).catch(err => {
+      console.error('[ledger] recordMessage failed (continuing):', err)
+    })
+  }
+
+  // The ledger message id assigned to this.history[index] by pushCtx, if any —
+  // what buildToolLabel/chatCall's collapse stub/compactHistory's eviction stub use
+  // to point the model at ledger `expand` for recovery. undefined for a message
+  // pushed before this.historyMsgIds existed (never happens in practice — pushCtx
+  // always assigns one) or for an out-of-range index.
+  private msgIdAt(index: number): string | undefined {
+    return this.historyMsgIds[index]
   }
 
   // UNIFIED REJECTION SURFACING. A harness-level block (a role-restricted tool
@@ -451,7 +527,10 @@ export class Agent {
   private rejectToolCall(name: ToolName, args: Record<string, unknown>, reason: string, emitAndLog: (e: AgentEvent) => void): void {
     emitAndLog({ type: 'tool_call', tool: name, args })
     emitAndLog({ type: 'tool_result', tool: name, output: '', error: reason, duration_ms: 0, rejected: true })
-    this.pushCtx({ role: 'tool', content: `Error: ${reason}` })
+    // Same tool label as a real executed result (buildToolLabel) — the model
+    // should be able to identify a rejected call the same way it identifies a
+    // real one, not just see a floating "Error: ...".
+    this.pushCtx({ role: 'tool', content: `${buildToolLabel(name, args)}\nError: ${reason}` })
   }
 
   // H21. Wraps rejectToolCall for the role gate, which `continue`s straight past the
@@ -524,7 +603,10 @@ export class Agent {
     emitAndLog({ type: 'tool_call', tool: name, args })
     emitAndLog({ type: 'tool_result', tool: name, output: cached.output, error: cached.error, duration_ms: 0, rejected: true, replayed: true })
     const body = cached.error ? `Error: ${cached.error}\n${cached.output}` : cached.output
-    this.pushCtx({ role: 'tool', content: `${label}\n\n[Previous result, reproduced verbatim — nothing has changed]\n${body}` })
+    // buildToolLabel identifies WHICH call this is a replay of, same as a real
+    // executed result — `label` here is the separate loop-recovery message
+    // (action.message, e.g. "L1: ..."), not a tool label.
+    this.pushCtx({ role: 'tool', content: `${buildToolLabel(name, args)}\n${label}\n\n[Previous result, reproduced verbatim — nothing has changed]\n${body}` })
   }
 
   // Lets the user force an eviction pass between turns (server.ts's POST
@@ -534,20 +616,18 @@ export class Agent {
   // same way an automatic eviction is.
   async compactNow(): Promise<{ compacted: boolean }> {
     if (this.history.length === 0) return { compacted: false }
-    const logger = new SessionLogger('Manual context compaction', this.model, this.options, this.sessionId)
+    let seq = 0
     const emitAndLog = (event: AgentEvent) => {
-      logger.log(event)
-      this.emit(event, logger.getSeq())   // seq for UI replay/live dedup (see chat())
+      seq++
+      this.emit(event, seq)   // seq for UI replay/live dedup (see chat())
     }
     try {
       const currentRunStart = this.history.length - 1
       this.phase = 'compacting'
       const result = await this.compactHistory(currentRunStart, 0, emitAndLog, true)
-      if (result.compacted) await this.persistHistory()
       return { compacted: result.compacted }
     } finally {
       this.phase = 'idle'
-      await logger.flush()
     }
   }
 
@@ -570,26 +650,47 @@ export class Agent {
     // enough to dip under the trigger threshold before immediately re-triggering.
     const numCtx = this.options.num_ctx ?? 65536
     const budget: EvictionBudget = { maxTokens: Math.floor(numCtx * 0.7) }
-    const { messages, evictedEpisodeIds, tokenEstimateBefore, tokenEstimateAfter } = evict(this.history, this.episodes, budget)
-    if (evictedEpisodeIds.length === 0 && tokenEstimateBefore === tokenEstimateAfter) return { newRunStart: currentRunStart, compacted: false }
+    // this.historyMsgIds is parallel to this.history (evict() never removes or
+    // reorders entries, only stubs `content` in place), so it stays valid as the
+    // recovery-id lookup for the just-evicted messages after this call.
+    const { messages, evictedMessageIds, tokenEstimateBefore, tokenEstimateAfter } = evict(this.history, this.historyMsgIds, budget)
+    if (evictedMessageIds.length === 0 && tokenEstimateBefore === tokenEstimateAfter) return { newRunStart: currentRunStart, compacted: false }
     this.history = messages
     this.lastCompactedAt = Date.now()
-    if (this.frameId) {
-      for (const id of evictedEpisodeIds) {
-        try {
-          await markEpisodeEvicted(config.workspacePath || '/workspace', id)
-        } catch (err) {
-          emitAndLog({ type: 'warning', message: `Marking episode evicted failed (${err instanceof Error ? err.message : String(err)}) — continuing` })
-        }
-      }
+    // LEDGER-SIDE EVICTION MARKERS. `messages` (now this.history) already carries
+    // the stubbed content evict() wrote in place — this.historyMsgIds stays
+    // parallel to it (evict() never reorders/removes entries, only mutates
+    // `content`), so for each evicted id, the SAME index that id was originally
+    // pushed at still holds its (now-stubbed) message. Recording that stub as a
+    // FOLLOW-UP ledger entry sharing the original's `id` (types.ts's
+    // LedgerMessage.evicted) is what lets a later reload (ledger.ts's readFrame,
+    // last-write-wins per id) see the compact stub instead of re-expanding the
+    // full original content — see dispatch.ts's persistent-frame preload, the
+    // actual consumer this exists for. Fire-and-forget, same stance as pushCtx's
+    // own recordMessage calls — harness bookkeeping must never block or fail a
+    // run, and losing one marker just means one message's NEXT reload is slightly
+    // less compact, never wrong (the ledger's own original entry is untouched
+    // either way, so `expand` still recovers it).
+    for (const evictedId of evictedMessageIds) {
+      const idx = this.historyMsgIds.indexOf(evictedId)
+      if (idx === -1) continue
+      const stubContent = this.history[idx].content
+      recordMessage(config.workspacePath || '/workspace', this.frameId, {
+        id: evictedId,
+        role: 'tool',
+        content: stubContent,
+        evicted: true,
+      }).catch(err => {
+        console.error('[ledger] recordMessage (eviction marker) failed (continuing):', err)
+      })
     }
     emitAndLog({
       type: 'compact',
-      summary: `deterministic eviction: stubbed ${evictedEpisodeIds.length} episode(s), ~${Math.round(tokenEstimateBefore)} → ~${Math.round(tokenEstimateAfter)} est. tokens`,
+      summary: `deterministic eviction: stubbed ${evictedMessageIds.length} tool message(s), ~${Math.round(tokenEstimateBefore)} → ~${Math.round(tokenEstimateAfter)} est. tokens`,
       messagesBefore: msgsBefore,
       messagesAfter: this.history.length,
       contextUsagePct,
-      rangeDescription: `evicted ${evictedEpisodeIds.length} episode(s), oldest-action-first`,
+      rangeDescription: `evicted ${evictedMessageIds.length} tool message(s), oldest first`,
       validated: false,
       manual,
     })
@@ -625,9 +726,28 @@ export class Agent {
     // never drift out of sync with what was actually sent this turn.
     const alCollapsed: Array<{ index: number; originalChars: number; sentChars: number; role: string }> = []
     this.history.forEach((m, i) => {
+      // Defensive filter at send time: an assistant message with no content AND
+      // no tool_calls carries nothing observable for the model and is dropped
+      // from what's actually sent. this.history itself is left untouched (it
+      // still needs these entries — Ollama's chat API expects strict
+      // assistant/tool alternation, and the tool_calls field lives on the
+      // assistant message the following tool result attaches to), so the JSONL
+      // log/context viewer/al-logger trace all still see the full picture; only
+      // the outbound `messages` array shrinks.
+      if (m.role === 'assistant' && !m.content && !((m as { tool_calls?: unknown[] }).tool_calls?.length)) return
       const c = m.content
       if (collapse.has(i) && typeof c === 'string' && c.length > TOOL_RESULT_COLLAPSE_OVER) {
-        const stub = `[older tool output collapsed — ${c.length} chars; re-read the file or re-run the command if you need it]\n${c.slice(0, 200).replace(/\s+/g, ' ')}…`
+        // this.historyMsgIds is parallel to this.history (same index i); when this
+        // message has a real ledger id, point the model at ledger `expand` instead
+        // of the old "re-read the file or re-run the command" advice, which cannot
+        // help for a command whose real-world effect (a mutation, a network fetch)
+        // isn't safely repeatable.
+        const msgId = this.msgIdAt(i)
+        // "msg_id" here MUST match the `ledger` tool's actual expand
+        // parameter name (tools/index.ts's `args.msg_id`) — see eviction.ts's
+        // own stub for the identical rationale.
+        const recovery = msgId ? `; msg_id "${msgId}" to recover` : ''
+        const stub = `[collapsed — ${c.length} chars${recovery}]\n${c.slice(0, 200).replace(/\s+/g, ' ')}…`
         messages.push({ role: 'tool', content: stub })
         alCollapsed.push({ index: i, originalChars: c.length, sentChars: stub.length, role: m.role })
       } else {
@@ -651,14 +771,13 @@ export class Agent {
     // doesn't get lost mid-history over a long run. Transient — not stored in
     // this.history, so it can never duplicate or drift out of sync, and it
     // survives eviction (which only rewrites this.history) for free.
-    if (this.roleTag) {
+    {
       const recite = this.buildLoopRecite()
       if (recite) messages.push({ role: 'tool', content: recite })
     }
     // MULTI-AGENT ARCHITECTURE: a role-scoped frame only offers Ollama the tools in
-    // this.allowedTools (frames.ts's ROLE_TOOLS); null (baseline, and every existing
-    // caller) offers the full set unchanged. Also patches `conclude`'s status enum
-    // and (for a read-only role) `bash`'s description — see buildOfferedTools's own
+    // this.allowedTools (frames.ts's ROLE_TOOLS). Also patches `conclude`'s status
+    // enum and (for a read-only role) `bash`'s description — see buildOfferedTools's own
     // comment for the full three-step rationale.
     const offeredTools = this.buildOfferedTools()
     // TIMEOUT ABORT — STREAMING: the Ollama JS client only tracks a request in
@@ -762,11 +881,12 @@ export class Agent {
   }
 
   // Re-anchor text for the loop-recovery steer, and for the per-iteration tail
-  // recitation in chatCall: intended to carry the run's objective (see
-  // eviction.ts's renderPinnedAnchor) when one is known, so a steered/recited
-  // message can re-anchor the model to it. Currently always returns '' — no call
-  // site here looks up the harness-tracked objective (ledger.ts's getObjective) —
-  // so every caller below gets a no-op today, same as the unrestricted baseline.
+  // recitation in chatCall: intended to carry the run's objective when one is
+  // known, so a steered/recited message can re-anchor the model to it. Currently
+  // always returns '' — the objective is now just a regular `system` message
+  // dispatch.ts pushes at the start of a run (recorded to the ledger like any
+  // other message), not a harness-tracked pinned value with its own lookup — so
+  // every caller below gets a no-op today.
   private buildLoopRecite(): string {
     return ''
   }
@@ -774,20 +894,17 @@ export class Agent {
   // THE TOOLS ACTUALLY OFFERED TO OLLAMA for this frame's role, computed identically
   // by chatCall() (the real per-iteration request) and chat() (the trace-log header,
   // which must describe the same set the model is actually given). Three steps, in
-  // order: (1) role-filter to this.allowedTools (null = unrestricted baseline, every
-  // tool); (2) patch `conclude`'s status enum to this role's ROLE_CONCLUDE_STATUSES
-  // (frames.ts's withConcludeStatusEnum); (3) for a READ-ONLY role (Dispatcher/
-  // Planner — the two roles that get `bash` back for investigation only, never for
-  // writing), patch `bash`'s tool DESCRIPTION to the read-only variant
-  // (frames.ts's patchBashForReadOnly) so the SCHEMA itself never invites a write,
-  // matching the role's own read-only prompt framing instead of contradicting it.
-  // Step 3 is a no-op for every other role (Implementer, the unrestricted baseline),
+  // order: (1) role-filter to this.allowedTools; (2) patch `conclude`'s status enum
+  // to this role's ROLE_CONCLUDE_STATUSES (frames.ts's withConcludeStatusEnum); (3)
+  // for a READ-ONLY role (Dispatcher/Planner — the two roles that get `bash` back
+  // for investigation only, never for writing), patch `bash`'s tool DESCRIPTION to
+  // the read-only variant (frames.ts's patchBashForReadOnly) so the SCHEMA itself
+  // never invites a write, matching the role's own read-only prompt framing instead
+  // of contradicting it. Step 3 is a no-op for every other role (Implementer),
   // which keeps the default read-write bash description unchanged.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private buildOfferedTools(): any[] {
-    const roleFiltered = this.allowedTools
-      ? toolDefinitions.filter(t => this.allowedTools!.includes(t.function.name as ToolName))
-      : toolDefinitions
+    const roleFiltered = toolDefinitions.filter(t => this.allowedTools.includes(t.function.name as ToolName))
     const withEnum = withConcludeStatusEnum(roleFiltered, this.roleTag)
     if (this.roleTag === 'dispatcher' || this.roleTag === 'planner') {
       return patchBashForReadOnly(withEnum, BASH_DESCRIPTION_READONLY)
@@ -797,27 +914,23 @@ export class Agent {
 
   async chat(userMessage: string, opts?: ChatOptions): Promise<string> {
     const resume = opts?.resume === true
-    const logger = new SessionLogger(userMessage, this.model, this.options, this.sessionId)
-    // NEW, ADDITIVE Markdown trace (al-logger.ts) — see the field doc comment above.
+    // Markdown trace (al-logger.ts) — see the field doc comment above.
     // The tool set offered is computed via the SAME buildOfferedTools() helper
     // chatCall() uses, since that filtering only depends on state already set
     // before chat() runs (dispatch.ts's spawnFrame calls setAllowedTools/setRole
     // before chat()), not on anything chatCall() itself derives per call — so
     // recomputing it here for the header is equivalent, not a guess.
     const alTools = this.buildOfferedTools()
-    // sessionId/frameId/jsonl filename are cross-reference IDs only (see al-logger.ts's
-    // header) — they let a reader of the trace jump straight to the matching JSONL
-    // log (logger.getFilename()) and, from there, to the session/frame this run
+    // sessionId/frameId are cross-reference IDs only (see al-logger.ts's header) —
+    // they let a reader of the trace jump straight to the session/frame this run
     // belongs to. this.sessionId is always a string (never undefined) but an empty
     // one means "no session yet", which the header should omit rather than render
     // as an empty label. this.userQuery (set via setUserQuery by dispatch.ts) is the
     // ORIGINAL human request, distinct from `userMessage` below (this frame's own
-    // assignment text) — falls back to userMessage when never set, so the
-    // unrestricted baseline Agent (which never calls setUserQuery) still gets a
-    // sensible header.
+    // assignment text) — falls back to userMessage when never set.
     this.traceLogger = new TraceLogger(
-      this.userQuery || userMessage, this.model, this.options, this.roleTag ?? 'agent', alTools,
-      this.sessionId || undefined, this.frameId ?? undefined, logger.getFilename(),
+      this.userQuery || userMessage, this.model, this.options, this.roleTag, alTools,
+      this.sessionId || undefined, this.frameId || undefined,
     )
     // Each chat() call gets its OWN trace file (a fresh header + turn numbering
     // from 1), even on a resumed frame — so "new" for turn 1 of THIS file always
@@ -825,21 +938,19 @@ export class Agent {
     // reader sees with no other file to cross-reference.
     this.alLastMessageCount = 0
 
+    // Frame-local sequence counter — the SSE stream's/UI's replay-dedup mechanism
+    // depends on every emitted event carrying a per-run __seq, which used to come
+    // from SessionLogger.getSeq(). Now generated directly here.
+    let seq = 0
     const emitAndLog = (event: AgentEvent) => {
-      logger.log(event)
-      // Pass the seq log() just assigned (it pushes synchronously, before its
-      // first await, so getSeq() already reflects this event) so the SSE stream
-      // carries the same per-run seq the JSONL persists — this is what lets the
-      // UI dedupe replayed-vs-live events at the reconnect boundary.
-      const seq = logger.getSeq()
+      seq++
       this.emit(event, seq)
-      // NEW, ADDITIVE Markdown trace: forward harness-level events (eviction/
-      // compact, warning, error) to the trace logger too, along with the JSONL seq
-      // this event was just written at — logEvent() stores it so the NEXT turn/
-      // response it renders carries a seq cross-reference. logEvent() is a no-op
-      // (render-wise) for any AgentEvent variant it doesn't render (see its own
-      // switch), so this is safe to call unconditionally for every event without a
-      // parallel filter here.
+      // Markdown trace: forward harness-level events (eviction/compact, warning,
+      // error) to the trace logger too, along with the seq this event was just
+      // assigned — logEvent() stores it so the NEXT turn/response it renders
+      // carries a seq cross-reference. logEvent() is a no-op (render-wise) for any
+      // AgentEvent variant it doesn't render (see its own switch), so this is safe
+      // to call unconditionally for every event without a parallel filter here.
       this.traceLogger?.logEvent(event, seq)
     }
 
@@ -851,28 +962,55 @@ export class Agent {
     // do and how). Neither mentions tools (Ollama's own `tools` parameter, sent by
     // chatCall below, already shows the model what it has), the filesystem, or
     // AGENTS.md/MEMORY.md — those lived in the old buildSystemPrompt/
-    // loadProjectContext (both removed) and were never role-specific. Falls back
-    // to a generic identity/no instructions for the unrestricted baseline
-    // (roleTag null, which never sets ROLE_IDENTITY/ROLE_INSTRUCTIONS), so that
-    // Agent still opens with a real system message rather than none at all.
+    // loadProjectContext (both removed) and were never role-specific.
     // Skipped entirely on a RESUMED turn: the frame's history already carries
     // these three messages from its original (non-resumed) chat() call —
     // re-pushing them would duplicate the identity/instructions on every resume.
     if (!resume) {
-      const identity = this.roleTag ? ROLE_IDENTITY[this.roleTag] : 'You are Argo, a coding assistant.'
-      this.pushCtx({ role: 'system', content: identity })
+      // model/modelOptions recorded ONCE per frame, on this opening [system]
+      // identity message — the agent itself only ever sees the plain system
+      // content (uiMeta never reaches the model); the UI/ledger reader gets the
+      // model name and sampling options this whole frame ran with.
+      this.pushCtx(
+        { role: 'system', content: ROLE_IDENTITY[this.roleTag] },
+        undefined,
+        { model: this.model, modelOptions: this.options },
+      )
+
+      // INJECTED CONTEXT — Dispatcher gets AGENTS.md and MEMORY.md right after
+      // identity, BEFORE the user request, so project-specific instructions are
+      // available when classifying. Always shown, even when the files don't exist
+      // (the agent should know they're absent rather than wonder).
+      const ws = config.workspacePath || '/workspace'
+      if (this.roleTag === 'dispatcher') {
+        for (const file of ['AGENTS.md', 'MEMORY.md']) {
+          let content: string
+          try {
+            content = await fs.readFile(path.join(ws, file), 'utf-8')
+            if (!content.trim()) content = '(empty file)'
+          } catch {
+            content = '(file not found)'
+          }
+          this.pushCtx({ role: 'assistant', content: '' })
+          this.pushCtx({ role: 'tool', content: `[read_file: ${file}]\n${content}` })
+        }
+      }
     }
     this.pushCtx({ role: 'user', content: userMessage })
     // Captured IMMEDIATELY after the [user] push, before the [system] instructions
-    // push that may or may not follow it — computing this via arithmetic after all
-    // three pushes would depend on whether the instructions message actually got
-    // pushed (it's skipped when this.roleTag has no ROLE_INSTRUCTIONS entry, e.g.
-    // the unrestricted baseline), which is exactly the kind of off-by-one that
-    // silently points currentRunStart at the wrong message.
+    // push that may or may not follow it.
     const userMessageIndex = this.history.length - 1
     if (!resume) {
-      const instructions = this.roleTag ? ROLE_INSTRUCTIONS[this.roleTag] : ''
+      const instructions = ROLE_INSTRUCTIONS[this.roleTag] ?? ''
       if (instructions) this.pushCtx({ role: 'system', content: instructions })
+
+      // All agents get a project file listing after the instructions.
+      try {
+        const lsResult = await bash('ls -la /workspace/', config.workspacePath || '/workspace')
+        const lsContent = (lsResult.output && lsResult.output !== NO_OUTPUT) ? lsResult.output : '(empty workspace)'
+        this.pushCtx({ role: 'assistant', content: '' })
+        this.pushCtx({ role: 'tool', content: `[bash: ls -la /workspace/]\n${lsContent}` })
+      } catch { /* injected context is best-effort — never abort a run for it */ }
     }
     this.phase = 'running'
     // The index of the message that started this run — compactHistory() always
@@ -904,8 +1042,8 @@ export class Agent {
       // from where the previous turn stopped, so a resumed frame reports "ITER
       // 11/20" rather than starting over at 1 — and so a caller can still see the
       // frame's TOTAL effort. Everything the fresh-run branch below clears
-      // (loopState, editedPaths, episodes, the trouble flags) is deliberately left
-      // in place: the follow-up message is a continuation of the same work. Note
+      // (loopState, editedPaths, toolResultCount, the trouble flags) is deliberately
+      // left in place: the follow-up message is a continuation of the same work. Note
       // loopSteerEscalated/ollamaRetryCount are STICKY per frame on purpose —
       // friction that happened in an earlier turn of this frame is still friction
       // dispatch.ts's standup trigger should see.
@@ -921,7 +1059,7 @@ export class Agent {
       this.editedPaths = []
       this.lastCommandOutput = ''
       this.actionTrace = []
-      this.episodes = []
+      this.toolResultCount = 0
     }
     // No-progress detector: tool calls since the last actual change to the project.
     // A run that keeps inspecting without ever editing is stuck (the novel-arg
@@ -940,8 +1078,8 @@ export class Agent {
     // a resumed turn — nothing new was pushed above, so there is nothing fresh to
     // show.
     if (!resume) {
-      const identity = this.roleTag ? ROLE_IDENTITY[this.roleTag] : 'You are Argo, a coding assistant.'
-      const instructions = this.roleTag ? ROLE_INSTRUCTIONS[this.roleTag] : ''
+      const identity = ROLE_IDENTITY[this.roleTag]
+      const instructions = ROLE_INSTRUCTIONS[this.roleTag] ?? ''
       emitAndLog({ type: 'system_prompt', content: instructions ? `${identity}\n\n${instructions}` : identity })
     }
 
@@ -951,10 +1089,9 @@ export class Agent {
     // 20/35/45 checkpoints below simply never fired for them, since they hit their
     // own hard maxIterations ceiling first and got ZERO mid-run steering. Each
     // checkpoint is min(the original fixed value, a fraction of this run's own
-    // maxIterations) — for any budget >=~60 (Implementer's, and the baseline's own
-    // typical config) this reduces to exactly the original fixed values (unchanged);
-    // for a short-budget role it scales down proportionally instead of never firing
-    // at all.
+    // maxIterations) — for any budget >=~60 (Implementer's typical config) this
+    // reduces to exactly the original fixed values (unchanged); for a short-budget
+    // role it scales down proportionally instead of never firing at all.
     // Offset by iterationBase on a RESUMED turn so the checkpoints keep firing at
     // the same positions WITHIN this turn — the alternative (absolute numbering)
     // would put every checkpoint in the past for a resumed frame and silently give
@@ -969,11 +1106,10 @@ export class Agent {
     // PROGRESS_CHECK_MESSAGES). When this frame's role has an entry there (currently
     // Planner and Implementer only), its checkpoints are these EXACT per-call
     // iteration numbers with EXACT message text, replacing the generic fraction-of-
-    // maxIterations mechanism below for this frame only. null for every other role
-    // (Dispatcher, the unrestricted baseline), which keeps the generic mechanism
-    // exactly as it was.
-    const roleProgressIterations = this.roleTag ? PROGRESS_CHECK_ITERATIONS[this.roleTag] : undefined
-    const roleProgressMessages = this.roleTag ? PROGRESS_CHECK_MESSAGES[this.roleTag] : undefined
+    // maxIterations mechanism below for this frame only. undefined for every other
+    // role (Dispatcher), which keeps the generic mechanism exactly as it was.
+    const roleProgressIterations = PROGRESS_CHECK_ITERATIONS[this.roleTag]
+    const roleProgressMessages = PROGRESS_CHECK_MESSAGES[this.roleTag]
     const stallCheckpoints = roleProgressIterations
       ? roleProgressIterations.map(n => this.iterationBase + n)
       : [isDispatcherTaskStartCheckpoint ? 1 : 0.4, 0.65, 0.85].map((frac, idx) =>
@@ -1149,8 +1285,27 @@ export class Agent {
 
         const msg = response.message
 
-        if (msg.content) {
-          emitAndLog({ type: 'thought', content: msg.content })
+        // Assistant-message UI metadata for THIS turn's response — attached to
+        // whichever pushCtx call below actually records `msg` (the thinking-turn
+        // branch's `if (msg.content) this.pushCtx(msg)`, or the hasCalls branch's
+        // `this.pushCtx(msg)` right before running tool calls). Never attached to
+        // a tool-role or system/user pushCtx call — those get their own uiMeta
+        // (toolName/toolArgs/durationMs/error) or none at all.
+        const assistantUiMeta: Omit<LedgerMessage, 'id' | 'role' | 'content'> = {
+          thinking: msg.thinking,
+          promptTokens: response.prompt_eval_count,
+          generatedTokens: response.eval_count,
+          totalDurationMs: response.total_duration != null ? Math.round(response.total_duration / 1e6) : undefined,
+        }
+
+        // msg.thinking (the model's raw chain-of-thought) is distinct from
+        // msg.content (its own visible text) — a turn can have either alone: a
+        // pure-reasoning turn that spends its whole token budget on thinking
+        // never reaches content, and used to emit nothing at all here, which is
+        // why such a turn (e.g. one that hits num_predict mid-thought) rendered
+        // as a blank gap in the UI even though the model clearly did something.
+        if (msg.content || msg.thinking) {
+          emitAndLog({ type: 'thought', content: msg.content, thinking: msg.thinking })
         }
 
         // Determine tool calls — native API first, then fallback to JSON parsed from content
@@ -1177,7 +1332,7 @@ export class Agent {
           // it need a parent assistant turn to attach to — Ollama's chat API
           // expects a strict assistant/tool alternation, and dropping that parent
           // would desync it.
-          if (msg.content) this.pushCtx(msg)
+          if (msg.content) this.pushCtx(msg, undefined, assistantUiMeta)
           consecutiveThinkingTurns++
           // Only nudge from the 2nd consecutive thinking turn on — the model gets one
           // free turn to reason/plan without being told to hurry up; a SECOND turn in
@@ -1191,7 +1346,7 @@ export class Agent {
         }
 
         consecutiveThinkingTurns = 0
-        this.pushCtx(msg)
+        this.pushCtx(msg, undefined, assistantUiMeta)
 
         const callsToRun = nativeCalls.length > 0
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1207,7 +1362,7 @@ export class Agent {
           // role the tool, since every agent needs a way to finish) falls through
           // to the standard "not available in this role" rejection instead of
           // being silently intercepted here regardless of role.
-          if (name === 'conclude' && (this.allowedTools === null || this.allowedTools.includes('conclude'))) {
+          if (name === 'conclude' && this.allowedTools.includes('conclude')) {
             emitAndLog({ type: 'tool_call', tool: name, args })
             const status = typeof args.status === 'string' ? args.status.trim().toUpperCase() : ''
             const answer = typeof args.message === 'string' ? args.message.trim() : ''
@@ -1218,7 +1373,7 @@ export class Agent {
               continue
             }
             // Validate status against the role's allowed keywords
-            if (this.roleTag) {
+            {
               const validStatuses = ROLE_CONCLUDE_STATUSES[this.roleTag]
               if (validStatuses && !validStatuses.includes(status)) {
                 const err = concludeStatusError(this.roleTag, status)
@@ -1250,7 +1405,7 @@ export class Agent {
           // never sees it — the call simply never runs), but IS counted as a gate
           // rejection (H21) since allowedTools is fixed for this frame's whole life
           // and a role refusal can never later succeed here — see handleGateRejection.
-          if (this.allowedTools && !this.allowedTools.includes(name)) {
+          if (!this.allowedTools.includes(name)) {
             const stop = this.handleGateRejection(
               name, args, gateKey, 'role',
               `tool "${name}" is not available in this role — it was NOT called.`,
@@ -1308,7 +1463,11 @@ export class Agent {
           emitAndLog({ type: 'tool_call', tool: name, args })
 
           const start = Date.now()
-          const result = await executeTool(name, args)
+          // The `ledger` tool needs to know WHICH FRAME is calling it, so it reads
+          // only that frame's own file — never something the model supplies itself
+          // as a tool argument (see tools/index.ts's LedgerToolContext doc). Every
+          // other tool ignores this parameter entirely.
+          const result = await executeTool(name, args, { frameId: this.frameId })
           const duration_ms = Date.now() - start
 
           // A `bash` call just ran — its effect on the filesystem is unknowable
@@ -1340,42 +1499,29 @@ export class Agent {
           // `#### New messages` (beginTurn reads it straight off this.history), so a
           // separate "Tool Results" section would only duplicate it.
 
+          // The message id is minted HERE, before pushCtx, purely so buildToolLabel
+          // can put it in the label the model actually sees (`[bash: ... | msg-xxx]`)
+          // — pushCtx is then told to use this SAME id (rather than minting its own)
+          // so the label and the ledger record agree. Intentionally NOT minted for
+          // `ledger` calls (query-only bookkeeping), so those keep an unlabelled tool
+          // result, same as before this change. This is also what getRunState()'s
+          // toolResults counts — a REAL executed tool result, never a rejection,
+          // replay, or nudge.
+          const msgId = name !== 'ledger' ? newLedgerId('msg') : undefined
+          if (msgId) this.toolResultCount++
+
+          // Label the result with the call that produced it (tool name + primary
+          // arg + message id) — see buildToolLabel's comment above. Only for a REAL
+          // executed result; rejectToolCall/replayToolCall label their own pushCtx
+          // calls separately, and this path never runs for `conclude` (intercepted
+          // earlier, above this executeTool call).
+          const toolLabel = buildToolLabel(name, args)
           this.pushCtx({
             role: 'tool',
             content: result.error
-              ? `Error: ${result.error}\n${result.output}`
-              : result.output,
-          })
-
-          // MULTI-AGENT ARCHITECTURE: every tool call becomes a CWL episode
-          // (exploratory | action), linked to its inferred dependencies, and —
-          // when this instance is running as part of a dispatch (this.frameId set)
-          // — written to the ledger losslessly (the full result survives there
-          // even once evicted from the live window; see eviction.ts / ledger.ts).
-          // `ledger` itself is a query-only bookkeeping call, not a typed episode.
-          if (name !== 'ledger') {
-            const kind = classifyTool(name)
-            const episodeId = newLedgerId('ep')
-            const deps = inferDependencies(this.episodes, kind)
-            const messageIndex = this.history.length - 1 // the tool-result message just pushed
-            this.episodes.push({ episodeId, kind, tool: name, messageIndex, dependsOn: deps })
-            if (this.frameId) {
-              const fullContent = result.error ? `Error: ${result.error}\n${result.output}` : result.output
-              try {
-                await recordEpisode(config.workspacePath || '/workspace', {
-                  frameId: this.frameId,
-                  episodeId,
-                  episodeKind: kind,
-                  tool: name,
-                  argsSummary: JSON.stringify(args).slice(0, 300),
-                  dependsOn: deps,
-                  fullContent,
-                })
-              } catch (err) {
-                emitAndLog({ type: 'warning', message: `Episode record failed (${err instanceof Error ? err.message : String(err)}) — continuing` })
-              }
-            }
-          }
+              ? `${toolLabel}\nError: ${result.error}\n${result.output}`
+              : `${toolLabel}\n${result.output}`,
+          }, msgId, { toolName: name, toolArgs: args, durationMs: duration_ms, error: !!result.error })
           if (name === 'edit_file' || name === 'write_file') {
             const p = typeof args.path === 'string' ? args.path : ''
             if (p && !this.editedPaths.includes(p)) this.editedPaths.push(p)
@@ -1438,18 +1584,18 @@ export class Agent {
       this.phase = 'error'
       return message
     } finally {
-      await Promise.all([logger.flush(), this.persistHistory(), this.traceLogger?.close()])
+      await this.traceLogger?.close()
     }
   }
 
   reset() {
     this.history = []
-    fs.unlink(this.historyFile).catch(() => {})
+    this.historyMsgIds = []
   }
 
   loadHistory(messages: Array<{ role: string; content: string }>) {
     this.history = messages as Message[]
-    fs.writeFile(this.historyFile, JSON.stringify(this.history)).catch(() => {})
+    this.historyMsgIds = messages.map(() => undefined) // raw transcript load — no ledger ids
   }
 
   getChatHistory(): Array<{ role: string; content: string }> {
@@ -1479,14 +1625,18 @@ export class Agent {
   } {
     const MAX = 4000
     let totalChars = 0
-    const messages = this.history.map(m => {
-      const full = typeof m.content === 'string' ? m.content : String(m.content ?? '')
-      totalChars += full.length
-      const content = full.length > MAX
-        ? `${full.slice(0, MAX)}…(+${full.length - MAX} more chars)`
-        : full
-      return { role: m.role, content, chars: full.length, ts: this.historyTs.get(m) ?? null }
-    })
+    const messages = this.history
+      // Skip empty assistant messages (tool-call structural parents with no
+      // visible content — needed for Ollama alternation but nothing to show).
+      .filter(m => !(m.role === 'assistant' && !m.content))
+      .map(m => {
+        const full = typeof m.content === 'string' ? m.content : String(m.content ?? '')
+        totalChars += full.length
+        const content = full.length > MAX
+          ? `${full.slice(0, MAX)}…(+${full.length - MAX} more chars)`
+          : full
+        return { role: m.role, content, chars: full.length, ts: this.historyTs.get(m) ?? null }
+      })
 
     return {
       messages,
@@ -1512,8 +1662,9 @@ export class Agent {
 
   // Public so dispatch.ts can call it once at the end of a whole dispatch run,
   // using any convenient already-constructed frame's Agent instance — the logic
-  // itself is instance-agnostic (just git + this.ollama for the commit message),
-  // unlike the baseline loop's per-run call, which stays private.
+  // itself is instance-agnostic (just git + this.ollama for the commit message).
+  // Also called internally from chat()'s own conclude handler when autoCommit is
+  // enabled for a single-frame run.
   async autoCommit(emitAndLog: (e: AgentEvent) => void): Promise<void> {
     try {
       // Initialise git if workspace isn't tracked yet (idempotent on existing repos)

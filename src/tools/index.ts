@@ -1,52 +1,57 @@
 import { bash } from './bash.js'
 import { webSearch } from './web-search.js'
-import { readFile, readFiles, writeFile, editFile } from './file-ops.js'
+import { readFile, writeFile, editFile } from './file-ops.js'
 import { fetchUrl } from './fetch-url.js'
 import { browserFetch } from './browser-fetch.js'
 import * as ledger from '../ledger.js'
 import { config } from '../config.js'
 import type { ToolName, ToolResult } from '../types.js'
 
-// MULTI-AGENT LEDGER TOOL. Query-only from a model's perspective — the harness-automatic
-// writers (recordDelegation, recordConclusion, ...) are called directly from
-// dispatch.ts/frames.ts, never through this tool, so they can never be forgotten. Root
-// is config.workspacePath, NOT a literal '/workspace' — that literal only exists on the
-// filesystem in-container; standalone dev mode runs this process directly on the host
-// (see dispatch.ts's root() for the full rationale). Never throws — errors go in the
-// `error` field, matching every other tool in this module.
-async function runLedgerTool(args: Record<string, unknown>): Promise<ToolResult> {
+// PER-FRAME LEDGER TOOL. Query-only from a model's perspective — the
+// harness-automatic writer (ledger.recordMessage) is called directly from
+// agent.ts's pushCtx, never through this tool, so it can never be forgotten. Root
+// is config.workspacePath, NOT a literal '/workspace' — that literal only exists on
+// the filesystem in-container; standalone dev mode runs this process directly on
+// the host (see dispatch.ts's root() for the full rationale). Never throws —
+// errors go in the `error` field, matching every other tool in this module.
+//
+// Each frame sees ONLY ITS OWN messages, scoped by `ctx.frameId` — never something
+// the model itself supplies as a tool argument (a model could otherwise ask to see
+// through another frame's eyes). There is no cross-agent visibility any more: the
+// old dispatcher-sees-all/planner-sees-implementer rules are gone, since the frame
+// identity now IS the file, and a frame only ever reads its own file. `ctx` stays
+// optional only so callers/tests that invoke executeTool directly (outside a
+// frame) don't need to fabricate one.
+export interface LedgerToolContext {
+  frameId: string
+}
+
+async function runLedgerTool(args: Record<string, unknown>, ctx?: LedgerToolContext): Promise<ToolResult> {
+  if (!ctx) return { output: '(ledger is only available inside a dispatch)' }
   const root = config.workspacePath || '/workspace'
   const action = typeof args.action === 'string' ? args.action : ''
   try {
     switch (action) {
-      case 'get_goal': {
-        const obj = await ledger.getObjective(root)
-        return { output: obj ?? '(no objective set yet)' }
+      case 'get_objective': {
+        // The objective is the first user-role message in this frame's ledger
+        const msgs = await ledger.readFrame(root, ctx.frameId)
+        const objective = msgs.find(m => m.role === 'user')
+        return { output: objective?.content ?? '(no objective found)' }
       }
       case 'get_recent': {
-        const n = typeof args.n === 'number' ? args.n : 10
-        const scope = args.scope === 'frame' || args.scope === 'task' ? args.scope : undefined
-        return { output: JSON.stringify(await ledger.getRecent(root, n, scope)) }
+        const n = typeof args.n === 'number' ? args.n : 20
+        const msgs = await ledger.readFrame(root, ctx.frameId)
+        const stripped = msgs.slice(-n).map(m => ({ id: m.id, role: m.role, content: m.content }))
+        return { output: JSON.stringify(stripped) }
       }
-      case 'get_conclusion': {
-        const frameId = typeof args.frame_id === 'string' ? args.frame_id : ''
-        if (!frameId) return { output: '', error: 'get_conclusion requires frame_id' }
-        const c = await ledger.getConclusion(root, frameId)
-        return { output: c ? JSON.stringify(c) : '(no conclusion recorded for that frame)' }
-      }
-      case 'get_frame_trail': {
-        const frameId = typeof args.frame_id === 'string' ? args.frame_id : ''
-        if (!frameId) return { output: '', error: 'get_frame_trail requires frame_id' }
-        return { output: JSON.stringify(await ledger.getFrameTrail(root, frameId)) }
-      }
-      case 'expand': {
-        const episodeId = typeof args.episode_id === 'string' ? args.episode_id : ''
-        if (!episodeId) return { output: '', error: 'expand requires episode_id' }
-        const content = await ledger.expand(root, episodeId)
-        return { output: content ?? '(no content recorded for that episode, or it was never evicted)' }
+      case 'get_msg_id': {
+        const msgId = typeof args.msg_id === 'string' ? args.msg_id : ''
+        if (!msgId) return { output: '', error: 'get_msg_id requires msg_id' }
+        const content = await ledger.expand(root, msgId, ctx.frameId)
+        return { output: content ?? '(no content found for that msg_id)' }
       }
       default:
-        return { output: '', error: `Unknown ledger action: ${action}. Valid: get_goal, get_recent, get_conclusion, get_frame_trail, expand.` }
+        return { output: '', error: `Unknown ledger action: ${action}. Valid: get_objective, get_recent, get_msg_id.` }
     }
   } catch (err) {
     return { output: '', error: String(err) }
@@ -90,16 +95,15 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'read_file',
-      description: 'Read or search files in the container. Use path to read one file, or paths to read several files in one call. For large files, use offset/limit to read the relevant line range instead of relying on truncated whole-file output. If you do not know where relevant content is, use pattern to search the entire file for an exact literal substring and get matching line numbers, then read around those lines with offset/limit — or set context to also see lines of surrounding code with each match, saving a follow-up call. Any absolute path works; project files are under /workspace. Whole-file reads are capped at 8000 characters per file and may omit the middle.',
+      description: 'Read or search a file. For large files, use offset/limit to read a specific line range. Use pattern to search for an exact literal substring and get matching line numbers with optional context lines. Whole-file reads are capped at 8000 characters and may omit the middle.',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Absolute path to one file, e.g. /workspace/src/app.ts or /tmp/output.txt. Required unless paths is set instead.' },
-          paths: { type: 'array', items: { type: 'string' }, maxItems: 10, description: 'Absolute paths to multiple files (max 10). Each file is returned in a labeled section; missing files produce inline errors without failing the whole call. When set, path, offset, limit, and pattern are ignored.' },
-          offset: { type: 'integer', minimum: 1, description: '1-based first line to return. Use with limit to page through a large file. Ignored when pattern is set.' },
-          limit: { type: 'integer', minimum: 1, description: 'Number of lines to return from offset. If omitted, reads to the end, subject to the 8000-character cap. Ignored when pattern is set.' },
-          pattern: { type: 'string', description: 'Search the entire file for this exact literal substring and return matching line numbers instead of file content. Not a regex. When set, offset and limit are ignored.' },
-          context: { type: 'integer', minimum: 0, maximum: 20, description: 'When pattern is set, show this many lines of context around each match (default 0 = line numbers only). Saves a follow-up read_file call for most symbol lookups.' },
+          path: { type: 'string', description: 'Absolute path to the file, e.g. /workspace/src/app.ts.' },
+          offset: { type: 'integer', minimum: 1, description: '1-based first line to return. Ignored when pattern is set.' },
+          limit: { type: 'integer', minimum: 1, description: 'Number of lines from offset. Ignored when pattern is set.' },
+          pattern: { type: 'string', description: 'Search for this exact literal substring (not a regex). Returns matching line numbers.' },
+          context: { type: 'integer', minimum: 0, maximum: 20, description: 'Lines of context around each pattern match (default 0).' },
         },
         required: ['path'],
         additionalProperties: false,
@@ -207,19 +211,17 @@ export const toolDefinitions = [
     type: 'function' as const,
     function: {
       name: 'ledger',
-      description: 'Query Argo\'s persistent multi-agent record for prior objectives, agent results, and task history. Use it to recover or verify prior work instead of guessing from memory or incomplete context.',
+      description: 'Recover information that has been collapsed or evicted from your current context.',
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
-            enum: ['get_goal', 'get_recent', 'get_conclusion', 'get_frame_trail', 'expand'],
-            description: 'What to retrieve: get_goal = immutable objective; get_recent = recent ledger entries; get_conclusion = one frame\'s final result; get_frame_trail = one frame\'s full recorded history; expand = full content of an evicted episode.',
+            enum: ['get_objective', 'get_recent', 'get_msg_id'],
+            description: 'What to retrieve: get_objective = your original assignment; get_recent = recent context entries; get_msg_id = restore the full content referenced by an evicted/collapsed stub.',
           },
-          frame_id: { type: 'string', description: 'Frame ID for get_conclusion or get_frame_trail.' },
-          episode_id: { type: 'string', description: 'Episode ID for expand.' },
-          n: { type: 'number', description: 'Number of entries to return for get_recent.' },
-          scope: { type: 'string', enum: ['frame', 'task'], description: 'Optional get_recent filter: restrict standup entries to frame- or task-level records.' },
+          n: { type: 'number', description: 'Number of entries to return for get_recent. Default 20.' },
+          msg_id: { type: 'string', description: 'Message ID to recover with get_msg_id, taken verbatim from the collapsed/evicted stub.' },
         },
         required: ['action'],
         additionalProperties: false,
@@ -228,20 +230,15 @@ export const toolDefinitions = [
   },
 ]
 
-export async function executeTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+export async function executeTool(name: string, args: Record<string, unknown>, ctx?: LedgerToolContext): Promise<ToolResult> {
   switch (name as ToolName) {
     case 'bash':
       return bash(args.command as string, args.cwd as string | undefined, args.timeout_ms as number | undefined)
     case 'web_search':
       return webSearch(args.query as string, args.max_results as number | undefined)
     case 'read_file': {
-      // Multi-file read: paths array takes precedence over single path
-      const paths = Array.isArray(args.paths) ? args.paths as string[] : null
-      if (paths && paths.length > 0) {
-        return readFiles(paths)
-      }
       if (!args.path || typeof args.path !== 'string') {
-        return { output: '', error: 'read_file requires either a "path" string or a "paths" array.' }
+        return { output: '', error: 'read_file requires a "path" string.' }
       }
       return readFile(args.path as string, args.offset as number | undefined, args.limit as number | undefined, args.pattern as string | undefined, args.context as number | undefined)
     }
@@ -257,7 +254,7 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
       // Handled in the agent loop (terminates the session); never dispatched here.
       return { output: '', error: 'conclude is handled by the agent loop' }
     case 'ledger':
-      return runLedgerTool(args)
+      return runLedgerTool(args, ctx)
     default:
       return { output: '', error: `Unknown tool: ${name}` }
   }

@@ -9,6 +9,21 @@ import type { AgentEvent } from './types.js'
 import type { Ollama } from 'ollama'
 import { Agent, parseChangedFiles, buildFallbackCommitMessage, isCleanStatus } from './agent.js'
 import { NO_OUTPUT } from './tools/bash.js'
+import { ROLE_TOOLS } from './frames.js'
+
+// Every real Agent instance (dispatch.ts's spawnFrame) always calls
+// setAllowedTools()/setRole() before chat() runs — there is no unrestricted mode
+// any more (an un-configured Agent offers NO tools, not every tool; see
+// dispatch.test.ts's own coverage of that default). The generic loop-mechanics
+// tests below are about the tool-dispatch LOOP itself (repetition/loop-recovery/
+// retry/eviction), not about any one role's specific tool set, so they use the
+// Implementer's tool superset (read_file/write_file/edit_file/bash/conclude/etc)
+// as a stand-in "give it everything it needs" role — this mirrors agent.ts's own
+// default roleTag ('implementer') exactly, so a bare `new Agent(...)` used this
+// way needs only this one extra call to behave like a real frame.
+function grantFullTools(agent: Agent): void {
+  agent.setAllowedTools(ROLE_TOOLS.implementer)
+}
 
 test('setMaxIterations clamps out-of-range values into [10, 1000]', () => {
   const agent = new Agent(() => {})
@@ -56,7 +71,7 @@ test('isCleanStatus treats bash\'s NO_OUTPUT sentinel the same as a genuinely bl
 // without waiting for the near-full trigger. Deterministic — no LLM call, since
 // eviction is a pure, no-model context-management pass.
 
-test('compactNow evicts old tool-result episodes and marks the emitted event manual', async () => {
+test('compactNow evicts old tool-result messages and marks the emitted event manual', async () => {
   const events: AgentEvent[] = []
   const agent = new Agent(e => events.push(e), 'test-model')
   const sessionId = `test-compact-now-${Date.now()}`
@@ -66,11 +81,12 @@ test('compactNow evicts old tool-result episodes and marks the emitted event man
   const lastMessage = 'EXACT CURRENT PROMPT — must survive the manual eviction verbatim'
   agent.loadHistory([
     { role: 'user', content: 'Start working on the task.' },
-    // Long assistant messages, not tool results: no CWL episode metadata exists for
-    // history loaded this way (loadHistory is a raw transcript load, not a live
-    // run), so evict()'s primary "strip oldest episodes" pass finds nothing to
-    // evict and falls through to its second-pass fallback — truncating long
-    // assistant messages, oldest first — which is what this test actually exercises.
+    // Long assistant messages, not tool results: history loaded this way
+    // (loadHistory is a raw transcript load, not a live run) carries no tool-role
+    // messages at all, so evict()'s primary "strip oldest tool messages" pass finds
+    // nothing to evict and falls through to its second-pass fallback — truncating
+    // long assistant messages, oldest first — which is what this test actually
+    // exercises.
     ...Array.from({ length: 20 }, (_, i) => ({ role: 'assistant', content: `Iteration ${i} reasoning: `.padEnd(600, 'x') })),
     { role: 'user', content: lastMessage },
   ])
@@ -166,6 +182,7 @@ test('chat retry: a failed per-iteration call is retried once and the run contin
   const { ollama, getCalls } = flakyOllama([new Error('Ollama did not respond within 180s'), finalAnswer])
   const agent = new Agent(e => events.push(e), 'test-model', ollama)
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   agent.setChatRetryDelayMs(0)  // don't actually wait before retrying, in the test
   try {
     const answer = await agent.chat('argo chat retry case a')
@@ -186,6 +203,7 @@ test('chat retry: if both the call and its retry fail, the outer-catch error beh
   const { ollama, getCalls } = flakyOllama([new Error('boom-1'), new Error('boom-2')])
   const agent = new Agent(e => events.push(e), 'test-model', ollama)
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   agent.setChatRetryDelayMs(0)
   try {
     const answer = await agent.chat('argo chat retry case b')
@@ -218,6 +236,7 @@ test('chat retry: a stop issued during the retry wait is honored and no retry is
   } as unknown as Ollama
   agent = new Agent(e => events.push(e), 'test-model', ollama)
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   agent.setChatRetryDelayMs(0)
   try {
     const answer = await agent.chat('argo chat retry case c')
@@ -237,6 +256,7 @@ test('a read-only run finishes directly with no mutation gate to satisfy', async
   const sessionId = `test-readonly-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, finalAnswer]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     const answer = await agent.chat('argo read-only case')
     assert.equal(readResults(events).length, 1)                         // the read ran
@@ -267,6 +287,7 @@ test('loop ladder: repeated identical non-mutating call is blocked and escalates
     readCall, readCall, readCall, readCall, readCall, readCall, readCall, finalAnswer,
   ]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     const answer = await agent.chat('argo loop ladder case')
 
@@ -310,6 +331,7 @@ test('loop ladder: a blocked repeat is served the EARLIER call\'s actual result,
   const sessionId = `test-loop-replay-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, readCall, finalAnswer]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     await agent.chat('argo loop replay case')
 
@@ -351,6 +373,7 @@ test('loop ladder: a cosmetically-varied repeat (leading "./") is recognised as 
   const sessionId = `test-loop-normalize-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCallNormA, readCallNormB, finalAnswer]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     const answer = await agent.chat('argo loop normalization case')
 
@@ -390,6 +413,7 @@ test('loop ladder: a trailing-slash repeat is NO LONGER collapsed (FIX 3) — bo
   }
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCallNormA, readCallTrailingSlash, finalAnswer]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     const answer = await agent.chat('argo loop trailing slash case')
 
@@ -421,6 +445,7 @@ test('loop ladder: a project mutation between two identical calls resets the lad
     readCall, readCall, writeCall, readCall, finalAnswer,
   ]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     const answer = await agent.chat('argo loop mutation case')
 
@@ -467,6 +492,7 @@ test('loop ladder: an intervening bash call invalidates the cached replay (FIX 1
     readCall, readCall, bashCall, readCall, finalAnswer,
   ]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     const answer = await agent.chat('argo loop bash invalidate case')
 
@@ -493,47 +519,47 @@ test('loop ladder: an intervening bash call invalidates the cached replay (FIX 1
 })
 
 // ── FIX 4: a replay (rejected: true, replayed: true, error: undefined) must stay
-// distinguishable from a real fast execution in the persisted log.
-
-test('loop ladder: a replay is recorded as replayed:true (not error) in the JSONL log (FIX 4)', async () => {
+// distinguishable from a real fast execution — in the LIVE event stream. There is
+// no separate run-level JSONL log any more (SessionLogger removed entirely; the
+// ledger, per-frame under .argo/frames/, is the only durable record, and it has no
+// rejected/replayed field either — pushCtx's rejectToolCall/replayToolCall call
+// sites push a plain tool message with no uiMeta) — so this flag exists ONLY on
+// the live event, nowhere at rest.
+test('loop ladder: a replay is recorded as replayed:true (not error) on the live event stream (FIX 4)', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-loop-replay-logger-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, readCall, finalAnswer]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     await agent.chat('argo loop replay logger case')
 
-    assert.ok(
-      events.some(e => e.type === 'tool_result' && e.replayed === true),
-      'expected a replayed tool_result (same setup as the replay test above)',
+    const replayed = events.find((e): e is Extract<AgentEvent, { type: 'tool_result' }> =>
+      e.type === 'tool_result' && e.replayed === true,
     )
-
-    const files = await fs.readdir(LOGS_DIR)
-    const jsonlFile = files.find(f => f.endsWith('.jsonl') && f.includes('argo-loop-replay-logger-case'))
-    assert.ok(jsonlFile, 'expected a jsonl log file for this run')
-    const jsonl = await fs.readFile(path.join(LOGS_DIR, jsonlFile as string), 'utf-8')
-    const replayedLine = jsonl.trim().split('\n').find(l => l.includes('"replayed":true'))
-    assert.ok(replayedLine, 'expected a tool_result line with replayed:true in the jsonl')
+    assert.ok(replayed, 'expected a replayed tool_result on the live event stream (same setup as the replay test above)')
     // A replay correctly carries the cached result — including any error from the
     // original execution. The replayed:true flag is what distinguishes it, not the
     // absence of an error field.
-    assert.ok(replayedLine!.includes('"replayed":true'), 'replayed flag must be set')
+    assert.equal(replayed!.rejected, true, 'a replay is still marked rejected (the tool did not actually run a second time)')
   } finally {
     await cleanupSession(sessionId, 'argo-loop-replay-logger-case')
   }
 })
 
 // ── Pinning what previously went untested by inspection alone: a replayed tool
-// call must not create a second CWL ledger episode. The `continue` in the
+// call must not count as a second real tool result. The `continue` in the
 // ladder's block/replay branch (agent.ts, right after replayToolCall/
-// rejectToolCall) fires BEFORE the episode-recording block — episode count
-// staying at 1 after 2 attempts (1 real + 1 replayed) is the pin.
+// rejectToolCall) fires BEFORE the real-execution path (executeTool + the
+// toolResultCount increment) — the count staying at 1 after 2 attempts (1 real + 1
+// replayed) is the pin.
 
-test('loop ladder: a replayed tool call does not create a second ledger episode', async () => {
+test('loop ladder: a replayed tool call does not count as a second real tool result', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-loop-replay-episodes-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, readCall, finalAnswer]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   try {
     await agent.chat('argo loop replay episode case')
 
@@ -541,9 +567,9 @@ test('loop ladder: a replayed tool call does not create a second ledger episode'
     assert.equal(reads.length, 2)
     assert.equal(reads[1].replayed, true)
 
-    // Only the FIRST (real) read became a CWL episode — the replayed 2nd attempt
-    // never reaches the episode-recording block.
-    assert.equal(agent.getRunState().episodes, 1)
+    // Only the FIRST (real) read counts as a real tool result — the replayed 2nd
+    // attempt never reaches the real-execution path.
+    assert.equal(agent.getRunState().toolResults, 1)
   } finally {
     await cleanupSession(sessionId, 'argo-loop-replay-episode-case')
   }
@@ -613,6 +639,7 @@ test('loop ladder (H21b): a model that never stops repeating past L2 is eventual
   // readCall is the only element, so it recurs every iteration — never stops on its own.
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall]))
   agent.setSessionId(sessionId)
+  grantFullTools(agent)
   agent.setMaxIterations(20) // DEFAULT_LOOP_CONFIG halts at blocks=10 (the 11th attempt) — well inside 20
   try {
     const answer = await agent.chat('argo loop halt case')
