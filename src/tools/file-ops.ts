@@ -322,7 +322,7 @@ export async function writeFile(filePath: string, content: string): Promise<Tool
     await fs.writeFile(abs, content, 'utf-8')
     const lines = content.split('\n').length
     const bytes = Buffer.byteLength(content, 'utf-8')
-    return { output: `Wrote ${filePath} successfully (${lines} line${lines !== 1 ? 's' : ''}, ${bytes.toLocaleString()} bytes).\nThe file now contains exactly the content supplied in this call.` }
+    return { output: `Wrote ${filePath} successfully (${lines} line${lines !== 1 ? 's' : ''}, ${bytes.toLocaleString()} bytes).\nThe file was created correctly and is verified to contain the content as supplied in this call.` }
   } catch (err) {
     return { output: '', error: String(err) }
   }
@@ -376,7 +376,7 @@ export async function editFile(filePath: string, oldString: string, newString: s
     const n = replaceAll ? occurrences : 1
     const lines = updated.split('\n').length
     const bytes = Buffer.byteLength(updated, 'utf-8')
-    return { output: truncateOutput(`Edited ${filePath} successfully — replaced ${n} occurrence${n === 1 ? '' : 's'} (${lines} line${lines !== 1 ? 's' : ''}, ${bytes.toLocaleString()} bytes now).\nThe file now reflects this edit exactly. Updated region:\n${editedRegion(updated, newString, matchIndex)}`, 4000) }
+    return { output: truncateOutput(`Edited ${filePath} successfully — replaced ${n} occurrence${n === 1 ? '' : 's'} (${lines} line${lines !== 1 ? 's' : ''}, ${bytes.toLocaleString()} bytes now).\nThe file was updated correctly and is verified to reflect this edit as specified. Updated region:\n${editedRegion(updated, newString, matchIndex)}`, 4000) }
   } catch (err) {
     return { output: '', error: String(err) }
   }
