@@ -1,5 +1,13 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* AGENT COLORS (used in donut rings, accordion titles, conclude cards):
+   Dispatcher:  #f59e0b (amber/gold)
+   Planner:     #a78bfa (purple)
+   Implementer: #34d399 (green/emerald)
+   Kept in sync with AGENT_COLORS in app.js and the --agent-* custom
+   properties below — one place to change the palette, three places it's read.
+*/
+
 :root {
   --bg: #090b12;
   --surface: #111520;
@@ -16,6 +24,9 @@
   --blue: #3b82f6;
   --orange: #f97316;
   --purple: #a855f7;
+  --agent-dispatcher: #f59e0b;
+  --agent-planner: #a78bfa;
+  --agent-implementer: #34d399;
   --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
   --chat-width: 50%;
   --tree-width: 240px;
@@ -317,10 +328,11 @@ body {
 
 /* ── Combined context + status indicator ──────────────────────────────
    Lives in the header's CHAT section (#indicator-area), at the right end of
-   #toolbar-chat. Donut ring = context usage, tick = auto-compaction
-   threshold, core = agent state (green/yellow/flashing-violet), center text
-   = current iteration while running. Precise numbers + status/model text
-   live in the dropdown (#ctx-dropdown). */
+   #toolbar-chat. HAL 9000-styled donut: three concentric rings (outer→inner
+   = Dispatcher/Planner/Implementer, each in its own AGENT_COLORS color)
+   show that role's own context usage; the solid glowing center core = agent
+   state (green/yellow/flashing-violet/red), like HAL's red eye. Precise
+   numbers + status/model text live in the dropdown (#ctx-dropdown). */
 #indicator-area {
   display: flex;
   align-items: center;
@@ -334,15 +346,14 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 2px;
+  padding: 1px;
   border-radius: 50%;
   cursor: pointer;
   line-height: 0;
   transition: background .15s;
 }
 #token-counter:hover { background: rgba(201,162,39,.12); }
-#token-counter .ctx-donut { display: block; }
-#token-counter .ctx-tick { opacity: .85; }
+#token-counter .ctx-donut { display: block; width: 40px; height: 40px; }
 
 /* Core (agent-state dot) — solid state color with a soft glow (same "shiny" quality
    as the home screen's #status-dot, via the inline drop-shadow filter set in
