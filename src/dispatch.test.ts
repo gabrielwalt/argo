@@ -506,10 +506,8 @@ test('a no-tool-call turn gets the nudge on the 2nd consecutive thinking turn, n
     )
     // Only ONE nudge — the 2nd consecutive no-tool-call turn, not the 1st
     assert.equal(nudges.length, 1)
-    assert.equal(
-      nudges[0].message,
-      'Your turn produced no tool calls. To finish, call conclude with your final answer. To keep working, make your next tool call.',
-    )
+    assert.ok(nudges[0].message.includes('produced no tool calls'))
+    assert.ok(nudges[0].message.includes('<tool_call>'))
   } finally {
     await cleanupDispatchSession(sessionId)
   }

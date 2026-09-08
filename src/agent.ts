@@ -130,26 +130,30 @@ function summarizeCall(name: string, args: Record<string, unknown>): string {
 // Produces the exact tool call as the model would have issued it — raw JSON,
 // not a prettified format. The model sees this as its own prior action and
 // should recognize the format as identical to what it produces.
+// Wraps the tool call JSON in <tool_call> tags — the exact format qwen's chat
+// template uses. When the model sees its own prior calls in context, they look
+// identical to what qwen produces natively, reinforcing the correct format.
 function formatToolCallContent(name: string, args: Record<string, unknown>): string {
+  let json: string
   // For write_file, omit the full content (too large) — show path + char count
   if (name === 'write_file' && typeof args.content === 'string') {
     const truncated = { ...args, content: `(${args.content.length} chars)` }
-    return JSON.stringify({ name, arguments: truncated })
-  }
-  // For edit_file, truncate old_string/new_string if long
-  if (name === 'edit_file') {
+    json = JSON.stringify({ name, arguments: truncated })
+  } else if (name === 'edit_file') {
+    // For edit_file, truncate old_string/new_string if long
     const truncated = { ...args }
     for (const key of ['old_string', 'new_string'] as const) {
       const v = truncated[key]
       if (typeof v === 'string' && v.length > 200) truncated[key] = v.slice(0, 200) + '…'
     }
-    return JSON.stringify({ name, arguments: truncated })
+    json = JSON.stringify({ name, arguments: truncated })
+  } else if (name === 'conclude' && typeof args.message === 'string' && args.message.length > 200) {
+    // For conclude, truncate long messages
+    json = JSON.stringify({ name, arguments: { ...args, message: args.message.slice(0, 200) + '…' } })
+  } else {
+    json = JSON.stringify({ name, arguments: args })
   }
-  // For conclude, truncate long messages
-  if (name === 'conclude' && typeof args.message === 'string' && args.message.length > 200) {
-    return JSON.stringify({ name, arguments: { ...args, message: args.message.slice(0, 200) + '…' } })
-  }
-  return JSON.stringify({ name, arguments: args })
+  return `<tool_call>\n${json}\n</tool_call>`
 }
 
 // A "project mutation" is an edit_file/write_file targeting the git-tracked
@@ -1377,7 +1381,7 @@ export class Agent {
           // free turn to reason/plan without being told to hurry up; a SECOND turn in
           // a row with no tool call is when a reminder actually earns its place.
           if (consecutiveThinkingTurns >= 2) {
-            const nudge = 'Your turn produced no tool calls. To finish, call conclude with your final answer. To keep working, make your next tool call.'
+            const nudge = 'Your turn produced no tool calls. To call a tool, wrap the call in <tool_call> tags, e.g.:\n<tool_call>\n{"name": "bash", "arguments": {"command": "ls"}}\n</tool_call>\nTo finish, call conclude with your final answer. To keep working, make your next tool call.'
             emitAndLog({ type: 'warning', message: nudge })
             this.pushCtx({ role: 'system', content: nudge })
           }
@@ -1676,10 +1680,7 @@ export class Agent {
           // ledger file — see pushCtx), so recognize these by their distinctive
           // content shape instead: a JSON object with a `name` field (the raw
           // tool call format formatToolCallContent produces).
-          let isToolCallDescription = false
-          if (typeof msg.content === 'string' && msg.content.startsWith('{')) {
-            try { isToolCallDescription = !!JSON.parse(msg.content).name } catch { /* not JSON */ }
-          }
+          const isToolCallDescription = typeof msg.content === 'string' && msg.content.startsWith('<tool_call>')
           return !isToolCallDescription
         }
         return false
