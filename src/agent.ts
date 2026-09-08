@@ -1211,7 +1211,7 @@ export class Agent {
           if (idx !== -1) {
             const stall = roleProgressMessages[idx]
             emitAndLog({ type: 'warning', message: stall })
-            this.pushCtx({ role: 'tool', content: stall })
+            this.pushCtx({ role: 'system', content: stall })
           }
         } else if (stallCheckpoints.includes(iterNum)) {
           // Real edits landing since the LAST checkpoint (not since run start — a
@@ -1238,7 +1238,7 @@ export class Agent {
               ? `STALL: ${iterNum} iterations without finishing — your approach is not converging. Call conclude NOW with your best verdict/answer given what you have found so far, or take one genuinely different action — do not repeat what has not worked.`
               : `PROGRESS CHECK: ${iterNum} iterations in and not finished. Objective: "${objective}". State what you have confirmed so far, then either call conclude with your verdict/answer or take the single most important remaining action — do not keep re-checking the same thing.`
             emitAndLog({ type: 'warning', message: stall })
-            this.pushCtx({ role: 'tool', content: stall })
+            this.pushCtx({ role: 'system', content: stall })
           }
         }
 
@@ -1274,7 +1274,7 @@ export class Agent {
             return capMsg
           }
           emitAndLog({ type: 'warning', message: response.timeoutError })
-          this.pushCtx({ role: 'tool', content: `Error: ${response.timeoutError}` })
+          this.pushCtx({ role: 'system', content: `Error: ${response.timeoutError}` })
           continue iterations
         }
         consecutiveTimeouts = 0 // reset on any successful response
@@ -1395,7 +1395,7 @@ export class Agent {
           if (consecutiveThinkingTurns >= 2) {
             const nudge = 'Your turn produced no tool calls. To finish, call conclude with your final answer. To keep working, make your next tool call.'
             emitAndLog({ type: 'warning', message: nudge })
-            this.pushCtx({ role: 'tool', content: nudge })
+            this.pushCtx({ role: 'system', content: nudge })
           }
           continue
         }
@@ -1631,7 +1631,7 @@ export class Agent {
               noProgressSteers++
               const rg = regroundSteer(userMessage, `${callsSinceMutation} tool calls without changing any file`)
               emitAndLog({ type: 'warning', message: rg })
-              this.pushCtx({ role: 'tool', content: rg })
+              this.pushCtx({ role: 'system', content: rg })
             }
           }
         }

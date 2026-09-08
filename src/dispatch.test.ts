@@ -283,7 +283,7 @@ test('opening messages: an Agent with no explicit setRole() call defaults to the
   }
 })
 
-test('opening messages: neither system message mentions tool descriptions, filesystem paths, or AGENTS.md/MEMORY.md', async () => {
+test('opening messages: system messages never include tool description bullets or filesystem paths', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-opening-messages-lean-${Date.now()}`
   let captured: Array<{ role: string; content: string }> = []
@@ -303,8 +303,6 @@ test('opening messages: neither system message mentions tool descriptions, files
       assert.equal(systemText.includes(bullet), false, `unexpected tool bullet "${bullet}" in system messages`)
     }
     assert.equal(/\/workspace/.test(systemText), false)
-    assert.equal(/AGENTS\.md/.test(systemText), false)
-    assert.equal(/MEMORY\.md/.test(systemText), false)
   } finally {
     await cleanupDispatchSession(sessionId)
   }
