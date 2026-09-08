@@ -1006,6 +1006,7 @@ export class Agent {
     // Skipped entirely on a RESUMED turn: the frame's history already carries
     // these three messages from its original (non-resumed) chat() call —
     // re-pushing them would duplicate the identity/instructions on every resume.
+    let userMessageIndex = -1
     if (!resume) {
       // model/modelOptions recorded ONCE per frame, on this opening [system]
       // identity message — the agent itself only ever sees the plain system
@@ -1017,15 +1018,14 @@ export class Agent {
         { model: this.model, modelOptions: this.options },
       )
 
-      // INJECTED CONTEXT — Dispatcher gets AGENTS.md and MEMORY.md right after
-      // identity, BEFORE the user request, so project-specific instructions are
-      // available when classifying. Always shown, even when the files don't exist
-      // (the agent should know they're absent rather than wonder).
-      // INJECTED CONTEXT — project awareness injected BEFORE the user request
-      // so the agent already knows the workspace state when it reads the task.
+      // INJECTED CONTEXT — the ordering differs by role:
+      //
+      // Implementer:  identity → user → instructions → ls -la
+      // Disp/Planner: identity → AGENTS.md → MEMORY.md → user → instructions → ls -la
       const ws = config.workspacePath || '/workspace'
+      const instructions = ROLE_INSTRUCTIONS[this.roleTag] ?? ''
 
-      // Dispatcher gets AGENTS.md and MEMORY.md (project-specific instructions).
+      // Dispatcher gets AGENTS.md and MEMORY.md before the user request.
       if (this.roleTag === 'dispatcher') {
         for (const file of ['AGENTS.md', 'MEMORY.md']) {
           let content: string
@@ -1044,7 +1044,12 @@ export class Agent {
         }
       }
 
-      // All agents get a project file listing.
+      // User assignment + instructions
+      this.pushCtx({ role: 'user', content: userMessage })
+      userMessageIndex = this.history.length - 1
+      if (instructions) this.pushCtx({ role: 'system', content: instructions })
+
+      // All agents get a project file listing after instructions.
       try {
         const lsResult = await bash('ls -la /workspace/', ws)
         const lsContent = (lsResult.output && lsResult.output !== NO_OUTPUT) ? lsResult.output : '(empty workspace)'
@@ -1055,14 +1060,10 @@ export class Agent {
         } as Message)
         this.pushCtx({ role: 'tool', content: lsContent })
       } catch { /* injected context is best-effort */ }
-    }
-    this.pushCtx({ role: 'user', content: userMessage })
-    // Captured IMMEDIATELY after the [user] push, before the [system] instructions
-    // push that may or may not follow it.
-    const userMessageIndex = this.history.length - 1
-    if (!resume) {
-      const instructions = ROLE_INSTRUCTIONS[this.roleTag] ?? ''
-      if (instructions) this.pushCtx({ role: 'system', content: instructions })
+    } else {
+      // RESUMED turn — just push the follow-up message, no identity/instructions/injection
+      this.pushCtx({ role: 'user', content: userMessage })
+      userMessageIndex = this.history.length - 1
     }
     this.phase = 'running'
     // The index of the message that started this run — compactHistory() always
