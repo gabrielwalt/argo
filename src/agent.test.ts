@@ -196,25 +196,22 @@ test('chat retry: a failed per-iteration call is retried once and the run contin
   }
 })
 
-test('chat retry: if both the call and its retry fail, the outer-catch error behavior is unchanged', async () => {
+test('chat retry: if both the call and its retry fail, the error is injected as context and the run continues', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-chat-retry-b-${Date.now()}`
-  // Both the original and the retry throw — no third attempt; the second error propagates.
+  // Both the original and the retry throw — the error is injected into context
+  // rather than killing the run, so the iteration loop continues.
   const { ollama, getCalls } = flakyOllama([new Error('boom-1'), new Error('boom-2')])
   const agent = new Agent(e => events.push(e), 'test-model', ollama)
   agent.setSessionId(sessionId)
   grantFullTools(agent)
   agent.setChatRetryDelayMs(0)
+  agent.setMaxIterations(10)
   try {
-    const answer = await agent.chat('argo chat retry case b')
-
-    assert.equal(getCalls(), 2)                       // original + one retry only, then it stops
-    assert.match(answer, /^Unexpected error: boom-2/) // returns the existing outer-catch message
-    const err = events.find((e): e is Extract<AgentEvent, { type: 'error' }> => e.type === 'error')
-    assert.ok(err)
-    assert.match(err.message, /^Unexpected error: boom-2/)  // still emits one error event
-    assert.equal(events.filter(e => e.type === 'error').length, 1)
-    assert.equal(warningsMatching(events, /Ollama request failed .* retrying once/).length, 1)  // first failure warned before retrying
+    await agent.chat('argo chat retry case b')
+    assert.ok(getCalls() >= 2, 'at least the original + one retry')
+    assert.equal(warningsMatching(events, /Ollama request failed .* retrying once/).length >= 1, true)
+    assert.equal(warningsMatching(events, /Ollama retry also failed/).length >= 1, true)
   } finally {
     await cleanupSession(sessionId, 'argo-chat-retry-case-b')
   }

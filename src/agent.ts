@@ -984,14 +984,13 @@ export class Agent {
       try {
         return await this.chatCall(emitAndLog)
       } catch (retryErr) {
-        // Only soft-recover on timeouts — other errors (malformed response, etc.) are
-        // still fatal and rethrown to chat()'s outer catch as before.
-        if (isTimeout(retryErr)) {
-          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
-          emitAndLog({ type: 'warning', message: `Ollama retry also timed out (${retryMsg}) — injecting error and continuing` })
-          return { timeoutError: `The model did not respond (${retryMsg}). Your previous request was lost. Continue from where you left off — re-issue your last tool call or take a different approach.` }
-        }
-        throw retryErr
+        // Both attempts failed. Instead of killing the run, inject the error as
+        // context so the model can adapt — XML parse errors, timeouts, and other
+        // transient Ollama failures are all recoverable since temperature > 0
+        // means the next iteration gets a fresh generation attempt.
+        const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
+        emitAndLog({ type: 'warning', message: `Ollama retry also failed (${retryMsg}) — injecting error and continuing` })
+        return { timeoutError: `The model request failed (${retryMsg}). Your previous request was lost. Continue from where you left off — re-issue your last tool call or take a different approach.` }
       }
     }
   }
