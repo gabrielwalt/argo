@@ -1397,9 +1397,9 @@ function addRoleCardIterationSeparator(frameId, n) {
   const label = el.querySelector('.trace-separator-label')
   card.iterTimerId = setInterval(() => {
     if (!label) return
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
+    const elapsed = Math.floor((Date.now() - startTime) / 1000)
     label.textContent = `Iteration ${n} (${elapsed}s…)`
-  }, 100)
+  }, 1000)
   maybeAutoScroll()
   return el
 }
