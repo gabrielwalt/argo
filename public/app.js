@@ -59,15 +59,33 @@ scrollBottomBtn.addEventListener('click', () => {
 })
 
 // ── Combined context + status indicator (donut) ────────────────────
-// Latest context size the model saw, plus the fraction at which auto-compaction
-// fires (fetched once from /status on boot). The donut's ring+tick are drawn
-// from these and redrawn on every token_usage; precise numbers live in the
-// dropdown. The donut's CENTER communicates agent state (see indicatorState).
-// frameId/role identify the owning frame when the reading came from a
-// frame-tagged token_usage (see handleEvent), so the dropdown can always say
-// WHOSE numbers it's showing rather than an unattributed count.
+// Latest context size the model saw. The donut's three rings are drawn from
+// per-role state (ctxStateByRole) and redrawn on every token_usage; precise
+// numbers live in the dropdown. The donut's CENTER communicates agent state
+// (see indicatorState). frameId/role identify the owning frame when the
+// reading came from a frame-tagged token_usage (see handleEvent), so the
+// dropdown can always say WHOSE numbers it's showing rather than an
+// unattributed count.
 let ctxState = { promptTokens: 0, numCtx: 0, pct: 0, frameId: null, role: null }
-let compactThreshold = 0.667
+
+// Per-agent-role context reading, one entry per concentric ring in the donut
+// (see renderDonut). Updated from token_usage's __role tag; ctxState above
+// stays the single most-recent reading (any role) for the dropdown.
+let ctxStateByRole = {
+  dispatcher:  { promptTokens: 0, numCtx: 0, pct: 0 },
+  planner:     { promptTokens: 0, numCtx: 0, pct: 0 },
+  implementer: { promptTokens: 0, numCtx: 0, pct: 0 },
+}
+
+// Fixed per-role color, used for that role's donut ring, its accordion
+// heading (getOrCreateRoleCard), and its conclude card. Keep in sync with
+// the CSS custom properties (--agent-dispatcher/planner/implementer) and the
+// documentation block at the top of styles.css.
+const AGENT_COLORS = {
+  dispatcher:  '#f59e0b',  // amber/gold
+  planner:     '#a78bfa',  // purple
+  implementer: '#34d399',  // green/emerald
+}
 
 // Drives the donut's core color: 'ready' (green) / 'busy' (yellow, running) /
 // 'compacting' (flashing violet) / 'error' (red). Set by setStatus(), except
@@ -81,64 +99,64 @@ let indicatorState = 'ready'
 // too brief to see; kept as a safety net rather than removed.
 let compactingNow = false
 let compactStartTime = null
-// Deprecated fields from the old LLM-summarization compaction's progress reporting
-// (no longer emitted — deterministic eviction has no multi-step sub-calls to report
-// progress on). Left in place only because the "Compacting…" status label formatter
-// still reads them defensively; always null in the current harness.
-let compactElapsedS = null
-let compactTimeoutS = null
-let compactStep = null
 let lastCompactionDurationS = null
 
-// Arc color mirrors the old ctx-ok/ctx-warn/ctx-danger thresholds, read from the
-// same CSS custom properties so the palette stays in one place (styles.css).
-function ctxArcColor(pct) {
-  const root = getComputedStyle(document.documentElement)
-  if (pct >= 90) return root.getPropertyValue('--red').trim()
-  if (pct >= 70) return root.getPropertyValue('--yellow').trim()
-  return root.getPropertyValue('--muted').trim()
-}
-
+// HAL 9000-style donut: a solid glowing core (agent state) surrounded by
+// three concentric rings, one per agent role — outer = Dispatcher, middle =
+// Planner, inner = Implementer — each filled to that role's own context
+// usage percentage, in that role's own fixed color (AGENT_COLORS).
 function renderDonut() {
-  const size = 24, cx = 12, cy = 12, r = 8, sw = 3
-  const pct = Math.max(0, Math.min(100, ctxState.pct))
-  const circ = 2 * Math.PI * r
-  const dash = circ * (pct / 100)
-  const color = ctxArcColor(pct)
-  // Threshold tick at the compaction trigger. Compaction now fires when only ~4096 tokens of
-  // headroom remain (COMPACT_RESERVE_TOKENS), so the tick sits at (numCtx-reserve)/numCtx; fall
-  // back to the old fraction before the first token_usage. Angle from 12 o'clock (−90° SVG).
-  const thrFrac = ctxState.numCtx ? Math.max(0, 1 - 4096 / ctxState.numCtx) : compactThreshold
-  const ang = thrFrac * 2 * Math.PI - Math.PI / 2
-  const rIn = r - sw / 2 - 1, rOut = r + sw / 2 + 1
-  const tx1 = (cx + rIn * Math.cos(ang)).toFixed(2), ty1 = (cy + rIn * Math.sin(ang)).toFixed(2)
-  const tx2 = (cx + rOut * Math.cos(ang)).toFixed(2), ty2 = (cy + rOut * Math.sin(ang)).toFixed(2)
+  const size = 40, cx = 20, cy = 20
 
-  // Core: solid state color, filling the middle of the ring. Glows to match the state
-  // color (same "shiny" treatment as the home screen's status dot) and pulses gently
-  // while busy/compacting; steady (just the glow) while ready/idle.
+  const rings = [
+    { role: 'dispatcher',  r: 16, sw: 3 },
+    { role: 'planner',     r: 12, sw: 3 },
+    { role: 'implementer', r: 8,  sw: 3 },
+  ]
+
+  // Core: solid state color, filling the center like HAL's red eye. Glows to
+  // match the state color (same "shiny" treatment as the home screen's status
+  // dot) and pulses gently while busy/compacting; steady (just the glow)
+  // while ready/idle.
   const coreColor = { ready: 'var(--green)', busy: 'var(--yellow)', compacting: 'var(--purple)', error: 'var(--red)' }[indicatorState] || 'var(--green)'
   const coreClass = indicatorState === 'compacting' ? 'ctx-core compacting'
     : indicatorState === 'busy' ? 'ctx-core running'
     : 'ctx-core'
-  const coreR = r - sw / 2 - 2.5
+  const coreR = 4
 
-  tokenCounter.innerHTML =
-    `<svg class="ctx-donut" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">`
-    + `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--border)" stroke-width="${sw}"/>`
-    + `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${color}" stroke-width="${sw}"`
-    + ` stroke-dasharray="${dash.toFixed(2)} ${(circ - dash).toFixed(2)}" transform="rotate(-90 ${cx} ${cy})"/>`
-    + `<line class="ctx-tick" x1="${tx1}" y1="${ty1}" x2="${tx2}" y2="${ty2}" stroke="var(--text)" stroke-width="1.5"/>`
-    + `<circle class="${coreClass}" cx="${cx}" cy="${cy}" r="${coreR.toFixed(2)}" fill="${coreColor}" style="filter: drop-shadow(0 0 3px ${coreColor})"/>`
-    + `</svg>`
+  let svg = `<svg class="ctx-donut" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">`
+
+  for (const ring of rings) {
+    const state = ctxStateByRole[ring.role]
+    const pct = Math.max(0, Math.min(100, state.pct))
+    const circ = 2 * Math.PI * ring.r
+    const dash = circ * (pct / 100)
+    const color = AGENT_COLORS[ring.role]
+    // Background ring (track)
+    svg += `<circle cx="${cx}" cy="${cy}" r="${ring.r}" fill="none" stroke="var(--border)" stroke-width="${ring.sw}" opacity="0.3"/>`
+    // Fill ring
+    if (pct > 0) {
+      svg += `<circle cx="${cx}" cy="${cy}" r="${ring.r}" fill="none" stroke="${color}" stroke-width="${ring.sw}"`
+        + ` stroke-dasharray="${dash.toFixed(2)} ${(circ - dash).toFixed(2)}" transform="rotate(-90 ${cx} ${cy})"/>`
+    }
+  }
+
+  svg += `<circle class="${coreClass}" cx="${cx}" cy="${cy}" r="${coreR}" fill="${coreColor}" style="filter: drop-shadow(0 0 4px ${coreColor})"/>`
+  svg += `</svg>`
+
+  tokenCounter.innerHTML = svg
 }
 
 // Update stored context size + redraw. Precise numbers show in the dropdown;
-// the donut itself only ever shows the ring (usage), tick (threshold) and
+// the donut itself only ever shows the three per-role rings (usage) and
 // core+center-text (agent state / iteration). frameId/role identify which
 // agent this reading belongs to (see ctxState above); omitted for an untagged,
 // harness-level reading.
 function updateCtx(promptTokens, numCtx, frameId = null, role = null) {
+  if (role && ctxStateByRole[role]) {
+    const pct = numCtx > 0 ? Math.round(100 * promptTokens / numCtx) : 0
+    ctxStateByRole[role] = { promptTokens, numCtx, pct }
+  }
   const pct = numCtx ? Math.round(promptTokens / numCtx * 100) : 0
   ctxState = { promptTokens, numCtx, pct, frameId, role }
   renderDonut()
@@ -151,6 +169,16 @@ function updateCtx(promptTokens, numCtx, frameId = null, role = null) {
 function fmtTokensK(n) {
   if (n == null) return '—'
   return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
+}
+
+// Format a duration in ms for display. Under 60s: "12.3s" (one decimal).
+// 60s and over: "2m 15s" (whole seconds, no decimals).
+function fmtDuration(ms) {
+  const totalSec = ms / 1000
+  if (totalSec < 60) return `${totalSec.toFixed(1)}s`
+  const min = Math.floor(totalSec / 60)
+  const sec = Math.floor(totalSec % 60)
+  return `${min}m ${sec}s`
 }
 
 // ── Confirm dialog / toast — replace native confirm()/alert() ────
@@ -979,9 +1007,6 @@ const ctxDropdown = $('ctx-dropdown')
 
 function compactStatusText() {
   if (indicatorState === 'compacting') {
-    if (compactElapsedS != null) {
-      return `Compacting…${compactStep ? ' ' + compactStep : ''} (${compactElapsedS}s / ${compactTimeoutS}s)`
-    }
     return lastCompactionDurationS ? `Compacting… (~${lastCompactionDurationS}s)` : 'Compacting…'
   }
   if (indicatorState === 'error') return 'Error'
@@ -1339,6 +1364,7 @@ function getOrCreateRoleCard(frameId, role, assignment) {
   const heading = document.createElement('h3')
   heading.className = 'agent-heading'
   heading.textContent = meta.title
+  heading.style.color = AGENT_COLORS[role] || 'var(--text)'
 
   // No outcome/status element here — the conclude card rendered right after this
   // accordion (see renderAgentConclusion) already carries the status badge and
@@ -1417,8 +1443,8 @@ function annotateRoleCardIterationTiming(frameId, ms) {
   if (!el) return
   const label = el.querySelector('.trace-separator-label')
   if (!label) return
-  const base = label.textContent.replace(/\s*\([\d.]+s[…)]*\)$/, '')
-  label.textContent = `${base} (${(ms / 1000).toFixed(1)}s)`
+  const base = label.textContent.replace(/\s*\([^)]*\)$/, '')
+  label.textContent = `${base} (${fmtDuration(ms)})`
 }
 
 // Appends a pre-built HTML element (used for formatted tool calls / thinking /
@@ -1814,9 +1840,20 @@ function renderAgentConclusion(frameId, role, status, content) {
   // since this is called right after closeRoleCardQuiet() on the SAME frameId.
   const card = roleCards.get(frameId)
   const metaHtml = card
-    ? `<span class="conclude-meta">${card.iterations} iteration${card.iterations !== 1 ? 's' : ''} · ${((Date.now() - card.startTime) / 1000).toFixed(1)}s</span>`
+    ? `<span class="conclude-meta">${card.iterations} iteration${card.iterations !== 1 ? 's' : ''} · ${fmtDuration(Date.now() - card.startTime)}</span>`
     : ''
-  el.innerHTML = `<div class="conclusion-title">${escHtml(role)} concluded`
+  // Agent color on the role label only, keyed off the frame's actual role
+  // (card.role, e.g. "dispatcher") rather than the display name passed in.
+  // Deliberately layered alongside — not replacing — the existing
+  // status-keyword coloring (border/background/status-badge, set by the
+  // CSS status-* rules above): an inline style here would win over those
+  // regardless of selector specificity, so this only ever touches the label
+  // text/dot, never border-left-color or background.
+  const agentColor = card ? AGENT_COLORS[card.role] : null
+  const roleLabelHtml = agentColor
+    ? `<span class="conclude-role-label" style="color:${agentColor}"><span class="conclude-role-dot" style="background:${agentColor}"></span>${escHtml(role)}</span>`
+    : escHtml(role)
+  el.innerHTML = `<div class="conclusion-title">${roleLabelHtml} concluded`
     + (status ? `<span class="status">${escHtml(String(status))}</span>` : '')
     + metaHtml
     + `</div><div class="conclusion-text">${renderMarkdown(text)}</div>`
@@ -3117,9 +3154,7 @@ async function boot() {
   const groundingSetting = document.querySelector('.setting-grounding')
   if (groundingSetting) groundingSetting.classList.toggle('hidden', !!status.agents)
 
-  // Draw an empty donut immediately (visible before the first token_usage), and
-  // capture the auto-compaction threshold for the donut's tick.
-  compactThreshold = typeof status.compactThreshold === 'number' ? status.compactThreshold : 0.667
+  // Draw an empty donut immediately (visible before the first token_usage).
   renderDonut()
 
   // Auto-commit defaults OFF; restore whatever the worker currently has set.
