@@ -334,8 +334,8 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
     'EFFICIENCY\n' +
     'Use each tool call to obtain new information or advance the task. Do not repeat or perform an ' +
     'equivalent inspection when the current context already establishes the fact. Treat successful tool ' +
-    'results as authoritative unless something may have changed since. Plan your approach before acting ' +
-    'and execute in the minimum number of steps.\n\n' +
+    'results as authoritative unless something may have changed since. Choose your approach before acting ' +
+    'and proceed without unnecessary steps.\n\n' +
     'The .argo/ folder is harness bookkeeping — ignore its contents. Use the `ledger` tool to recover past ' +
     'messages that may have been evicted or collapsed from your context.',
   planner:
@@ -369,8 +369,8 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
     'EFFICIENCY\n' +
     'Use each tool call to obtain new information or advance the task. Do not repeat or perform an ' +
     'equivalent inspection when the current context already establishes the fact. Treat successful tool ' +
-    'results as authoritative unless something may have changed since. Plan your approach before acting ' +
-    'and execute in the minimum number of steps.\n\n' +
+    'results as authoritative unless something may have changed since. Choose your approach before acting ' +
+    'and proceed without unnecessary steps.\n\n' +
     'The .argo/ folder is harness bookkeeping — ignore its contents. Use the `ledger` tool to recover past ' +
     'messages that may have been evicted or collapsed from your context.',
   implementer:
@@ -397,8 +397,9 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
     'Use each tool call to obtain new information or advance the task. Do not repeat or perform an ' +
     'equivalent inspection when the current context already establishes the fact. Treat successful tool ' +
     'results as authoritative unless something may have changed since. After a successful write or edit, ' +
-    'do not re-read the file merely to confirm it. Plan your complete implementation before making your ' +
-    'first tool call, then execute in the minimum number of steps.\n\n' +
+    'do not re-read the file merely to confirm it. Before acting, identify what you need to establish; ' +
+    'once the relevant project state is understood, form a coherent implementation approach and execute ' +
+    'it without unnecessary steps.\n\n' +
     'The .argo/ folder is harness bookkeeping — do not touch or inspect its contents. Use the `ledger` tool ' +
     'to recover past messages that may have been evicted or collapsed from your context.',
 }
