@@ -94,11 +94,11 @@ test('patchBashForReadOnly is a no-op (same content) when there is no bash tool 
 // sub-tasks, its `conclude` answer), then resumed repeatedly to produce one fully
 // self-contained Implementer assignment at a time, also delivered via `conclude`.
 
-test('planner identity: one sentence, names the role and the two-part job (decompose + produce assignments)', () => {
+test('planner identity: one sentence, names the role and the two-part job (turn objectives into units + produce assignments)', () => {
   const text = ROLE_IDENTITY.planner
   assert.ok(/PLANNER/.test(text))
-  assert.ok(text.includes('decompose'))
-  assert.ok(text.includes('assignments'))
+  assert.ok(text.includes('turn objectives into'))
+  assert.ok(text.includes('assignment'))
 })
 
 test('planner instructions: describes the two-phase flow — overall plan first, then resumed to produce one assignment at a time', () => {
@@ -126,9 +126,10 @@ test('planner instructions: does not mention a Tester (there is none)', () => {
   assert.equal(/\bTester\b/.test(text), false)
 })
 
-test('planner instructions: still states it never writes or edits (matches the assignment prompt\'s READ-ONLY statement)', () => {
+test('planner instructions: still states it is read-only (matches the assignment prompt\'s READ-ONLY statement)', () => {
   const text = ROLE_INSTRUCTIONS.planner
-  assert.ok(text.includes('never write or edit anything'))
+  assert.ok(text.includes('READ-ONLY'))
+  assert.ok(text.includes('do not implement or modify'))
 })
 
 // ── Planner read-only framing — the Planner's tool list has bash (investigation
@@ -146,15 +147,20 @@ test('planner instructions: explicitly states it is READ-ONLY', () => {
 // loadProjectContext (both removed) and were never role-specific; Ollama's own
 // `tools` parameter already shows the model its tools.
 
-test('role prompts (identity + instructions) never mention tool descriptions, filesystem paths, or AGENTS.md/MEMORY.md', () => {
+test('role prompts (identity + instructions) never mention filesystem paths, git, or environment details', () => {
   for (const role of ['dispatcher', 'planner', 'implementer'] as const) {
     const text = `${ROLE_IDENTITY[role]}\n${ROLE_INSTRUCTIONS[role]}`
     assert.equal(/\/workspace/.test(text), false, `${role}: no /workspace mention`)
-    assert.equal(/AGENTS\.md/.test(text), false, `${role}: no AGENTS.md mention`)
-    assert.equal(/MEMORY\.md/.test(text), false, `${role}: no MEMORY.md mention`)
     assert.equal(/git/i.test(text), false, `${role}: no git/autocommit mention`)
     assert.equal(/Ubuntu/.test(text), false, `${role}: no environment mention`)
   }
+})
+
+test('dispatcher and planner instructions reference AGENTS.md/MEMORY.md for context extraction', () => {
+  assert.ok(ROLE_INSTRUCTIONS.dispatcher.includes('AGENTS.md'))
+  assert.ok(ROLE_INSTRUCTIONS.dispatcher.includes('MEMORY.md'))
+  assert.ok(ROLE_INSTRUCTIONS.planner.includes('AGENTS.md'))
+  assert.ok(ROLE_INSTRUCTIONS.planner.includes('MEMORY.md'))
 })
 
 // ── update_plan does not exist as a tool at all any more — the plan/act gate and
