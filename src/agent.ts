@@ -494,6 +494,9 @@ export class Agent {
   // is the `ollama` package's own type and isn't ours to extend) purely so pushCtx
   // stays the ONE call site that talks to ledger.recordMessage.
   private pushCtx(m: Message, id?: string, uiMeta?: Omit<LedgerMessage, 'id' | 'role' | 'content'>): void {
+    // Never push an empty assistant message — these are structural noise that
+    // confuses the model and wastes context space.
+    if (m.role === 'assistant' && !m.content) return
     this.history.push(m)
     this.historyTs.set(m, Date.now())
     const msgId = id ?? newLedgerId('msg')
@@ -1451,7 +1454,7 @@ export class Agent {
           // "<Tool> called:" assistant message (formatToolCallContent), which is
           // never empty, so Ollama's strict assistant/tool alternation is preserved
           // there regardless of whether the model's own content was empty.
-          if (msg.content || msg.thinking) this.pushCtx({ role: 'assistant', content: msg.content ?? '', thinking: msg.thinking } as Message, undefined, assistantUiMeta)
+          if (msg.content) this.pushCtx({ role: 'assistant', content: msg.content, thinking: msg.thinking } as Message, undefined, assistantUiMeta)
           consecutiveThinkingTurns++
           // Only nudge from the 2nd consecutive thinking turn on — the model gets one
           // free turn to reason/plan without being told to hurry up; a SECOND turn in
@@ -1473,8 +1476,8 @@ export class Agent {
         // field) is deliberately NOT pushed to this.history any more: it's used
         // below only to derive callsToRun for dispatch, and is replaced in
         // history by the explicit per-call assistant messages that follow.
-        if (msg.content || msg.thinking) {
-          this.pushCtx({ role: 'assistant', content: msg.content ?? '', thinking: msg.thinking } as Message, undefined, assistantUiMeta)
+        if (msg.content) {
+          this.pushCtx({ role: 'assistant', content: msg.content, thinking: msg.thinking } as Message, undefined, assistantUiMeta)
         }
 
         const callsToRun = nativeCalls.length > 0
