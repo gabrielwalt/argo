@@ -1451,7 +1451,7 @@ export class Agent {
           // "<Tool> called:" assistant message (formatToolCallContent), which is
           // never empty, so Ollama's strict assistant/tool alternation is preserved
           // there regardless of whether the model's own content was empty.
-          if (msg.content) this.pushCtx(msg, undefined, assistantUiMeta)
+          if (msg.content || msg.thinking) this.pushCtx({ role: 'assistant', content: msg.content ?? '', thinking: msg.thinking } as Message, undefined, assistantUiMeta)
           consecutiveThinkingTurns++
           // Only nudge from the 2nd consecutive thinking turn on — the model gets one
           // free turn to reason/plan without being told to hurry up; a SECOND turn in
@@ -1473,8 +1473,8 @@ export class Agent {
         // field) is deliberately NOT pushed to this.history any more: it's used
         // below only to derive callsToRun for dispatch, and is replaced in
         // history by the explicit per-call assistant messages that follow.
-        if (msg.content) {
-          this.pushCtx({ role: 'assistant', content: msg.content }, undefined, assistantUiMeta)
+        if (msg.content || msg.thinking) {
+          this.pushCtx({ role: 'assistant', content: msg.content ?? '', thinking: msg.thinking } as Message, undefined, assistantUiMeta)
         }
 
         const callsToRun = nativeCalls.length > 0
