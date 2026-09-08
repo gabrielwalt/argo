@@ -70,7 +70,7 @@ export function evict(
   for (let i = 0; i < trimmed.length; i++) {
     if (remaining <= budget.maxTokens) break
     const msg = trimmed[i]
-    if (msg.role !== 'tool' || typeof msg.content !== 'string' || msg.content.startsWith('[evicted')) continue
+    if (msg.role !== 'tool' || typeof msg.content !== 'string' || msg.content.startsWith('[evicted') || msg.content.startsWith('[collapsed')) continue
     const before = msg.content.length
     const id = messageIds[i]
     // "msg_id" here MUST match the `ledger` tool's actual expand parameter

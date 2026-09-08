@@ -98,13 +98,6 @@ export interface AlMessage {
   content: string
 }
 
-export interface AlCollapsedMessage {
-  index: number
-  originalChars: number
-  sentChars: number
-  role: string
-}
-
 export interface AlToolCall {
   name: string
   args: object
@@ -259,9 +252,11 @@ export class TraceLogger {
   /**
    * Called right before a new Ollama request is issued for this turn. Opens a new
    * `## Turn N` section (closing the previous one first, if still open) and writes
-   * the `### Call` block: any context-editing modifications (collapsed tool
-   * results), then the messages newly added to history since the previous turn
-   * (or ALL of them, on turn 1).
+   * the `### Call` block: the messages newly added to history since the previous
+   * turn (or ALL of them, on turn 1). Collapse and eviction now both modify
+   * this.history IN PLACE (agent.ts's collapseOldToolResults/compactHistory), so
+   * a shortened tool result just shows up as a shorter entry in `newMessages` —
+   * there's no separate "context modifications" detail to log here any more.
    *
    * `totalMessages` is the full history length AS SENT to the model this turn
    * (matches the harness's own `ollama_request.message_count` event semantics —
@@ -271,7 +266,7 @@ export class TraceLogger {
    * `newMessages` are exactly the messages this turn is presenting for the first
    * time — turn 1: everything; later turns: the tail added since the last beginTurn.
    */
-  beginTurn(totalMessages: number, newMessages: AlMessage[], collapsed?: AlCollapsedMessage[]) {
+  beginTurn(totalMessages: number, newMessages: AlMessage[]) {
     this.closeTurnIfOpen()
     this.turnNumber++
     this.inTurn = true
@@ -282,13 +277,6 @@ export class TraceLogger {
     lines.push('')
     lines.push(`### Call (${totalMessages} messages, ${newMessages.length} new)`)
     lines.push('')
-    if (collapsed && collapsed.length > 0) {
-      lines.push('#### Context modifications')
-      for (const c of collapsed) {
-        lines.push(`- Collapsed message #${c.index} (${escapeMd(c.role)}, ${c.originalChars}→${c.sentChars} chars)`)
-      }
-      lines.push('')
-    }
     lines.push('#### New messages')
     if (newMessages.length === 0) {
       lines.push('_(none)_')
