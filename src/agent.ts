@@ -1397,8 +1397,8 @@ export class Agent {
         // field) is deliberately NOT pushed to this.history any more: it's used
         // below only to derive callsToRun for dispatch, and is replaced in
         // history by the explicit per-call assistant messages that follow.
-        if (msg.content || msg.thinking) {
-          this.pushCtx({ role: 'assistant', content: msg.content ?? '' }, undefined, assistantUiMeta)
+        if (msg.content) {
+          this.pushCtx({ role: 'assistant', content: msg.content }, undefined, assistantUiMeta)
         }
 
         const callsToRun = nativeCalls.length > 0
