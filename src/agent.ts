@@ -16,7 +16,7 @@ import {
   // tool-call loop below). See loop.ts's H21 header note for the evidence.
   noteGateRejection, gateEscalationMessage, gateStopMessage, type GateReason,
 } from './loop.js'
-import { evict, type EvictionBudget } from './eviction.js'
+import { estimateTokens, estimateTokensForText } from './eviction.js'
 import { recordMessage, newId as newLedgerId } from './ledger.js'
 
 // Parses tool calls that a model wrote as JSON code blocks in its text content
@@ -94,16 +94,20 @@ export function buildFallbackCommitMessage(changedFiles: string[]): string {
   return `Agent: update ${changedFiles.length} files`
 }
 
-// Deterministic context editing (see collapseOldToolResults, called from chatCall):
-// the most recent N tool results are kept verbatim in this.history; older ones
-// longer than M chars are collapsed to a short restorable stub, IN PLACE — same
-// mutation pattern as eviction (compactHistory), so this.history always matches
-// exactly what the model sees. This keeps the LIVE window small over long runs —
-// which is what keeps small local models emitting native tool calls — and makes
-// the (much rarer) deterministic eviction pass fire less often. Not exported:
-// nothing outside this file (including tests) references either constant.
-const KEEP_RECENT_TOOL_RESULTS = 4
-const TOOL_RESULT_COLLAPSE_OVER = 600
+// UNIFIED CONTEXT MANAGEMENT (see manageContext, called from chatCall): a single
+// deterministic, no-LLM pass replaces the old two-mechanism split (a fixed
+// "keep the N most recent tool results verbatim" collapse pass, plus a
+// separately-triggered "evict the oldest tool messages" pass). See
+// manageContext's own header comment for the full percent-of-num_ctx algorithm.
+// Not exported: nothing outside this file (including tests) references these.
+const CONTEXT_TRIGGER_PCT = 0.6 // manageContext runs once usage crosses this fraction of num_ctx
+const CONTEXT_VERBATIM_PCT = 0.4 // newest assistant/tool messages kept verbatim, up to this fraction of num_ctx
+const CONTEXT_COLLAPSE_PCT = 0.1 // next-oldest slice collapsed (stub + first 200 chars) up to this fraction of num_ctx
+const COLLAPSE_PREVIEW_CHARS = 200
+// Harness-injected system messages (progress checks, stall/reground steers,
+// timeout errors, thinking-turn nudges) older than this many assistant turns are
+// pruned entirely from this.history by manageContext — see its own comment.
+const HARNESS_MESSAGE_MAX_ITERATION_AGE = 20
 
 // Short human-readable summary of a call's key arguments — included in the loop
 // detection warning so the reader can verify WHICH call was repeated, not just that
@@ -210,7 +214,7 @@ export class Agent {
   // tokens of thinking before producing any content, which intermittently hangs
   // Ollama's MLX runner on Apple M5 (ollama/ollama#17426). 8192 is generous for any
   // single tool-calling turn (thinking + content + tool call JSON).
-  private options: ModelOptions = { temperature: 0.6, top_p: 0.95, top_k: 20, num_predict: 8192 }
+  private options: ModelOptions = { temperature: 0.6, top_p: 0.95, top_k: 20, num_predict: 16384 }
   private autoCommitEnabled = config.autoCommit
   private maxIterations: number = config.maxIterations
   private sessionId = ''
@@ -620,11 +624,12 @@ export class Agent {
     this.pushCtx({ role: 'tool', content: `${label}\n\n[Previous result, reproduced verbatim — nothing has changed]\n${body}` })
   }
 
-  // Lets the user force an eviction pass between turns (server.ts's POST
+  // Lets the user force a context-management pass between turns (server.ts's POST
   // /compact-now, guarded the same way /reset is — only when the agent isn't
-  // mid-run). Reuses compactHistory exactly as the automatic threshold path does.
-  // Writes its own tiny run-shaped JSONL log so the manual trigger is traceable the
-  // same way an automatic eviction is.
+  // mid-run). Reuses manageContext exactly as the automatic threshold path does,
+  // except it ignores the usual 60%-of-num_ctx trigger (force=true) so a manual
+  // request always does something as long as there's an eligible assistant/tool
+  // message to collapse or evict.
   async compactNow(): Promise<{ compacted: boolean }> {
     if (this.history.length === 0) return { compacted: false }
     let seq = 0
@@ -633,129 +638,215 @@ export class Agent {
       this.emit(event, seq)   // seq for UI replay/live dedup (see chat())
     }
     try {
-      const currentRunStart = this.history.length - 1
       this.phase = 'compacting'
-      const result = await this.compactHistory(currentRunStart, 0, emitAndLog, true)
+      const result = this.manageContext(0, emitAndLog, { manual: true, force: true })
       return { compacted: result.compacted }
     } finally {
       this.phase = 'idle'
     }
   }
 
-  // Deterministic, no-LLM eviction (CWL-style — see eviction.ts): strips the oldest
-  // already-durably-persisted tool-call episodes from the live window when it grows
-  // too large, never restructuring this.history's surviving indices. This is the
-  // ONLY context-management mechanism in this codebase — there is no LLM-
-  // summarization fallback path. Returns the active prompt's index unchanged
-  // (eviction never removes or reorders the current run's own prompt).
-  private async compactHistory(
-    currentRunStart: number,
+  // UNIFIED CONTEXT MANAGEMENT. The ONE mechanism that keeps this.history's live
+  // window bounded over a long run — replaces the old two-mechanism split (a
+  // fixed "keep N most recent tool results verbatim" collapse pass, always run
+  // every turn from chatCall, plus a separately-triggered "evict the oldest tool
+  // messages" eviction pass from the main loop once near-full). Both mutated
+  // this.history in place and both wrote ledger markers; this keeps that same
+  // in-place-mutation, ledger-marker-writing shape, just as a single pass with a
+  // single trigger and a single set of percent-of-num_ctx budgets:
+  //
+  //   1. Estimate total tokens (chars/CHARS_PER_TOKEN, see eviction.ts). Below
+  //      CONTEXT_TRIGGER_PCT (60%) of num_ctx, do nothing (unless force=true).
+  //   2. System and user messages are ALWAYS kept verbatim — never touched here,
+  //      full stop. They don't count against any budget below; only assistant/
+  //      tool messages are ever collapsed or evicted.
+  //   3. Walk the assistant/tool messages NEWEST TO OLDEST, keeping them
+  //      verbatim, until CONTEXT_VERBATIM_PCT (40%) of num_ctx worth of tokens is
+  //      spent. Everything older than that point is eligible to be shortened.
+  //   4. Of the eligible (older) assistant/tool messages, walk OLDEST TO NEWEST
+  //      shortening them: the first slice — however many it takes to remove
+  //      about CONTEXT_COLLAPSE_PCT (10%) of num_ctx worth of tokens — gets
+  //      COLLAPSED (stub + first 200 chars, with a msg_id recovery pointer);
+  //      everything past that (older still, or if 10% was never reached) gets
+  //      fully EVICTED (short stub only, msg_id recovery pointer, no preview).
+  //      Net effect: verbatim (40%) + collapsed stubs (10%) ≈ 50% of num_ctx,
+  //      down from the 60%+ that triggered this pass.
+  //   5. Every collapsed/evicted message gets a follow-up ledger entry sharing
+  //      its original id, `evicted: true` — same mechanism the old two passes
+  //      both used (ledger.ts's readFrame, last-write-wins per id), so a later
+  //      reload sees the compact stub instead of re-expanding the full original.
+  //
+  // Also prunes stale harness-injected system messages (see pruneHarnessMessages)
+  // as an additive pass — unrelated to the token budget above, but bundled into
+  // the same "keep this.history clean" call so chatCall only needs to call one
+  // method.
+  private manageContext(
     contextUsagePct: number,
     emitAndLog: (e: AgentEvent) => void,
-    manual = false,
-  ): Promise<{ newRunStart: number; compacted: boolean }> {
+    opts: { manual?: boolean; force?: boolean } = {},
+  ): { compacted: boolean } {
     const msgsBefore = this.history.length
-    // Budget in the SAME unit the trigger fires on (tokens, via numCtx), not an
-    // unrelated flat char count — the root cause this replaces (see eviction.ts).
-    // Target ~70% of num_ctx post-eviction so there's real headroom left, not just
-    // enough to dip under the trigger threshold before immediately re-triggering.
     const numCtx = this.options.num_ctx ?? 65536
-    const budget: EvictionBudget = { maxTokens: Math.floor(numCtx * 0.7) }
-    // this.historyMsgIds is parallel to this.history (evict() never removes or
-    // reorders entries, only stubs `content` in place), so it stays valid as the
-    // recovery-id lookup for the just-evicted messages after this call.
-    const { messages, evictedMessageIds, tokenEstimateBefore, tokenEstimateAfter } = evict(this.history, this.historyMsgIds, budget)
-    if (evictedMessageIds.length === 0 && tokenEstimateBefore === tokenEstimateAfter) return { newRunStart: currentRunStart, compacted: false }
-    this.history = messages
-    this.lastCompactedAt = Date.now()
-    // LEDGER-SIDE EVICTION MARKERS. `messages` (now this.history) already carries
-    // the stubbed content evict() wrote in place — this.historyMsgIds stays
-    // parallel to it (evict() never reorders/removes entries, only mutates
-    // `content`), so for each evicted id, the SAME index that id was originally
-    // pushed at still holds its (now-stubbed) message. Recording that stub as a
-    // FOLLOW-UP ledger entry sharing the original's `id` (types.ts's
-    // LedgerMessage.evicted) is what lets a later reload (ledger.ts's readFrame,
-    // last-write-wins per id) see the compact stub instead of re-expanding the
-    // full original content — see dispatch.ts's persistent-frame preload, the
-    // actual consumer this exists for. Fire-and-forget, same stance as pushCtx's
-    // own recordMessage calls — harness bookkeeping must never block or fail a
-    // run, and losing one marker just means one message's NEXT reload is slightly
-    // less compact, never wrong (the ledger's own original entry is untouched
-    // either way, so `expand` still recovers it).
-    for (const evictedId of evictedMessageIds) {
-      const idx = this.historyMsgIds.indexOf(evictedId)
-      if (idx === -1) continue
-      const stubContent = this.history[idx].content
-      recordMessage(config.workspacePath || '/workspace', this.frameId, {
-        id: evictedId,
-        role: 'tool',
-        content: stubContent,
-        evicted: true,
-      }).catch(err => {
-        console.error('[ledger] recordMessage (eviction marker) failed (continuing):', err)
-      })
+    const prunedCount = this.pruneHarnessMessages()
+
+    const tokensBefore = estimateTokens(this.history)
+    const triggerTokens = numCtx * CONTEXT_TRIGGER_PCT
+    if (!opts.force && tokensBefore <= triggerTokens) {
+      return { compacted: prunedCount > 0 }
     }
-    emitAndLog({
-      type: 'compact',
-      summary: `deterministic eviction: stubbed ${evictedMessageIds.length} tool message(s), ~${Math.round(tokenEstimateBefore)} → ~${Math.round(tokenEstimateAfter)} est. tokens`,
-      messagesBefore: msgsBefore,
-      messagesAfter: this.history.length,
-      contextUsagePct,
-      rangeDescription: `evicted ${evictedMessageIds.length} tool message(s), oldest first`,
-      validated: false,
-      manual,
-    })
-    return { newRunStart: currentRunStart, compacted: true }
-  }
 
-  // Collapse older tool results in this.history IN PLACE. Keeps the most recent
-  // KEEP_RECENT_TOOL_RESULTS tool messages verbatim; anything older AND longer
-  // than TOOL_RESULT_COLLAPSE_OVER gets replaced with a short stub + first 200
-  // chars. Same in-place mutation pattern as eviction (compactHistory) — both
-  // permanently modify this.history so it always matches what the model sees.
-  // Also writes collapse markers to the ledger (same as eviction markers) so
-  // the Dispatcher's persistent-frame reload stays compact.
-  private collapseOldToolResults(): void {
-    const toolPos: number[] = []
-    this.history.forEach((m, i) => { if (m.role === 'tool') toolPos.push(i) })
-    const collapseSet = new Set(toolPos.slice(0, Math.max(0, toolPos.length - KEEP_RECENT_TOOL_RESULTS)))
+    const verbatimBudget = numCtx * CONTEXT_VERBATIM_PCT
+    const collapseBudget = numCtx * CONTEXT_COLLAPSE_PCT
 
-    for (const i of collapseSet) {
-      const m = this.history[i]
-      const c = m.content
-      if (typeof c !== 'string' || c.length <= TOOL_RESULT_COLLAPSE_OVER) continue
-      // Already shortened by a previous collapse pass or by eviction — skip so we
-      // never produce a stub-of-a-stub (eviction.ts's evict() makes the matching
-      // check for '[collapsed' on its own pass).
-      if (c.startsWith('[collapsed') || c.startsWith('[evicted')) continue
+    // Indices of every assistant/tool message, in this.history's own (oldest-
+    // first) order — the only messages ever eligible for collapse/eviction.
+    // System and user messages are excluded here and therefore never touched by
+    // anything below.
+    const eligible: number[] = []
+    this.history.forEach((m, i) => { if (m.role === 'assistant' || m.role === 'tool') eligible.push(i) })
 
-      // this.historyMsgIds is parallel to this.history (same index i); when this
-      // message has a real ledger id, point the model at ledger `expand` instead
-      // of the old "re-read the file or re-run the command" advice, which cannot
-      // help for a command whose real-world effect (a mutation, a network fetch)
-      // isn't safely repeatable.
-      const msgId = this.msgIdAt(i)
-      // "msg_id" here MUST match the `ledger` tool's actual expand
-      // parameter name (tools/index.ts's `args.msg_id`) — see eviction.ts's
-      // own stub for the identical rationale.
-      const recovery = msgId ? `; msg_id "${msgId}" to recover` : ''
-      const stub = `[collapsed — ${c.length} chars${recovery}]\n${c.slice(0, 200).replace(/\s+/g, ' ')}…`
-      m.content = stub
+    // Walk NEWEST TO OLDEST filling the verbatim budget — everything that fits
+    // stays untouched; the first index where the running total exceeds budget
+    // (and everything older than it) is eligible to be shortened.
+    let spent = 0
+    let splitPos = eligible.length // index INTO `eligible`, not into this.history
+    for (let k = eligible.length - 1; k >= 0; k--) {
+      const content = this.history[eligible[k]].content
+      const tokens = typeof content === 'string' ? estimateTokensForText(content) : 0
+      if (spent + tokens > verbatimBudget && spent > 0) { splitPos = k + 1; break }
+      spent += tokens
+      splitPos = k
+    }
+    const toShorten = eligible.slice(0, splitPos) // oldest-first, only the "older than verbatim budget" slice
 
-      // Write collapse marker to ledger (same as eviction markers) so a later
-      // reload (ledger.ts's readFrame, last-write-wins per id) sees the compact
-      // stub instead of re-expanding the full original content.
-      if (msgId) {
+    let collapsedCount = 0
+    let evictedCount = 0
+    if (toShorten.length === 0) {
+      if (prunedCount === 0) return { compacted: false }
+    } else {
+      // Of the older slice, walk OLDEST TO NEWEST: the first ~CONTEXT_COLLAPSE_PCT
+      // worth gets collapsed (keeps a 200-char preview); the rest gets fully
+      // evicted (stub only). Both groups get ledger markers the same way.
+      let collapseSpent = 0
+      let collapseEnd = 0 // index INTO toShorten — [0, collapseEnd) collapses, [collapseEnd, end) evicts
+      for (; collapseEnd < toShorten.length; collapseEnd++) {
+        const idx = toShorten[collapseEnd]
+        const content = this.history[idx].content
+        const tokens = typeof content === 'string' ? estimateTokensForText(content) : 0
+        if (collapseSpent >= collapseBudget) break
+        collapseSpent += tokens
+      }
+
+      const shortenedIds: string[] = []
+      for (let k = 0; k < toShorten.length; k++) {
+        const idx = toShorten[k]
+        const m = this.history[idx]
+        const c = m.content
+        if (typeof c !== 'string') continue
+        // Already shortened by an earlier pass — skip so we never produce a
+        // stub-of-a-stub.
+        if (c.startsWith('[collapsed') || c.startsWith('[evicted')) continue
+
+        const msgId = this.msgIdAt(idx)
+        // "msg_id" here MUST match the `ledger` tool's actual expand parameter
+        // name (tools/index.ts's `args.msg_id`) — this prose is the only place a
+        // model learns what to pass, and a mismatched key would silently fail
+        // the recovery this stub exists to offer.
+        const recovery = msgId ? `; msg_id "${msgId}" to recover` : ''
+        const isCollapse = k < collapseEnd
+        const stub = isCollapse
+          ? `[collapsed — ${c.length} chars${recovery}]\n${c.slice(0, COLLAPSE_PREVIEW_CHARS).replace(/\s+/g, ' ')}…`
+          : `[evicted — ${c.length} chars${recovery}]`
+        m.content = stub
+        if (isCollapse) collapsedCount++
+        else evictedCount++
+        if (msgId) shortenedIds.push(msgId)
+      }
+
+      // LEDGER-SIDE MARKERS. this.historyMsgIds stays parallel to this.history
+      // (this pass never reorders/removes entries, only mutates `content`), so
+      // for each shortened id, the same index it was originally pushed at still
+      // holds its (now-stubbed) message. Recording that stub as a FOLLOW-UP
+      // ledger entry sharing the original's `id` (types.ts's
+      // LedgerMessage.evicted) is what lets a later reload (ledger.ts's
+      // readFrame, last-write-wins per id) see the compact stub instead of
+      // re-expanding the full original content — see dispatch.ts's
+      // persistent-frame preload, the actual consumer this exists for.
+      // Fire-and-forget, same stance as pushCtx's own recordMessage calls —
+      // harness bookkeeping must never block or fail a run.
+      for (const id of shortenedIds) {
+        const idx = this.historyMsgIds.indexOf(id)
+        if (idx === -1) continue
         recordMessage(config.workspacePath || '/workspace', this.frameId, {
-          id: msgId,
+          id,
           role: 'tool',
-          content: stub,
-          evicted: true,  // reuse the same flag — collapsed and evicted are both "shortened"
+          content: this.history[idx].content,
+          evicted: true,
         }).catch(err => {
-          console.error('[ledger] recordMessage (collapse marker) failed (continuing):', err)
+          console.error('[ledger] recordMessage (context-management marker) failed (continuing):', err)
         })
       }
     }
+
+    this.lastCompactedAt = Date.now()
+    const tokensAfter = estimateTokens(this.history)
+    emitAndLog({
+      type: 'compact',
+      summary: `context management: collapsed ${collapsedCount}, evicted ${evictedCount} message(s)` +
+        (prunedCount > 0 ? `, pruned ${prunedCount} stale harness message(s)` : '') +
+        `, ~${Math.round(tokensBefore)} → ~${Math.round(tokensAfter)} est. tokens`,
+      messagesBefore: msgsBefore,
+      messagesAfter: this.history.length,
+      contextUsagePct,
+      rangeDescription: `collapsed ${collapsedCount}/evicted ${evictedCount} assistant/tool message(s), oldest of the non-verbatim slice first`,
+      validated: false,
+      manual: opts.manual,
+    })
+    return { compacted: true }
+  }
+
+  // Removes stale harness-injected `system`-role messages from this.history —
+  // thinking-turn nudges, PROGRESS CHECK/STALL messages, reground steers, and
+  // injected timeout errors (all pushed via pushCtx with `role: 'system'` from
+  // the main iteration loop below, NOT by the model) — once they are more than
+  // HARNESS_MESSAGE_MAX_ITERATION_AGE assistant turns old. These accumulate as
+  // pure noise on a long run: each was only ever useful in the turn or two right
+  // after it fired.
+  //
+  // The frame's OPENING system messages (ROLE_IDENTITY and, if present,
+  // ROLE_INSTRUCTIONS — both pushed once at the top of chat(), before any
+  // assistant message exists) are never candidates: this walk only considers a
+  // system message that has at least one assistant message BEFORE it in
+  // this.history, which the two opening messages never do (nothing has run yet
+  // when they're pushed). Removes matching entries from this.history AND the
+  // parallel this.historyMsgIds (same index) in one pass, working from the end
+  // backwards so earlier indices stay valid as later ones are spliced out.
+  private pruneHarnessMessages(): number {
+    // Forward pass to classify: a system message is a REMOVAL CANDIDATE only if
+    // at least one assistant message appears strictly BEFORE it — the frame's
+    // opening system messages (ROLE_IDENTITY/ROLE_INSTRUCTIONS) are pushed before
+    // any assistant turn has happened, so this excludes them by construction,
+    // with no special-casing of "the first few messages" required.
+    let assistantsSoFar = 0
+    const isCandidate: boolean[] = this.history.map(m => {
+      if (m.role === 'assistant') { assistantsSoFar++; return false }
+      return m.role === 'system' && assistantsSoFar > 0
+    })
+    // Age of a candidate = how many assistant messages appear AFTER it — computed
+    // with a backward running total, then removed oldest-safe (highest index
+    // first) so earlier indices stay valid as later ones are spliced out.
+    let assistantsAfter = 0
+    let removed = 0
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      if (this.history[i].role === 'assistant') { assistantsAfter++; continue }
+      if (!isCandidate[i]) continue
+      if (assistantsAfter > HARNESS_MESSAGE_MAX_ITERATION_AGE) {
+        this.history.splice(i, 1)
+        this.historyMsgIds.splice(i, 1)
+        removed++
+      }
+    }
+    return removed
   }
 
   // Issues one main per-iteration chat call (system prompt + full history) with
@@ -994,7 +1085,6 @@ export class Agent {
     // Skipped entirely on a RESUMED turn: the frame's history already carries
     // these three messages from its original (non-resumed) chat() call —
     // re-pushing them would duplicate the identity/instructions on every resume.
-    let userMessageIndex = -1
     if (!resume) {
       // model/modelOptions recorded ONCE per frame, on this opening [system]
       // identity message — the agent itself only ever sees the plain system
@@ -1034,7 +1124,6 @@ export class Agent {
 
       // User assignment + instructions
       this.pushCtx({ role: 'user', content: userMessage })
-      userMessageIndex = this.history.length - 1
       if (instructions) this.pushCtx({ role: 'system', content: instructions })
 
       // All agents get a project file listing after instructions.
@@ -1051,21 +1140,8 @@ export class Agent {
     } else {
       // RESUMED turn — just push the follow-up message, no identity/instructions/injection
       this.pushCtx({ role: 'user', content: userMessage })
-      userMessageIndex = this.history.length - 1
     }
     this.phase = 'running'
-    // The index of the message that started this run — compactHistory() always
-    // keeps history[currentRunStart] verbatim, however many iterations follow it.
-    // Reassigned (not recomputed) after each eviction pass, since eviction can
-    // replace `this.history` wholesale and returns the prompt's new position in it.
-    // Points at the [user] assignment message specifically (not the identity
-    // message ahead of it on a fresh run, nor the instructions message after it) —
-    // matches the pre-existing convention where this always pointed at the entry
-    // userMessage's own pushCtx. On a RESUMED turn there is no identity/
-    // instructions pair around it — the follow-up message pushed for this turn IS
-    // the last entry, so this.history.length - 1 is exactly userMessageIndex would
-    // have computed anyway.
-    let currentRunStart = userMessageIndex
     // Consecutive no-tool-call ("thinking") turns, local to this chat() call (not a
     // class field — a class field would carry across a resumed frame's later chat()
     // call and could suppress or misfire the nudge for state it never actually saw).
@@ -1302,24 +1378,27 @@ export class Agent {
             eval_duration_ms: response.eval_duration != null ? Math.round(response.eval_duration / 1e6) : undefined,
             total_duration_ms: response.total_duration != null ? Math.round(response.total_duration / 1e6) : undefined,
           })
-          // Trigger when only ~compactReserveTokens of headroom remain (near-full),
-          // instead of at a fixed fraction — the context is allowed to fill more
-          // before the eviction pass runs.
+          // Trigger at CONTEXT_TRIGGER_PCT (60%) of num_ctx — manageContext's own
+          // threshold, mirrored here only so the emitted contextUsagePct/log message
+          // reflect the response that actually crossed it. manageContext re-checks
+          // the same threshold itself (and no-ops if already under it), so calling
+          // it unconditionally every iteration would be harmless too; gating the
+          // call on the same trigger here just avoids a wasted call on the (vast
+          // majority of) iterations that are nowhere near full.
           const usagePct = response.prompt_eval_count / numCtx
-          if (response.prompt_eval_count >= numCtx - config.compactReserveTokens) {
+          if (usagePct >= CONTEXT_TRIGGER_PCT) {
             try {
               this.phase = 'compacting'
-              const result = await this.compactHistory(currentRunStart, usagePct, emitAndLog)
-              currentRunStart = result.newRunStart
+              this.manageContext(usagePct, emitAndLog)
               this.phase = 'running'
             } catch (err) {
               // Deliberately falls through to the next normal iteration rather than
               // blocking on a synchronous retry: a hard block risks the loop getting
-              // stuck retrying eviction forever if it's failing for a structural
-              // reason, with no forward progress and no way for the user to see a
-              // real answer.
+              // stuck retrying context management forever if it's failing for a
+              // structural reason, with no forward progress and no way for the user
+              // to see a real answer.
               this.phase = 'running'
-              emitAndLog({ type: 'warning', message: `Context eviction failed (${err instanceof Error ? err.message : String(err)}) — continuing with full history` })
+              emitAndLog({ type: 'warning', message: `Context management failed (${err instanceof Error ? err.message : String(err)}) — continuing with full history` })
             }
           }
         }
@@ -1496,12 +1575,11 @@ export class Agent {
             if (action.kind === 'compact') {
               try {
                 this.phase = 'compacting'
-                const r = await this.compactHistory(currentRunStart, 0, emitAndLog)
-                currentRunStart = r.newRunStart
+                this.manageContext(0, emitAndLog, { force: true })
                 this.phase = 'running'
               } catch (err) {
                 this.phase = 'running'
-                emitAndLog({ type: 'warning', message: `Loop-recovery eviction failed (${err instanceof Error ? err.message : String(err)}) — continuing` })
+                emitAndLog({ type: 'warning', message: `Loop-recovery context management failed (${err instanceof Error ? err.message : String(err)}) — continuing` })
               }
             }
             // Carry the ladder rung as a STRUCTURED field, not just inside the
