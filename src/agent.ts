@@ -782,7 +782,7 @@ export class Agent {
     {
       const newSlice = this.history.slice(this.alLastMessageCount)
       const newAlMessages = newSlice.map(m => ({ role: String(m.role), content: typeof m.content === 'string' ? m.content : String(m.content ?? '') }))
-      this.traceLogger?.beginTurn(messages.length, newAlMessages, alCollapsed.length > 0 ? alCollapsed : undefined)
+      this.traceLogger?.beginTurn(messages.length, newAlMessages)
       this.alLastMessageCount = this.history.length
     }
     // Recitation (Manus todo.md pattern): keep the objective at the very tail of
@@ -1405,6 +1405,8 @@ export class Agent {
             emitAndLog({ type: 'tool_call', tool: name, args })
             const status = typeof args.status === 'string' ? args.status.trim().toUpperCase() : ''
             const answer = typeof args.message === 'string' ? args.message.trim() : ''
+            // Push the "Conclude called:" assistant message for ALL conclude attempts
+            this.pushCtx({ role: 'assistant', content: formatToolCallContent(name, args) }, undefined, { toolName: name })
             if (!status || !answer) {
               const err = 'conclude needs both a "status" keyword and a non-empty "message" string. Call it again with both parameters.'
               emitAndLog({ type: 'tool_result', tool: name, output: '', error: err, duration_ms: 0 })
