@@ -1,69 +1,55 @@
-// THE LEDGER. The audit trail of the call-frame stack: spawning a frame is a
-// `delegation` entry, a frame finishing is a `conclusion` entry, and every tool call
-// inside a frame is an `episode` entry (the CWL eviction graph — see eviction.ts).
-// Append-only JSONL at /workspace/.argo/ledger.jsonl — deliberately NOT a database
-// (this project's own memory research already settled grep-able files over a
-// database for a near-identical case; nothing here needs real query performance). A
-// small separate state.json under the same directory holds the one PINNED value that
-// isn't an append-only event: the immutable `objective` — read every iteration, so it
-// doesn't belong in a growing log.
+// THE LEDGER. Per-frame, append-only JSONL files under /workspace/.argo/frames/ —
+// one file per call frame (dispatcher/planner/implementer instance), holding the
+// exact messages (system/user/assistant/tool) that frame itself saw in its live
+// context, PLUS UI-only metadata (thinking, tool args, token counts, ...) that is
+// never handed back to the model. A frame's identity comes from WHICH FILE its
+// entries live in — there is no frameId/taskId/agent/ts field on the entry itself
+// any more (see types.ts's LedgerMessage). The file itself is append-only, so
+// "chronological order" always means append order — but a message that is later
+// EVICTED from the live in-memory history (agent.ts's compactHistory) gets a
+// SECOND entry appended sharing its original `id`, marked `evicted: true`, whose
+// content is the short recovery stub rather than the original. readFrame (below)
+// is the deduplicated, last-write-wins-per-id view built from that raw log — what
+// every consumer other than `expand` actually wants; `expand` alone reads the raw
+// log to recover the ORIGINAL, pre-eviction entry.
 //
-// Pure I/O module: no LLM calls here. The model-invoked half of this API is exposed as
-// the `ledger` tool (src/tools/index.ts); the harness-automatic half (recordDelegation,
-// recordConclusion, recordEpisode, ...) is called directly from dispatch.ts/frames.ts —
-// never a tool call, so it can never be forgotten by the model.
+// /workspace/.argo/sessions.json is the registry: session -> runs -> ordered list
+// of frames spawned during that run (frameId/role/parentFrameId). This is the only
+// place that records which role a frame is and where it sits in the delegation
+// tree — the frame's own ledger file carries none of that.
+//
+// Deliberately NOT a database (this project's own memory research already settled
+// grep-able files over a database for a near-identical case; nothing here needs
+// real query performance).
+//
+// Pure I/O module: no LLM calls here. The model-invoked half of this API is exposed
+// as the `ledger` tool (src/tools/index.ts: `messages` / `expand`), scoped to the
+// CALLING FRAME's own file only — cross-agent visibility has been removed entirely,
+// each frame sees only itself. The harness-automatic half (recordMessage) is called
+// directly from agent.ts's pushCtx call sites — never a tool call, so it can never
+// be forgotten by the model.
 
 import { promises as fs } from 'fs'
 import path from 'path'
-import type {
-  LedgerEntry,
-  LedgerDelegationEntry,
-  LedgerConclusionEntry,
-  LedgerInjectionEntry,
-  LedgerEpisodeEntry,
-} from './types.js'
+import type { LedgerMessage, Role, SessionRegistry } from './types.js'
 
 function argoDir(root: string): string {
   return path.join(root, '.argo')
 }
-function ledgerFile(root: string): string {
-  return path.join(argoDir(root), 'ledger.jsonl')
+function framesDir(root: string): string {
+  return path.join(argoDir(root), 'frames')
 }
-function stateFile(root: string): string {
-  return path.join(argoDir(root), 'state.json')
+function frameFile(root: string, frameId: string): string {
+  return path.join(framesDir(root), `${frameId}.jsonl`)
 }
-
-interface PinnedState {
-  objective: string | null
-  objectiveSetAt: number | null
+function registryFile(root: string): string {
+  return path.join(argoDir(root), 'sessions.json')
 }
 
-const EMPTY_STATE: PinnedState = { objective: null, objectiveSetAt: null }
-
-async function readState(root: string): Promise<PinnedState> {
-  try {
-    const raw = await fs.readFile(stateFile(root), 'utf-8')
-    const parsed = JSON.parse(raw) as Partial<PinnedState>
-    return {
-      objective: typeof parsed.objective === 'string' ? parsed.objective : null,
-      objectiveSetAt: typeof parsed.objectiveSetAt === 'number' ? parsed.objectiveSetAt : null,
-    }
-  } catch {
-    return { ...EMPTY_STATE }
-  }
-}
-
-async function writeState(root: string, state: PinnedState): Promise<void> {
-  await fs.mkdir(argoDir(root), { recursive: true })
-  const tmp = `${stateFile(root)}.tmp`
-  await fs.writeFile(tmp, JSON.stringify(state, null, 2))
-  await fs.rename(tmp, stateFile(root))
-}
-
-// Ensures /workspace/.gitignore excludes .argo/ — harness bookkeeping (delegation
-// trails, drafts), never a tracked deliverable. Idempotent, mirrors how autoCommit()
-// (agent.ts) idempotently ensures `git init` has run. Appends rather than overwrites,
-// and never assumes the user's repo already has a .gitignore.
+// Ensures /workspace/.gitignore excludes .argo/ — harness bookkeeping (the ledger,
+// per-frame logs), never a tracked deliverable. Idempotent, mirrors how
+// autoCommit() (agent.ts) idempotently ensures `git init` has run. Appends rather
+// than overwrites, and never assumes the user's repo already has a .gitignore.
 export async function ensureGitignored(root: string): Promise<void> {
   // Fails open, fully — a housekeeping nicety (keep .argo/ out of the user's git
   // history), never something that should be able to abort a run. Root can be wrong
@@ -77,41 +63,71 @@ export async function ensureGitignored(root: string): Promise<void> {
     } catch {
       // No .gitignore yet — fine, we'll create one.
     }
-    if (content.split('\n').some(l => l.trim() === '.argo/' || l.trim() === '.argo')) return
-    const sep = content && !content.endsWith('\n') ? '\n' : ''
-    await fs.writeFile(gi, `${content}${sep}.argo/\n`)
+    if (!content.split('\n').some(l => l.trim() === '.argo/' || l.trim() === '.argo')) {
+      const sep = content && !content.endsWith('\n') ? '\n' : ''
+      await fs.writeFile(gi, `${content}${sep}.argo/\n`)
+    }
   } catch (err) {
     console.error('[ledger] ensureGitignored failed (continuing):', err)
+  }
+  // Stale-file cleanup: an older pre-ledger build of this harness wrote a single
+  // .argo/state.json bookkeeping file that has no successor (session tracking now
+  // lives entirely in sessions.json + the per-frame files above) — remove it on
+  // every dispatch start so a workspace that was ever run under that build doesn't
+  // keep carrying dead bookkeeping forward indefinitely. Fails open, same stance
+  // as the .gitignore step above: never lets a stale-file cleanup failure abort a
+  // real run. Deliberately does NOT touch the old JSONL/history-*.json files under
+  // logs/ — those are a different directory and, unlike state.json, are user-
+  // visible run history rather than pure internal bookkeeping.
+  try {
+    await fs.unlink(path.join(argoDir(root), 'state.json'))
+  } catch {
+    // Never existed, or already gone — nothing to do.
   }
 }
 
 let idCounter = 0
 // Monotonic-enough ids for a single process/run — collisions would need the same
 // millisecond AND the same in-process counter value, which a single Node process
-// driving one strictly-sequential dispatch loop (see docs/subagents-plan.md's hard
-// no-parallelism rule) cannot produce.
+// driving one strictly-sequential dispatch loop (see dispatch.ts's own "no two LLM
+// calls ever run concurrently" hard rule) cannot produce.
 export function newId(prefix: string): string {
   idCounter += 1
   return `${prefix}-${Date.now().toString(36)}-${idCounter}`
 }
 
-async function append(root: string, entry: LedgerEntry): Promise<void> {
-  await fs.mkdir(argoDir(root), { recursive: true })
-  await fs.appendFile(ledgerFile(root), `${JSON.stringify(entry)}\n`)
+// ── Per-frame ledger files ──
+
+// Append one message to a frame's own ledger file. Fire-and-forget from the
+// caller's perspective (agent.ts never awaits this into the hot path) but this
+// function itself does the real write and can throw — callers decide how to
+// handle a failure (agent.ts/dispatch.ts both just log and continue).
+export async function recordMessage(root: string, frameId: string, msg: LedgerMessage): Promise<void> {
+  await fs.mkdir(framesDir(root), { recursive: true })
+  await fs.appendFile(frameFile(root, frameId), `${JSON.stringify(msg)}\n`)
 }
 
-async function readAll(root: string): Promise<LedgerEntry[]> {
+// Read every RAW entry recorded for one frame, in append (chronological) order —
+// including both an evicted message's ORIGINAL entry and its later eviction-marker
+// entry (types.ts's LedgerMessage.evicted) as two separate array elements sharing
+// one `id`. Missing file (a frame that never recorded anything, or an unknown
+// frameId) returns an empty array rather than throwing — same fail-open stance as
+// the old single-file readAll(). Internal — callers almost always want the
+// deduplicated view (readFrame, below) or the ORIGINAL specifically (expand,
+// below); this is exposed only for those two to share the actual file-reading
+// logic, never called directly outside this module.
+async function readFrameRaw(root: string, frameId: string): Promise<LedgerMessage[]> {
   let raw: string
   try {
-    raw = await fs.readFile(ledgerFile(root), 'utf-8')
+    raw = await fs.readFile(frameFile(root, frameId), 'utf-8')
   } catch {
     return []
   }
-  const out: LedgerEntry[] = []
+  const out: LedgerMessage[] = []
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue
     try {
-      out.push(JSON.parse(line) as LedgerEntry)
+      out.push(JSON.parse(line) as LedgerMessage)
     } catch {
       // A malformed line (e.g. a partial write from a crash mid-append) is skipped,
       // never fatal — the ledger is an audit trail, not a transactional store.
@@ -120,115 +136,157 @@ async function readAll(root: string): Promise<LedgerEntry[]> {
   return out
 }
 
-function hasFrameId(e: LedgerEntry): e is LedgerEntry & { frameId: string } {
-  return 'frameId' in e && typeof (e as { frameId?: unknown }).frameId === 'string'
-}
-function hasTargetFrameId(e: LedgerEntry): e is LedgerInjectionEntry {
-  return e.kind === 'injection'
-}
-
-// ── Harness-automatic writers — never a model tool call, cannot be forgotten ──
-
-export async function recordDelegation(root: string, e: Omit<LedgerDelegationEntry, 'kind' | 'ts'>): Promise<void> {
-  await append(root, { kind: 'delegation', ts: Date.now(), ...e })
-}
-
-export async function recordConclusion(root: string, e: Omit<LedgerConclusionEntry, 'kind' | 'ts'>): Promise<void> {
-  await append(root, { kind: 'conclusion', ts: Date.now(), ...e })
-}
-
-export async function recordInjection(root: string, e: Omit<LedgerInjectionEntry, 'kind' | 'ts'>): Promise<void> {
-  await append(root, { kind: 'injection', ts: Date.now(), ...e })
-}
-
-export async function recordEpisode(root: string, e: Omit<LedgerEpisodeEntry, 'kind' | 'ts'>): Promise<void> {
-  await append(root, { kind: 'episode', ts: Date.now(), ...e })
-}
-
-// JSONL is append-only, so an eviction is recorded as a NEW record for the same
-// episodeId carrying evictedAt — never a rewrite of the original line. Readers that
-// want "is this episode currently evicted" should look at the LATEST record for a
-// given episodeId (see getEpisode below), same pattern as the task ledger's
-// re-plan-preserves-history convention.
-export async function markEpisodeEvicted(root: string, episodeId: string): Promise<void> {
-  const entries = await readAll(root)
-  const versions = entries.filter((e): e is LedgerEpisodeEntry => e.kind === 'episode' && e.episodeId === episodeId)
-  const latest = versions[versions.length - 1]
-  if (!latest) return
-  await append(root, { ...latest, evictedAt: Date.now() })
-}
-
-async function getEpisode(root: string, episodeId: string): Promise<LedgerEpisodeEntry | null> {
-  const entries = await readAll(root)
-  const versions = entries.filter((e): e is LedgerEpisodeEntry => e.kind === 'episode' && e.episodeId === episodeId)
-  return versions.length ? versions[versions.length - 1] : null
-}
-
-// ── Model-invoked API (the `ledger` tool multiplexes onto these — see tools/index.ts) ──
-
-export async function getObjective(root: string): Promise<string | null> {
-  return (await readState(root)).objective
-}
-
-// Immutable once set — a second call is a no-op returning {ok:false} UNLESS force is
-// true, which is the distinct, loud, ledger-logged act a real revision requires (the
-// caller is responsible for also recording WHY via recordInjection/a conclusion, this
-// function only guards the write itself).
-export async function setObjective(
-  root: string,
-  objective: string,
-  force = false,
-): Promise<{ ok: boolean; reason?: string }> {
-  const state = await readState(root)
-  if (state.objective && !force) {
-    return { ok: false, reason: 'objective already set — immutable; pass force to deliberately revise it' }
+// Read one frame's messages as they should be REPLAYED — the eviction-aware view.
+// Most entries have exactly one line in the file and pass through unchanged. A
+// message that was later evicted (agent.ts's compactHistory, once eviction stubs it
+// out of the live in-memory history) has TWO lines sharing the same `id`: the
+// original (full content) followed by an eviction-marker entry (`evicted: true`,
+// content is the short recovery stub) appended once eviction actually runs — see
+// that call site's own comment. Deduplicating by id, LAST entry wins, is exactly
+// what makes the stub replace the original here: an evicted message's marker entry
+// was appended strictly after its original, so it is later in append order and
+// wins the dedup. A message that was NEVER evicted has only the one entry, which
+// trivially "wins" against nothing.
+//
+// This is what the `ledger` tool's `messages` action (tools/index.ts) shows a model
+// browsing its own history, and what dispatch.ts's persistent-frame reload
+// (spawnFrame's Agent.loadHistory preload) loads back — both want the CURRENT,
+// already-compact view, not a growing duplicate-laden raw log.
+export async function readFrame(root: string, frameId: string): Promise<LedgerMessage[]> {
+  const entries = await readFrameRaw(root, frameId)
+  const byId = new Map<string, LedgerMessage>()
+  const order: string[] = []
+  for (const e of entries) {
+    if (!byId.has(e.id)) order.push(e.id)
+    byId.set(e.id, e) // last write for this id wins — see this function's own comment
   }
-  await writeState(root, { ...state, objective, objectiveSetAt: Date.now() })
-  return { ok: true }
+  return order.map(id => byId.get(id)!)
 }
 
-export async function getConclusion(root: string, frameId: string): Promise<LedgerConclusionEntry | null> {
-  const entries = await readAll(root)
-  const matches = entries.filter((e): e is LedgerConclusionEntry => e.kind === 'conclusion' && e.frameId === frameId)
-  return matches.length ? matches[matches.length - 1] : null
+// Re-inject a specific evicted/collapsed message's full ORIGINAL content on
+// demand — the ledger's lossless pointer to every original, made concrete. Reads
+// the RAW (non-deduplicated) log and takes the FIRST entry for that id that is not
+// itself an eviction marker — the original is always written before any later
+// marker for the same id (readFrameRaw's own append-order guarantee), so "first
+// non-evicted entry" is exactly "the original," never a stub. (A collapsed-but-
+// never-evicted message was only ever written once — its lone entry is trivially
+// both the first and the original.)
+//
+// When `frameId` is given (the normal case — the `ledger` tool always passes the
+// calling frame's own id, since cross-agent visibility no longer exists), only
+// that frame's file is searched. Without it, every frame file under
+// .argo/frames/ is searched — used by callers that don't have a specific frame in
+// scope (tests, tooling). Returns null if the id was never recorded anywhere in
+// scope.
+export async function expand(root: string, messageId: string, frameId?: string): Promise<string | null> {
+  if (frameId) {
+    const entries = await readFrameRaw(root, frameId)
+    const original = entries.find(e => e.id === messageId && !e.evicted)
+    return original ? original.content : null
+  }
+  let files: string[]
+  try {
+    files = await fs.readdir(framesDir(root))
+  } catch {
+    return null
+  }
+  for (const file of files) {
+    if (!file.endsWith('.jsonl')) continue
+    const entries = await readFrameRaw(root, file.slice(0, -'.jsonl'.length))
+    const original = entries.find(e => e.id === messageId && !e.evicted)
+    if (original) return original.content
+  }
+  return null
 }
 
-// A specific frame's FULL story — delegation, standups, injections, kill/restart
-// reason if any, and its conclusion. What the Planner uses to understand a failure
-// in detail before proposing a fix (getConclusion's one-line summary is what a normal
-// dependency hand-off gets instead — see frames.ts buildStartingContext).
-export async function getFrameTrail(root: string, frameId: string): Promise<LedgerEntry[]> {
-  const entries = await readAll(root)
-  return entries.filter(e => (hasFrameId(e) && e.frameId === frameId) || (hasTargetFrameId(e) && e.targetFrameId === frameId))
+// ── Registry (sessions.json) ──
+
+async function readRegistry(root: string): Promise<SessionRegistry> {
+  try {
+    const raw = await fs.readFile(registryFile(root), 'utf-8')
+    const parsed = JSON.parse(raw)
+    if (parsed && Array.isArray(parsed.sessions)) return parsed as SessionRegistry
+    return { sessions: [] }
+  } catch {
+    return { sessions: [] }
+  }
 }
 
-// Sliding window over the ledger — what the Dispatcher reads for a standup. `scope`
-// filters standup entries to just one granularity when present; every other entry
-// kind is unaffected by the filter (the Dispatcher still wants delegations/
-// conclusions in its recent-activity view regardless of which standup scope it's
-// checking).
-export async function getRecent(root: string, n: number, scope?: 'frame' | 'task'): Promise<LedgerEntry[]> {
-  const entries = await readAll(root)
-  const filtered = scope ? entries.filter(e => e.kind !== 'standup' || e.scope === scope) : entries
-  return filtered.slice(-Math.max(0, n))
+async function writeRegistry(root: string, registry: SessionRegistry): Promise<void> {
+  await fs.mkdir(argoDir(root), { recursive: true })
+  await fs.writeFile(registryFile(root), JSON.stringify(registry, null, 2))
 }
 
-// Re-inject a specific evicted episode's full original content on demand — LCM's
-// "lossless pointer to every original" (docs/subagents-plan.md), made concrete.
-// Returns null if the episode was never recorded (not "not found vs. never evicted" —
-// callers that only care about content don't need to distinguish those).
-export async function expand(root: string, episodeId: string): Promise<string | null> {
-  const ep = await getEpisode(root, episodeId)
-  return ep?.fullContent ?? null
+// Public read accessor — the whole-file read-modify-write registerFrame does
+// internally, exposed for callers (tests, tooling, a future UI) that just need to
+// inspect current state without registering anything.
+export async function getRegistry(root: string): Promise<SessionRegistry> {
+  return readRegistry(root)
 }
 
-// Count of ACTION episodes across the whole task since a given timestamp — the
-// pacing signal for task-scope Dispatcher standups (paced by real work, not raw
-// steps; see docs/subagents-plan.md "The Boss" — historical name for this role).
-// Exploratory episodes don't count.
-export async function countActionEpisodesSince(root: string, sinceTs: number): Promise<number> {
-  const entries = await readAll(root)
-  return entries.filter(
-    (e): e is LedgerEpisodeEntry => e.kind === 'episode' && e.episodeKind === 'action' && e.ts > sinceTs,
-  ).length
+// Registers one spawned frame under session `sessionId`'s run `runIndex` — called
+// once per frame spawn (dispatch.ts's spawnFrame), right alongside minting its
+// frameId. Creates the session and/or run entry on first use. `runIndex` is
+// 0-based and stable for the lifetime of one runDispatchLoop call; a run that
+// doesn't exist yet at that index is created (and any gap filled with empty runs)
+// rather than assumed to already be there, so callers never need a separate
+// "start a run" step.
+export async function registerFrame(
+  root: string,
+  sessionId: string,
+  runIndex: number,
+  frame: { frameId: string; role: Role; parentFrameId: string | null },
+): Promise<void> {
+  const registry = await readRegistry(root)
+  let session = registry.sessions.find(s => s.id === sessionId)
+  if (!session) {
+    session = { id: sessionId, runs: [] }
+    registry.sessions.push(session)
+  }
+  while (session.runs.length <= runIndex) {
+    session.runs.push({ startedAt: new Date().toISOString(), frames: [] })
+  }
+  session.runs[runIndex].frames.push({ frameId: frame.frameId, role: frame.role, parentFrameId: frame.parentFrameId })
+  await writeRegistry(root, registry)
+}
+
+// ── Current session pointer ──
+// Replaces server.ts's old current-session.txt file — "which session is active"
+// now lives as a field on the SAME registry file frames are already recorded in,
+// rather than a second small bookkeeping file. Whole-file read-modify-write, same
+// pattern as registerFrame above.
+
+export async function setCurrentSession(root: string, sessionId: string): Promise<void> {
+  const reg = await readRegistry(root)
+  reg.currentSessionId = sessionId
+  await writeRegistry(root, reg)
+}
+
+export async function getCurrentSession(root: string): Promise<string | null> {
+  const reg = await readRegistry(root)
+  return reg.currentSessionId ?? null
+}
+
+// Removes one session's entry from the registry AND every frame file that
+// session's runs ever registered — server.ts's DELETE /logs/:sessionId. Returns
+// the frameIds that were removed (so the caller, or a future UI, can confirm what
+// was actually deleted) — an unknown sessionId is a no-op, returning [].
+export async function deleteSession(root: string, sessionId: string): Promise<string[]> {
+  const registry = await readRegistry(root)
+  const session = registry.sessions.find(s => s.id === sessionId)
+  if (!session) return []
+  const frameIds = session.runs.flatMap(r => r.frames.map(f => f.frameId))
+  await Promise.all(frameIds.map(frameId => fs.unlink(frameFile(root, frameId)).catch(() => {})))
+  registry.sessions = registry.sessions.filter(s => s.id !== sessionId)
+  await writeRegistry(root, registry)
+  return frameIds
+}
+
+// Clears every frame file and resets the registry to empty — server.ts's DELETE
+// /logs (the "delete everything and start over" action). Deliberately drops
+// currentSessionId too — the caller (server.ts) always mints and sets a fresh one
+// immediately after calling this.
+export async function resetAllSessions(root: string): Promise<void> {
+  await fs.rm(framesDir(root), { recursive: true, force: true }).catch(() => {})
+  await writeRegistry(root, { sessions: [] })
 }

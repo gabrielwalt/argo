@@ -1,78 +1,24 @@
 // STRUCTURED CONTEXT EVICTION. The ONLY context-management mechanism in this
-// codebase, following CWL ("Beyond Compaction: Structured Context Eviction for
-// Long-Horizon Agents", arXiv:2606.11213): a deterministic, no-LLM policy that types every
-// tool call as an episode (exploratory | action) and evicts the oldest, already-durably-
-// persisted ones first when the live window gets too large. Nothing evicted is actually
-// gone — the full original survives in the ledger's episode record (ledger.ts) and can be
-// pulled back via expand().
+// codebase: a deterministic, no-LLM policy that evicts the OLDEST tool-result
+// messages first when the live window gets too large. Nothing evicted is actually
+// gone — the full original survives in the ledger (ledger.ts) under its message
+// id and can be pulled back via ledger's expand().
 //
-// v1 SIMPLIFICATION, noted explicitly: CWL's paper describes FOUR graduated eviction
-// levels (reasoning trace -> bulk output -> intermediate artifact -> full removal). This
-// implementation collapses straight to a single "stub" level — the same restorable-stub
-// shape agent.ts's existing KEEP_RECENT_TOOL_RESULTS collapse already uses — because the
-// full original is losslessly recoverable from the ledger either way (expand()); the
-// graduated levels are a refinement to try if eviction proves too coarse in practice, not
-// a correctness requirement.
+// v2 SIMPLIFICATION: the earlier CWL-derived dependency-graph/episode-kind
+// machinery (exploratory vs. action, harness-inferred dependsOn) has been removed
+// entirely — it added significant bookkeeping for a benefit that never justified
+// it once the ledger became a flat message list. Eviction is now simply "oldest
+// tool messages first," which is easy for anyone (or any model) to reason about.
 
 import type { Message } from 'ollama'
-import type { EpisodeKind } from './types.js'
 
-// Mapped onto Argo's actual tools (docs/subagents-plan.md). `bash` is classified as an
-// action for ALL calls, not just mutating ones — reliably distinguishing a read-only
-// `bash` invocation from a mutating one would require parsing the command string, which
-// is not worth the false-negative risk (treating a mutation as exploratory would let it
-// be evicted as if its effect weren't durably persisted, when it might not be).
-// Everything not listed here (write_file, edit_file, bash, and any unknown/future
-// tool) defaults to 'action' — the safer default, since an action episode is never
-// evicted early.
-const EXPLORATORY_TOOLS = new Set(['read_file', 'web_search', 'fetch_url'])
-
-export function classifyTool(name: string): EpisodeKind {
-  return EXPLORATORY_TOOLS.has(name) ? 'exploratory' : 'action'
-}
-
-export interface EpisodeMeta {
-  episodeId: string
-  kind: EpisodeKind
-  tool: string
-  messageIndex: number // index into the message array this episode's tool-result occupies
-  dependsOn: string[]
-}
-
-// Harness-inferred dependency heuristic — a DELIBERATE deviation from CWL's paper, which
-// has the model declare links via a tool call. Correctness must not depend on a local
-// model remembering a bookkeeping step (the same principle behind every other
-// harness-owned mechanism in this project). A new action depends on every exploratory
-// episode recorded since the last action, or since frame start. An explicit override
-// exists on the `ledger` tool's `link` action for a model that wants to be precise, but
-// it's never required (see tools/index.ts).
-export function inferDependencies(priorEpisodes: EpisodeMeta[], newKind: EpisodeKind): string[] {
-  if (newKind !== 'action') return []
-  const deps: string[] = []
-  for (let i = priorEpisodes.length - 1; i >= 0; i--) {
-    const ep = priorEpisodes[i]
-    if (ep.kind === 'action') break
-    deps.unshift(ep.episodeId)
-  }
-  return deps
-}
-
-// The pinned anchor: the objective (immutable, Dispatcher-authored). Always present,
-// recited at the tail, NEVER subject to eviction — small and structured by
-// construction. Locking the objective here is a direct structural fix for the
-// original failure that motivated this project: a run quietly solving a different,
-// more interesting problem than the one asked.
-export function renderPinnedAnchor(objective: string | null): string {
-  if (!objective) return ''
-  return `[OBJECTIVE — immutable, set once by the Dispatcher; never redefine it]\n${objective}`
-}
-
-// Chars-per-token estimate used to translate a token budget into the char counts we can
-// actually measure cheaply on every turn. Conservative for code-heavy content (which
-// tends to run closer to ~3-4 chars/token than prose's ~4-5), so this errs toward
-// evicting slightly MORE than a precise tokenizer would require rather than less — the
-// failure mode we're fixing (root cause above: a char budget that can be satisfied while
-// token usage stays near-full) only gets worse if the estimate under-counts tokens.
+// Chars-per-token estimate used to translate a token budget into the char counts we
+// can actually measure cheaply on every turn. Conservative for code-heavy content
+// (which tends to run closer to ~3-4 chars/token than prose's ~4-5), so this errs
+// toward evicting slightly MORE than a precise tokenizer would require rather than
+// less — the failure mode we're fixing (root cause: a char budget that can be
+// satisfied while token usage stays near-full) only gets worse if the estimate
+// under-counts tokens.
 const CHARS_PER_TOKEN = 3.5
 
 function estimateTokens(msgs: Message[]): number {
@@ -91,59 +37,60 @@ export interface EvictionBudget {
 
 export const DEFAULT_EVICTION_BUDGET: EvictionBudget = { maxTokens: Math.floor(65_536 * 0.7) }
 
-// Deterministic, no-LLM eviction: strips the OLDEST action episodes first (their effect
-// is already durably persisted — a file on disk, a ledger conclusion — so the raw record
-// isn't needed live), then exploratory episodes nothing still-live depends on. Never
-// evicts an exploratory episode while an action still in context depends on it. If that
-// alone isn't enough to reach budget, falls back to truncating long assistant messages
-// (oldest first) — the second pass below — since early-iteration reasoning is generally
-// the lowest-value content left once episodes are exhausted. Runs every turn — cheap
-// enough that "every turn" is the right cadence, unlike LLM compaction. Returns the
-// trimmed messages, which episodeIds were evicted this pass (the caller is responsible
-// for calling ledger.markEpisodeEvicted for each), and before/after token estimates for
+// A message's ledger id, when known — used to label a stub with its recovery
+// pointer (ledger.expand). Passed in parallel to `messages` (same index), since
+// Message itself (the ollama package's own type) carries no id field of its own.
+export type MessageIds = Array<string | undefined>
+
+// Deterministic, no-LLM eviction: strips the OLDEST tool-result messages first
+// (their effect is already durably persisted in the ledger, so the raw record
+// isn't needed live). If that alone isn't enough to reach budget, falls back to
+// truncating long assistant messages (oldest first) — the second pass below —
+// since early-iteration reasoning is generally the lowest-value content left once
+// tool results are exhausted. Runs every turn — cheap enough that "every turn" is
+// the right cadence, unlike LLM compaction. Returns the trimmed messages, which
+// message ids were evicted this pass, and before/after token estimates for
 // logging.
 export function evict(
   messages: Message[],
-  episodes: EpisodeMeta[],
+  messageIds: MessageIds = [],
   budget: EvictionBudget = DEFAULT_EVICTION_BUDGET,
-): { messages: Message[]; evictedEpisodeIds: string[]; tokenEstimateBefore: number; tokenEstimateAfter: number } {
+): { messages: Message[]; evictedMessageIds: string[]; tokenEstimateBefore: number; tokenEstimateAfter: number } {
   const tokensBefore = estimateTokens(messages)
   if (tokensBefore <= budget.maxTokens) {
-    return { messages, evictedEpisodeIds: [], tokenEstimateBefore: tokensBefore, tokenEstimateAfter: tokensBefore }
+    return { messages, evictedMessageIds: [], tokenEstimateBefore: tokensBefore, tokenEstimateAfter: tokensBefore }
   }
 
-  const dependedOn = new Set<string>()
-  for (const ep of episodes) for (const d of ep.dependsOn) dependedOn.add(d)
-
-  // Oldest action episodes first, then exploratory episodes nothing depends on.
-  // episodes is assumed oldest-first (the order they were recorded in).
-  const candidates = episodes
-    .filter(ep => ep.kind === 'action')
-    .concat(episodes.filter(ep => ep.kind === 'exploratory' && !dependedOn.has(ep.episodeId)))
-
-  const evictedEpisodeIds: string[] = []
+  const evictedMessageIds: string[] = []
   const trimmed = messages.map(m => ({ ...m }))
   let remaining = tokensBefore
 
-  for (const ep of candidates) {
+  // Oldest tool messages first — messages is assumed oldest-first (this.history's
+  // own order).
+  for (let i = 0; i < trimmed.length; i++) {
     if (remaining <= budget.maxTokens) break
-    const msg = trimmed[ep.messageIndex]
-    if (!msg || typeof msg.content !== 'string' || msg.content.startsWith('[evicted')) continue
+    const msg = trimmed[i]
+    if (msg.role !== 'tool' || typeof msg.content !== 'string' || msg.content.startsWith('[evicted')) continue
     const before = msg.content.length
-    const stub = `[evicted — episode ${ep.episodeId}, ${before} chars, tool ${ep.tool}; call ledger with action "expand" and this episodeId to recover it]`
+    const id = messageIds[i]
+    // "msg_id" here MUST match the `ledger` tool's actual expand parameter
+    // name (tools/index.ts's `args.msg_id`) — this prose is the only place a
+    // model learns what to pass, and a mismatched key would silently fail the
+    // recovery this stub exists to offer.
+    const recovery = id ? `; msg_id "${id}" to recover` : ''
+    const stub = `[evicted — ${before} chars${recovery}]`
     msg.content = stub
     remaining -= (before - stub.length) / CHARS_PER_TOKEN
-    evictedEpisodeIds.push(ep.episodeId)
+    if (id) evictedMessageIds.push(id)
   }
 
-  // Second pass, "good enough" safety valve: episode eviction only ever touches
-  // tool-result content, so a slice dominated by assistant thinking/content, user
-  // messages, or tool-call argument JSON can still be over budget with zero episodes
-  // left to evict (the second real-run trace in the problem statement: 99% context,
-  // only 1 episode left). Truncate the longest-standing assistant messages, oldest
-  // first, until back under budget or nothing left worth truncating. Not
-  // token-precise — it doesn't need to be; getting from ~94% to ~70% beats staying
-  // at 96% with a technically-satisfied char budget.
+  // Second pass, "good enough" safety valve: tool-message eviction only ever
+  // touches tool-result content, so a slice dominated by assistant thinking/
+  // content, user messages, or tool-call argument JSON can still be over budget
+  // with zero tool messages left to evict. Truncate the longest-standing assistant
+  // messages, oldest first, until back under budget or nothing left worth
+  // truncating. Not token-precise — it doesn't need to be; getting from ~94% to
+  // ~70% beats staying at 96% with a technically-satisfied char budget.
   if (remaining > budget.maxTokens) {
     const TRUNCATE_THRESHOLD = 500 // chars — don't bother with already-short messages
     const TRUNCATE_TO = 200 // keep first N chars + a marker
@@ -151,11 +98,11 @@ export function evict(
       const msg = trimmed[i]
       if (msg.role === 'assistant' && typeof msg.content === 'string' && msg.content.length > TRUNCATE_THRESHOLD) {
         const before = msg.content.length
-        msg.content = msg.content.slice(0, TRUNCATE_TO) + `\n[...truncated from ${before} chars — early-iteration reasoning]`
+        msg.content = msg.content.slice(0, TRUNCATE_TO) + `\n[...truncated from ${before} chars]`
         remaining -= (before - msg.content.length) / CHARS_PER_TOKEN
       }
     }
   }
 
-  return { messages: trimmed, evictedEpisodeIds, tokenEstimateBefore: tokensBefore, tokenEstimateAfter: remaining }
+  return { messages: trimmed, evictedMessageIds, tokenEstimateBefore: tokensBefore, tokenEstimateAfter: remaining }
 }

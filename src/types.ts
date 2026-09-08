@@ -17,7 +17,13 @@ export type AgentEvent =
   | { type: 'start'; model: string; query: string; options: ModelOptions }
   | { type: 'iteration'; current: number; max: number }
   | { type: 'ollama_request'; iteration: number; message_count: number; model: string }
-  | { type: 'thought'; content: string }
+  // content: the model's own visible text alongside/instead of a tool call (Ollama's
+  // message.content). thinking: its separate raw chain-of-thought (message.thinking,
+  // reasoning models only) — the actual internal reasoning, distinct from content.
+  // Either may be present without the other (e.g. a turn that spends its whole
+  // token budget on thinking and never reaches content) — never both absent, since
+  // the emit site only fires when at least one is non-empty.
+  | { type: 'thought'; content?: string; thinking?: string }
   | { type: 'system_prompt'; content: string }
   | { type: 'tool_call'; tool: ToolName; args: Record<string, unknown> }
   // rejected: true marks a HARNESS-level block (role restriction, loop steer/replay) —
@@ -64,12 +70,11 @@ export type AgentEvent =
   // TAGGED with FrameTag (below) by dispatch.ts's spawnFrame — reusing the existing
   // event shapes rather than adding a parallel set for them.
   | { type: 'objective'; text: string }
-  | { type: 'replan'; reason: string }
 
 // Tags a spawned frame's own events (thought/tool_call/tool_result/done/...) with
 // which role produced them and where that frame sits in the delegation tree. An event
-// with no tags is the top-level dispatch narrative (rendered exactly like the baseline
-// single-loop UI); a tagged event belongs inside that frame's own card instead.
+// with no tags is the top-level dispatch narrative; a tagged event belongs inside
+// that frame's own card instead.
 export interface FrameTag {
   __frameId?: string
   __role?: Role
@@ -98,6 +103,13 @@ export interface FrameSpawnRequest {
   assignment: string             // this frame's specific goal/prompt
   dependsOn?: string[]           // frameIds whose distilled conclusion feeds this one
   maxIterations?: number         // per-role default (frames.ts) if omitted
+  // If set, reuse THIS frameId instead of minting a new one, and preload the new
+  // Agent's history from that frameId's existing ledger file (dispatch.ts's
+  // spawnFrame) before its chat() call — the mechanism behind the Dispatcher's
+  // one-persistent-frame-per-session context model (see dispatch.ts's
+  // dispatcherFrameId). The frame is assumed to already be registered in the
+  // session registry from a previous run, so spawnFrame skips registerFrame for it.
+  persistentFrameId?: string
 }
 
 export interface FrameResult {
@@ -110,71 +122,59 @@ export interface FrameResult {
   issues?: string[]
 }
 
-// ── The ledger — five entry shapes, tree-structured (frameId + parentFrameId) ──
-// Append-only JSONL at /workspace/.argo/ledger.jsonl (src/ledger.ts). Every entry
-// carries `ts` (ms epoch) and `kind` as its discriminant.
+// ── The ledger — PER-FRAME FILES ──
+// One append-only JSONL file per frame under /workspace/.argo/frames/ (src/ledger.ts),
+// registered in /workspace/.argo/sessions.json. Frame identity comes from WHICH FILE
+// an entry lives in — there is no frameId/taskId/agent field on the entry itself any
+// more. Chronological order is append order (no `ts` field needed either). This is
+// deliberately the SAME shape as a chat message — no separate delegation/conclusion/
+// standup/injection/episode bookkeeping — so the ledger stays simple enough for the
+// model itself to read back via the `ledger` tool (tools/index.ts), which strips
+// even further down to {id, role, content} before returning it to the model.
+export interface LedgerMessage {
+  // Core fields (what agents see via the ledger tool):
+  id: string                    // unique message ID for expand recovery
+  role: 'system' | 'user' | 'assistant' | 'tool'
+  content: string
 
-export interface LedgerDelegationEntry {
-  kind: 'delegation'
-  ts: number
-  frameId: string
-  parentFrameId: string | null
-  from: Role | 'harness'
-  to: Role
-  prompt: string
-  contextGiven?: string[]
+  // UI metadata (stored in the file, NOT returned to agents):
+  thinking?: string             // model's chain-of-thought (separate from content)
+  toolName?: string             // tool name (on tool_call and tool_result entries)
+  toolArgs?: Record<string, unknown>  // structured tool arguments
+  durationMs?: number           // tool execution time in ms
+  error?: boolean               // true if tool result was an error
+  promptTokens?: number         // tokens in the prompt this turn
+  generatedTokens?: number      // tokens generated this turn
+  totalDurationMs?: number      // total Ollama response time in ms
+  model?: string                // model name — set on the first message of a frame
+  modelOptions?: ModelOptions   // sampling options — set on the first message of a frame
+  // True ONLY on a follow-up "eviction marker" entry appended AFTER a message's
+  // original entry (ledger.ts's recordMessage, called from agent.ts's
+  // compactHistory once eviction stubs a message in the live in-memory history) —
+  // never on the original entry itself, and never on a `messages`/`expand` result
+  // (see ledger.ts's readFrame/expand for how the two entries that can share one
+  // `id` are told apart). Its own `content` IS the stub text
+  // (`[evicted — N chars; msg_id "..." to recover]`), not the original.
+  evicted?: boolean
 }
 
-export interface LedgerConclusionEntry {
-  kind: 'conclusion'
-  ts: number
-  frameId: string
-  status: FrameStatus
-  summary: string
-  filesTouched: string[]
-  filesWritten: string[]
-  confidence?: number
-  issues?: string[]
+// ── Session registry (src/ledger.ts) ──
+// /workspace/.argo/sessions.json — maps a session to its runs, and each run to the
+// ORDERED list of frames spawned during it (dispatch.ts's spawnFrame registers each
+// one via ledger.registerFrame as it's created). This is the only place frame
+// parentage/role is recorded now — the frame's own ledger file carries no such
+// metadata, since the file IS the frame's scope.
+export interface SessionRegistry {
+  currentSessionId?: string   // the active session — replaces current-session.txt
+  sessions: Array<{
+    id: string              // session ID
+    runs: Array<{
+      startedAt: string     // ISO timestamp
+      frames: Array<{
+        frameId: string     // e.g. "dispatcher-abc"
+        role: Role          // dispatcher/planner/implementer
+        parentFrameId: string | null
+      }>
+    }>
+  }>
 }
-
-export interface LedgerStandupEntry {
-  kind: 'standup'
-  ts: number
-  scope: 'frame' | 'task'
-  frameId?: string
-  covered: number            // action-episode count (task-scope) or step count (frame-scope)
-  summary: string
-  concern?: string
-}
-
-export interface LedgerInjectionEntry {
-  kind: 'injection'
-  ts: number
-  targetFrameId: string
-  message: string
-  reason: string
-  injectedBy: Role | 'harness' | 'loop-detector'
-  expectsResponse?: boolean
-}
-
-export type EpisodeKind = 'exploratory' | 'action'
-
-export interface LedgerEpisodeEntry {
-  kind: 'episode'
-  ts: number
-  frameId: string
-  episodeId: string
-  episodeKind: EpisodeKind
-  tool: string
-  argsSummary: string
-  dependsOn: string[]        // episodeIds this one drew on (harness-inferred by default)
-  evictedAt?: number         // ms epoch when stripped from the live window; undefined = still live
-  fullContent?: string       // the original message content, kept here so expand() is lossless
-}
-
-export type LedgerEntry =
-  | LedgerDelegationEntry
-  | LedgerConclusionEntry
-  | LedgerStandupEntry
-  | LedgerInjectionEntry
-  | LedgerEpisodeEntry
