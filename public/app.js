@@ -63,16 +63,11 @@ scrollBottomBtn.addEventListener('click', () => {
 // fires (fetched once from /status on boot). The donut's ring+tick are drawn
 // from these and redrawn on every token_usage; precise numbers live in the
 // dropdown. The donut's CENTER communicates agent state (see indicatorState).
-// frameId/role: null for the baseline agent's own token_usage (untagged events,
-// the pre-multi-agent path); set to the owning frame's identity when the reading
-// came from a frame-tagged token_usage instead (see handleEvent), so the dropdown
-// can always say WHOSE numbers it's showing rather than an unattributed count.
+// frameId/role identify the owning frame when the reading came from a
+// frame-tagged token_usage (see handleEvent), so the dropdown can always say
+// WHOSE numbers it's showing rather than an unattributed count.
 let ctxState = { promptTokens: 0, numCtx: 0, pct: 0, frameId: null, role: null }
 let compactThreshold = 0.667
-// True while a user-triggered /compact-now is in flight — used to (a) disable the
-// dropdown/modal action and (b) let compaction trace events render even when
-// they'd otherwise be suppressed (e.g. while viewing a past session).
-let manualCompacting = false
 
 // Drives the donut's core color: 'ready' (green) / 'busy' (yellow, running) /
 // 'compacting' (flashing violet) / 'error' (red). Set by setStatus(), except
@@ -141,7 +136,8 @@ function renderDonut() {
 // Update stored context size + redraw. Precise numbers show in the dropdown;
 // the donut itself only ever shows the ring (usage), tick (threshold) and
 // core+center-text (agent state / iteration). frameId/role identify which
-// agent this reading belongs to (see ctxState above); omitted for the baseline.
+// agent this reading belongs to (see ctxState above); omitted for an untagged,
+// harness-level reading.
 function updateCtx(promptTokens, numCtx, frameId = null, role = null) {
   const pct = numCtx ? Math.round(promptTokens / numCtx * 100) : 0
   ctxState = { promptTokens, numCtx, pct, frameId, role }
@@ -150,7 +146,8 @@ function updateCtx(promptTokens, numCtx, frameId = null, role = null) {
 
 // Compact k-token formatting for the dropdown's frame-owned reading, where the
 // role name added ahead of it (see buildCtxDropdown) eats into the available
-// width — the baseline reading keeps the original full toLocaleString() format.
+// width — the untagged, harness-level reading keeps the original full
+// toLocaleString() format.
 function fmtTokensK(n) {
   if (n == null) return '—'
   return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
@@ -328,60 +325,49 @@ settingsPanel.addEventListener('click', e => e.stopPropagation())
 syncSettingsUI()
 
 // ── Inline trace block (in chat) ──────────────────────────────────
-let currentTraceBlock = null
+// There is no longer a wrapping "Run log" DOM element (see startTraceBlock) —
+// traceRunActive is the flag that replaces `!!currentTraceBlock` checks
+// throughout the top-level (untagged-event) trace path.
+let traceRunActive = false
 let traceToolCalls = 0
 let traceStartTime = null
-// Latest iteration number of the CURRENT trace block — drives the collapsed
-// title while running (see addIterationSeparator()).
+// Latest iteration number of the current run.
 let latestIteration = null
 // True once any per-agent conclude card (renderAgentConclusion) has rendered
 // during the CURRENT run — reset per run in startTraceBlock(). Every live run
 // is a dispatch run (see startTraceBlock's comment), so this is set on every
 // normal run; it exists so the harness's own untagged, top-level 'message'/
-// 'done' — which restates the exact same final answer for the (bypassed)
-// baseline-agent code path — doesn't ALSO render a redundant generic "Agent
-// concluded" card on top of the per-agent ones. See renderConclusionCard.
+// 'done' — which restates the exact same final answer — doesn't ALSO render a
+// redundant generic "Agent concluded" card on top of the per-agent ones. See
+// renderConclusionCard.
 let anyFrameConcludedThisRun = false
 
-// ── Collapsed "current activity" pacing ─────────────────────────
-// Trace items append the instant their SSE event arrives, so a fast run's
-// collapsed one-line summary would otherwise flicker through several lines a
-// second. Queue surfaced lines instead: each one stays on screen for at
-// least ACTIVITY_MIN_MS before the next queued one takes over. Nothing is
-// ever dropped — a burst just drains at a readable pace, a little behind
-// live (the expanded trace below still has every item, instantly, in order).
-const ACTIVITY_MIN_MS = 5000
-let activityQueue = []
-let activityTimer = null
+// ── Collapsed "current activity" pacing (retired) ────────────────
+// This used to pace a one-line summary into the wrapping "Run log" block's
+// collapsed subtitle. That block no longer exists (see startTraceBlock's
+// comment) — each agent now has its own independent accordion, so there is
+// no single collapsed line left to surface activity on. surfaceActivity/
+// summarize are kept as no-ops/harmless helpers rather than ripped out of
+// every call site, since each call site still marks a meaningful "something
+// just happened" moment that a future single-line indicator could reuse.
+function surfaceActivity(_text) { /* no-op — see comment above */ }
+function clearActivityQueue() { /* no-op — see comment above */ }
 
-function surfaceActivity(text) {
-  if (!currentTraceBlock) return
-  activityQueue.push(text)
-  pumpActivityQueue()
-}
-
-function pumpActivityQueue() {
-  if (activityTimer || !currentTraceBlock || !activityQueue.length) return
-  currentTraceBlock.subtitle.textContent = activityQueue.shift()
-  activityTimer = setTimeout(() => {
-    activityTimer = null
-    pumpActivityQueue()
-  }, ACTIVITY_MIN_MS)
-}
-
-function clearActivityQueue() {
-  activityQueue = []
-  clearTimeout(activityTimer)
-  activityTimer = null
-}
-
-// One line, no newlines — for the collapsed activity subtitle only; the full
-// text still goes into the expanded trace item body untouched.
+// One line, no newlines — was for the collapsed activity subtitle only; the
+// full text still goes into the expanded trace item body untouched. No
+// longer called anywhere but kept for the same reason as surfaceActivity.
 function summarize(text, max = 90) {
   const oneLine = String(text ?? '').replace(/\s+/g, ' ').trim()
   return oneLine.length > max ? oneLine.slice(0, max - 1) + '…' : oneLine
 }
 
+// Resets per-run trace state at the start of every run. There is no longer a
+// wrapping "Run log" accordion here — every spawned agent gets its own
+// standalone accordion (see getOrCreateRoleCard), rendered directly into
+// #messagesEl, and the plain top-level (untagged-event) trace items render
+// the same way (see addTopLevelTraceHtml/addTraceItem). This function still
+// exists (rather than being called for its side effects) as the one place
+// that clears state which must not leak from one run into the next.
 function startTraceBlock(model) {
   traceToolCalls = 0
   traceStartTime = Date.now()
@@ -398,88 +384,39 @@ function startTraceBlock(model) {
   activeDispatcherFrameId = null
   lastObjectiveText = ''
   lastConclusionKey = ''
-  // Every live run goes through dispatch.ts's runDispatchLoop (server.ts's /chat
-  // never calls the baseline agent.chat() directly), which — on top of every
-  // per-frame conclude card rendered via handleFrameEvent/renderAgentConclusion —
+  // Every live run goes through dispatch.ts's runDispatchLoop, which — on top of
+  // every per-frame conclude card rendered via handleFrameEvent/renderAgentConclusion —
   // ALSO emits its own untagged, harness-level 'message'/'done' with the exact
-  // same final answer, for the (bypassed) baseline-agent code path to render its
-  // own generic "Agent concluded" card. See renderConclusionCard below, which
-  // this flag makes a no-op for the rest of the run once any per-agent conclude
-  // card has already shown that same result.
+  // same final answer, which would otherwise render its own generic "Agent
+  // concluded" card. See renderConclusionCard below, which this flag makes a
+  // no-op for the rest of the run once any per-agent conclude card has already
+  // shown that same result.
   anyFrameConcludedThisRun = false
-
-  const block = document.createElement('div')
-  block.className = 'trace-block running'
-
-  const toggle = document.createElement('div')
-  toggle.className = 'trace-block-toggle'
-
-  const arrow = document.createElement('span')
-  arrow.className = 'trace-block-arrow'
-  arrow.textContent = '▶'
-
-  const titleWrap = document.createElement('div')
-  titleWrap.className = 'trace-block-title-wrap'
-
-  const title = document.createElement('span')
-  title.className = 'trace-block-title'
-  title.textContent = `Running · ${model}`
-
-  const subtitle = document.createElement('span')
-  subtitle.className = 'trace-block-subtitle'
-
-  titleWrap.append(title, subtitle)
-
-  const meta = document.createElement('span')
-  meta.className = 'trace-block-meta'
-
-  toggle.append(arrow, titleWrap, meta)
-  toggle.addEventListener('click', () => {
-    block.classList.toggle('open')
-    arrow.textContent = block.classList.contains('open') ? '▼' : '▶'
-  })
-
-  const items = document.createElement('div')
-  items.className = 'trace-block-items'
-
-  block.append(toggle, items)
-  messagesEl.appendChild(block)
-  maybeAutoScroll()
-
-  currentTraceBlock = { el: block, items, title, subtitle, meta, arrow }
+  // Marks a run as "in progress" for the top-level (untagged-event) trace path —
+  // addTopLevelTraceHtml/addTraceItem/addIterationSeparator all check this rather
+  // than a DOM element, since there's no wrapping block to hold one anymore.
+  traceRunActive = true
 }
 
+// Ends the run's top-level trace state. No DOM to finalize (see startTraceBlock) —
+// this just clears the activity queue and marks the run as no longer active.
 function finalizeTraceBlock() {
-  if (!currentTraceBlock) return
-  const dur = traceStartTime ? ((Date.now() - traceStartTime) / 1000).toFixed(1) : ''
-  // Not "Agent trace" — this is the plain top-level (baseline/untagged-event) run
-  // log, not a container that groups agents together. Each spawned agent instead
-  // gets its OWN standalone, independently-collapsible accordion rendered directly
-  // in #messagesEl (see getOrCreateRoleCard) — a sibling of this block, never nested
-  // inside it.
-  currentTraceBlock.title.textContent = 'Run log'
-  currentTraceBlock.subtitle.textContent = ''
-  currentTraceBlock.meta.textContent = `${traceToolCalls} tool${traceToolCalls !== 1 ? 's' : ''} · ${dur}s`
-  currentTraceBlock.el.classList.remove('running')
   clearActivityQueue()
-  currentTraceBlock = null
+  traceRunActive = false
 }
 
 // Bold full-width divider marking a new iteration — a structural break in
 // the trace, not another event row (no label/body chrome, no left edge to
-// match). Also drives the collapsed title while running: "Iteration N" so
-// glancing at a collapsed block shows how far the run has gotten, instead of
-// a static "Running · model".
+// match). Rendered directly into #messagesEl, a sibling of the chat bubbles,
+// role-card accordions and conclude cards around it — there is no wrapping
+// "Run log" block to append into or to drive a collapsed title on anymore.
 function addIterationSeparator(n) {
   latestIteration = n
-  if (!currentTraceBlock) return null
+  if (!traceRunActive) return null
   const el = document.createElement('div')
   el.className = 'trace-separator'
   el.innerHTML = `<span class="trace-separator-line"></span><span class="trace-separator-label">Iteration ${n}</span><span class="trace-separator-line"></span>`
-  currentTraceBlock.items.appendChild(el)
-  if (currentTraceBlock.el.classList.contains('running')) {
-    currentTraceBlock.title.textContent = `Iteration ${n}`
-  }
+  messagesEl.appendChild(el)
   maybeAutoScroll()
   return el
 }
@@ -597,15 +534,15 @@ function handleEvent(event) {
   // "dispatcher-level" glance the multi-agent UI is built around.
   if (event.__frameId) {
     // token_usage is handled HERE, before the routing below, and deliberately not
-    // inside handleFrameEvent: in multi-agent mode the baseline agent is bypassed
-    // (see CONTEXT-VIEWER-CONTRACT.md) and never emits its own token_usage, so the
-    // donut would otherwise sit frozen near-zero regardless of what the frames are
-    // actually doing. The per-frame Agent instances are the only ones that ever
-    // call the model, so the donut has to read straight off whichever frame's
+    // inside handleFrameEvent: the harness's untagged, top-level path never emits
+    // its own token_usage in multi-agent mode, so the donut would otherwise sit
+    // frozen near-zero regardless of what the frames are actually doing. The
+    // per-frame Agent instances are the only ones that ever call the model, so
+    // the donut has to read straight off whichever frame's
     // token_usage just arrived. This does NOT skip the routing below — it falls
-    // through to handleFrameEvent()/the early return exactly as before, since
-    // token_usage has no role-card representation of its own (see the comment at
-    // the bottom of handleFrameEvent).
+    // through to handleFrameEvent()/the early return exactly as before, which ALSO
+    // uses this same event to annotate the frame's current iteration divider with
+    // its response time (see annotateRoleCardIterationTiming).
     if (event.type === 'token_usage') updateCtx(event.prompt_tokens, event.num_ctx, event.__frameId, event.__role)
     handleFrameEvent(event)
     if (event.type === 'start') {
@@ -636,13 +573,12 @@ function handleEvent(event) {
       break
 
     case 'thought':
-      addTopLevelTraceHtml(buildThoughtEl(event.content))
-      surfaceActivity(summarize(event.content))
+      renderThoughtItems(event, null)
+      surfaceActivity(summarize(event.content || event.thinking))
       break
 
     case 'tool_call': {
       traceToolCalls++
-      for (const el of buildThinkingContentEls(event)) addTopLevelTraceHtml(el)
       addTopLevelToolCall(event.tool, event.args)
       surfaceActivity(event.tool)
       break
@@ -662,12 +598,9 @@ function handleEvent(event) {
     }
 
     case 'message':
-      // The baseline (single-loop) agent's final answer arrives as an
-      // assistant 'message' — rendered as its own conclusion card (see
-      // renderConclusionCard), same family as the per-frame cards below,
-      // rather than a plain chat bubble. (In multi-agent mode this path isn't
-      // taken at all — the baseline loop is bypassed — so it never collides
-      // with the per-frame cards rendered by handleFrameEvent.)
+      // The harness's own untagged, top-level assistant 'message' — rendered
+      // as its own conclusion card (see renderConclusionCard), same family as
+      // the per-frame cards below, rather than a plain chat bubble.
       if (event.role === 'assistant') {
         renderConclusionCard('Agent concluded', event.content)
       }
@@ -717,26 +650,14 @@ function handleEvent(event) {
     }
 
     case 'compact':
-      // A manually triggered compaction (see the indicator dropdown / context
-      // viewer's "Compact now") has no run following it to eventually fire
-      // 'done' and restore status — reflect that here instead of leaving the
-      // dot/indicator stuck on "Running"/"Compacting".
       compactingNow = false
       if (compactStartTime) {
         lastCompactionDurationS = Math.round((Date.now() - compactStartTime) / 1000)
         compactStartTime = null
       }
-      if (event.manual) setStatus('ready', 'Ready')
-      else setStatus('busy', `Running · ${currentRunModel}`)
+      setStatus('busy', `Running · ${currentRunModel}`)
       addTraceItem('compact', `Context compacted (${event.messagesBefore}→${event.messagesAfter} msgs)`, `${event.rangeDescription}\n\n${event.summary}`, true)
       surfaceActivity('Context compacted')
-      // A user-triggered manual compaction (no run to fire 'done') finalizes its
-      // own trace block here; an in-run auto-compaction leaves the block open for
-      // the run to keep filling. The donut's ring keeps showing the last known size.
-      if (manualCompacting) {
-        finalizeTraceBlock()
-        manualCompacting = false
-      }
       break
 
     case 'warning':
@@ -763,28 +684,36 @@ function handleEvent(event) {
   }
 }
 
-// Appends a pre-built HTML element directly into the top-level (current) trace
-// block's item list — the top-level equivalent of addRoleCardHtml, used for
-// formatted tool calls and thinking/content blocks outside any per-frame section.
+// Appends a pre-built HTML element directly into #messagesEl — the top-level
+// equivalent of addRoleCardHtml, used for formatted tool calls and
+// thinking/content blocks outside any per-frame section. There is no wrapping
+// "Run log" block to append into anymore (see startTraceBlock's comment); this
+// still gates on traceRunActive so nothing renders once a run has ended.
 function addTopLevelTraceHtml(el) {
-  if (!currentTraceBlock || !el) return
-  currentTraceBlock.items.appendChild(el)
+  if (!traceRunActive || !el) return
+  messagesEl.appendChild(el)
   maybeAutoScroll()
 }
 
 function addTopLevelToolCall(tool, args) {
   const wrap = document.createElement('div')
   wrap.innerHTML = formatToolCall(tool, args)
+  wireToolCallExpanders(wrap)
   addTopLevelTraceHtml(wrap.firstElementChild)
 }
 
 // Renders one PERSISTED (replayed) event into the trace/chat. Reuses the same
 // DOM helpers as the live path for identical visual output, but omits every
-// live-only side effect (status bar, busy state, git/file refreshes, iteration
-// and token counters — those reflect a *running* agent, not history). Unlike the
-// live path it also renders user messages: on replay there is no submit handler
-// to have added them optimistically. ollama_request / token_usage are live-only
-// telemetry with nothing to draw into the trace.
+// live-only side effect (status bar, busy state, git/file refreshes, the
+// top-level iteration/token counters — those reflect a *running* agent, not
+// history). Unlike the live path it also renders user messages: on replay
+// there is no submit handler to have added them optimistically. A tagged
+// event still goes through the shared handleFrameEvent() below exactly like
+// the live path, so a replayed run's role-card accordions show the same
+// per-iteration dividers and response timings (from 'iteration'/'token_usage')
+// as they did live — only the untagged top-level 'iteration' case (further
+// down) skips the live-only iterLabel/status-bar update. Untagged
+// ollama_request has no role-card representation either way.
 function handleEventForSession(event) {
   if (event.__frameId) {
     handleFrameEvent(event)
@@ -804,12 +733,11 @@ function handleEventForSession(event) {
       break
 
     case 'thought':
-      addTopLevelTraceHtml(buildThoughtEl(event.content))
+      renderThoughtItems(event, null)
       break
 
     case 'tool_call': {
       traceToolCalls++
-      for (const el of buildThinkingContentEls(event)) addTopLevelTraceHtml(el)
       addTopLevelToolCall(event.tool, event.args)
       break
     }
@@ -824,9 +752,9 @@ function handleEventForSession(event) {
 
     case 'message':
       // Only a genuine USER message is a plain chat bubble on replay — the
-      // baseline agent's own final answer renders as a conclusion card (see
-      // the live path in handleEvent for why), same on replay for identical
-      // visual output.
+      // harness's own top-level final answer renders as a conclusion card
+      // (see the live path in handleEvent for why), same on replay for
+      // identical visual output.
       if (event.role === 'assistant') renderConclusionCard('Agent concluded', event.content)
       else addChatMessage(event.role, event.content)
       break
@@ -1045,8 +973,7 @@ async function stopAgent() {
 // the context viewer), and "↺ Clear conversation" (replaces the old
 // standalone new-session button). Reuses the .nav-crumb / .nav-dropdown
 // pattern, so closeAllDropdowns() (outside-click + Escape) closes it for
-// free. "Compact now" lives in the context viewer's title bar instead of
-// here (see viewContext()).
+// free.
 const navCtx = $('nav-ctx')
 const ctxDropdown = $('ctx-dropdown')
 
@@ -1077,8 +1004,8 @@ function buildCtxDropdown() {
     line2.className = 'ctx-status-line2'
     // A frame-owned reading (multi-agent mode) is prefixed with WHOSE context this
     // is, so a number never appears without an owner — see the token_usage handling
-    // in handleEvent(). The baseline (ctxState.role === null) keeps the original
-    // precise format unchanged.
+    // in handleEvent(). An untagged reading (ctxState.role === null) keeps the
+    // original precise format unchanged.
     line2.textContent = ctxState.role
       ? `${(ROLE_META[ctxState.role] || { title: ctxState.role }).title} · ${fmtTokensK(ctxState.promptTokens)} / ${fmtTokensK(ctxState.numCtx)} (${ctxState.pct}%)`
       : `${ctxState.promptTokens.toLocaleString()} / ${ctxState.numCtx.toLocaleString()} tokens · ${ctxState.pct}%`
@@ -1155,64 +1082,15 @@ tokenCounter.addEventListener('click', (e) => {
   }
 })
 
-// Manual compaction. Disabled in the UI while busy/in-flight, but guard anyway.
-// Ensures a trace block exists so the 'compact' event has somewhere to render;
-// that event (see handleEvent) finalizes the block on completion.
-async function compactNow() {
-  if (busy || manualCompacting) return
-  manualCompacting = true
-  const createdBlock = !currentTraceBlock
-  if (createdBlock) startTraceBlock('manual compaction')
-  try {
-    const resp = await fetch(`${API_BASE}/compact-now`, { method: 'POST' })
-    if (resp.status === 409) {
-      showToast('Agent is finishing the previous run — try again in a moment')
-      cleanupManualCompaction(createdBlock)
-      return
-    }
-    const result = await resp.json()
-    if (!resp.ok) {
-      showToast(result.error || 'Failed to compact')
-      cleanupManualCompaction(createdBlock)
-      return
-    }
-    if (!result.compacted) {
-      showToast('Nothing to compact yet')
-      cleanupManualCompaction(createdBlock)
-      return
-    }
-    // Success: the 'compact' event renders into the trace and finalizes the
-    // block (see handleEvent). Nothing more to do here.
-  } catch {
-    showToast('Failed to compact')
-    cleanupManualCompaction(createdBlock)
-  }
-}
-
-// Tear down after a manual compaction that produced no trace: drop the empty
-// block we created (no dangling "0 tools" block), else finalize it.
-function cleanupManualCompaction(createdBlock) {
-  if (createdBlock && currentTraceBlock) {
-    if (currentTraceBlock.items.childElementCount === 0) {
-      currentTraceBlock.el.remove()
-      clearActivityQueue()
-      currentTraceBlock = null
-    } else {
-      finalizeTraceBlock()
-    }
-  }
-  manualCompacting = false
-}
-
 // ── Frame-aware context viewer ──────────────────────────────────────
 // GET /frames lists every frame of the current session (see CONTEXT-VIEWER-CONTRACT.md);
-// GET /context?frame=<id> loads one of them, GET /context with no param is still the
-// baseline agent (bypassed entirely in multi-agent mode — see renderContext()). /frames
-// is the newer of the two routes, so it may 404 if this half of the feature isn't deployed
-// yet on the running server; ctxFramesData stays null in that case and the viewer falls
-// back to the single-context view it always had.
+// GET /context?frame=<id> loads one of them, GET /context with no param loads the
+// harness's own untagged, top-level context. /frames is the newer of the two routes,
+// so it may 404 if this half of the feature isn't deployed yet on the running server;
+// ctxFramesData stays null in that case and the viewer falls back to the single-context
+// view it always had.
 let ctxFramesData = null       // last /frames response, or null when the route is unavailable
-let ctxSelectedFrame = null    // frameId currently shown in #diff-content, or null for the baseline
+let ctxSelectedFrame = null    // frameId currently shown in #diff-content, or null for the untagged context
 
 // Fetches JSON defensively: an unreachable/not-yet-deployed route can 404 with an HTML
 // "Cannot GET …" body, and parsing that as JSON is exactly the
@@ -1231,21 +1109,16 @@ async function fetchJson(url) {
 }
 
 // Default selection per the contract: the frame currently running, else the largest by
-// totalChars (the one actually worth reading) — falling back to the baseline when there
-// are no frames at all yet (a fresh session, or agents mode simply off).
+// totalChars (the one actually worth reading) — falling back to the untagged context
+// when there are no frames at all yet (a fresh session, or agents mode simply off).
 function pickDefaultFrame(framesData) {
   if (framesData.active) return framesData.active
   const frames = framesData.frames || []
   if (!frames.length) return null
+  // Default to the frame with the most content (likely the most interesting)
   let best = frames[0]
   for (const f of frames) if ((f.totalChars ?? 0) > (best.totalChars ?? 0)) best = f
   return best.frameId
-}
-
-function baselineOptionLabel(baselineBypassed) {
-  return baselineBypassed
-    ? 'Baseline agent — bypassed in multi-agent mode'
-    : 'Baseline agent (single-loop)'
 }
 
 // Reuses ROLE_META (the same names the role sections use) rather than inventing a
@@ -1261,16 +1134,12 @@ function renderCtxFrameBar() {
   ctxFrameBar.classList.remove('hidden')
   if (!ctxFramesData) {
     ctxFrameBar.classList.add('note-only')
-    ctxFrameHint.textContent = 'Per-frame inspection needs a server restart — showing the baseline context only.'
+    ctxFrameHint.textContent = 'Per-frame inspection needs a server restart — showing the top-level context only.'
     return
   }
   ctxFrameBar.classList.remove('note-only')
   ctxFrameHint.textContent = ''
   ctxFrameSelect.innerHTML = ''
-  const baseOpt = document.createElement('option')
-  baseOpt.value = ''
-  baseOpt.textContent = baselineOptionLabel(ctxFramesData.baselineBypassed)
-  ctxFrameSelect.appendChild(baseOpt)
   for (const f of ctxFramesData.frames || []) {
     const opt = document.createElement('option')
     opt.value = f.frameId
@@ -1280,30 +1149,9 @@ function renderCtxFrameBar() {
   ctxFrameSelect.value = ctxSelectedFrame ?? ''
 }
 
-// "Compact now" acts on the baseline agent only (src/server.ts's /compact-now targets
-// the single baseline Agent instance) — never offer it for a frame it cannot act on, or
-// for a bypassed baseline that has nothing to compact. Always visible, disabled with an
-// explanatory title rather than hidden, so it doesn't look like a button that silently
-// does nothing.
-function updateCompactBtnState(data) {
-  diffCompactBtn.classList.remove('hidden')
-  const isBaseline = ctxSelectedFrame == null
-  if (!isBaseline) {
-    diffCompactBtn.disabled = true
-    diffCompactBtn.title = 'Compact now only acts on the baseline agent — select it above to use it'
-  } else if (data.baselineBypassed) {
-    diffCompactBtn.disabled = true
-    diffCompactBtn.title = 'Baseline agent is bypassed in multi-agent mode — nothing to compact'
-  } else {
-    diffCompactBtn.disabled = busy || manualCompacting
-    diffCompactBtn.title = 'Compact context now'
-  }
-  diffCompactBtn.textContent = 'Compact now'
-}
-
-// Loads one frame's context (or the baseline's, when frameId is null) into the already-open
-// modal. Shared by viewContext() (initial load) and the selector's change handler / the
-// "Compact now" refresh (neither of which should re-fetch /frames or re-pick a default).
+// Loads one frame's context (or the untagged, top-level context, when frameId is null)
+// into the already-open modal. Shared by viewContext() (initial load) and the
+// selector's change handler.
 async function loadFrameContext(frameId) {
   ctxSelectedFrame = frameId
   if (ctxFramesData) ctxFrameSelect.value = frameId ?? ''
@@ -1315,26 +1163,21 @@ async function loadFrameContext(frameId) {
     showToast('Failed to load context')
     return
   }
-  // Title names the owner (never a bare, unattributed count) but keeps the bypass
-  // explanation itself inside the body (renderContext) rather than repeating it here.
-  const meta = data.role ? (ROLE_META[data.role] || { title: data.role }) : null
-  const owner = meta ? meta.title : 'Baseline agent'
+  // Title names the owner (never a bare, unattributed count).
+  const meta = ROLE_META[data.role] || { title: data.role || 'Agent' }
+  const owner = meta.title
   diffTitle.textContent = `${owner} — Context (${data.messageCount ?? 0} messages · ${(data.totalChars ?? 0).toLocaleString()} chars · num_ctx ${(data.numCtx ?? 0).toLocaleString()})`
   diffContent.innerHTML = renderContext(data)
-  updateCompactBtnState(data)
 }
 
 ctxFrameSelect.addEventListener('change', () => {
   loadFrameContext(ctxFrameSelect.value || null)
 })
 
-// View the exact context the model currently sees. Read-only; reuses #diff-modal. The
-// modal's title bar carries a "Compact now" action (replacing the old dropdown item);
-// see updateCompactBtnState() for when it's actually enabled.
+// View the exact context the model currently sees. Read-only; reuses #diff-modal.
 async function viewContext() {
   diffTitle.textContent = 'Context'
   diffContent.textContent = 'Loading…'
-  diffCompactBtn.classList.add('hidden')
   ctxFrameBar.classList.add('hidden')
   diffModal.classList.add('open')
 
@@ -1348,22 +1191,9 @@ async function viewContext() {
 
 function renderContext(data) {
   let html = ''
-  // The baseline is bypassed entirely in multi-agent mode (never accumulates history) —
-  // say so plainly instead of letting an empty context read as a bug (see
-  // CONTEXT-VIEWER-CONTRACT.md). Only applies to the baseline (frameId == null); a frame
-  // that is genuinely empty (e.g. spawned but never ran) still falls through to the
-  // ordinary "(empty context)" fallback below.
-  if (data.frameId == null && data.baselineBypassed) {
-    html += '<div class="ctx-msg ctx-bypassed"><div class="ctx-content">Baseline loop — bypassed in multi-agent mode. It never ran this session, so there is nothing here to show. Select a frame above to see what the agents actually did.</div></div>'
-  }
   // Right-aligned wall-clock time (when the message entered the model context, from the
   // backend WeakMap via getContext). Omitted when unknown (e.g. messages restored from disk).
   const timeTag = (ts) => ts != null ? `<span class="ctx-time">${escHtml(new Date(ts).toLocaleTimeString())}</span>` : ''
-  if (data.compaction != null) {
-    const c = data.compaction
-    const text = typeof c === 'string' ? c : JSON.stringify(c, null, 2)
-    html += `<div class="ctx-msg ctx-ledger"><div class="ctx-role"><span>Compaction ledger</span>${timeTag(data.compactionTs)}</div><div class="ctx-content">${escHtml(text)}</div></div>`
-  }
   for (const m of (data.messages ?? [])) {
     const role = String(m.role ?? '')
     html += `<div class="ctx-msg"><div class="ctx-role ctx-role-${escHtml(role)}"><span>${escHtml(role)} · ${(m.chars ?? 0).toLocaleString()} chars</span>${timeTag(m.ts)}</div><div class="ctx-content">${escHtml(m.content ?? '')}</div></div>`
@@ -1392,12 +1222,14 @@ sendBtn.addEventListener('mouseleave', () => {
   sendStop.classList.add('hidden')
 })
 
-// `container` defaults to the top-level trace block's own item list, but a role
-// card (see below) passes its OWN nested items list so the same rendering logic
-// (label/body/expand-on-long-text) works identically whether an event belongs to
-// the top-level run or to one specific agent's turn inside it.
+// `container` defaults to #messagesEl itself (the top-level, untagged-event
+// trace has no wrapping block to hold its own item list anymore — see
+// startTraceBlock's comment), but a role card (see below) passes its OWN
+// nested items list so the same rendering logic (label/body/expand-on-long-text)
+// works identically whether an event belongs to the top-level run or to one
+// specific agent's turn inside it.
 function addTraceItem(className, label, body, collapsible, container) {
-  const target = container || (currentTraceBlock && currentTraceBlock.items)
+  const target = container || (traceRunActive ? messagesEl : null)
   if (!target) return null
   const el = document.createElement('div')
   el.className = `trace-item ${className}`
@@ -1441,9 +1273,9 @@ function addTraceItem(className, label, body, collapsible, container) {
 // ── Multi-agent architecture (config.agents) — per-agent accordions ──────────────
 // Every event a spawned frame produces (thought/tool_call/plan/done/...) arrives
 // tagged with __frameId/__role/__parentFrameId (see types.ts's FrameTag); an
-// untagged event is the top-level dispatch narrative, rendered exactly like the
-// single-loop baseline (unchanged code path below). A tagged event instead goes
-// into its OWN standalone collapsible accordion for that one frame's turn — a
+// untagged event is the top-level dispatch narrative, rendered by the plain top-level
+// code path (unchanged code path below). A tagged event instead goes into its OWN
+// standalone collapsible accordion for that one frame's turn — a
 // direct sibling of chat bubbles/conclude cards in #messagesEl's flat chronological
 // flow, since dispatch is strictly sequential (docs/subagents-plan.md's hard
 // no-parallelism rule), so execution order alone already shows which agent ran
@@ -1526,7 +1358,11 @@ function getOrCreateRoleCard(frameId, role, assignment) {
   messagesEl.appendChild(card)
   maybeAutoScroll()
 
-  const record = { el: card, arrow, items, role, status: null }
+  // iterations/startTime/lastOllamaMs track this frame's own progress for the
+  // iteration-counter/timing annotations (see handleFrameEvent's 'iteration'/
+  // 'token_usage' cases) and the conclude card's "N iterations · Ts" meta line
+  // (see renderAgentConclusion).
+  const record = { el: card, arrow, items, role, status: null, iterations: 0, startTime: Date.now(), lastOllamaMs: null }
   roleCards.set(frameId, record)
   return record
 }
@@ -1535,6 +1371,54 @@ function addRoleCardItem(frameId, className, label, body, collapsible) {
   const card = roleCards.get(frameId)
   if (!card) return
   addTraceItem(className, label, body, collapsible, card.items)
+}
+
+// Per-frame iteration divider — the role-card counterpart to the top-level
+// addIterationSeparator(). Rendered INSIDE the accordion's own items list
+// (unlike the top-level one, which has no card to nest inside) so a
+// multi-agent run's trace still shows "which iteration is this" per agent.
+// Stashes the element on the card record (as `lastIterEl`) so a following
+// 'token_usage' event — which carries the response's timing but has no
+// separator of its own — can annotate THIS most recent divider with it
+// once it arrives (see the 'token_usage' case in handleFrameEvent).
+function addRoleCardIterationSeparator(frameId, n) {
+  const card = roleCards.get(frameId)
+  if (!card) return null
+  card.iterations = n
+  // Stop any previous iteration's live timer before starting a new one
+  if (card.iterTimerId) { clearInterval(card.iterTimerId); card.iterTimerId = null }
+  const el = document.createElement('div')
+  el.className = 'trace-separator'
+  el.innerHTML = `<span class="trace-separator-line"></span><span class="trace-separator-label">Iteration ${n}</span><span class="trace-separator-line"></span>`
+  card.items.appendChild(el)
+  card.lastIterEl = el
+  // Start a live elapsed-time counter that ticks until token_usage arrives
+  const startTime = Date.now()
+  const label = el.querySelector('.trace-separator-label')
+  card.iterTimerId = setInterval(() => {
+    if (!label) return
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
+    label.textContent = `Iteration ${n} (${elapsed}s…)`
+  }, 100)
+  maybeAutoScroll()
+  return el
+}
+
+// Replaces the live elapsed counter with the actual response time once known.
+// The divider renders immediately on 'iteration' with a ticking counter; the
+// 'token_usage' event carries the real timing and stops the timer.
+function annotateRoleCardIterationTiming(frameId, ms) {
+  const card = roleCards.get(frameId)
+  if (!card) return
+  card.lastOllamaMs = ms
+  // Stop the live counter
+  if (card.iterTimerId) { clearInterval(card.iterTimerId); card.iterTimerId = null }
+  const el = card.lastIterEl
+  if (!el) return
+  const label = el.querySelector('.trace-separator-label')
+  if (!label) return
+  const base = label.textContent.replace(/\s*\([\d.]+s[…)]*\)$/, '')
+  label.textContent = `${base} (${(ms / 1000).toFixed(1)}s)`
 }
 
 // Appends a pre-built HTML element (used for formatted tool calls / thinking /
@@ -1557,6 +1441,7 @@ function addRoleCardHtml(frameId, el) {
 function closeRoleCardQuiet(frameId) {
   const card = roleCards.get(frameId)
   if (!card) return
+  if (card.iterTimerId) { clearInterval(card.iterTimerId); card.iterTimerId = null }
   card.el.classList.remove('active')
 }
 
@@ -1569,15 +1454,75 @@ function closeRoleCard(frameId) {
 }
 
 // ── Per-tool formatted call display ──────────────────────────────
+// A tool call's own content (a bash script, a write_file body, an edit's
+// old/new blocks, a long conclude message) can run many lines — heredocs,
+// pipelines, Playwright scripts, whole-file rewrites. Long tool RESULTS
+// already collapse (see addTraceItem's `collapsible` param); this gives
+// tool CALLS the same treatment. Building raw HTML strings here (rather than
+// DOM elements, like addTraceItem) rules out addTraceItem's `.onclick =`
+// approach — wireToolCallExpanders() below attaches the toggle listeners
+// once, after the string is parsed into real DOM by the caller.
+const TOOL_CALL_COLLAPSE_LINES = 4
+
+// Renders one code/text block as either a plain <pre><code> (short content)
+// or a collapsed one with a "▼ Show more" toggle (content past
+// TOOL_CALL_COLLAPSE_LINES lines) — the tool-call counterpart of
+// addTraceItem's collapsible .trace-body. Collapsed by default: unlike a
+// 'thought' (the substance of a turn, shown expanded), a multi-line script or
+// file body is the kind of thing worth a glance-and-skip most of the time.
+// `heading` (optional) labels a block within a tool call that has more than
+// one (e.g. edit_file's "Old"/"New") — omitted for a single-block tool call.
+// `extraClass` (optional) adds a caller-specific class to the collapsed <pre>
+// (e.g. conclude's "conclude-message-code") without post-hoc string surgery.
+function collapsibleCodeHtml(text, heading, extraClass) {
+  const str = String(text ?? '')
+  const lines = str.split('\n')
+  const headingHtml = heading ? `<div class="tool-call-block-label">${escHtml(heading)}</div>` : ''
+  if (lines.length <= TOOL_CALL_COLLAPSE_LINES) {
+    return `${headingHtml}<pre><code>${escHtml(str)}</code></pre>`
+  }
+  const preview = lines.slice(0, 3).join('\n')
+  const preClass = extraClass ? `tool-call-code collapsed ${extraClass}` : 'tool-call-code collapsed'
+  // Both the collapsed preview and the full text are pre-rendered into the DOM
+  // (not re-rendered on toggle) — the toggle just swaps which <code> is
+  // visible, same "cheap, no re-render" approach as .thinking-body/.trace-body.
+  return `${headingHtml}`
+    + `<pre class="${preClass}"><code class="tcc-preview">${escHtml(preview)}</code><code class="tcc-full">${escHtml(str)}</code></pre>`
+    + `<button type="button" class="expand-btn tool-call-expand">▼ Show more (${lines.length} lines)</button>`
+}
+
+// Wires up every collapsed code block's toggle inside a just-inserted tool-call
+// element. Call sites build the HTML via formatToolCall() then set it via
+// innerHTML (so the browser parses it into real elements first) — this attaches
+// the actual click behavior afterward, same two-step as renderThoughtItems
+// would need if it built strings instead of elements.
+function wireToolCallExpanders(root) {
+  if (!root || !root.querySelectorAll) return
+  root.querySelectorAll('.tool-call-expand').forEach(btn => {
+    const pre = btn.previousElementSibling
+    if (!pre || !pre.classList.contains('tool-call-code')) return
+    const lineMatch = btn.textContent.match(/\((\d+) lines\)/)
+    const lineCount = lineMatch ? lineMatch[1] : ''
+    let expanded = false
+    btn.addEventListener('click', () => {
+      expanded = !expanded
+      pre.classList.toggle('collapsed', !expanded)
+      btn.textContent = expanded ? '▲ Collapse' : `▼ Show more (${lineCount} lines)`
+    })
+  })
+}
+
 // Replaces the old raw JSON.stringify(event.args, null, 2) dump with a small,
 // tool-specific rendering. Returns an HTML string (caller wraps it in whatever
-// container is appropriate — a role-card item or a top-level trace item).
+// container is appropriate — a role-card item or a top-level trace item) —
+// callers MUST run the result through wireToolCallExpanders() once inserted,
+// so any collapsible block built by collapsibleCodeHtml() above actually toggles.
 function formatToolCall(tool, args) {
   args = args || {}
   switch (tool) {
     case 'bash': {
       const cmd = args.command ?? args.cmd ?? ''
-      return `<div class="tool-call"><strong>Bash</strong><pre><code>${escHtml(String(cmd))}</code></pre></div>`
+      return `<div class="tool-call"><strong>Bash</strong>${collapsibleCodeHtml(cmd)}</div>`
     }
     case 'read_file': {
       const path = args.path ?? ''
@@ -1589,16 +1534,28 @@ function formatToolCall(tool, args) {
     }
     case 'write_file': {
       const path = args.path ?? ''
-      return `<div class="tool-call"><strong>Write file</strong> <code>${escHtml(String(path))}</code></div>`
+      const content = args.content ?? ''
+      return `<div class="tool-call"><strong>Write file</strong> <code>${escHtml(String(path))}</code>${collapsibleCodeHtml(content)}</div>`
     }
     case 'edit_file': {
       const path = args.path ?? ''
-      return `<div class="tool-call"><strong>Edit file</strong> <code>${escHtml(String(path))}</code></div>`
+      const oldStr = args.old_string ?? args.old ?? ''
+      const newStr = args.new_string ?? args.new ?? ''
+      return `<div class="tool-call"><strong>Edit file</strong> <code>${escHtml(String(path))}</code>`
+        + collapsibleCodeHtml(oldStr, 'Old')
+        + collapsibleCodeHtml(newStr, 'New')
+        + `</div>`
     }
     case 'conclude': {
       const status = args.status ?? args.outcome ?? ''
       const message = args.message ?? args.content ?? ''
-      return `<div class="tool-call conclude"><strong>Concluded</strong>${status ? ` <span class="status">${escHtml(String(status))}</span>` : ''}<div class="conclude-message">${escHtml(String(message))}</div></div>`
+      // A long conclude message collapses just like any other block — the
+      // "Old"/"New"-style heading is omitted since there's only ever one.
+      const msgLines = String(message ?? '').split('\n')
+      const messageHtml = msgLines.length > TOOL_CALL_COLLAPSE_LINES
+        ? collapsibleCodeHtml(message, null, 'conclude-message-code')
+        : `<div class="conclude-message">${escHtml(String(message))}</div>`
+      return `<div class="tool-call conclude"><strong>Concluded</strong>${status ? ` <span class="status">${escHtml(String(status))}</span>` : ''}${messageHtml}</div>`
     }
     case 'web_search': {
       const q = args.query ?? args.q ?? ''
@@ -1617,83 +1574,20 @@ function formatToolCall(tool, args) {
     }
     default: {
       const body = JSON.stringify(args, null, 2)
-      return `<div class="tool-call"><strong>${escHtml(tool || 'Tool')}</strong><pre><code>${escHtml(body)}</code></pre></div>`
+      return `<div class="tool-call"><strong>${escHtml(tool || 'Tool')}</strong>${collapsibleCodeHtml(body)}</div>`
     }
   }
 }
 
-// Builds the "Thinking" block for a 'thought' AgentEvent (msg.content — the
-// assistant's own textual reasoning/response, emitted alongside or instead of a
-// tool call — see agent.ts's emitAndLog({ type: 'thought', ... })). This is the
-// UI counterpart of the "#### Thinking" section in the Markdown trace log
-// (al-logger.ts's logResponse) — the SAME text must show up here, not just get
-// silently dropped whenever a turn has no tool call to hang it off of.
-// Whitespace-preserving (pre-wrap, via .trace-thought-body in styles.css) and
-// collapsible for long text, expanded by default (a thought is the actual
-// substance of the agent's turn, worth seeing without an extra click — unlike
-// a tool result, which defaults collapsed).
-function buildThoughtEl(content) {
-  const text = String(content ?? '')
-  const wrap = document.createElement('div')
-  wrap.className = 'trace-thought'
-  const label = document.createElement('strong')
-  label.textContent = 'Thinking'
-  const body = document.createElement('div')
-  body.className = 'trace-thought-body'
-  body.textContent = text
-  wrap.append(label, body)
-
-  if (text.length > 300) {
-    const btn = document.createElement('button')
-    btn.className = 'expand-btn'
-    let expanded = true
-    btn.textContent = '▲ Collapse'
-    btn.onclick = () => {
-      expanded = !expanded
-      body.classList.toggle('collapsed', !expanded)
-      btn.textContent = expanded ? '▲ Collapse' : '▼ Show all'
-    }
-    wrap.appendChild(btn)
-  }
-  return wrap
-}
-
-// Builds the optional "Thinking" (collapsible) and "Content" blocks that precede
-// a model response's tool calls, when the event carries them. Returns an array of
-// DOM elements (possibly empty) — used by both the top-level and per-frame paths.
-function buildThinkingContentEls(event) {
-  const els = []
-  if (event.thinking) {
-    const wrap = document.createElement('div')
-    wrap.className = 'trace-item thinking-block'
-    const btn = document.createElement('button')
-    btn.className = 'expand-btn thinking-toggle'
-    btn.textContent = '▶ Thinking'
-    const body = document.createElement('div')
-    body.className = 'trace-body collapsed thinking-body'
-    body.textContent = event.thinking
-    let expanded = false
-    btn.onclick = () => {
-      expanded = !expanded
-      body.classList.toggle('collapsed', !expanded)
-      btn.textContent = expanded ? '▼ Thinking' : '▶ Thinking'
-    }
-    wrap.append(btn, body)
-    els.push(wrap)
-  }
-  if (event.content) {
-    const wrap = document.createElement('div')
-    wrap.className = 'trace-item content-block'
-    const label = document.createElement('div')
-    label.className = 'trace-label'
-    label.textContent = 'Content'
-    const body = document.createElement('div')
-    body.className = 'trace-body'
-    body.textContent = event.content
-    wrap.append(label, body)
-    els.push(wrap)
-  }
-  return els
+// Renders a 'thought' AgentEvent's fields into a container using addTraceItem
+// (the same rendering path as Bash/Result/Warning/etc.). Two distinct fields:
+//   event.thinking — the model's internal chain-of-thought. Collapsible.
+//   event.content  — the model's visible response text. Collapsible.
+// Either can appear alone. `container` is the DOM element to append into
+// (a role card's items list, or null for the top-level messagesEl).
+function renderThoughtItems(event, container) {
+  if (event.thinking) addTraceItem('reasoning', 'Reasoning', event.thinking, true, container)
+  if (event.content) addTraceItem('response', 'Response', event.content, true, container)
 }
 
 // Routes ONE tagged event into its frame's role card. Shared by the live and replay
@@ -1707,11 +1601,10 @@ function handleFrameEvent(event) {
       getOrCreateRoleCard(frameId, role, event.query)
       break
     case 'thought':
-      // The model's own textual reasoning/response for this turn — must show up
-      // in the accordion exactly like it does in the Markdown trace log's
-      // "#### Thinking" section, not just be swallowed because there's no tool
-      // call to hang it off of. See buildThoughtEl.
-      addRoleCardHtml(frameId, buildThoughtEl(event.content))
+      // The model's reasoning (event.thinking) and visible text (event.content)
+      // rendered the same way as tool results/warnings — via addTraceItem into
+      // this frame's role card items.
+      renderThoughtItems(event, roleCards.get(frameId)?.items)
       break
     case 'tool_call': {
       // The 'conclude' call itself never renders as a trace item — the conclude
@@ -1724,9 +1617,9 @@ function handleFrameEvent(event) {
         if (card) card.status = event.args?.status ?? event.args?.outcome ?? null
         break
       }
-      for (const el of buildThinkingContentEls(event)) addRoleCardHtml(frameId, el)
       const wrap = document.createElement('div')
       wrap.innerHTML = formatToolCall(event.tool, event.args)
+      wireToolCallExpanders(wrap)
       addRoleCardHtml(frameId, wrap.firstElementChild)
       break
     }
@@ -1772,8 +1665,22 @@ function handleFrameEvent(event) {
       addRoleCardItem(frameId, 'error-item', 'Error', event.message, false)
       closeRoleCard(frameId)
       break
-    // iteration / token_usage / ollama_request: live-only telemetry with
-    // nothing worth a per-frame UI element.
+    case 'iteration':
+      // Mirrors the top-level addIterationSeparator(), but nested inside this
+      // frame's own accordion and counted on the card record (roleCards) for
+      // the conclude card's "N iterations" meta line — see renderAgentConclusion.
+      addRoleCardIterationSeparator(frameId, event.current)
+      break
+    case 'token_usage':
+      // eval_duration_ms/total_duration_ms cover the thinking + generation time
+      // for the response that just arrived — annotate the iteration divider it
+      // belongs to (see annotateRoleCardIterationTiming) rather than adding a
+      // separate trace item just for a number.
+      if (event.total_duration_ms != null) annotateRoleCardIterationTiming(frameId, event.total_duration_ms)
+      break
+    // ollama_request: carries iteration/message_count ahead of the response
+    // itself, but nothing here isn't already covered by 'iteration' (the
+    // divider) and 'token_usage' (the timing) — no separate UI element.
   }
 }
 
@@ -1783,7 +1690,7 @@ function handleFrameEvent(event) {
 // the chat immediately (which would show it ABOVE the Dispatcher's trace, i.e.
 // before the work that produced it), it's held until the most recently active
 // Dispatcher frame card closes, then appended right after. If no Dispatcher frame
-// is currently open (baseline/legacy path, or the event arrived with nothing to
+// is currently open (legacy path, or the event arrived with nothing to
 // wait for), it renders immediately as before.
 function renderObjective(event) {
   lastObjectiveText = String(event.text ?? '')
@@ -1836,10 +1743,10 @@ function stripDuplicatedObjective(text) {
 // Agent-conclusion card — the harness's 'done' content, displayed as its OWN
 // card (same visual family as the Objective card, distinct accent) rather
 // than as a plain chat message. Rendered AFTER that agent's trace section
-// (role card, or the top-level run for the baseline). `label` is the
+// (role card, or the top-level run). `label` is the
 // heading, e.g. "Dispatcher concluded" / "Implementer concluded".
 // Guards against rendering the exact same conclusion twice under the same label —
-// some harness builds emit the baseline's final answer on BOTH the 'message' and
+// some harness builds emit the same final answer on BOTH the 'message' and
 // 'done' events; only the first should become a card.
 let lastConclusionKey = ''
 
@@ -1889,18 +1796,29 @@ function renderAgentConclusion(frameId, role, status, content) {
   lastConclusionKey = key
   // Marks this run as having a per-agent conclude card — see the flag's own
   // comment — so the harness's own top-level 'message'/'done' (dispatch.ts's
-  // untagged echo of the same final answer, for the bypassed baseline path)
-  // doesn't ALSO render a generic "Agent concluded" card underneath/on top of
-  // this one. Set even if the text below turns out to be empty after stripping
-  // a duplicated objective — a real per-agent conclusion happened either way.
+  // untagged echo of the same final answer) doesn't ALSO render a generic
+  // "Agent concluded" card underneath/on top of this one. Set even if the
+  // text below turns out to be empty after stripping a duplicated objective —
+  // a real per-agent conclusion happened either way.
   anyFrameConcludedThisRun = true
   const text = stripDuplicatedObjective(String(content))
   if (!text.trim()) return
   const statusClass = status ? `status-${String(status).toLowerCase()}` : ''
   const el = document.createElement('div')
   el.className = `message conclusion agent-conclusion md ${statusClass}`.trim()
+  // "N iterations · Ts" meta line — tracked per-frame on the role card record
+  // (iterations incremented on each 'iteration' event, startTime stamped when
+  // the card was created — see getOrCreateRoleCard/addRoleCardIterationSeparator).
+  // Omitted (rather than showing "0 iterations · 0.0s") for a card that somehow
+  // has no record left (frameId not in roleCards) — should not normally happen,
+  // since this is called right after closeRoleCardQuiet() on the SAME frameId.
+  const card = roleCards.get(frameId)
+  const metaHtml = card
+    ? `<span class="conclude-meta">${card.iterations} iteration${card.iterations !== 1 ? 's' : ''} · ${((Date.now() - card.startTime) / 1000).toFixed(1)}s</span>`
+    : ''
   el.innerHTML = `<div class="conclusion-title">${escHtml(role)} concluded`
     + (status ? `<span class="status">${escHtml(String(status))}</span>` : '')
+    + metaHtml
     + `</div><div class="conclusion-text">${renderMarkdown(text)}</div>`
   el.querySelectorAll('a').forEach(a => a.setAttribute('target', '_blank'))
   messagesEl.appendChild(el)
@@ -2213,7 +2131,8 @@ async function newSession() {
   await fetch(`${API_BASE}/reset`, { method: 'POST' })
   sessionStartTime = new Date()
   currentSessionQuery = ''
-  currentTraceBlock = null
+  traceRunActive = false
+  roleCards.clear()
   messagesEl.innerHTML = '<div class="message system">New session started.</div>'
   messagesAtBottom = true
   scrollBottomBtn.classList.add('hidden')
@@ -2357,7 +2276,6 @@ async function refreshGitLog() {
 async function showDiff(hash) {
   diffContent.textContent = 'Loading…'
   diffTitle.textContent = hash.slice(0, 7)
-  diffCompactBtn.classList.add('hidden')
   ctxFrameBar.classList.add('hidden')   // this modal use has no frames to pick from
   diffModal.classList.add('open')
 
@@ -2387,34 +2305,6 @@ function colorize(text) {
 $('refresh-git').addEventListener('click', refreshGitLog)
 $('close-diff').addEventListener('click', () => diffModal.classList.remove('open'))
 diffModal.addEventListener('click', (e) => { if (e.target === diffModal) diffModal.classList.remove('open') })
-
-// "Compact now" in the context viewer's title bar — replaces the old
-// dropdown item. Only meaningfully enabled when idle (see viewContext()); the
-// busy/manualCompacting guard here is a defensive backstop.
-const diffCompactBtn = $('diff-compact-now')
-diffCompactBtn.addEventListener('click', async () => {
-  // updateCompactBtnState() only ever leaves this enabled while the baseline (not a
-  // frame) is selected and not bypassed — but disabled buttons can still receive a
-  // click from some assistive tech, so keep the same defensive re-check as before.
-  if (diffCompactBtn.disabled || busy || manualCompacting) return
-  diffCompactBtn.disabled = true
-  diffCompactBtn.textContent = 'Compacting…'
-  await compactNow()
-  // Reload just the currently selected frame (the baseline, since that's the only
-  // state this button is ever enabled in) rather than the full viewContext() — that
-  // would re-fetch /frames and re-run the active/largest-frame default, silently
-  // switching the view away from what the click was actually about. Guarded by
-  // whether the context viewer (not the git-diff use of this modal, which hides
-  // ctxFrameBar) is still the open view.
-  if (diffModal.classList.contains('open') && !ctxFrameBar.classList.contains('hidden')) {
-    await loadFrameContext(ctxSelectedFrame)
-  } else {
-    // Modal closed (or showing a git diff) mid-compaction — nothing to reload, but
-    // still leave the button in a clean state for whenever it's shown again.
-    diffCompactBtn.disabled = busy || manualCompacting
-    diffCompactBtn.textContent = 'Compact now'
-  }
-})
 
 // ── Files tab ────────────────────────────────────────────────────
 // A single tree rooted at the container's real filesystem (or the mounted

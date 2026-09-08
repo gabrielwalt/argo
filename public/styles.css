@@ -434,7 +434,6 @@ body {
 #diff-content .ctx-role-assistant { color: var(--green); }
 #diff-content .ctx-role-system    { color: var(--gold); }
 #diff-content .ctx-role-tool      { color: var(--blue); }
-#diff-content .ctx-ledger .ctx-role { color: var(--gold); }
 #diff-content .ctx-content {
   padding: 10px;
   white-space: pre-wrap;
@@ -738,9 +737,22 @@ main {
 .conclusion-title { font-weight: 600; color: var(--green); margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
 .conclusion-text { white-space: normal; }
 
+/* Per-agent conclude card's "N iterations · Ts" annotation (renderAgentConclusion
+   in app.js) — sits inline in the title row (.conclusion-title is display:flex),
+   pushed to the far right via margin-left:auto so it reads as metadata rather
+   than competing with the title or status badge. */
+.conclude-meta {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+  opacity: .75;
+  font-weight: 400;
+  font-family: var(--font-mono);
+}
+
 /* Per-agent conclude card (renderAgentConclusion in app.js) — one accordion's
    result, rendered right after it closes. Same card family as .message.conclusion
-   (the baseline's own "Agent concluded"), but distinguished from it visually via
+   (the top-level "Agent concluded" card), but distinguished from it visually via
    .agent-conclusion, and further tinted PER STATUS keyword (SIMPLE/SUCCESS/FAIL/
    ANSWER/...) so a failure reads red at a glance instead of the same green as a
    success. Unrecognized/missing status keywords fall back to the base green. */
@@ -1212,9 +1224,42 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   word-break: break-word;
 }
 
+/* Collapsible tool-call code blocks (collapsibleCodeHtml() in app.js) — the
+   tool-CALL counterpart of .trace-body.collapsed for tool RESULTS. A single
+   <pre class="tool-call-code"> holds both a 3-line .tcc-preview and the full
+   .tcc-full text; only one is shown at a time via the .collapsed toggle, so
+   there's no re-render on expand/collapse. */
+.tool-call-code .tcc-full { display: none; }
+.tool-call-code.collapsed .tcc-preview { display: block; }
+.tool-call-code.collapsed .tcc-full { display: none; }
+.tool-call-code:not(.collapsed) .tcc-preview { display: none; }
+.tool-call-code:not(.collapsed) .tcc-full { display: block; }
+.tool-call-block-label {
+  margin-top: 6px;
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: .05em;
+}
+.tool-call-block-label:first-child { margin-top: 0; }
+.tool-call .tool-call-expand { margin-top: 4px; }
+
 /* Conclude tool call — a status badge plus the concluding message, with
    whitespace/newlines preserved. */
 .tool-call.conclude { border-left: 3px solid var(--gold); }
+.tool-call.conclude pre.conclude-message-code {
+  background: none;
+  border: none;
+  padding: 0;
+  margin-top: 6px;
+}
+.tool-call.conclude pre.conclude-message-code code {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+  color: var(--text);
+  opacity: .9;
+}
 .status {
   display: inline-block;
   padding: 1px 7px;
@@ -1236,42 +1281,11 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   opacity: .9;
 }
 
-/* Thinking (collapsible, defaults closed) / Content blocks shown ahead of a
-   frame's or the top-level run's tool calls — see buildThinkingContentEls(). */
-.thinking-block .thinking-toggle { margin-bottom: 0; }
-.thinking-body { margin-top: 4px; font-style: italic; opacity: .75; }
-.content-block .trace-label { color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: .05em; }
-
-/* The model's own textual reasoning/response for a turn (the 'thought'
-   AgentEvent — see buildThoughtEl() in app.js), rendered directly in an agent's
-   accordion (or the top-level run) alongside its tool calls — the UI counterpart
-   of the Markdown trace log's "#### Thinking" section, so this text is never
-   silently dropped just because the turn also made a tool call. Expanded by
-   default (unlike .thinking-body/.tool-result, which default collapsed) since
-   this IS the substance of the turn; long text still gets a collapse toggle. */
-.trace-thought {
-  padding: 5px 10px;
-  border-radius: 5px;
-  background: var(--surface);
-  animation: trace-in .12s ease-out;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: #93c5fd;
-}
-.trace-thought > strong {
-  display: block;
-  margin-bottom: 3px;
-  font-weight: 700;
-}
-.trace-thought-body {
-  white-space: pre-wrap;
-  word-break: break-word;
-  line-height: 1.4;
-  color: var(--text);
-  opacity: .85;
-}
-.trace-thought-body.collapsed { max-height: 60px; overflow: hidden; }
-.trace-thought .expand-btn { margin-top: 2px; }
+/* Reasoning / Response trace items (rendered via addTraceItem, same as
+   tool-result/warning/etc.). "Reasoning" = model's internal chain-of-thought;
+   "Response" = model's visible text for this turn. */
+.trace-item.reasoning .trace-label { color: #a78bfa; }
+.trace-item.response .trace-label { color: #93c5fd; }
 
 /* ── Git log panel ── */
 #git-panel { border-top: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; }
@@ -1929,27 +1943,6 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   box-shadow: 0 0 0 2px rgba(201,162,39,.07);
 }
 #ctx-frame-hint { font-size: 11px; color: var(--muted); font-style: italic; }
-
-/* Baseline-bypassed notice inside the context viewer — reuses .ctx-msg's card
-   chrome with the semantic "warning" yellow (not an error: the empty context
-   is expected, just easy to mistake for a bug — see CONTEXT-VIEWER-CONTRACT.md). */
-#diff-content .ctx-msg.ctx-bypassed {
-  border-color: rgba(234,179,8,.35);
-  background: rgba(234,179,8,.06);
-}
-#diff-content .ctx-msg.ctx-bypassed .ctx-content { color: var(--yellow); font-style: italic; }
-
-/* "Compact now" in the context viewer's title bar — replaces the old dropdown
-   item; only meaningfully actionable while idle (see viewContext() in app.js). */
-#diff-compact-now {
-  background: none;
-  border: 1px solid var(--border);
-  color: var(--gold);
-  padding: 4px 12px;
-  font-size: 12px;
-}
-#diff-compact-now:hover:not(:disabled) { border-color: var(--gold); }
-#diff-compact-now:disabled { color: var(--muted); opacity: .45; cursor: not-allowed; }
 
 #diff-content {
   overflow: auto;
