@@ -944,7 +944,7 @@ export async function runDispatchLoop(
   // sessionId across runs reuses the existing id, which is what lets spawnFrame's
   // persistentFrameId preload find and extend the right ledger file.
   if (dispatcherFrameSessionId !== currentSessionId) {
-    dispatcherFrameId = `dispatcher-${currentSessionId}`
+    dispatcherFrameId = ledger.newId('dispatcher')
     dispatcherFrameSessionId = currentSessionId
   }
 
