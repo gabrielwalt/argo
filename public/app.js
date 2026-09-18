@@ -58,39 +58,29 @@ scrollBottomBtn.addEventListener('click', () => {
   scrollBottomBtn.classList.add('hidden')
 })
 
-// ── Combined context + status indicator (donut) ────────────────────
-// Latest context size the model saw. The donut's three rings are drawn from
-// per-role state (ctxStateByRole) and redrawn on every token_usage; precise
-// numbers live in the dropdown. The donut's CENTER communicates agent state
-// (see indicatorState). frameId/role identify the owning frame when the
-// reading came from a frame-tagged token_usage (see handleEvent), so the
-// dropdown can always say WHOSE numbers it's showing rather than an
-// unattributed count.
-let ctxState = { promptTokens: 0, numCtx: 0, pct: 0, frameId: null, role: null }
+// ── Combined status indicator ────────────────────────────────────
+// Small toolbar text trigger (#token-counter) — click opens a dropdown with
+// "⚙ Model & parameters" and "↺ Clear conversation". Per-agent token/context
+// data used to live here as a donut with concentric per-role rings; it now
+// lives in the Context tab's sidebar instead (renderCtxAgentList), fed
+// directly from GET /frames polling rather than live token_usage events —
+// see AGENT_COLORS below, still shared with the sidebar and the in-chat
+// role-card accordions.
 
-// Per-agent-role context reading, one entry per concentric ring in the donut
-// (see renderDonut). Updated from token_usage's __role tag; ctxState above
-// stays the single most-recent reading (any role) for the dropdown.
-let ctxStateByRole = {
-  dispatcher:  { promptTokens: 0, numCtx: 0, pct: 0 },
-  planner:     { promptTokens: 0, numCtx: 0, pct: 0 },
-  implementer: { promptTokens: 0, numCtx: 0, pct: 0 },
-}
-
-// Fixed per-role color, used for that role's donut ring, its accordion
-// heading (getOrCreateRoleCard), and its conclude card. Keep in sync with
-// the CSS custom properties (--agent-dispatcher/planner/implementer) and the
-// documentation block at the top of styles.css.
+// Fixed per-role color, used for that role's context-sidebar dot/token bar,
+// its accordion heading (getOrCreateRoleCard), and its conclude card. Keep in
+// sync with the CSS custom properties (--agent-dispatcher/planner/implementer)
+// and the documentation block at the top of styles.css.
 const AGENT_COLORS = {
   dispatcher:  '#f59e0b',  // amber/gold
   planner:     '#a78bfa',  // purple
   implementer: '#34d399',  // green/emerald
 }
 
-// Drives the donut's core color: 'ready' (green) / 'busy' (yellow, running) /
-// 'compacting' (flashing violet) / 'error' (red). Set by setStatus(), except
-// while compactingNow is true, which always wins (a compaction can happen
-// mid-run, and should visually override "Running").
+// Drives the status indicator's text: 'ready' (green) / 'busy' (yellow,
+// running) / 'compacting' (flashing violet) / 'error' (red). Set by
+// setStatus(), except while compactingNow is true, which always wins (a
+// compaction can happen mid-run, and should visually override "Running").
 let indicatorState = 'ready'
 // True while a 'compact' event's eviction pass is in flight, cleared by that same
 // event (or a safety-net clear on the next 'iteration'/'error') — independent of
@@ -101,71 +91,16 @@ let compactingNow = false
 let compactStartTime = null
 let lastCompactionDurationS = null
 
-// HAL 9000-style donut: a solid glowing core (agent state) surrounded by
-// three concentric rings, one per agent role — outer = Dispatcher, middle =
-// Planner, inner = Implementer — each filled to that role's own context
-// usage percentage, in that role's own fixed color (AGENT_COLORS).
-function renderDonut() {
-  const size = 40, cx = 20, cy = 20
-
-  const rings = [
-    { role: 'dispatcher',  r: 16, sw: 3 },
-    { role: 'planner',     r: 12, sw: 3 },
-    { role: 'implementer', r: 8,  sw: 3 },
-  ]
-
-  // Core: solid state color, filling the center like HAL's red eye. Glows to
-  // match the state color (same "shiny" treatment as the home screen's status
-  // dot) and pulses gently while busy/compacting; steady (just the glow)
-  // while ready/idle.
-  const coreColor = { ready: 'var(--green)', busy: 'var(--yellow)', compacting: 'var(--purple)', error: 'var(--red)' }[indicatorState] || 'var(--green)'
-  const coreClass = indicatorState === 'compacting' ? 'ctx-core compacting'
-    : indicatorState === 'busy' ? 'ctx-core running'
-    : 'ctx-core'
-  const coreR = 4
-
-  let svg = `<svg class="ctx-donut" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">`
-
-  for (const ring of rings) {
-    const state = ctxStateByRole[ring.role]
-    const pct = Math.max(0, Math.min(100, state.pct))
-    const circ = 2 * Math.PI * ring.r
-    const dash = circ * (pct / 100)
-    const color = AGENT_COLORS[ring.role]
-    // Background ring (track)
-    svg += `<circle cx="${cx}" cy="${cy}" r="${ring.r}" fill="none" stroke="var(--border)" stroke-width="${ring.sw}" opacity="0.3"/>`
-    // Fill ring
-    if (pct > 0) {
-      svg += `<circle cx="${cx}" cy="${cy}" r="${ring.r}" fill="none" stroke="${color}" stroke-width="${ring.sw}"`
-        + ` stroke-dasharray="${dash.toFixed(2)} ${(circ - dash).toFixed(2)}" transform="rotate(-90 ${cx} ${cy})"/>`
-    }
-  }
-
-  svg += `<circle class="${coreClass}" cx="${cx}" cy="${cy}" r="${coreR}" fill="${coreColor}" style="filter: drop-shadow(0 0 4px ${coreColor})"/>`
-  svg += `</svg>`
-
-  tokenCounter.innerHTML = svg
+// Plain-text status trigger — replaces the old per-role donut SVG. Just the
+// current status word + model (see compactStatusText, defined further down
+// alongside buildCtxDropdown, which this reuses for identical wording).
+function renderStatusIndicator() {
+  tokenCounter.textContent = compactStatusText()
 }
 
-// Update stored context size + redraw. Precise numbers show in the dropdown;
-// the donut itself only ever shows the three per-role rings (usage) and
-// core+center-text (agent state / iteration). frameId/role identify which
-// agent this reading belongs to (see ctxState above); omitted for an untagged,
-// harness-level reading.
-function updateCtx(promptTokens, numCtx, frameId = null, role = null) {
-  if (role && ctxStateByRole[role]) {
-    const pct = numCtx > 0 ? Math.round(100 * promptTokens / numCtx) : 0
-    ctxStateByRole[role] = { promptTokens, numCtx, pct }
-  }
-  const pct = numCtx ? Math.round(promptTokens / numCtx * 100) : 0
-  ctxState = { promptTokens, numCtx, pct, frameId, role }
-  renderDonut()
-}
-
-// Compact k-token formatting for the dropdown's frame-owned reading, where the
-// role name added ahead of it (see buildCtxDropdown) eats into the available
-// width — the untagged, harness-level reading keeps the original full
-// toLocaleString() format.
+// Compact k-token formatting, used by the context sidebar's per-agent token bar
+// (renderCtxAgentList) where a role name/label ahead of it eats into the
+// available width.
 function fmtTokensK(n) {
   if (n == null) return '—'
   return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
@@ -250,7 +185,7 @@ const MAX_ITERATIONS_DEFAULT = 1000
 let maxIterations = MAX_ITERATIONS_DEFAULT
 // Grounding & self-consistency guard (writing/research tasks). Default ON; sent with
 // every /chat request so the worker's per-run flag matches this toggle.
-let grounding = true
+let grounding = false // vestigial — kept to avoid breaking /chat request shape
 
 // ── Settings dropdown — draft-then-apply ────────────────────────────
 // The dropdown no longer live-applies: opening it seeds `settingsDraft` from
@@ -275,7 +210,7 @@ function syncSettingsUI() {
   $('opt-num-ctx').value = src.num_ctx
   $('opt-max-iterations').value = src.maxIterations
   $('opt-max-iterations-val').textContent = src.maxIterations
-  $('opt-grounding').checked = src.grounding
+  // grounding checkbox removed
   const sel = $('opt-model')
   if (sel && src.model && sel.querySelector(`option[value="${src.model}"]`)) sel.value = src.model
 }
@@ -335,14 +270,14 @@ $('opt-max-iterations').addEventListener('input', e => {
   settingsDraft.maxIterations = parseInt(e.target.value, 10)
   $('opt-max-iterations-val').textContent = settingsDraft.maxIterations
 })
-$('opt-grounding').addEventListener('change', e => { if (settingsDraft) settingsDraft.grounding = e.target.checked })
+// grounding checkbox removed
 // Reset restores the DRAFT to defaults (still requires Save to commit), so it
 // composes with the same draft/Save/Cancel flow as every other control.
 $('settings-reset').addEventListener('click', () => {
   if (!settingsDraft) return
   Object.assign(settingsDraft, DEFAULTS)
   settingsDraft.maxIterations = MAX_ITERATIONS_DEFAULT
-  settingsDraft.grounding = true
+  settingsDraft.grounding = false
   syncSettingsUI()
 })
 $('settings-cancel').addEventListener('click', cancelSettingsPanel)
@@ -531,10 +466,11 @@ async function replaySessionRuns(runs) {
   const ordered = (runs ?? []).slice().sort((a, b) => a.startedAt.localeCompare(b.startedAt))
   for (const run of ordered) {
     try {
-      const resp = await fetch(`${API_BASE}/logs/${encodeURIComponent(run.filename)}`)
-      if (!resp.ok) continue
-      const data = await resp.json()
-      for (const evt of (data.events ?? [])) {
+      // Ledger-reconstructed runs (GET /logs) carry their events inline —
+      // no separate file to fetch. Only fall back to GET /logs/:filename for
+      // legacy pre-ledger runs, which have a filename but no `events` field.
+      const events = run.events ?? (await fetch(`${API_BASE}/logs/${encodeURIComponent(run.filename)}`).then(r => r.ok ? r.json() : null).then(data => data?.events)) ?? []
+      for (const evt of events) {
         if (typeof evt.__seq === 'number') lastSeq = evt.__seq
         handleEventForSession(evt)
       }
@@ -561,17 +497,6 @@ function handleEvent(event) {
   // the switch below. Also nudges the status bar to name the active role, the
   // "dispatcher-level" glance the multi-agent UI is built around.
   if (event.__frameId) {
-    // token_usage is handled HERE, before the routing below, and deliberately not
-    // inside handleFrameEvent: the harness's untagged, top-level path never emits
-    // its own token_usage in multi-agent mode, so the donut would otherwise sit
-    // frozen near-zero regardless of what the frames are actually doing. The
-    // per-frame Agent instances are the only ones that ever call the model, so
-    // the donut has to read straight off whichever frame's
-    // token_usage just arrived. This does NOT skip the routing below — it falls
-    // through to handleFrameEvent()/the early return exactly as before, which ALSO
-    // uses this same event to annotate the frame's current iteration divider with
-    // its response time (see annotateRoleCardIterationTiming).
-    if (event.type === 'token_usage') updateCtx(event.prompt_tokens, event.num_ctx, event.__frameId, event.__role)
     handleFrameEvent(event)
     if (event.type === 'start') {
       const meta = ROLE_META[event.__role] || { title: event.__role }
@@ -632,10 +557,6 @@ function handleEvent(event) {
       if (event.role === 'assistant') {
         renderConclusionCard('Agent concluded', event.content)
       }
-      break
-
-    case 'token_usage':
-      updateCtx(event.prompt_tokens, event.num_ctx)
       break
 
     case 'done': {
@@ -821,8 +742,9 @@ function setStatus(state, text) {
   statusDot.className = state === 'ready' ? '' : state
   statusText.textContent = text
   indicatorState = compactingNow ? 'compacting' : state
-  renderDonut()
-  // Keep an open dropdown's status/context rows live rather than stale text.
+  renderStatusIndicator()
+  // Keep an open dropdown's "Clear conversation" disabled state (tied to `busy`)
+  // live rather than stale.
   if (navCtx.classList.contains('open')) buildCtxDropdown()
 }
 
@@ -913,6 +835,14 @@ function setBusy(val) {
   // Leave the textarea enabled while the agent runs so the user can queue prompts.
   inputEl.placeholder = val ? 'Queue a prompt… (Enter to queue)' : originalPlaceholder
 
+  // If the Context tab is already open when a run starts, make sure it's polling —
+  // covers the case where the tab was opened while idle (setFilesMode only starts
+  // polling on the click that opens the tab). Deliberately don't stop polling on
+  // val===false: the tab should keep showing live state until the user switches away
+  // (setFilesMode's stopCtxPolling handles that), including across a finished run in
+  // case another one starts right after.
+  if (val) maybeStartCtxPollingForActiveTab()
+
   if (val) {
     // The boat stays visible: it first departs to the right (beginDepart), and only once
     // that one-shot transition finishes does it start sailing — setSailing randomly
@@ -994,14 +924,15 @@ async function stopAgent() {
 }
 
 // ── Combined indicator dropdown ───────────────────────────────────
-// Clicking the indicator opens a dropdown with a non-clickable 2-line status
-// readout (status+model / precise context numbers) on top, then three
-// clickable actions: "⚙ Model & parameters" (opens the settings panel, which
-// used to be opened by the now-removed gear button), "🔍 View context" (opens
-// the context viewer), and "↺ Clear conversation" (replaces the old
-// standalone new-session button). Reuses the .nav-crumb / .nav-dropdown
-// pattern, so closeAllDropdowns() (outside-click + Escape) closes it for
-// free.
+// Clicking the indicator (a plain status-word trigger — see
+// renderStatusIndicator) opens a dropdown with two clickable actions: "⚙
+// Model & parameters" (opens the settings panel, which used to be opened by
+// the now-removed gear button) and "↺ Clear conversation" (replaces the old
+// standalone new-session button). Precise per-agent token/context numbers
+// used to show here as a non-clickable readout; they now live in the Context
+// tab's sidebar instead (renderCtxAgentList). Reuses the .nav-crumb /
+// .nav-dropdown pattern, so closeAllDropdowns() (outside-click + Escape)
+// closes it for free.
 const navCtx = $('nav-ctx')
 const ctxDropdown = $('ctx-dropdown')
 
@@ -1016,36 +947,6 @@ function compactStatusText() {
 
 function buildCtxDropdown() {
   ctxDropdown.innerHTML = ''
-
-  // Non-clickable 2-line status readout — plain info, not an action.
-  const head = document.createElement('div')
-  head.className = 'ctx-status-head'
-  const line1 = document.createElement('div')
-  line1.className = 'ctx-status-line1'
-  line1.textContent = compactStatusText()
-  head.appendChild(line1)
-  if (ctxState.numCtx) {
-    const line2 = document.createElement('div')
-    line2.className = 'ctx-status-line2'
-    // A frame-owned reading (multi-agent mode) is prefixed with WHOSE context this
-    // is, so a number never appears without an owner — see the token_usage handling
-    // in handleEvent(). An untagged reading (ctxState.role === null) keeps the
-    // original precise format unchanged.
-    line2.textContent = ctxState.role
-      ? `${(ROLE_META[ctxState.role] || { title: ctxState.role }).title} · ${fmtTokensK(ctxState.promptTokens)} / ${fmtTokensK(ctxState.numCtx)} (${ctxState.pct}%)`
-      : `${ctxState.promptTokens.toLocaleString()} / ${ctxState.numCtx.toLocaleString()} tokens · ${ctxState.pct}%`
-    head.appendChild(line2)
-  } else {
-    const line2 = document.createElement('div')
-    line2.className = 'ctx-status-line2 muted'
-    line2.textContent = 'No context yet'
-    head.appendChild(line2)
-  }
-  ctxDropdown.appendChild(head)
-
-  const sep = document.createElement('div')
-  sep.className = 'nav-drop-sep'
-  ctxDropdown.appendChild(sep)
 
   // Action 1 — model & parameters. Opens the LLM settings panel (formerly
   // opened by the standalone gear button, now removed).
@@ -1065,17 +966,12 @@ function buildCtxDropdown() {
   })
   ctxDropdown.appendChild(settingsRow)
 
-  // Action 2 — view context. Opens the context viewer.
-  const ctxRow = document.createElement('div')
-  ctxRow.className = 'nav-drop-item'
-  ctxRow.innerHTML = `<span>🔍 View context</span>`
-  ctxRow.addEventListener('click', () => {
-    navCtx.classList.remove('open')
-    viewContext()
-  })
-  ctxDropdown.appendChild(ctxRow)
+  // "View context" used to live here as a dropdown action that opened a modal —
+  // replaced by the always-available Context tab in the files/changes panel
+  // (see #files-mode-toggle's "Context" button and refreshCtxPanel()), so the
+  // modal path is no longer wired into the UI.
 
-  // Action 3 — clear conversation (was the standalone "＋" button in the breadcrumb;
+  // Action 2 — clear conversation (was the standalone "＋" button in the breadcrumb;
   // now uses a reset-style "↺" glyph, which reads as clearing/restarting rather
   // than adding).
   const clearDisabled = busy
@@ -1107,15 +1003,15 @@ tokenCounter.addEventListener('click', (e) => {
   }
 })
 
-// ── Frame-aware context viewer ──────────────────────────────────────
-// GET /frames lists every frame of the current session (see CONTEXT-VIEWER-CONTRACT.md);
+// ── Frame-aware context data ──────────────────────────────────────
+// GET /frames lists every conversation's frames (see server.ts's ConversationSummary);
 // GET /context?frame=<id> loads one of them, GET /context with no param loads the
 // harness's own untagged, top-level context. /frames is the newer of the two routes,
-// so it may 404 if this half of the feature isn't deployed yet on the running server;
-// ctxFramesData stays null in that case and the viewer falls back to the single-context
-// view it always had.
-let ctxFramesData = null       // last /frames response, or null when the route is unavailable
-let ctxSelectedFrame = null    // frameId currently shown in #diff-content, or null for the untagged context
+// so it may 404 if this half of the feature isn't deployed yet on the running server.
+// This used to back a modal-based context viewer (viewContext()/renderContext(), reusing
+// #diff-modal) opened from the combined indicator's dropdown — replaced by the always-visible
+// Context tab below (see #files-mode-toggle's "context" mode and refreshCtxPanel()), which
+// polls the same two routes into #ctx-panel instead of a one-shot modal.
 
 // Fetches JSON defensively: an unreachable/not-yet-deployed route can 404 with an HTML
 // "Cannot GET …" body, and parsing that as JSON is exactly the
@@ -1131,99 +1027,6 @@ async function fetchJson(url) {
   } catch {
     return null
   }
-}
-
-// Default selection per the contract: the frame currently running, else the largest by
-// totalChars (the one actually worth reading) — falling back to the untagged context
-// when there are no frames at all yet (a fresh session, or agents mode simply off).
-function pickDefaultFrame(framesData) {
-  if (framesData.active) return framesData.active
-  const frames = framesData.frames || []
-  if (!frames.length) return null
-  // Default to the frame with the most content (likely the most interesting)
-  let best = frames[0]
-  for (const f of frames) if ((f.totalChars ?? 0) > (best.totalChars ?? 0)) best = f
-  return best.frameId
-}
-
-// Reuses ROLE_META (the same names the role sections use) rather than inventing a
-// second vocabulary for the same four roles.
-function frameOptionLabel(f) {
-  const meta = ROLE_META[f.role] || { title: f.role }
-  return `${meta.title} (${f.frameId}) · ${(f.totalChars ?? 0).toLocaleString()} chars${f.live ? ' · live' : ''}`
-}
-
-// Rebuilds the selector from ctxFramesData — or, when it's null (no /frames route),
-// drops the select entirely and shows a plain explanatory line instead.
-function renderCtxFrameBar() {
-  ctxFrameBar.classList.remove('hidden')
-  if (!ctxFramesData) {
-    ctxFrameBar.classList.add('note-only')
-    ctxFrameHint.textContent = 'Per-frame inspection needs a server restart — showing the top-level context only.'
-    return
-  }
-  ctxFrameBar.classList.remove('note-only')
-  ctxFrameHint.textContent = ''
-  ctxFrameSelect.innerHTML = ''
-  for (const f of ctxFramesData.frames || []) {
-    const opt = document.createElement('option')
-    opt.value = f.frameId
-    opt.textContent = frameOptionLabel(f)
-    ctxFrameSelect.appendChild(opt)
-  }
-  ctxFrameSelect.value = ctxSelectedFrame ?? ''
-}
-
-// Loads one frame's context (or the untagged, top-level context, when frameId is null)
-// into the already-open modal. Shared by viewContext() (initial load) and the
-// selector's change handler.
-async function loadFrameContext(frameId) {
-  ctxSelectedFrame = frameId
-  if (ctxFramesData) ctxFrameSelect.value = frameId ?? ''
-  diffContent.textContent = 'Loading…'
-  const qs = frameId ? `?frame=${encodeURIComponent(frameId)}` : ''
-  const data = await fetchJson(`${API_BASE}/context${qs}`)
-  if (!data) {
-    diffContent.textContent = 'Failed to load context.'
-    showToast('Failed to load context')
-    return
-  }
-  // Title names the owner (never a bare, unattributed count).
-  const meta = ROLE_META[data.role] || { title: data.role || 'Agent' }
-  const owner = meta.title
-  diffTitle.textContent = `${owner} — Context (${data.messageCount ?? 0} messages · ${(data.totalChars ?? 0).toLocaleString()} chars · num_ctx ${(data.numCtx ?? 0).toLocaleString()})`
-  diffContent.innerHTML = renderContext(data)
-}
-
-ctxFrameSelect.addEventListener('change', () => {
-  loadFrameContext(ctxFrameSelect.value || null)
-})
-
-// View the exact context the model currently sees. Read-only; reuses #diff-modal.
-async function viewContext() {
-  diffTitle.textContent = 'Context'
-  diffContent.textContent = 'Loading…'
-  ctxFrameBar.classList.add('hidden')
-  diffModal.classList.add('open')
-
-  // /frames is the newer of the two routes and may not be deployed yet (see
-  // fetchJson) — that is an expected, quiet fallback, not an error toast.
-  ctxFramesData = await fetchJson(`${API_BASE}/frames`)
-  renderCtxFrameBar()
-  const defaultFrame = ctxFramesData ? pickDefaultFrame(ctxFramesData) : null
-  await loadFrameContext(defaultFrame)
-}
-
-function renderContext(data) {
-  let html = ''
-  // Right-aligned wall-clock time (when the message entered the model context, from the
-  // backend WeakMap via getContext). Omitted when unknown (e.g. messages restored from disk).
-  const timeTag = (ts) => ts != null ? `<span class="ctx-time">${escHtml(new Date(ts).toLocaleTimeString())}</span>` : ''
-  for (const m of (data.messages ?? [])) {
-    const role = String(m.role ?? '')
-    html += `<div class="ctx-msg"><div class="ctx-role ctx-role-${escHtml(role)}"><span>${escHtml(role)} · ${(m.chars ?? 0).toLocaleString()} chars</span>${timeTag(m.ts)}</div><div class="ctx-content">${escHtml(m.content ?? '')}</div></div>`
-  }
-  return html || '<div class="ctx-msg"><div class="ctx-content">(empty context)</div></div>'
 }
 
 // Stop click: intercept button click when busy to cancel instead of submit
@@ -1302,8 +1105,8 @@ function addTraceItem(className, label, body, collapsible, container) {
 // code path (unchanged code path below). A tagged event instead goes into its OWN
 // standalone collapsible accordion for that one frame's turn — a
 // direct sibling of chat bubbles/conclude cards in #messagesEl's flat chronological
-// flow, since dispatch is strictly sequential (docs/subagents-plan.md's hard
-// no-parallelism rule), so execution order alone already shows which agent ran
+// flow, since dispatch is strictly sequential (dispatch.ts's own "no two LLM calls
+// ever run concurrently" rule), so execution order alone already shows which agent ran
 // after which. Each accordion is followed immediately by that frame's own conclude
 // card (see renderAgentConclusion) once it closes.
 //
@@ -1342,7 +1145,7 @@ let lastObjectiveText = ''
 // opt-in detail. `assignment` (the frame's originating query/request) is deliberately
 // NOT rendered here — it's already shown as the user's chat message, and isn't
 // readable in this compact form.
-function getOrCreateRoleCard(frameId, role, assignment) {
+function getOrCreateRoleCard(frameId, role, assignment, implementerIndex) {
   const existing = roleCards.get(frameId)
   if (existing) {
     existing.el.classList.add('active')
@@ -1363,7 +1166,11 @@ function getOrCreateRoleCard(frameId, role, assignment) {
 
   const heading = document.createElement('h3')
   heading.className = 'agent-heading'
-  heading.textContent = meta.title
+  // Numbered when this frame is one of several Implementers a Planner spawned
+  // for one objective (dispatch.ts's taskNumber, threaded through as
+  // __implementerIndex) — e.g. "Implementer Agent 2" — so the trace makes it
+  // clear which of several is which.
+  heading.textContent = meta.title + (implementerIndex ? ` ${implementerIndex}` : '')
   heading.style.color = AGENT_COLORS[role] || 'var(--text)'
 
   // Live status: iteration count + elapsed timer, shown on the toggle row
@@ -1390,7 +1197,14 @@ function getOrCreateRoleCard(frameId, role, assignment) {
   // iteration-counter/timing annotations (see handleFrameEvent's 'iteration'/
   // 'token_usage' cases) and the conclude card's "N iterations · Ts" meta line
   // (see renderAgentConclusion).
-  const record = { el: card, arrow, items, role, status: null, iterations: 0, startTime: Date.now(), lastOllamaMs: null, statusSpan, runTimerId: null }
+  // hadContentThisIteration/lastIterEl (see addRoleCardIterationSeparator and
+  // pruneTrailingEmptyIteration) track whether anything actually rendered for
+  // the current iteration's divider — a response that produced neither
+  // thinking/content nor a tool call (a genuinely empty turn; agent.ts still
+  // counts it as an iteration) used to leave a bare "Iteration N" divider with
+  // nothing following it until the next one. Pruned instead once it's known
+  // to have stayed empty.
+  const record = { el: card, arrow, items, role, implementerIndex: implementerIndex || null, status: null, iterations: 0, startTime: Date.now(), lastOllamaMs: null, statusSpan, runTimerId: null, lastIterEl: null, hadContentThisIteration: false }
   // Start a live elapsed-time counter on the accordion heading
   record.runTimerId = setInterval(() => {
     const elapsed = Math.floor((Date.now() - record.startTime) / 1000)
@@ -1405,6 +1219,19 @@ function addRoleCardItem(frameId, className, label, body, collapsible) {
   const card = roleCards.get(frameId)
   if (!card) return
   addTraceItem(className, label, body, collapsible, card.items)
+  card.hadContentThisIteration = true
+}
+
+// Removes the current iteration's divider if nothing ever rendered under it —
+// called right before a NEW divider replaces it (addRoleCardIterationSeparator)
+// and when the frame closes (closeRoleCard/closeRoleCardQuiet), so a trailing
+// empty final iteration doesn't survive either. Safe to call any time: a no-op
+// once the element's already gone or content did arrive.
+function pruneTrailingEmptyIteration(card) {
+  if (card.lastIterEl && !card.hadContentThisIteration) {
+    card.lastIterEl.remove()
+  }
+  card.lastIterEl = null
 }
 
 // Per-frame iteration divider — the role-card counterpart to the top-level
@@ -1414,10 +1241,16 @@ function addRoleCardItem(frameId, className, label, body, collapsible) {
 // Stashes the element on the card record (as `lastIterEl`) so a following
 // 'token_usage' event — which carries the response's timing but has no
 // separator of its own — can annotate THIS most recent divider with it
-// once it arrives (see the 'token_usage' case in handleFrameEvent).
+// once it arrives (see the 'token_usage' case in handleFrameEvent). Rendered
+// eagerly (before this iteration's own response is even known) so its live
+// elapsed-time counter gives "is it alive" feedback while waiting — but
+// pruned by the NEXT call (or by closeRoleCard) if it turns out nothing
+// followed it (see pruneTrailingEmptyIteration).
 function addRoleCardIterationSeparator(frameId, n) {
   const card = roleCards.get(frameId)
   if (!card) return null
+  pruneTrailingEmptyIteration(card)
+  card.hadContentThisIteration = false
   card.iterations = n
   // Stop any previous iteration's live timer before starting a new one
   if (card.iterTimerId) { clearInterval(card.iterTimerId); card.iterTimerId = null }
@@ -1462,6 +1295,7 @@ function addRoleCardHtml(frameId, el) {
   const card = roleCards.get(frameId)
   if (!card || !el) return
   card.items.appendChild(el)
+  card.hadContentThisIteration = true
   maybeAutoScroll()
 }
 
@@ -1475,6 +1309,9 @@ function addRoleCardHtml(frameId, el) {
 function closeRoleCardQuiet(frameId) {
   const card = roleCards.get(frameId)
   if (!card) return
+  // Catches a trailing empty final iteration — there's no "next" divider to
+  // trigger the usual prune-on-create check once the frame is closing.
+  pruneTrailingEmptyIteration(card)
   if (card.iterTimerId) { clearInterval(card.iterTimerId); card.iterTimerId = null }
   if (card.runTimerId) { clearInterval(card.runTimerId); card.runTimerId = null }
   // Show final stats on the accordion heading
@@ -1639,12 +1476,17 @@ function handleFrameEvent(event) {
   const role = event.__role
   switch (event.type) {
     case 'start':
-      getOrCreateRoleCard(frameId, role, event.query)
+      getOrCreateRoleCard(frameId, role, event.query, event.__implementerIndex)
       break
     case 'thought':
       // The model's reasoning (event.thinking) and visible text (event.content)
       // rendered the same way as tool results/warnings — via addTraceItem into
-      // this frame's role card items.
+      // this frame's role card items. agent.ts only ever emits 'thought' when
+      // at least one of thinking/content is non-empty, so reaching this case
+      // at all means something real is about to render — never a no-op guard
+      // needed here for the iteration-divider tracking (see
+      // pruneTrailingEmptyIteration).
+      { const card = roleCards.get(frameId); if (card) card.hadContentThisIteration = true }
       renderThoughtItems(event, roleCards.get(frameId)?.items)
       break
     case 'tool_call': {
@@ -1653,9 +1495,12 @@ function handleFrameEvent(event) {
       // wired from the 'done' case below) replaces it entirely. Capture its
       // status now, though: 'done' carries only the message text, not the
       // status keyword, so this is the only place that value is ever seen.
+      // Still real content for this iteration (the conclude card is about to
+      // show it) — mark it so, or the concluding iteration's own divider would
+      // be wrongly pruned as empty (see pruneTrailingEmptyIteration).
       if (event.tool === 'conclude') {
         const card = roleCards.get(frameId)
-        if (card) card.status = event.args?.status ?? event.args?.outcome ?? null
+        if (card) { card.status = event.args?.status ?? event.args?.outcome ?? null; card.hadContentThisIteration = true }
         break
       }
       const wrap = document.createElement('div')
@@ -1832,6 +1677,14 @@ function renderConclusionCard(label, content) {
 // the same frame's 'done' twice (e.g. across replay + live) shouldn't double the card.
 function renderAgentConclusion(frameId, role, status, content) {
   if (content == null || content === '') return
+  // Numbered when this frame is one of several Implementers a Planner spawned
+  // for one objective — see getOrCreateRoleCard's identical treatment of the
+  // accordion heading; roleCards is the one place this frame's number is
+  // stashed (set at card-creation time from the 'start' event's
+  // __implementerIndex tag). Folded into `role` itself right here so every
+  // use below (dedup key, label) picks it up with no further changes.
+  const implementerIndex = roleCards.get(frameId)?.implementerIndex
+  role = role + (implementerIndex ? ` ${implementerIndex}` : '')
   const key = `${role}\u0000${status}\u0000${content}`
   if (key === lastConclusionKey) return
   lastConclusionKey = key
@@ -2240,25 +2093,26 @@ async function loadModels() {
     const resp = await fetch(`${API_BASE}/models`)
     const models = await resp.json()
     select.innerHTML = ''
-    models.forEach(name => {
+    const supported = models.filter(name => name.startsWith('qwen3.8') || name.startsWith('qwen3.6'))
+    supported.forEach(name => {
       const opt = document.createElement('option')
       opt.value = name
-      const toolBadge = (name.startsWith('qwen3') || name.startsWith('devstral')) ? ' 🔧' : ''
-      const noToolBadge = (name.startsWith('gemma')) ? ' ⚠️ no tool support' : ''
-      opt.textContent = `${name}${toolBadge}${noToolBadge}`
+      opt.textContent = name
       select.appendChild(opt)
     })
-    // Default to qwen3.6 (the validated best model) when it's in the list,
-    // falling back to the first model otherwise. This only picks the
+    // Default to qwen3.6 when it's in the list, falling back to qwen3.8,
+    // then the first model from the unfiltered list. This only picks the
     // DEFAULT — applySessionSettings()/a sticky restored model still wins
     // when this runs before/after that, since selectModel() here just sets
     // the initial value and later calls simply overwrite it.
-    if (models.length) {
-      const preferred = models.find(name => name === 'qwen3.6' || name.startsWith('qwen3.6'))
-      selectModel(preferred || models[0])
+    if (supported.length) {
+      const preferred = supported.find(name => name.startsWith('qwen3.6'))
+      selectModel(preferred || supported[0])
+    } else if (models.length) {
+      selectModel(models[0])
     }
   } catch {
-    const fallback = 'llama3.1:8b'
+    const fallback = 'qwen3.6:latest'
     select.innerHTML = ''
     const opt = document.createElement('option')
     opt.value = fallback
@@ -2422,7 +2276,7 @@ function scheduleWorkspaceRefresh() {
   wsRefreshTimer = setTimeout(refreshWorkspacePane, 700)
 }
 
-// ── Files / Changes toggle ────────────────────────────────────────
+// ── Files / Changes / Context toggle ────────────────────────────────────────
 const filesModeToggle = $('files-mode-toggle')
 
 function setFilesMode(mode) {
@@ -2431,14 +2285,298 @@ function setFilesMode(mode) {
   filesModeToggle.querySelectorAll('.vt-btn').forEach(b => b.classList.toggle('active', b.dataset.mode === mode))
   // A file/diff selected in one mode isn't meaningful in the other.
   closeViewer()
-  if (mode === 'files') refreshFiles()
-  else refreshChanges()
+
+  // Context mode swaps out the tree|viewer split for #ctx-panel entirely (it has its
+  // own sidebar|messages split — see #ctx-panel in index.html); Files/Changes share
+  // the tree pane + viewer pane, so those two just re-render into #files-tree.
+  const isContext = mode === 'context'
+  $('file-tree-pane').classList.toggle('hidden', isContext)
+  $('tree-resize').classList.toggle('hidden', isContext)
+  $('file-viewer-pane').classList.toggle('hidden', isContext)
+  $('ctx-panel').classList.toggle('hidden', !isContext)
+
+  if (isContext) {
+    startCtxPolling()
+  } else {
+    stopCtxPolling()
+    if (mode === 'files') refreshFiles()
+    else refreshChanges()
+  }
 }
 filesModeToggle.addEventListener('click', (e) => {
   const btn = e.target.closest('.vt-btn')
   if (!btn) return
   setFilesMode(btn.dataset.mode)
 })
+
+// ── Context tab — live per-agent context viewer ─────────────────────────────
+// Polls GET /frames (list of active agent frames) + GET /context?frame=<id> (one
+// frame's messages) every 2s while the Context tab is showing AND either a run is
+// active or the tab is open (see startCtxPolling callers: setFilesMode above and the
+// busy-state hook in setBusy). Renders a left sidebar of agents (#ctx-agent-list) and
+// a right pane of the selected agent's messages (#ctx-messages) — see refreshCtxPanel.
+let ctxPollingTimer = null
+let ctxSelectedFrame = null   // frameId currently shown in #ctx-messages, or null
+let ctxLastMessages = []      // previous render's messages, for new/superseded diffing
+let ctxLastFrameId = null     // frameId ctxLastMessages belongs to, so switching agents doesn't misattribute a diff
+
+function startCtxPolling() {
+  if (ctxPollingTimer) return
+  refreshCtxPanel()
+  ctxPollingTimer = setInterval(refreshCtxPanel, 2000)
+}
+
+function stopCtxPolling() {
+  if (ctxPollingTimer) { clearInterval(ctxPollingTimer); ctxPollingTimer = null }
+}
+
+// Starts polling only if the Context tab is the one currently showing — safe to call
+// unconditionally from run-lifecycle hooks (setBusy) regardless of which tab is active.
+function maybeStartCtxPollingForActiveTab() {
+  if (filesMode === 'context') startCtxPolling()
+}
+
+async function refreshCtxPanel() {
+  // GET /frames responds { active: frameId|null, conversations: ConversationSummary[] }
+  // (see server.ts) — one group per conversation (= session), current one first, each
+  // holding EVERY frame ever spawned across that whole conversation's life.
+  const framesData = await fetchJson(`${API_BASE}/frames`)
+  const conversations = framesData?.conversations || []
+  const frames = conversations.flatMap(c => c.frames)
+  renderCtxAgentList(conversations, framesData?.active ?? null)
+  // Auto-select ONLY when there's no valid current selection (first poll ever, or
+  // the previously-selected frame no longer exists) — never override an existing,
+  // still-valid selection just because a different frame became active. Without
+  // this guard, every poll (every 2s) would re-snap the view to whatever's live,
+  // making it impossible to browse a past/different conversation's frame for more
+  // than a couple seconds. The sidebar list itself still live-updates regardless
+  // (dots/token bars) — only the selection (and thus the right-pane messages) is
+  // sticky once made. Prefer the actually-running frame as the fallback pick when
+  // one exists; otherwise the first frame (oldest-first, current conversation first).
+  if (!ctxSelectedFrame || !frames.some(f => f.frameId === ctxSelectedFrame)) {
+    ctxSelectedFrame = framesData?.active ?? (frames.length ? frames[0].frameId : null)
+  }
+  if (ctxSelectedFrame) {
+    await refreshCtxMessages(ctxSelectedFrame)
+  } else {
+    // No frames at all (agents mode off, or nothing has run yet) — fall back to the
+    // harness's own untagged, top-level context so the tab isn't just empty.
+    await refreshCtxMessages(null)
+  }
+}
+
+// One row per agent frame: role label (+ Implementer number, if any — see
+// FrameSummary.implementerIndex), a status dot, and a token-usage bar underneath.
+// Dot color is purely a liveness reading, independent of which conversation group
+// the frame sits in: green+pulsing = the one frame actually executing right now
+// (`active`, dispatch.ts's own "no two LLM calls ever run concurrently" rule means
+// there is ever at most one); orange = spawned this run but not the one executing
+// (e.g. a Planner waiting on its Implementer); grey = everything else (a past
+// conversation, or an earlier run of the still-current one — liveFrames is cleared
+// at the start of every new run, so it no longer knows about those either).
+function renderCtxAgentRow(f, active) {
+  const meta = ROLE_META[f.role] || { name: f.role }
+  const color = AGENT_COLORS[f.role] || 'var(--muted)'
+  const selected = f.frameId === ctxSelectedFrame ? ' selected' : ''
+  const label = meta.name + (f.implementerIndex ? ` ${f.implementerIndex}` : '')
+  const dotClass = f.frameId === active ? 'running' : f.live ? 'active-run' : 'past'
+  const dotTitle = f.frameId === active ? 'Running now' : f.live ? 'Active this run' : 'Past conversation'
+  const pct = (f.promptTokens != null && f.numCtx) ? Math.max(0, Math.min(100, Math.round(100 * f.promptTokens / f.numCtx))) : null
+  const tokenLabel = pct != null ? `${fmtTokensK(f.promptTokens)} / ${fmtTokensK(f.numCtx)} (${pct}%)` : '—'
+  return `<div class="ctx-agent-item${selected}" data-frame="${escHtml(f.frameId)}">`
+    + `<div class="ctx-agent-row">`
+    + `<span class="ctx-agent-dot ${dotClass}" title="${dotTitle}"></span>`
+    + `<span class="ctx-agent-role" style="color:${color}">${escHtml(label)}</span>`
+    + `</div>`
+    + `<div class="ctx-agent-tokenbar"><div class="ctx-agent-tokenbar-fill" style="width:${pct ?? 0}%;background:${color}"></div></div>`
+    + `<div class="ctx-agent-tokenlabel">${escHtml(tokenLabel)}</div>`
+    + `</div>`
+}
+
+function renderCtxAgentList(conversations, active) {
+  const list = $('ctx-agent-list')
+  if (!conversations.length) {
+    list.innerHTML = '<div class="ctx-agent-empty">No active agents</div>'
+    return
+  }
+  list.innerHTML = conversations.map(conv => {
+    const label = conv.current ? 'Current conversation'
+      : conv.sessionId === null ? 'Other'
+      : conv.startedAt ? formatDate(conv.startedAt) : 'Past conversation'
+    const rows = conv.frames.map(f => renderCtxAgentRow(f, active)).join('')
+    return `<div class="ctx-conv-group"><div class="ctx-conv-label">${escHtml(label)}</div>${rows}</div>`
+  }).join('')
+  list.querySelectorAll('.ctx-agent-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const frameId = el.dataset.frame
+      if (frameId === ctxSelectedFrame) return
+      ctxSelectedFrame = frameId
+      ctxLastMessages = []
+      ctxLastFrameId = null
+      list.querySelectorAll('.ctx-agent-item').forEach(x => x.classList.toggle('selected', x === el))
+      refreshCtxMessages(frameId)
+    })
+  })
+}
+
+async function refreshCtxMessages(frameId) {
+  const qs = frameId ? `?frame=${encodeURIComponent(frameId)}` : ''
+  const data = await fetchJson(`${API_BASE}/context${qs}`)
+  if (!data) return
+  renderCtxMessages(frameId, data.messages || [], data.numCtx)
+}
+
+// True when a message's content was rewritten in place to a placeholder — compaction/eviction
+// replace the original text with one of these markers rather than removing the message.
+function isCtxSuperseded(content) {
+  const s = String(content ?? '')
+  return s.startsWith('[superseded') || s.startsWith('[evicted') || s.startsWith('[collapsed')
+}
+
+// Same threshold/behavior as addTraceItem()'s "▼ Show all" / "▲ Collapse" body
+// expander in the chat panel — kept consistent so a long message reads and
+// expands the same way in both places, rather than this panel's old
+// click-anywhere-on-the-item toggle with its own truncate-to-200-chars preview.
+const CTX_MSG_COLLAPSE_THRESHOLD = 300
+
+// DOM element per message index, for the currently-displayed frame only —
+// lets renderCtxMessages() below leave an UNCHANGED message's element
+// completely untouched on every poll, instead of replacing the whole pane's
+// innerHTML every 2s. Untouched means: whatever the user was doing to that
+// specific element (expanded it, selected some of its text) survives; only
+// elements whose underlying data actually changed get replaced.
+let ctxMsgEls = []
+
+function buildCtxMsgEl(m, i, isNew) {
+  const role = String(m.role ?? '')
+  const content = String(m.content ?? '')
+  const nowSuperseded = isCtxSuperseded(content)
+  // `deleted` (server.ts's mergeWithDeleted) is a message the agent's own
+  // context no longer contains at all — fully spliced out (a superseded
+  // call+result pair, a spent failed-attempt pair, a replaced "[Reasoning]"
+  // artifact), unlike `superseded`/collapsed/evicted above, which are still
+  // LIVE, just rewritten to a short placeholder. A deleted entry still shows
+  // its full original content (the ledger never stubs these), so it needs
+  // its own explicit "deleted" badge — the greyed styling alone wouldn't be
+  // enough to tell it apart from a normal message at a glance.
+  const isDeleted = m.deleted === true
+  const chars = m.chars ?? content.length
+
+  const el = document.createElement('div')
+  el.className = 'ctx-msg-item'
+    + (isNew ? ' new' : '')
+    + (nowSuperseded ? ' superseded' : '')
+    + (isDeleted ? ' deleted' : '')
+  el.dataset.idx = String(i)
+
+  const head = document.createElement('div')
+  head.className = 'ctx-msg-head'
+  const roleEl = document.createElement('span')
+  roleEl.className = `ctx-msg-role role-${role}`
+  roleEl.textContent = role
+  head.appendChild(roleEl)
+  if (isDeleted) {
+    const badge = document.createElement('span')
+    badge.className = 'ctx-msg-deleted-badge'
+    badge.textContent = 'deleted'
+    head.appendChild(badge)
+  }
+  const charsEl = document.createElement('span')
+  charsEl.className = 'ctx-msg-chars'
+  charsEl.textContent = `${chars.toLocaleString()} chars`
+  head.appendChild(charsEl)
+  el.appendChild(head)
+
+  // Full content always in the DOM (matching addTraceItem's own body element),
+  // CSS-truncated via .collapsed rather than swapped in/out of textContent —
+  // that's what lets a click on the expand button below toggle purely by
+  // class, with nothing to re-render and nothing to disrupt.
+  const body = document.createElement('div')
+  body.className = 'ctx-msg-preview'
+  body.textContent = content
+  el.appendChild(body)
+
+  if (content.length > CTX_MSG_COLLAPSE_THRESHOLD) {
+    body.classList.add('collapsed')
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.className = 'expand-btn'
+    btn.textContent = '▼ Show all'
+    let expanded = false
+    btn.onclick = () => {
+      expanded = !expanded
+      body.classList.toggle('collapsed', !expanded)
+      btn.textContent = expanded ? '▲ Collapse' : '▼ Show all'
+    }
+    el.appendChild(btn)
+  }
+  return el
+}
+
+function renderCtxMessages(frameId, messages, numCtx) {
+  const pane = $('ctx-messages')
+  // Diff against the previous render of the SAME frame only — switching agents (or the
+  // frame list reshuffling) isn't a "new message", so don't animate/flag on that boundary.
+  const sameFrame = frameId === ctxLastFrameId
+  const prev = sameFrame ? ctxLastMessages : []
+  if (!sameFrame) { pane.innerHTML = ''; ctxMsgEls = [] }
+
+  if (messages.length === 0) {
+    pane.innerHTML = '<div class="ctx-agent-empty">(empty context)</div>'
+    ctxMsgEls = []
+    ctxLastMessages = messages
+    ctxLastFrameId = frameId
+    return
+  }
+  const emptyEl = pane.querySelector('.ctx-agent-empty')
+  if (emptyEl) emptyEl.remove()
+
+  messages.forEach((m, i) => {
+    const prevMsg = prev[i]
+    // Only flag as "new" once we have a prior render to diff against — the very first
+    // paint of a frame's messages shouldn't animate every single one in at once.
+    const isNew = !prevMsg && prev.length > 0
+    const unchanged = prevMsg && prevMsg.role === m.role && prevMsg.content === m.content && prevMsg.deleted === m.deleted
+    if (unchanged && ctxMsgEls[i]) return // leave this element (and any expand state/selection inside it) alone
+
+    const el = buildCtxMsgEl(m, i, isNew)
+    const existing = ctxMsgEls[i]
+    if (existing && existing.parentNode === pane) {
+      pane.replaceChild(el, existing)
+    } else {
+      // Whatever currently sits at position i (a later message, or the
+      // num_ctx footer if this is a brand-new trailing message) is the
+      // correct insertion anchor — null falls back to appendChild.
+      pane.insertBefore(el, pane.children[i] || null)
+    }
+    ctxMsgEls[i] = el
+    // Newly-added items animate in via the .new class (@keyframes ctx-msg-enter
+    // in styles.css); strip it after the animation so it can retrigger later.
+    if (isNew) setTimeout(() => el.classList.remove('new'), 500)
+  })
+
+  while (ctxMsgEls.length > messages.length) {
+    const el = ctxMsgEls.pop()
+    if (el && el.parentNode === pane) el.remove()
+  }
+
+  // num_ctx footer — a standalone element kept last, updated/moved in place
+  // rather than being part of a full innerHTML rebuild.
+  let numCtxEl = pane.querySelector('.ctx-numctx')
+  if (numCtx) {
+    if (!numCtxEl) {
+      numCtxEl = document.createElement('div')
+      numCtxEl.className = 'ctx-numctx'
+    }
+    numCtxEl.textContent = `num_ctx: ${numCtx.toLocaleString()}`
+    pane.appendChild(numCtxEl) // appendChild on an existing node moves it — keeps it last
+  } else if (numCtxEl) {
+    numCtxEl.remove()
+  }
+
+  ctxLastMessages = messages
+  ctxLastFrameId = frameId
+}
 
 // ── Changes mode — VS Code-style git view ──────────────────────────
 // Renders into the SAME #files-tree container the file tree uses (only one
@@ -3169,14 +3307,13 @@ async function boot() {
   showEnvBanner(status.env)
   if (!window.__WS__ && !status.workspacePath) { showNoWorkspaceScreen(); finishReplay(); return }
 
-  // Multi-agent architecture (config.agents): the grounding toggle isn't wired to
+  // Multi-agent architecture (config.agents): the grounding toggle was removed.
   // dispatch.ts's frames yet — hide it rather than show a control that would
   // silently do nothing, same principle as everywhere else in this UI.
-  const groundingSetting = document.querySelector('.setting-grounding')
-  if (groundingSetting) groundingSetting.classList.toggle('hidden', !!status.agents)
+  // grounding setting removed
 
-  // Draw an empty donut immediately (visible before the first token_usage).
-  renderDonut()
+  // Show a status word immediately, before the first real status change.
+  renderStatusIndicator()
 
   // Auto-commit defaults OFF; restore whatever the worker currently has set.
   autoCommit = !!status.autoCommit
@@ -3209,6 +3346,7 @@ async function boot() {
   refreshFiles()
   initResize('panel-resize', () => $('chat-panel').getBoundingClientRect().width, '--chat-width', 240)
   initResize('tree-resize', () => $('file-tree-pane').getBoundingClientRect().width, '--tree-width', 120)
+  initResize('ctx-resize', () => $('ctx-sidebar').getBoundingClientRect().width, '--ctx-sidebar-width', 120)
 }
 
 boot()

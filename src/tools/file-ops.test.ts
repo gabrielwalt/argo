@@ -28,8 +28,37 @@ after(async () => {
 test('allowed workspace access works', async () => {
   const w = await writeFile('/workspace/a.txt', 'hello')
   assert.equal(w.error, undefined)
+  assert.match(w.output, /Successfully wrote the file \/workspace\/a\.txt/)
+  assert.match(w.output, /5 characters/)
+  assert.ok(w.output.includes('hello'), 'write_file tool result should echo the written content')
   const r = await readFile('/workspace/a.txt')
   assert.equal(r.output, 'hello')
+})
+
+// write_file/edit_file echo content the AGENT ITSELF authored — unlike
+// read_file/bash/fetch_url (external, uncontrolled-size content this tool
+// never wrote), a truncated echo here would leave the model unsure what the
+// back half of its own file actually says. Deliberately never capped, even
+// far past read_file's 8000-char cap and the old (now-removed) ECHO_CAP.
+test('writeFile echoes arbitrarily large content back in full, never truncated', async () => {
+  const big = 'X'.repeat(50_000) + '\nEND_MARKER\n'
+  const w = await writeFile('/workspace/big.txt', big)
+  assert.equal(w.error, undefined)
+  assert.ok(w.output.includes(big), 'the full written content must appear verbatim in the tool result')
+  assert.ok(!w.output.includes('chars omitted'), 'must never apply truncateOutput\'s marker')
+  assert.ok(w.output.includes('END_MARKER'), 'content past the old 8000-char/ECHO_CAP boundary must survive')
+})
+
+test('editFile echoes the full updated file back in full, never truncated, even for a large file', async () => {
+  const big = 'line\n'.repeat(10_000) + 'NEEDLE\n' + 'line\n'.repeat(10_000)
+  await writeFile('/workspace/big-edit.txt', big)
+  const e = await editFile('/workspace/big-edit.txt', 'NEEDLE', 'REPLACED_NEEDLE')
+  assert.equal(e.error, undefined)
+  assert.ok(e.output.includes('REPLACED_NEEDLE'), 'the edit must appear')
+  assert.ok(!e.output.includes('chars omitted'), 'must never apply truncateOutput\'s marker')
+  // Content on BOTH sides of the edit, far past any old truncation boundary,
+  // must still be present.
+  assert.equal((e.output.match(/^line$/gm) ?? []).length, 20_000)
 })
 
 test('a path outside /workspace is reachable directly, no confinement', async () => {
@@ -79,7 +108,9 @@ test('editFile replaces a unique match, applies it, and reports what changed wit
   const e = await editFile('/workspace/edit-a.txt', '(2 * R)', '(8 * R)')
   assert.equal(e.error, undefined)
   assert.match(e.output, /replaced 1 occurrence/)
-  assert.match(e.output, /2: const k = \(8 \* R\)/)      // shows the changed line, numbered
+  assert.ok(e.output.includes('const k = (8 * R)'), 'edit_file tool result should echo the full updated file')
+  assert.ok(e.output.includes('line one'), 'full file content includes lines before the edit')
+  assert.ok(e.output.includes('line three'), 'full file content includes lines after the edit')
   // The change actually landed on disk.
   assert.equal((await readFile('/workspace/edit-a.txt')).output, 'line one\nconst k = (8 * R)\nline three')
 })

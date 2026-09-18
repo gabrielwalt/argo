@@ -47,12 +47,7 @@
       <option value="65536" selected>65,536</option>
     </select>
   </div>
-  <div class="setting-group setting-grounding">
-    <label for="opt-grounding">Fact-check writing before finishing
-      <span class="info-affordance" tabindex="0" title="On writing/research tasks, before finishing, Argo re-checks the drafted document's facts and figures against the sources it actually fetched, and blocks completion until unsupported claims are fixed.">ⓘ</span>
-    </label>
-    <input type="checkbox" id="opt-grounding" checked>
-  </div>
+
   <div class="setting-group">
     <label for="opt-temperature">Temperature</label>
     <div class="setting-control">
@@ -105,15 +100,14 @@
         </div>
       </nav>
 
-      <!-- Combined context + status indicator — center shows agent state
-           (green=ready / yellow=running, with iteration number / flashing
-           violet=compacting); ring shows context usage; tick marks the
-           auto-compaction threshold. Click opens a dropdown: a non-clickable
-           status+context readout on top, then Model & parameters, View
-           context, and Clear conversation actions. -->
+      <!-- Combined status indicator — a plain status word (Ready/Running ·
+           model/Compacting…/Error, see app.js's renderStatusIndicator). Used
+           to also show a per-role context-usage donut; that per-agent detail
+           now lives in the Context tab's sidebar instead (renderCtxAgentList).
+           Click opens a dropdown: Model & parameters, Clear conversation. -->
       <div id="indicator-area">
         <div class="nav-crumb" id="nav-ctx">
-          <span id="token-counter" title="Status &amp; context — click for details"></span>
+          <span id="token-counter" title="Status — click for details"></span>
           <div class="nav-dropdown" id="ctx-dropdown"></div>
         </div>
       </div>
@@ -145,9 +139,10 @@
   <!-- RIGHT column — file/change half -->
   <section id="files-panel">
     <div id="toolbar-files" class="col-toolbar">
-      <div class="viewer-toggle" id="files-mode-toggle" title="Switch between the file tree and uncommitted/committed changes">
+      <div class="viewer-toggle" id="files-mode-toggle" title="Switch between the file tree, uncommitted/committed changes, and each agent's live context">
         <button type="button" class="vt-btn active" data-mode="files">Files</button>
         <button type="button" class="vt-btn" data-mode="changes">Changes</button>
+        <button type="button" class="vt-btn" data-mode="context">Context</button>
       </div>
       <button id="refresh-files" class="icon-btn" title="Refresh">↻</button>
       <span id="file-viewer-path"></span>
@@ -180,6 +175,20 @@
            or a colorized diff). -->
       <div id="file-viewer-pane">
         <pre id="file-viewer-content" class="file-viewer-empty">Select a file to view</pre>
+      </div>
+
+      <!-- Context pane (Context mode) — live view of each agent's context:
+           left sidebar lists frames/agents, right pane shows the selected
+           agent's messages. Hidden unless files-mode-toggle's "Context"
+           button is active; see setFilesMode()/refreshCtxPanel() in app.js. -->
+      <div id="ctx-panel" class="hidden">
+        <div id="ctx-sidebar">
+          <div id="ctx-agent-list"></div>
+        </div>
+        <div id="ctx-resize" class="resize-handle"></div>
+        <div id="ctx-messages-pane">
+          <div id="ctx-messages"></div>
+        </div>
       </div>
     </div>
   </section>

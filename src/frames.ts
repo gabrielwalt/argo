@@ -334,10 +334,8 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
     'EFFICIENCY\n' +
     'Use each tool call to obtain new information or advance the task. Do not repeat or perform an ' +
     'equivalent inspection when the current context already establishes the fact. Treat successful tool ' +
-    'results as authoritative unless something may have changed since. Choose your approach before acting ' +
-    'and proceed without unnecessary steps.\n\n' +
-    'The .argo/ folder is harness bookkeeping — ignore its contents. Use the `ledger` tool to recover past ' +
-    'messages that may have been evicted or collapsed from your context.',
+    'results as authoritative unless something may have changed since.\n\n' +
+    'The .argo/ folder is harness bookkeeping — ignore its contents.',
   planner:
     'Your job happens in two phases:\n' +
     '1. Given the objective, determine the most effective implementation strategy and call `conclude` with ' +
@@ -369,43 +367,33 @@ export const ROLE_INSTRUCTIONS: Record<Role, string> = {
     'EFFICIENCY\n' +
     'Use each tool call to obtain new information or advance the task. Do not repeat or perform an ' +
     'equivalent inspection when the current context already establishes the fact. Treat successful tool ' +
-    'results as authoritative unless something may have changed since. Choose your approach before acting ' +
-    'and proceed without unnecessary steps.\n\n' +
-    'The .argo/ folder is harness bookkeeping — ignore its contents. Use the `ledger` tool to recover past ' +
-    'messages that may have been evicted or collapsed from your context.',
+    'results as authoritative unless something may have changed since.\n\n' +
+    'The .argo/ folder is harness bookkeeping — ignore its contents.',
   implementer:
-    'Inspect the relevant project state and use external information when necessary rather than relying on ' +
-    'assumptions. Prefer the simplest coherent change that fully satisfies the assignment and preserves ' +
-    'unrelated behavior. Avoid unnecessary abstractions, dependencies or indirection.\n\n' +
+    'IMPLEMENTATION\n' +
+    'Read the relevant files and search for information when necessary, rather than relying on assumptions. ' +
+    'Prefer the simplest coherent change that fully satisfies the assignment and preserves unrelated behavior. ' +
+    'Avoid unnecessary abstractions, dependencies or indirection.\n\n' +
     'VERIFICATION\n' +
-    'Before concluding, verify the result against the assignment and any supplied original-request ' +
-    'constraints. Do not claim success without concrete evidence that the changed behavior works; run ' +
-    'relevant build, lint, tests, or a direct reproduction as appropriate. Distinguish verified facts from ' +
-    'assumptions.\n\n' +
+    'Unless the assignment explicitly asks for more, verify only the smallest sufficient set of checks, then stop. ' +
+    'Trust a successful tool result and your own prior reasoning once either has established a fact with evidence. ' +
+    'Do not re-read a file you just wrote to confirm it. ' +
+    'If something cannot reasonably be implemented or verified, report that limitation rather than continuing to fail at it.\n\n' +
     'PRECISION\n' +
     'Never reconstruct exact identifiers, paths, URLs, flags, or package names from memory; copy them from ' +
     'observed project or tool output, or inspect the source again.\n\n' +
     'CONCLUSION\n' +
-    'When concluding, provide a concise but complete handoff of the resulting project state: what you changed, ' +
-    'how you implemented it, how you verified it, and any important unexpected findings, deviations, ' +
-    'limitations, or remaining issues. Include the details another agent would need to understand the work ' +
-    'without repeating your investigation.\n' +
+    'Call the conclude tool and summarize what you changed, the resulting project state, the implementation approach, ' +
+    'the verification performed, and any important unexpected findings, limitations, or remaining issues.\n' +
     'If you cannot complete the assignment within reasonable effort, state what you tried, what failed, what ' +
-    'remains incomplete, and why it cannot be completed as scoped rather than repeatedly pursuing the same ' +
-    'unsuccessful approach.\n\n' +
+    'remains incomplete, and why it cannot be completed as scoped.\n\n' +
     'EFFICIENCY\n' +
     'Use each tool call to obtain new information or advance the task. Do not repeat or perform an ' +
     'equivalent inspection when the current context already establishes the fact. Treat successful tool ' +
-    'results as authoritative unless something may have changed since. ' +
-    'When a file already exists and needs a correction, prefer edit_file for targeted changes ' +
-    'over write_file for a full rewrite. Reserve write_file for genuinely new files or cases ' +
-    'where the majority of the file needs to change.\n' +
-    'After a successful write or edit, ' +
-    'do not re-read the file merely to confirm it. Before acting, identify what you need to establish; ' +
-    'once the relevant project state is understood, form a coherent implementation approach and execute ' +
-    'it without unnecessary steps.\n\n' +
-    'The .argo/ folder is harness bookkeeping — do not touch or inspect its contents. Use the `ledger` tool ' +
-    'to recover past messages that may have been evicted or collapsed from your context.',
+    'results as authoritative unless something may have changed since.\n' +
+    'When a file already exists and needs a correction, prefer edit_file for targeted changes over a full rewrite.' +
+    'Reserve write_file for genuinely new files or cases where most of the file needs to change.\n' +
+    'The .argo/ folder is harness bookkeeping — do not touch or inspect its contents.',
 }
 
 const SUMMARY_CHAR_CAP = 2000

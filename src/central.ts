@@ -213,6 +213,9 @@ async function startWorker(ws: WorkspaceEntry): Promise<string> {
     '-e', `OLLAMA_HOST=http://host.docker.internal:11434`,
     '-e', `ARGO_CENTRAL_URL=http://host.docker.internal:${config.port}`,
     '-e', `ARGO_INTERNAL_TOKEN=${internalToken}`,
+    // Pass the host's timezone so timestamps in traces/sessions match the
+    // user's clock rather than defaulting to UTC inside the container.
+    ...(process.env.TZ ? ['-e', `TZ=${process.env.TZ}`] : ['-v', '/etc/localtime:/etc/localtime:ro']),
   ]
 
   // Secret-shaped values (API keys, tokens, passwords) never enter the container's

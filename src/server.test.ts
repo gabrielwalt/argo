@@ -1,7 +1,8 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import type { Server } from 'http'
-import { app, parseFrameRole, frameIdFromHistoryFilename, buildDiskContextMessages, mergeFrameSummaries, chooseActiveFrame, type FrameSummary } from './server.js'
+import { app, parseFrameRole, frameIdFromHistoryFilename, buildDiskContextMessages, mergeFrameSummaries, chooseActiveFrame, mergeWithDeleted, type FrameSummary } from './server.js'
+import type { LedgerMessage } from './types.js'
 import { config } from './config.js'
 
 // server.ts's Express app, listening on an ephemeral port — no startServer()
@@ -72,7 +73,7 @@ test('GET /git-diff/:hash accepts a well-formed short hash (passes the format gu
   assert.notEqual(resp.status, 400)
 })
 
-// ── Frame context backend (CONTEXT-VIEWER-CONTRACT.md) — pure functions ──
+// ── Frame context backend (GET /frames, GET /context) — pure functions ──
 // No fs, no Ollama: these are the "id resolution, disk-recovery mapping, ordering,
 // active-frame choice" pieces called out as the testable logic in the task brief.
 // Real disk state in this dev environment's LOGS_DIR (leftover history-*.json from
@@ -120,16 +121,65 @@ test('buildDiskContextMessages: reconstructs role/content/chars from a raw histo
   assert.equal(result.messages.every(m => m.ts === null), true, 'disk-recovered messages never fabricate a timestamp')
 })
 
-test('buildDiskContextMessages: applies the same 4000-char truncation as agent.ts getContext()', () => {
+test('buildDiskContextMessages: never truncates, even far past the old 4000-char cap — matches agent.ts getContext()', () => {
   const long = 'x'.repeat(4500)
   const result = buildDiskContextMessages([{ role: 'assistant', content: long }])
   assert.equal(result.messages[0].chars, 4500)
-  assert.equal(result.messages[0].content, `${'x'.repeat(4000)}…(+500 more chars)`)
+  assert.equal(result.messages[0].content, long)
 })
 
 test('buildDiskContextMessages: non-array input yields an empty context, not a throw', () => {
   assert.deepEqual(buildDiskContextMessages(null), { messages: [], messageCount: 0, totalChars: 0 })
   assert.deepEqual(buildDiskContextMessages('not an array'), { messages: [], messageCount: 0, totalChars: 0 })
+})
+
+function ledgerMsg(id: string, role: LedgerMessage['role'], content: string): LedgerMessage {
+  return { id, role, content }
+}
+
+test('mergeWithDeleted: every ledger message still live comes back unchanged, all marked not-deleted', () => {
+  const ledgerMessages = [ledgerMsg('a', 'user', 'hi'), ledgerMsg('b', 'assistant', 'hello')]
+  const liveMessages = [
+    { id: 'a', role: 'user', content: 'hi', chars: 2, ts: 100 },
+    { id: 'b', role: 'assistant', content: 'hello', chars: 5, ts: 200 },
+  ]
+  const merged = mergeWithDeleted(ledgerMessages, liveMessages)
+  assert.deepEqual(merged, [
+    { id: 'a', role: 'user', content: 'hi', chars: 2, ts: 100, deleted: false },
+    { id: 'b', role: 'assistant', content: 'hello', chars: 5, ts: 200, deleted: false },
+  ])
+})
+
+test('mergeWithDeleted: a ledger message no longer live is shown deleted, in its original chronological position', () => {
+  // Ledger has A, B, C, D in that order; B and D were later fully removed from
+  // live history (e.g. B superseded, D a spent failed-attempt pair) — live only
+  // has A and C left, in the same relative order.
+  const ledgerMessages = [
+    ledgerMsg('a', 'assistant', 'A content'),
+    ledgerMsg('b', 'assistant', 'B content — removed from live'),
+    ledgerMsg('c', 'tool', 'C content'),
+    ledgerMsg('d', 'tool', 'D content — removed from live'),
+  ]
+  const liveMessages = [
+    { id: 'a', role: 'assistant', content: 'A content', chars: 9, ts: 1 },
+    { id: 'c', role: 'tool', content: 'C content', chars: 9, ts: 3 },
+  ]
+  const merged = mergeWithDeleted(ledgerMessages, liveMessages)
+  assert.equal(merged.length, 4)
+  assert.deepEqual(merged.map(m => [m.id, m.deleted]), [
+    ['a', false], ['b', true], ['c', false], ['d', true],
+  ])
+  assert.equal(merged[1].content, 'B content — removed from live')
+  assert.equal(merged[1].ts, null, 'a deleted entry never fabricates a timestamp')
+  assert.equal(merged[3].content, 'D content — removed from live')
+})
+
+test('mergeWithDeleted: a deleted entry is never truncated either, even far past the old 4000-char cap', () => {
+  const long = 'y'.repeat(4500)
+  const merged = mergeWithDeleted([ledgerMsg('gone', 'assistant', long)], [])
+  assert.equal(merged[0].deleted, true)
+  assert.equal(merged[0].chars, 4500)
+  assert.equal(merged[0].content, long)
 })
 
 function frame(overrides: Partial<FrameSummary>): FrameSummary {
@@ -143,6 +193,7 @@ function frame(overrides: Partial<FrameSummary>): FrameSummary {
     totalChars: 10,
     promptTokens: null,
     numCtx: null,
+    implementerIndex: null,
     ...overrides,
   }
 }
@@ -187,14 +238,21 @@ test('chooseActiveFrame: falls back to the most recently started live frame when
 // above: real leftover frame history files in this dev LOGS_DIR make exact-count
 // assertions unreliable, so these check SHAPE/invariants, not specific contents).
 
-test('GET /frames returns a well-shaped list (the dispatch loop is the only execution path)', async () => {
+test('GET /frames returns a well-shaped, conversation-grouped list (the dispatch loop is the only execution path)', async () => {
   const resp = await fetch(`${baseUrl}/frames`, { headers: authHeaders() })
   assert.equal(resp.status, 200)
-  const body = await resp.json() as { active: string | null; frames: FrameSummary[] }
-  assert.ok(Array.isArray(body.frames))
-  for (const f of body.frames) {
-    assert.ok(['planner', 'implementer', 'dispatcher'].includes(f.role))
-    assert.equal(typeof f.live, 'boolean')
+  const body = await resp.json() as {
+    active: string | null
+    conversations: Array<{ sessionId: string | null; current: boolean; startedAt: string | null; frames: FrameSummary[] }>
+  }
+  assert.ok(Array.isArray(body.conversations))
+  for (const conv of body.conversations) {
+    assert.equal(typeof conv.current, 'boolean')
+    assert.ok(Array.isArray(conv.frames))
+    for (const f of conv.frames) {
+      assert.ok(['planner', 'implementer', 'dispatcher'].includes(f.role))
+      assert.equal(typeof f.live, 'boolean')
+    }
   }
 })
 

@@ -7,9 +7,9 @@ import { config } from './config.js'
 import { LOGS_DIR } from './logger.js'
 import type { AgentEvent } from './types.js'
 import type { Ollama } from 'ollama'
-import { Agent, parseChangedFiles, buildFallbackCommitMessage, isCleanStatus } from './agent.js'
+import { Agent, parseChangedFiles, buildFallbackCommitMessage, isCleanStatus, looksLikeNarratedConclusion } from './agent.js'
 import { NO_OUTPUT } from './tools/bash.js'
-import { ROLE_TOOLS } from './frames.js'
+import { ROLE_TOOLS, ROLE_INSTRUCTIONS } from './frames.js'
 
 // Every real Agent instance (dispatch.ts's spawnFrame) always calls
 // setAllowedTools()/setRole() before chat() runs — there is no unrestricted mode
@@ -116,7 +116,8 @@ test('compactNow evicts old tool-result messages and marks the emitted event man
 // count-based baseline to toggle off.
 
 type ScriptedResponse = {
-  message: { role: string; content: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> }
+  message: { role: string; content: string; thinking?: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> }
+  prompt_eval_count?: number
 }
 
 // Returns each response in turn, then repeats the last one indefinitely — so a
@@ -155,6 +156,47 @@ async function cleanupSession(sessionId: string, slug: string): Promise<void> {
     ).catch(() => {}),
   ])
 }
+
+// ── pruneHarnessMessages must only ever remove HARNESS-INJECTED ephemeral system
+// messages (nudges/stalls/reground steers/timeout errors — pushCtx's `ephemeral:
+// true` call sites), never the frame's own permanent ROLE_INSTRUCTIONS. This used
+// to be inferred from position (a system message counted as removable once any
+// assistant message preceded it in history) — which broke specifically for the
+// Dispatcher/Planner roles: their opening sequence pushes injected AGENTS.md/
+// MEMORY.md read_file assistant/tool pairs BEFORE ROLE_INSTRUCTIONS (see chat()'s
+// opening messages), so by that old heuristic ROLE_INSTRUCTIONS already had
+// assistant messages ahead of it and looked exactly like a stale nudge.
+// HARNESS_MESSAGE_MAX_ITERATION_AGE is 1, and pruneHarnessMessages runs on every
+// manageContext call (the top of every chatCall) regardless of context budget —
+// so under the old bug, ROLE_INSTRUCTIONS was already gone by the SECOND
+// iteration's request, not just on a long run.
+test('pruneHarnessMessages never removes the Dispatcher\'s ROLE_INSTRUCTIONS, even after other assistant turns have run', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-role-instructions-survive-${Date.now()}`
+  // Iteration 1: a real tool call (produces an assistant message AFTER
+  // ROLE_INSTRUCTIONS's position in history — exactly the shape that tripped the
+  // old position-based heuristic). Iteration 2: manageContext runs BEFORE this
+  // second request and is where the old bug already spliced ROLE_INSTRUCTIONS out.
+  // Uses the Dispatcher's own valid conclude status (ANSWER) — not the shared
+  // `finalAnswer` fixture's SUCCESS, which only the Implementer's conclude accepts.
+  const dispatcherFinalAnswer: ScriptedResponse = {
+    message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'conclude', arguments: { status: 'ANSWER', message: 'Final answer.' } } }] },
+  }
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCall, dispatcherFinalAnswer]))
+  agent.setSessionId(sessionId)
+  agent.setRole('dispatcher')
+  agent.setAllowedTools(ROLE_TOOLS.dispatcher)
+  try {
+    const answer = await agent.chat('does ROLE_INSTRUCTIONS survive?')
+    assert.equal(answer, 'Final answer.')
+
+    const { messages } = agent.getContext()
+    const instructions = messages.find(m => m.role === 'system' && m.content === ROLE_INSTRUCTIONS.dispatcher)
+    assert.ok(instructions, 'ROLE_INSTRUCTIONS.dispatcher must still be present in context after other turns have run')
+  } finally {
+    await cleanupSession(sessionId, 'role-instructions-survive')
+  }
+})
 
 // ── Single automatic retry of a failed per-iteration Ollama call. The stub's
 // chat() throws on scripted attempts and resolves on others, and reports how
@@ -277,9 +319,13 @@ test('loop ladder: repeated identical non-mutating call is blocked and escalates
   const events: AgentEvent[] = []
   const sessionId = `test-loop-on-${Date.now()}`
   // 7 identical read_file calls, then a final answer. Per DEFAULT_LOOP_CONFIG (loop.ts):
-  // call 1 is new -> allowed + executed; calls 2-3 -> L0 steer (blocks 1-2); call 4 -> L1
-  // compaction + steer (blocks==3); calls 5-6 -> L0 steer (blocks 4-5); call 7 -> L2
-  // forced re-plan reframe (blocks==6). Never a mutation, so the streak never resets.
+  // call 1 is new -> allowed + executed; call 2 -> the ONE cached L0 replay
+  // (maxReplaysPerKey=1, not executed); calls 3, 5, 6 -> plain L0 steer; call 4 -> L1
+  // compaction + steer (blocks==3); call 7 -> L2 forced re-plan reframe (blocks==6).
+  // Since (H-duplicate-notice) steer/compact/replan no longer skip execution — only
+  // the cached replay does — calls 1, 3, 4, 5, 6, 7 all genuinely re-run the tool;
+  // only call 2 is served back without running. Never a mutation, so the streak
+  // never resets.
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([
     readCall, readCall, readCall, readCall, readCall, readCall, readCall, finalAnswer,
   ]))
@@ -288,12 +334,11 @@ test('loop ladder: repeated identical non-mutating call is blocked and escalates
   try {
     const answer = await agent.chat('argo loop ladder case')
 
-    // The identical call actually ran exactly once — every later repeat (no mutation
-    // since it last ran) was blocked before reaching the tool, not executed.
-    assert.equal(readResults(events).length, 1)
-    // Every attempt — real or rejected — still gets a tool_call event: a block looks
-    // exactly like a real attempt up to the tool_result, which is where `rejected`
-    // distinguishes them.
+    // Six of the seven identical calls actually ran (real re-executions are now
+    // allowed for steer/compact/replan — nothing failed, so there is no reason to
+    // block execution) — only the single cached L0 replay (call 2) did not.
+    assert.equal(readResults(events).length, 6)
+    // Every attempt — real, replayed, or gate-rejected — still gets a tool_call event.
     assert.equal(events.filter(e => e.type === 'tool_call' && e.tool === 'read_file').length, 7)
 
     // One warning steer per blocked repeat (6 of the 7 identical calls) — scoped to
@@ -365,7 +410,7 @@ const readCallNormB: ScriptedResponse = {
   message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: NORMALIZE_PATH_B } } }] },
 }
 
-test('loop ladder: a cosmetically-varied repeat (leading "./") is recognised as the SAME call and BLOCKED, but never served from cache (H20 + FIX 2)', async () => {
+test('loop ladder: a cosmetically-varied repeat (leading "./") is recognised as the SAME call and re-run for real, but never served from cache (H20 + FIX 2)', async () => {
   const events: AgentEvent[] = []
   const sessionId = `test-loop-normalize-${Date.now()}`
   const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([readCallNormA, readCallNormB, finalAnswer]))
@@ -374,18 +419,24 @@ test('loop ladder: a cosmetically-varied repeat (leading "./") is recognised as 
   try {
     const answer = await agent.chat('argo loop normalization case')
 
-    // Only the FIRST spelling actually ran: the normalised key recognised the second as
-    // a repeat and blocked it.
-    assert.equal(readResults(events).length, 1)
+    // The normalised key recognised the second as a no-progress repeat of the
+    // first — but since nothing about that repeat actually FAILED, it is still
+    // genuinely re-run (not skipped) rather than answered from a cache it isn't
+    // eligible for (see the next assertion) or blocked outright.
+    assert.equal(readResults(events).length, 2)
 
     // ...and it was NOT replayed, because the raw args differ. This is the FIX 2
-    // boundary: recognised for blocking, ineligible for a cached answer.
+    // boundary: recognised for the ladder's block/escalate decision, ineligible
+    // for a cached answer.
     const replay = events.find((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'read_file' && e.replayed === true)
     assert.equal(replay, undefined, 'a normalised-equal but raw-different repeat must not be answered from cache')
 
-    // It still produced a rejected tool_result — the plain L0 steer, not silence.
+    // It still surfaced the plain L0 steer wording as a warning, and as an
+    // ephemeral system-message duplicate-notice appended after the real result —
+    // never as a fabricated tool-result error (nothing failed).
+    assert.ok(warningsMatching(events, /STOP repeating it/).length > 0, 'expected the plain L0 steer to fire')
     const rejected = events.find((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'read_file' && e.rejected === true)
-    assert.ok(rejected, 'expected the blocked repeat to surface as a rejected tool_result carrying the L0 steer')
+    assert.equal(rejected, undefined, 'a duplicate call that is re-run for real must not be reported as a rejected tool_result')
 
     assert.equal(answer, 'Final answer.')
     assert.equal(events.some(e => e.type === 'error'), false)
@@ -498,11 +549,16 @@ test('loop ladder: an intervening bash call invalidates the cached replay (FIX 1
     assert.equal(reads[0].rejected, undefined)          // 1st: ran for real
     assert.equal(reads[1].rejected, true)                // 2nd: blocked...
     assert.equal(reads[1].replayed, true)                // ...and specifically replayed (no bash yet)
-    assert.equal(reads[2].rejected, true)                // 3rd: still a no-progress repeat by
-    // mutationCount (a real, separate, documented gap this fix does NOT close —
-    // see loop.ts's noteBashExecution doc comment) — but crucially NOT a replay:
+    // 3rd: still a no-progress repeat by mutationCount (a real, separate,
+    // documented gap this fix does NOT close — see loop.ts's noteBashExecution
+    // doc comment) — but the invalidated cache means it falls to the plain L0
+    // steer, which (like every non-replay rung) re-runs the call for real
+    // rather than fabricating a rejection — so it is NOT reported as rejected,
+    // and crucially NOT a replay either (never claims "nothing has changed"
+    // about a file bash may have just touched):
+    assert.equal(reads[2].rejected, undefined)
     assert.equal(reads[2].replayed ?? false, false)
-    assert.match(reads[2].error ?? '', /STOP repeating it/)       // the plain L0 steer fired instead
+    assert.ok(warningsMatching(events, /STOP repeating it/).length > 0)       // the plain L0 steer fired instead of a replay
     assert.doesNotMatch(reads[2].error ?? '', /reproduced verbatim/) // never claims "nothing has changed"
 
     // The bash call itself was never blocked by the ladder (a brand-new key) — it
@@ -512,6 +568,55 @@ test('loop ladder: an intervening bash call invalidates the cached replay (FIX 1
     assert.equal(answer, 'Final answer.')
   } finally {
     await cleanupSession(sessionId, 'argo-loop-bash-invalidate-case')
+  }
+})
+
+// ── DUPLICATE-CALL WARNING (steer/compact/replan rungs). A no-progress repeat
+// that reaches one of these rungs is no longer skipped — the call actually
+// re-runs (see the ladder tests above) — but the model still needs to know it
+// was a flagged repeat. That notice is a SEPARATE, ephemeral system message
+// appended to context right after the real tool result (never merged into the
+// tool result itself, and never framed as an "Error:" — nothing failed).
+test('a duplicate call re-run for real gets an ephemeral warning appended after its result, gone by the following iteration', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-duplicate-warning-${Date.now()}`
+  const distinguishCall: ScriptedResponse = {
+    message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'bash', arguments: { command: 'echo distinguish-me' } } }] },
+  }
+  // call 1: allow (real). call 2: the one cached L0 replay. call 3: replay budget
+  // exhausted -> plain L0 steer -> re-run for real, with the duplicate warning
+  // pushed right after. call 4 (a DIFFERENT call, so the streak doesn't just
+  // repeat the ladder again): the immediate next iteration — the warning must
+  // still be visible here. call 5: one iteration later — the warning must be
+  // gone by now.
+  const sequence: ScriptedResponse[] = [readCall, readCall, readCall, distinguishCall, finalAnswer]
+  let i = 0
+  let sawWarningAtIter4 = false
+  let sawWarningAtIter5 = false
+  const agent: Agent = new Agent(e => events.push(e), 'test-model', {
+    chat: async () => {
+      const idx = i++
+      const hasWarning = () => agent.getContext().messages.some(m => m.role === 'system' && /STOP repeating it/.test(m.content))
+      if (idx === 3) sawWarningAtIter4 = hasWarning()
+      if (idx === 4) sawWarningAtIter5 = hasWarning()
+      return sequence[Math.min(idx, sequence.length - 1)]
+    },
+  } as unknown as Ollama)
+  agent.setSessionId(sessionId)
+  grantFullTools(agent)
+  try {
+    await agent.chat('argo duplicate warning case')
+
+    // The 3rd (duplicate, steer-rung) call actually re-ran — a real tool_result,
+    // not a rejected/fabricated one.
+    const reads = events.filter((e): e is Extract<AgentEvent, { type: 'tool_result' }> => e.type === 'tool_result' && e.tool === 'read_file')
+    assert.equal(reads.length, 3)
+    assert.equal(reads[2].rejected, undefined)
+
+    assert.equal(sawWarningAtIter4, true, 'the duplicate-call warning must still be visible the immediate next iteration')
+    assert.equal(sawWarningAtIter5, false, 'the duplicate-call warning must be gone one further iteration later')
+  } finally {
+    await cleanupSession(sessionId, 'argo-duplicate-warning-case')
   }
 })
 
@@ -641,9 +746,12 @@ test('loop ladder (H21b): a model that never stops repeating past L2 is eventual
   try {
     const answer = await agent.chat('argo loop halt case')
 
-    // Exactly one real execution; every further repeat is blocked/escalated by the
-    // ladder, until 'halt' fires and ends the frame — never a 12th attempt.
-    assert.equal(readResults(events).length, 1)
+    // Every attempt except the one cached L0 replay (maxReplaysPerKey=1) actually
+    // re-runs the call for real — nothing about a duplicate repeat has failed, so
+    // steer/compact/replan/halt all execute rather than skip — right up through
+    // the call that finally triggers 'halt' and ends the frame; never a 12th
+    // attempt.
+    assert.equal(readResults(events).length, 10)
     assert.equal(events.filter(e => e.type === 'tool_call' && e.tool === 'read_file').length, 11)
 
     assert.match(answer, /STOPPING this frame/)
@@ -653,5 +761,404 @@ test('loop ladder (H21b): a model that never stops repeating past L2 is eventual
     assert.ok(events.some(e => e.type === 'error'))
   } finally {
     await cleanupSession(sessionId, 'argo-loop-halt-case')
+  }
+})
+
+// ── looksLikeNarratedConclusion — pure heuristic, no model/harness needed.
+
+test('looksLikeNarratedConclusion recognizes conclusion-shaped prose, not short/unrelated content', () => {
+  assert.equal(looksLikeNarratedConclusion('The implementation is now complete and satisfies every requirement in the original task.'), true)
+  assert.equal(looksLikeNarratedConclusion('I successfully implemented the hex grid renderer with draggable vector endpoints as requested.'), true)
+  assert.equal(looksLikeNarratedConclusion('Here\'s a summary of what changed in this pass, covering every file touched during the session.'), true)
+  assert.equal(looksLikeNarratedConclusion('## What was created\nA single HTML file with inline CSS and JavaScript for the grid.'), true)
+  assert.equal(looksLikeNarratedConclusion('Done.'), false) // too short
+  assert.equal(looksLikeNarratedConclusion('Let me check the file contents before deciding on the next step here.'), false)
+})
+
+// ── Reasoning artifact — at most one "[Reasoning]" message ever lives in
+// history; a new one fully replaces the old one, no stub.
+
+test('pushReasoningArtifact keeps only the latest reasoning message, replacing the old one entirely', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-reasoning-artifact-${Date.now()}`
+  const firstThinking = 'FIRST REASONING PASS — should be fully gone once the second one lands.'
+  const secondThinking = 'SECOND REASONING PASS — should be the only one left.'
+  const turn1: ScriptedResponse = { message: { role: 'assistant', content: '', thinking: firstThinking } }
+  const turn2: ScriptedResponse = { message: { role: 'assistant', content: '', thinking: secondThinking } }
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([turn1, turn2, finalAnswer]))
+  agent.setSessionId(sessionId)
+  grantFullTools(agent)
+  try {
+    const answer = await agent.chat('argo reasoning artifact case')
+    assert.equal(answer, 'Final answer.')
+
+    const messages = agent.getContext().messages
+    const reasoningMsgs = messages.filter(m => m.content.startsWith('[Reasoning]'))
+    assert.equal(reasoningMsgs.length, 1, 'exactly one [Reasoning] artifact should survive')
+    assert.match(reasoningMsgs[0].content, /SECOND REASONING PASS/)
+    assert.equal(messages.some(m => m.content.includes('FIRST REASONING PASS')), false, 'the first reasoning pass must leave no trace at all, not even a stub')
+  } finally {
+    await cleanupSession(sessionId, 'argo-reasoning-artifact-case')
+  }
+})
+
+// ── Auto-conclude — the model narrating a finished-looking summary as plain
+// content (never calling `conclude`) gets auto-completed on the 2nd occurrence.
+
+test('a 2nd narrated-conclusion turn auto-concludes with the model\'s own text instead of nudging a 3rd time', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-auto-conclude-${Date.now()}`
+  const firstSummary = 'The implementation is now complete and satisfies every requirement in the original task description.'
+  const secondSummary = 'The implementation has been now complete: a single HTML file with inline CSS and JavaScript, fully self-contained.'
+  const turn1: ScriptedResponse = { message: { role: 'assistant', content: firstSummary } }
+  const turn2: ScriptedResponse = { message: { role: 'assistant', content: secondSummary } }
+  // A 3rd scripted response the test would fail against if the loop somehow
+  // kept going instead of auto-concluding on turn 2 — proves early termination,
+  // not just a lucky matching answer.
+  const shouldNeverBeReached: ScriptedResponse = { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'bash', arguments: { command: 'echo should-not-run' } } }] } }
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([turn1, turn2, shouldNeverBeReached]))
+  agent.setSessionId(sessionId)
+  grantFullTools(agent)
+  try {
+    const answer = await agent.chat('argo auto-conclude case')
+
+    assert.equal(answer, secondSummary)
+    assert.equal(agent.getConcludeStatus(), 'SUCCESS')
+    assert.equal(agent.getIterationCount(), 2, 'must stop at the 2nd narrated turn, never reaching the 3rd scripted response')
+    assert.ok(warningsMatching(events, /auto-concluding/).length >= 1)
+    assert.equal(events.some(e => e.type === 'tool_call' && e.tool === 'bash'), false)
+    assert.equal(events.some(e => e.type === 'done'), true)
+  } finally {
+    await cleanupSession(sessionId, 'argo-auto-conclude-case')
+  }
+})
+
+// ── Self-calibrating token estimate (manageContext's trigger) — a real
+// prompt_eval_count far denser than the flat CHARS_PER_TOKEN constant would
+// ever predict for such tiny message content must still drive manageContext
+// to actually compact, proving the calibrated anchor (not raw accumulated
+// char growth, which stays negligible throughout this test) is what triggers
+// it. See eviction.ts's CHARS_PER_TOKEN comment / agent.ts's
+// recalibrateCharsPerToken for the real incident this fixes.
+
+test('manageContext compacts from a calibrated real-token anchor even when content stays tiny in char terms', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-calibration-${Date.now()}`
+  const NUM_CTX = 3000 // trigger=1800, verbatim budget=1200 (CONTEXT_TRIGGER_PCT=0.6, CONTEXT_VERBATIM_PCT=0.4)
+  // 15 short read_file calls to distinct nonexistent paths (distinct args so
+  // the loop-recovery ladder never blocks/replays one as a repeat, which
+  // would change what gets pushed). Each reports a real prompt_eval_count far
+  // above what such tiny message content could ever justify under the flat
+  // 3.5 chars/token constant — simulating dense content/tool-schema overhead
+  // the char estimate structurally can't see — growing only slightly turn to
+  // turn (real content stays small; it's the DENSITY that's simulated as high).
+  const denseCalls: ScriptedResponse[] = Array.from({ length: 15 }, (_, i) => ({
+    message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: `/nonexistent-${i}` } } }] },
+    prompt_eval_count: 2600 + i * 20,
+  }))
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([...denseCalls, finalAnswer]))
+  agent.setSessionId(sessionId)
+  grantFullTools(agent)
+  agent.setOptions({ num_ctx: NUM_CTX })
+  try {
+    await agent.chat('argo calibration case')
+
+    const compactEvents = events.filter(e => e.type === 'compact')
+    assert.ok(compactEvents.length > 0, 'a real, dense-content-simulating measurement must eventually force an ACTUAL compaction (something shortened), not just a trigger check')
+
+    // The flat 3.5-chars/token constant would need this many real chars to
+    // reach the trigger on its own — this run's actual pushed content (15
+    // tiny read_file calls/error results, plus the real system+user prompt)
+    // must stay comfortably under it, so compaction firing here can only be
+    // explained by the calibrated anchor, not accumulated char growth.
+    const FLAT_CHARS_PER_TOKEN = 3.5
+    const charsNeededForFlatTrigger = NUM_CTX * 0.6 * FLAT_CHARS_PER_TOKEN
+    const ctx = agent.getContext()
+    assert.ok(
+      ctx.totalChars < charsNeededForFlatTrigger,
+      `test content grew to ${ctx.totalChars} chars, at or past what the flat estimate alone would need (${charsNeededForFlatTrigger}) — no longer isolates the calibration effect`,
+    )
+  } finally {
+    await cleanupSession(sessionId, 'argo-calibration-case')
+  }
+})
+
+// ── manageContext must never "shorten" a message into something LONGER than
+// the original — observed live (2026-09-18): a 17-char tool result
+// ("(empty workspace)") and a 110-char bash tool-call description both got
+// "collapsed" into themselves plus a marker, ending up bigger than before.
+
+test('manageContext never turns a message into a stub longer than the original', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-no-pointless-collapse-${Date.now()}`
+  const NUM_CTX = 3000
+  // 15 short read_file calls to distinct nonexistent paths — each produces a
+  // genuinely tiny error result, far shorter than any collapsed/evicted
+  // marker's own text could ever be. Reuses the calibration test's own
+  // technique (a real prompt_eval_count far denser than the flat estimate)
+  // purely to force manageContext to actually walk back into this old, tiny
+  // content — the point here is what it does once it gets there, not why.
+  const denseCalls: ScriptedResponse[] = Array.from({ length: 15 }, (_, i) => ({
+    message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: `/nonexistent-shrink-${i}` } } }] },
+    prompt_eval_count: 2600 + i * 20,
+  }))
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([...denseCalls, finalAnswer]))
+  agent.setSessionId(sessionId)
+  grantFullTools(agent)
+  agent.setOptions({ num_ctx: NUM_CTX })
+  try {
+    await agent.chat('argo no-pointless-collapse case')
+    assert.ok(events.some(e => e.type === 'compact'), 'compaction must actually have run for this test to mean anything')
+    const messages = agent.getContext().messages
+    for (const m of messages) {
+      assert.equal(
+        m.content.startsWith('[collapsed') || m.content.startsWith('[evicted'),
+        false,
+        `a tiny original message was turned into a stub that cannot possibly be shorter: ${JSON.stringify(m.content)}`,
+      )
+    }
+  } finally {
+    await cleanupSession(sessionId, 'argo-no-pointless-collapse-case')
+  }
+})
+
+// ── Generalized single-slot reasoning artifact — covers content-channel
+// output from a no-tool-call turn, not just thinking-channel output.
+
+test('pushReasoningArtifact single-slot replacement also covers content-channel output from a no-tool-call turn', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-reasoning-content-${Date.now()}`
+  const firstPassContent = 'FIRST CONTENT PASS — rambling exploration with no tool call, should be fully gone once the second one lands.'
+  const secondPassThinking = 'SECOND PASS VIA THINKING — should be the only one left.'
+  const turn1: ScriptedResponse = { message: { role: 'assistant', content: firstPassContent } }
+  const turn2: ScriptedResponse = { message: { role: 'assistant', content: '', thinking: secondPassThinking } }
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([turn1, turn2, finalAnswer]))
+  agent.setSessionId(sessionId)
+  grantFullTools(agent)
+  try {
+    const answer = await agent.chat('argo reasoning content case')
+    assert.equal(answer, 'Final answer.')
+    const messages = agent.getContext().messages
+    const reasoningMsgs = messages.filter(m => m.content.startsWith('[Reasoning]'))
+    assert.equal(reasoningMsgs.length, 1, 'exactly one [Reasoning] artifact should survive, regardless of which channel each turn used')
+    assert.match(reasoningMsgs[0].content, /SECOND PASS VIA THINKING/)
+    assert.equal(messages.some(m => m.content.includes('FIRST CONTENT PASS')), false, 'the first (content-channel) pass must leave no trace at all, not even a stub')
+  } finally {
+    await cleanupSession(sessionId, 'argo-reasoning-content-case')
+  }
+})
+
+// ── Real thinking alongside a REAL tool call must reach the next turn's own
+// context as an explicit [Reasoning] artifact, ordered before the tool call's
+// own accompanying content — not merely attached as the Message.thinking
+// field, which does not reliably survive into the next request.
+
+test('a tool-calling turn with both thinking and content pushes reasoning first (single-slot), content second (permanent)', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-reasoning-hascalls-order-${Date.now()}`
+  const planText = "PLAN TEXT — the model's own commentary alongside its tool call."
+  const turn1: ScriptedResponse = {
+    message: {
+      role: 'assistant',
+      content: planText,
+      thinking: 'THINK ONE — should be replaced, not merged into the content message.',
+      tool_calls: [{ function: { name: 'read_file', arguments: { path: '/nonexistent-hascalls-reasoning-order' } } }],
+    },
+  }
+  const turn2: ScriptedResponse = { message: { role: 'assistant', content: '', thinking: 'THINK TWO — the only reasoning artifact that should remain.' } }
+  const sequence: ScriptedResponse[] = [turn1, turn2, finalAnswer]
+  let i = 0
+  let orderSnapshot: string[] = []
+  const agent: Agent = new Agent(e => events.push(e), 'test-model', {
+    chat: async () => {
+      const idx = i++
+      // Right before turn2 runs: turn1's own pushes are done and nothing has
+      // superseded them yet.
+      if (idx === 1) orderSnapshot = agent.getContext().messages.map(m => m.content)
+      return sequence[Math.min(idx, sequence.length - 1)]
+    },
+  } as unknown as Ollama)
+  agent.setSessionId(sessionId)
+  grantFullTools(agent)
+  try {
+    await agent.chat('argo hasCalls reasoning order case')
+
+    const reasoningIdx = orderSnapshot.findIndex(c => c.startsWith('[Reasoning]') && c.includes('THINK ONE'))
+    const contentIdx = orderSnapshot.findIndex(c => c === planText)
+    assert.notEqual(reasoningIdx, -1, 'expected the real reasoning to appear as its own [Reasoning] message')
+    assert.notEqual(contentIdx, -1, 'expected the accompanying content to appear as its own permanent message')
+    assert.ok(reasoningIdx < contentIdx, 'reasoning must come before the regular content, so content sits at the tail')
+
+    const messages = agent.getContext().messages
+    assert.equal(messages.some(m => m.content.includes('THINK ONE')), false, 'the superseded reasoning must leave no trace')
+    assert.ok(messages.some(m => m.content.startsWith('[Reasoning]') && m.content.includes('THINK TWO')))
+    assert.ok(
+      messages.some(m => m.content === planText),
+      'content accompanying a real tool call must survive as permanent, kept content — never superseded by a later reasoning push',
+    )
+  } finally {
+    await cleanupSession(sessionId, 'argo-hascalls-reasoning-order-case')
+  }
+})
+
+// ── A no-tool-call turn's own content is not a real reply either (nothing was
+// concluded, no tool ran) — when it comes alongside real thinking, both are
+// pushed together as a PAIRED reasoning artifact (real reasoning first, its
+// own content second, at the tail), and pushing the second half must not
+// supersede the first: they are the same slot-generation and must survive
+// together until the NEXT reasoning artifact replaces both at once.
+
+test('a no-tool-call turn with both thinking and content pushes both as a paired reasoning artifact, neither removing the other', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-reasoning-pair-${Date.now()}`
+  const turn1: ScriptedResponse = {
+    message: {
+      role: 'assistant',
+      content: 'REGULAR TEXT — no tool call, so this counts as reasoning too.',
+      thinking: 'REAL THINKING — the actual reasoning half of the pair.',
+    },
+  }
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([turn1, finalAnswer]))
+  agent.setSessionId(sessionId)
+  grantFullTools(agent)
+  try {
+    await agent.chat('argo reasoning pair case')
+    const messages = agent.getContext().messages
+    const reasoningMsgs = messages.filter(m => m.content.startsWith('[Reasoning]'))
+    assert.equal(reasoningMsgs.length, 2, 'both halves of the pair must survive together')
+    assert.match(reasoningMsgs[0].content, /REAL THINKING/)
+    assert.match(reasoningMsgs[1].content, /REGULAR TEXT/)
+  } finally {
+    await cleanupSession(sessionId, 'argo-reasoning-pair-case')
+  }
+})
+
+test('a later reasoning artifact removes BOTH messages of an earlier paired artifact', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-reasoning-pair-replaced-${Date.now()}`
+  const turn1: ScriptedResponse = { message: { role: 'assistant', content: 'OLD REGULAR TEXT', thinking: 'OLD REAL THINKING' } }
+  const turn2: ScriptedResponse = { message: { role: 'assistant', content: '', thinking: 'NEW REASONING — should replace both halves of the old pair.' } }
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([turn1, turn2, finalAnswer]))
+  agent.setSessionId(sessionId)
+  grantFullTools(agent)
+  try {
+    await agent.chat('argo reasoning pair replaced case')
+    const messages = agent.getContext().messages
+    assert.equal(messages.some(m => m.content.includes('OLD REGULAR TEXT')), false, "the old pair's regular half must be gone once a new reasoning artifact lands")
+    assert.equal(messages.some(m => m.content.includes('OLD REAL THINKING')), false, "the old pair's real-reasoning half must be gone once a new reasoning artifact lands")
+    const reasoningMsgs = messages.filter(m => m.content.startsWith('[Reasoning]'))
+    assert.equal(reasoningMsgs.length, 1)
+    assert.match(reasoningMsgs[0].content, /NEW REASONING/)
+  } finally {
+    await cleanupSession(sessionId, 'argo-reasoning-pair-replaced-case')
+  }
+})
+
+// ── Injected-listing cleanup — the harness's own auto-injected `fd`-style
+// project listing (pushed by chat()'s own setup code, before the model ever
+// runs) is removed entirely once real work starts (a successful write, or
+// any bash call — including the model's own first one).
+
+test('the harness\'s injected project listing is removed entirely once a write_file succeeds', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-injected-listing-write-${Date.now()}`
+  const tmpPath = '/tmp/argo-test-injected-listing-write.txt'
+  const doWrite: ScriptedResponse = {
+    message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'write_file', arguments: { path: tmpPath, content: 'hello' } } }] },
+  }
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([doWrite, finalAnswer]))
+  agent.setSessionId(sessionId)
+  grantFullTools(agent)
+  try {
+    await agent.chat('argo injected-listing write case')
+    const messages = agent.getContext().messages
+    assert.equal(messages.some(m => m.content.includes('fd . -t f -d 2')), false, 'the harness\'s injected listing must be fully gone once real work (the write) has started')
+    assert.ok(messages.some(m => m.content.includes('write_file')), 'the triggering write_file call itself must still be present')
+  } finally {
+    await cleanupSession(sessionId, 'argo-injected-listing-write-case')
+    await fs.unlink(tmpPath).catch(() => {})
+  }
+})
+
+test('the harness\'s injected project listing is also removed once the model\'s own first bash call runs', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-injected-listing-bash-${Date.now()}`
+  const modelBash: ScriptedResponse = {
+    message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'bash', arguments: { command: 'echo model-own-bash-call' } } }] },
+  }
+  const agent = new Agent(e => events.push(e), 'test-model', scriptedOllama([modelBash, finalAnswer]))
+  agent.setSessionId(sessionId)
+  grantFullTools(agent)
+  try {
+    await agent.chat('argo injected-listing bash case')
+    const messages = agent.getContext().messages
+    assert.equal(messages.some(m => m.content.includes('fd . -t f -d 2')), false, 'the harness\'s injected listing must be gone once the model runs any bash call of its own')
+    assert.ok(messages.some(m => m.content.includes('model-own-bash-call')), 'the triggering bash call itself must still be present')
+  } finally {
+    await cleanupSession(sessionId, 'argo-injected-listing-bash-case')
+  }
+})
+
+// ── Ledger recovery retires the old stub — once the model recovers a
+// collapsed/evicted message's full content via `ledger`'s get_msg_id, the OLD
+// stub (now duplicated by the freshly-recovered copy) is removed entirely.
+
+test('recovering a collapsed/evicted message via the ledger tool removes the old stub entirely', async () => {
+  const events: AgentEvent[] = []
+  const sessionId = `test-ledger-recover-${Date.now()}`
+  const NUM_CTX = 3000
+  // Deltas here are deliberately much larger per-turn than the other
+  // calibration test above (+200, not +20): recalibrateCharsPerToken is
+  // delta-based (measuredRatio = deltaChars/deltaTokens), and a SMALL token
+  // delta relative to the char growth these tiny messages produce blends
+  // effectiveCharsPerToken UP toward its clamp ceiling — loosening the
+  // verbatim budget every turn and never actually collapsing/evicting
+  // anything (confirmed by hand: with +20 deltas this test never produces a
+  // stub at all). A token delta comfortably bigger than the char delta keeps
+  // the ratio pinned near its floor instead, so the (still tiny, still
+  // "dense-content-simulating") messages actually get shortened once enough
+  // of them accumulate — which this test needs, unlike the anchor test above
+  // which only needs a compact EVENT to fire, not real shortening.
+  const denseCalls: ScriptedResponse[] = Array.from({ length: 15 }, (_, i) => ({
+    message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: `/nonexistent-recover-${i}` } } }] },
+    prompt_eval_count: 2600 + i * 200,
+  }))
+  let i = 0
+  let recovered = false
+  let recoveredMsgId = ''
+  // A dynamic mock, not a plain scriptedOllama array: the msg_id to recover
+  // isn't known until manageContext has actually produced a stub mid-run, so
+  // this inspects the agent's own live context on each call and switches to
+  // recovering the first stub it finds instead of continuing the script.
+  const agent: Agent = new Agent(e => events.push(e), 'test-model', {
+    chat: async () => {
+      if (!recovered) {
+        // Collapse stubs embed the `[collapsed ...]` marker mid-string (head +
+        // marker + tail), not at the start — only evict stubs are marker-only.
+        const stubbed = agent.getContext().messages.find(m => /\[(?:evicted|collapsed) — \d+ chars; msg_id "/.test(m.content))
+        if (stubbed) {
+          const match = /msg_id "([^"]+)"/.exec(stubbed.content)
+          if (match) {
+            recovered = true
+            recoveredMsgId = match[1]
+            return { message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'ledger', arguments: { action: 'get_msg_id', msg_id: match[1] } } }] } }
+          }
+        }
+        return denseCalls[Math.min(i++, denseCalls.length - 1)]
+      }
+      return finalAnswer
+    },
+  } as unknown as Ollama)
+  agent.setSessionId(sessionId)
+  grantFullTools(agent)
+  agent.setOptions({ num_ctx: NUM_CTX })
+  try {
+    await agent.chat('argo ledger recover case')
+    assert.ok(recovered, 'the test must actually have found a stub to recover, or it proves nothing')
+    const messages = agent.getContext().messages
+    const staleStub = messages.find(m => /\[(?:evicted|collapsed) — \d+ chars;/.test(m.content) && m.content.includes(`msg_id "${recoveredMsgId}"`))
+    assert.equal(staleStub, undefined, 'the old stub referencing the now-recovered msg_id must be gone entirely, not left duplicating the fresh copy')
+  } finally {
+    await cleanupSession(sessionId, 'argo-ledger-recover-case')
   }
 })

@@ -79,11 +79,14 @@ The only way a frame ends is by calling `conclude(status, message)`. Status must
 
 ## Data Stores
 
-Two data stores, serving different consumers:
+One data store now — the per-frame ledger, plus a small registry mapping sessions to frames:
 
 | Store | Location | Purpose |
 |-------|----------|---------|
 | **Ledger** (per-frame JSONL) | `.argo/frames/` inside the project | Agent memory + UI metadata. Every message every agent sees, plus thinking/tool args/timing. Agents query it via `ledger` tool (stripped to {id, role, content}). |
-| **Session JSONL** | `/app/logs/` (mapped to `~/.local/share/argo/logs/{workspace}/`) | Minimal run log. Only: `start` (model/options), `warning` (loop steers with L0/L1/L2), `error` (harness errors), `message` (role:user echo). All other event types are ledger-covered and skipped from disk. |
+| **Session registry** | `.argo/sessions.json` inside the project | Maps each session to its runs, each run to the ordered frames it spawned (`src/ledger.ts`'s `SessionRegistry`). No message content of its own — just enough to reconstruct which frames belong to which session/run. |
 
-The session JSONL is approaching redundancy — once the UI migrates to reading from the ledger, it can be removed entirely.
+The old separate "Session JSONL" run log under `~/.local/share/argo/logs/{workspace}/` (a minimal
+`start`/`warning`/`error`/`message` event stream) has been removed — the UI (`GET /logs`) now
+reconstructs the same information straight from the ledger and session registry above
+(`reconstructSessionEvents` in `src/server.ts`).

@@ -12,7 +12,17 @@
 
 **Living documentation:** Keep every `.md` file in this project current. After any work session where new decisions, patterns, or lessons emerged, update the relevant file immediately — never defer. Include only what has lasting value; prune stale content ruthlessly. A good test: "Will this matter in 3 months?" If yes, capture it. If no, cut it. **Especially: whenever the user teaches you a concept or principle essential to Argo's future architecture or implementation, record it in the right file** — this file for working principles and agent-loop/harness design, `MEMORY.md` for terse cross-session facts. Periodically reflect back over everything the user has told you across the whole collaboration and capture anything durable that isn't written down yet; a principle stated in conversation but never recorded is a principle you will lose.
 
-**Debug in the browser:** Use the Claude Preview MCP (`preview_start`, `preview_screenshot`, `preview_click`, `preview_eval`) for real browser testing when: (a) the user explicitly asks for it, (b) a complex UI change was implemented and confidence in immediate correctness is low, or (c) the user is reporting the same issue a second time. For straightforward fixes, read the code and ship — no browser verification needed. When testing is warranted, the workflow is: reproduce first → confirm root cause with eval/screenshot → fix → verify before declaring done. Launch config: `~/.claude/launch.json` (port 3001 standalone, or `http://localhost:3000/ws/{name}/` for the real worker).
+**Debug in the browser:** No browser-automation MCP tool is currently configured for this project — verify UI changes by reading the code, and where feasible by driving the running server directly (`curl` against the worker's own routes, e.g. `GET /frames`, `GET /status`) rather than assuming a screenshot tool exists. If a browser-automation MCP tool IS available in a given session, use it for real browser testing when: (a) the user explicitly asks for it, (b) a complex UI change was implemented and confidence in immediate correctness is low, or (c) the user is reporting the same issue a second time — reproduce first → confirm root cause → fix → verify before declaring done. `~/.claude/launch.json` has the standalone launch config (port 3001, or `http://localhost:3000/ws/{name}/` for the real worker) for whatever tool ends up used.
+
+**Always end a task by naming the exact deploy command(s).** Whenever a task touches any file under `src/`, `public/`, `docker/`, or `bin/argo`, the final message must tell the user precisely what to run to see the change in THEIR actual local Argo — not a vague "rebuild if needed". Name the literal command(s), derived from which files changed and which process actually reads them:
+
+- **`public/*` (`app.js`, `styles.css`, `index.html`)** — never needs a rebuild in any mode. Central's `/ws/:name/` route and static middleware read straight from the host's `public/` directory on every request (`src/central.ts`'s `PUBLIC_DIR`/`fs.readFile`) — say "just refresh the browser."
+- **`src/*` files that run INSIDE the worker container** (everything except `central.ts` itself — `server.ts`, `agent.ts`, `dispatch.ts`, `frames.ts`, `tools/*`, `eviction.ts`, `loop.ts`, `ledger.ts`, `types.ts`, `config.ts`, `health.ts`, `auth.ts`, ...) — under `pnpm dev` (tsx watch, :3001) this reloads automatically, say so explicitly rather than staying silent. Under the real `argo` CLI, the running worker is a Docker container built from `docker/agent.Dockerfile`, which compiles TypeScript from `src/` INSIDE its own builder stage — a host-side `pnpm build` never reaches it. Say: run **`argo rebuild`** (rebuilds the image from current source), then re-attach the workspace (`argo <path>`) — an already-running worker container is not swapped out from under a live session, so a stale one may need `argo stop` first if a rebuilt image should take over immediately.
+- **`src/central.ts` (or anything only central's own process imports/runs)** — this runs on the host as `dist/index.js`, compiled ahead of time. Say: run **`pnpm build`**, then restart central — **`argo stop && argo <path>`**.
+- **`bin/argo`** — a plain shell script, no build step. Say: "takes effect on your next `argo` invocation."
+- **Nothing under these paths changed** (e.g. a `.md`-only edit, a memory update) — no deploy note needed.
+
+If a task touched multiple categories (e.g. both `server.ts` and `app.js`), give the full combined set of commands, in the order to run them, not just one.
 
 ---
 
@@ -54,28 +64,34 @@ The workspace is always git-tracked. `autoCommit()` initialises a git repo if th
 **Global env**
 `~/.config/argo/env`. A `KEY=VALUE` file for host-level configuration: Tavily API key, default model, etc. Sourced by workers at container start.
 
-**Run log**
-Two files written per run to `~/.local/share/argo/logs/{workspace-name}/`:
-- `{sessionId}_{slug}.jsonl` — machine-readable newline-delimited JSON, one event per line, first line is metadata
-- `{sessionId}_{slug}.md` — human-readable markdown trace of the same run
-Both files are written atomically when the run completes (`logger.flush()`).
-
-**Session history**
-`~/.local/share/argo/logs/{workspace-name}/history.json`. The raw Ollama message array (user + assistant messages) for the current live session. Written after every run. Loaded on server start to restore session context across server restarts. This is what gives the agent memory within a session.
-
-**Current session pointer**
-`~/.local/share/argo/logs/{workspace-name}/current-session.txt`. A single line containing the active session ID. Written on session creation or reset. Used to tag new run logs with the correct session ID.
+**Ledger (session/frame storage)**
+`.argo/sessions.json` + `.argo/frames/*.jsonl`, both **inside the workspace** (not under
+`~/.local/share/argo/` — that old per-run JSONL+MD log, `history.json`, and `current-session.txt`
+are all gone; nothing writes them any more, see `src/logger.ts`'s own header comment). `sessions.json`
+(`src/ledger.ts`'s `SessionRegistry`) maps each session to its runs, each run to the ordered frames
+(Dispatcher/Planner/Implementer) it spawned. Each frame gets its own append-only JSONL file under
+`.argo/frames/<frameId>.jsonl` — every message that frame ever saw, plus UI-only metadata (thinking,
+tool args, timing) never sent back to the model. See "Session" and "Conversation" below, and
+`GLOSSARY.md` for the full terminology this maps onto.
 
 ### Session / interaction layer
 
-**Session**
-A conversation between user and agent. All runs between two `POST /reset` calls share the same session ID and accumulate history. From the user's perspective a session is a topic or task. Sessions are listed in the session dropdown; switching to a past session loads its messages into the chat view.
-
-**Run**
-One invocation of `agent.chat(userMessage)`. The user types a message, the agent loops until it has a final answer or hits the iteration limit, and one JSONL + MD log pair is written. Multiple runs belong to the same session and their messages accumulate in `history.json`. Runs are an internal implementation detail — never surfaced directly in the UI.
+**Session and Conversation** (see `GLOSSARY.md` for the canonical definitions — this file doesn't
+redefine them a second way). A **Session** is the persistent connection to one workspace, spanning
+every prompt the user ever sends it; the Dispatcher is the ONE frame that lives for a session's
+entire lifetime (its ledger file is reloaded and extended on every new prompt). A **Conversation**
+is one user request through to its resolution — what CLAUDE.md used to call a "Run" — and is scoped
+to a single call to `runDispatchLoop`; a Conversation may spawn its own short-lived Planner/
+Implementer frames, which start fresh and never carry over to the next Conversation. Sessions are
+listed in the session dropdown; switching to a past session loads its messages into the chat view.
+Conversations are an internal implementation detail — never surfaced directly in the UI.
 
 **Agent loop (ReAct)**
-The core processing pattern inside a run: the LLM is given the full system prompt + history and produces either (a) a final text answer (no tool calls) or (b) a thought + one or more tool calls. Tool results are appended to history and the loop repeats. Up to `MAX_ITERATIONS` per run (default: 1000).
+The core processing pattern inside one frame's run: the LLM is given the full system prompt +
+history and produces either (a) a final text answer (no tool calls) or (b) a thought + one or more
+tool calls. Tool results are appended to history and the loop repeats. The iteration cap is
+per-role, not a single flat number — `src/frames.ts`'s `ROLE_MAX_ITERATIONS` (dispatcher 15, planner
+40, implementer 160).
 
 Loop steering — a call repeating with no new information — is handled by `src/loop.ts`'s mutation-aware loop-recovery ladder, not a separate guard in `agent.ts`. See "Loop recovery" below for the full mechanism (L0 cached replay/steer, L1 eviction, L2 forced reframe, `halt`).
 
@@ -83,9 +99,9 @@ Loop steering — a call repeating with no new information — is handled by `sr
 
 **Multi-agent dispatch, not a single loop.** Argo does not run one undifferentiated ReAct loop over the whole task any more. `src/dispatch.ts`'s `runDispatchLoop` is harness code (never itself an LLM call) that classifies the request via a **Dispatcher** frame (ANSWER / SIMPLE / OBJECTIVE), then either hands the whole thing to one **Implementer** frame (SIMPLE) or to a **Planner** frame that produces an ordered list of implementation units and is then resumed, once per unit, to produce each Implementer's self-contained assignment (OBJECTIVE). Every frame — Dispatcher, Planner, Implementer — is one scoped `src/agent.ts` `Agent` instance: same ReAct loop, same tool-dispatch code, different `allowedTools`/system-prompt suffix/iteration budget (`src/frames.ts`). This replaced an earlier `update_plan`-based single-loop design (`this.currentPlan`, a plan/act gate blocking mutation until a plan existed, harness-owned task-ledger sequencing, an LLM self-critique checkpoint, and a grounding/layout judge) — all of that machinery, plus the Tester agent that used to independently re-verify every Implementer's work, was removed once the dispatch architecture's own role separation and the Implementer's own verification step made it redundant. `conclude(status, message)` is now the ONLY way any frame ends its turn — a turn with no tool calls is a thinking turn, not a finish. (The Dispatcher role was previously named "Boss" — renamed for clarity; the underlying classification/summarization behavior is unchanged.)
 
-**Context management is deterministic, not LLM-summarized.** `src/eviction.ts` types every tool call as a CWL episode (exploratory | action) and, when the live context approaches `num_ctx`, stubs out the oldest already-durably-persisted episodes first — no model call, no structured-summary state file. Nothing evicted is gone: the full original survives in the append-only ledger (`src/ledger.ts`, `/workspace/.argo/ledger.jsonl`) and can be recovered via the `ledger` tool's `expand` action. `KEEP_RECENT_TOOL_RESULTS`/`TOOL_RESULT_COLLAPSE_OVER` (`src/agent.ts`) is a second, cheaper pass that collapses older tool results before eviction's own threshold is even reached — this is what keeps native tool-calling reliable on a small local model over a long run, since native-call reliability falls as context grows.
+**Context management is deterministic, not LLM-summarized.** `src/eviction.ts` types every tool call as a CWL episode (exploratory | action) and, when the live context approaches `num_ctx`, stubs out the oldest already-durably-persisted episodes first — no model call, no structured-summary state file. Nothing evicted is gone: the full original survives in the frame's own append-only ledger file (`src/ledger.ts`, `.argo/frames/<frameId>.jsonl`) and can be recovered via the `ledger` tool's `expand` action. `KEEP_RECENT_TOOL_RESULTS`/`TOOL_RESULT_COLLAPSE_OVER` (`src/agent.ts`) is a second, cheaper pass that collapses older tool results before eviction's own threshold is even reached — this is what keeps native tool-calling reliable on a small local model over a long run, since native-call reliability falls as context grows.
 
-**Loop recovery.** `src/loop.ts`'s ladder detects a no-progress repeat (same call, nothing changed since it last ran) and escalates: L0 serves back the cached result of the earlier call (labeled as a repeat, not a bare block — cheaper and more informative than silence); L1 triggers a context eviction pass; L2 forces the model to produce a revised plan for the current task. If the model ignores the ladder long enough after L2, the frame `halt`s rather than looping indefinitely — reported as a partial result (never success). A separate role-gate counter (H21, `noteGateRejection`) bounds a tool call refused for being outside the current frame's `allowedTools`: escalating wording at the 3rd identical refusal, and the frame stops outright at the 6th.
+**Loop recovery.** `src/loop.ts`'s ladder detects a no-progress repeat (same call, nothing changed since it last ran) and escalates: the FIRST no-progress repeat of a given call (up to `maxReplaysPerKey`, default 1) serves back the cached result of the earlier call without re-running it (labeled as a repeat, not a bare block); every escalation past that — the plain L0 steer, L1 (context eviction), and L2 (forced re-plan) — **actually re-runs the tool call for real** (`src/agent.ts`'s tool-dispatch loop, the `duplicateWarning` path) rather than skipping it. This changed 2026-09-18: skipping used to fabricate a `SKIPPED` tool-result error and suppress the real result, which left the model with nothing useful once the ONE cached replay's budget was spent and the earlier real result had aged out of context (evicted/collapsed/superseded) — a duplicate `bash`/`read_file`/etc. call costs nothing to re-run, and nothing about it has actually failed. The ladder's steering prose is instead pushed as a separate, ephemeral **warning** system message immediately AFTER the real tool result (never merged into it, never framed as an `Error:`) — ephemeral via the same `pruneHarnessMessages`/`HARNESS_MESSAGE_MAX_ITERATION_AGE=1` mechanism as a stall/reground nudge, so it informs only the very next model turn and is gone from context one turn later. `supersedeOlderCalls` still runs on a successful re-execution exactly as it would for any other real call, so the OLDER duplicated call (for `read_file`/`write_file`/`edit_file`/`fetch_url`) is still removed from context, not left as a second stale copy. If the model ignores the ladder long enough after L2, the frame `halt`s rather than looping indefinitely — reported as a partial result (never success); `halt` also re-runs its own triggering call for real (with the same warning) before ending the frame, for the same reason. A separate role-gate counter (H21, `noteGateRejection`) bounds a tool call refused for being outside the current frame's `allowedTools` — a genuine, permanent refusal, unlike a duplicate-call repeat, so it is unaffected by any of the above and still fabricates a rejection: escalating wording at the 3rd identical refusal, and the frame stops outright at the 6th.
 
 The per-iteration Ollama call (`chatWithRetry` in `src/agent.ts`) gets **one automatic retry**. A failure of *only this call* — `withTimeout`'s own timeout, or a thrown error from the Ollama client (e.g. its Go backend rejecting a malformed qwen3.6 tool-call as `XML syntax error … <function> closed by </parameter>`) — used to end the whole run at the outer catch, forcing the user to notice and resend. It now emits a `warning`, waits `CHAT_RETRY_DELAY_MS` (default 2s, no backoff), and re-issues the identical request once; a second failure falls through to the existing outer catch unchanged. Safe because this call runs *before* any tool executes in the iteration (nothing has side-effected yet) and temperature > 0 gives the retry a real chance of parsing cleanly. This retry is applied to **nothing else** — never to tool execution (a bash command or file write must not be silently re-run) or to context eviction. If the user hits stop during the wait, the abort is honored (no retry into a stopped run).
 
@@ -99,16 +115,22 @@ The LLM's text content in a response that appears alongside or before tool calls
 A named capability a frame can invoke. Each tool is defined in `src/tools/` and registered in `src/tools/index.ts`. Full set: `bash`, `write_file`, `read_file`, `edit_file`, `fetch_url`, `browser_fetch`, `web_search`, `ledger`, `conclude`. Not every role gets every tool — `src/frames.ts`'s `ROLE_TOOLS` restricts each frame (only the Implementer holds `write_file`/`edit_file`; Planner and Dispatcher also get `bash`, but for investigation only — `src/frames.ts`'s `patchBashForReadOnly` swaps in a read-only tool DESCRIPTION for those two roles so the schema itself never invites a write, while their own prompts state the project is read-only for them). Every tool returns `{ output: string, error?: string }` — they never throw. `write_file`/`read_file`/`edit_file` accept any absolute path in the container; `/workspace/...` is the only one that's confined and git-tracked. `edit_file` (`file-ops.ts`) does an exact-string replace and **reports what it did** — occurrences replaced plus the updated lines, line-numbered — or errors clearly when the text is missing or matches more than one place, so an edit never applies silently or to the wrong spot (the failure behind a real "did my edit work? let me look again…" loop). Prefer it over an in-place `sed`, which gives no such feedback. `conclude(status, message)` is the only way any frame ends its turn — a turn with no tool calls is a thinking turn, not a finish.
 
 **Context window**
-The LLM's token budget for one Ollama call (the full history + system prompt + tool definitions). Configured via `num_ctx` (default 65,536). Shown as a token counter in the header. Context eviction triggers when only `config.compactReserveTokens` (default 13,107) tokens of headroom remain before `num_ctx` — a near-full trigger, not a fixed fraction, tuned to give deterministic eviction real room to work before the situation is critical.
+The LLM's token budget for one Ollama call (the full history + system prompt + tool definitions). Configured via `num_ctx` (default 65,536). Shown as a token counter in the header. Context management triggers at `CONTEXT_TRIGGER_PCT` (60%) of `num_ctx` (`src/agent.ts`'s `manageContext`) — **not** `config.compactReserveTokens`: that value only feeds a UI-facing `compactThreshold` display field in `server.ts` and is never read by the actual trigger decision, a docs/code drift that stood uncaught until 2026-09-18 (see Context eviction below for why it mattered in practice, not just as a documentation nit).
 
 **Context eviction**
-Deterministic, not an LLM summary — see `src/eviction.ts`. Every tool call is typed as a CWL episode (exploratory | action, `classifyTool`); when the live window needs to shrink, the OLDEST action episodes are stubbed first (their effect is already durably persisted — a file on disk, a ledger conclusion — so the raw record isn't needed live), then exploratory episodes nothing still-live depends on. If that alone doesn't reach budget, a second pass truncates long assistant messages, oldest first. Nothing evicted is actually gone — the full original survives in the ledger's episode record (`src/ledger.ts`) and can be recovered via the `ledger` tool's `expand` action. The objective (set once by the Dispatcher) and the current run's own prompt are never evicted. Regression suite: `src/eviction.test.ts`.
+Deterministic, not an LLM summary — see `manageContext` in `src/agent.ts`. Below the 60% trigger, nothing happens. Once triggered: system/user messages are never touched; assistant/tool messages are walked newest-to-oldest, keeping the newest `CONTEXT_VERBATIM_PCT` (40%) of `num_ctx` worth verbatim, then of the older slice, the next `CONTEXT_COLLAPSE_PCT` (10%) gets COLLAPSED (head(150 chars) + a `[collapsed...; msg_id "X" to recover]` placeholder + tail(150 chars)), and everything past that gets fully EVICTED (bare `[evicted...]` marker, no preview). Nothing evicted is actually gone — the full original survives in the ledger (`src/ledger.ts`) and can be recovered via the `ledger` tool's `expand` action.
+
+Whether the trigger and the internal verbatim/collapse/evict split actually fire at the RIGHT time depends entirely on how well token usage is *estimated* before the real number is known — and a flat chars-per-token constant turned out not to be good enough on its own. **Incident (2026-09-18, test-wind hex-grid run):** `eviction.ts`'s flat `CHARS_PER_TOKEN = 3.5` estimate is structurally blind to the tool-schema definitions sent with every request (never part of `this.history` at all — ~6KB/~1,700+ tokens of constant overhead per call, in that run's case) and was badly miscalibrated for that run's actual content (dense hex-grid coordinate/geometry math tokenizes far denser than the constant assumes). Result: real usage (Ollama's own `prompt_eval_count`) crossed 90% while the harness's own estimate never once reached its 60% trigger in a 13-turn run — `manageContext` never fired, confirmed directly via the UI's per-agent context gauge (which reads the real `prompt_eval_count`, not the estimate, and was accurately reporting 92% the whole time).
+
+**Fix — self-calibrating ratio, not a better constant.** `Agent` now tracks `effectiveCharsPerToken`, recalibrated after every real Ollama response (`recalibrateCharsPerToken`) against the actual `prompt_eval_count`, and used everywhere the flat constant used to be: both the aggregate trigger check (`estimateCurrentTokens`, anchored to the last real measurement plus a calibrated-ratio estimate of whatever's been added since — bounding error to just the recent delta instead of compounding it over a whole run) and the internal per-message verbatim/collapse/evict budget walk inside `manageContext` itself (so the actual shrink decisions use the same corrected ratio, not just the trigger). Recalibration uses the DELTA between two consecutive real measurements, not the running total — a total-based ratio is contaminated by the constant tool-schema overhead (which would make it look artificially dense early in a frame's life, then wrongly apply that skew to much larger later content); a delta cancels the constant term out, isolating an honest per-turn density sample, blended via an EMA (`ALPHA=0.5`) and clamped to `[1,6]` chars/token so one edge-case measurement can't send every later estimate off a cliff. Falls back to the shared default (`eviction.ts`'s `CHARS_PER_TOKEN`) until the first real measurement of a frame's life, and resets on `reset()`/`loadHistory()` (a reloaded frame has no calibration data of its own). Regression suite: `src/eviction.test.ts`, `src/agent.test.ts`.
+
+**Reasoning-artifact reinjection.** A model's own `thinking` output does not reliably survive into its NEXT turn's request just by being attached to a pushed `Message`'s `thinking` field — confirmed live (2026-09-18): whenever a turn also produced real `content` alongside `thinking` (with or without a tool call), the `thinking` half silently failed to reach later context. `Agent.pushReasoningArtifact` (`agent.ts`) is the one channel proven to survive: it re-pushes a turn's own scratch output as an explicit `[Reasoning]\n...`-prefixed assistant message, single-slotted — pushing a new one always removes every message the previous one occupied first, no stub, nothing worth recovering. Three shapes, by turn type: (1) a turn with a real tool call and `thinking` but no `content` — the `thinking` becomes the sole `[Reasoning]` artifact; `content` alongside a real tool call is never reasoning-labeled and is pushed as its own permanent message instead, since it accompanies a kept action. (2) A no-tool-call ("thinking") turn with only one of `content`/`thinking` — that one text becomes the sole artifact (a no-tool-call turn's own `content` is exactly as disposable as its `thinking`, since nothing was concluded either way). (3) A no-tool-call turn with BOTH — pushed as a **paired** artifact (real reasoning first, its own `content` second, both `[Reasoning]`-labeled): the two messages occupy the SAME slot-generation, so the second push never supersedes the first, and only the NEXT distinct reasoning artifact (from any later turn) removes both halves together. Regression suite: `src/agent.test.ts`.
 
 **Model**
 The Ollama model identifier (e.g. `qwen3.6:latest`, `llama3.1:8b`). Selected per session in the breadcrumb model picker. Applied on every Ollama API call within that session. Changing the model mid-session takes effect on the next run.
 
 **Model options**
-Per-session sampling parameters: `temperature`, `top_p`, `top_k`, `num_ctx`. Configured in the settings panel (⚙). Applied to all Ollama calls in the session. Defaults are `temp=0.8, top_p=0.9, top_k=40, ctx=65536`.
+Per-session sampling parameters: `temperature`, `top_p`, `top_k`, `num_ctx`. Configured in the settings panel (⚙), which overrides the model's own preset. There is no single flat default any more — `src/agent.ts`'s `MODEL_PRESETS` sets per-model values on selection (e.g. qwen3.6: `temp=0.6, top_p=0.95, top_k=20`; qwen3.8: `temp=0.7, top_p=0.8, top_k=20`), both at `num_ctx=65536`.
 
 ### UI / streaming layer
 
@@ -161,9 +183,12 @@ These are standing requirements captured from user feedback. Treat them as bindi
 - Never put the trace in a side panel, tab, or separate view.
 
 **Sessions vs runs**
-- A **session** is a conversation (group of user↔assistant exchanges). A **run** is one `chat()` call within a session. Runs are an internal implementation detail — never expose them in the UI.
-- The session dropdown shows only sessions (date + query preview + Clear button). No run counts, no sub-items.
-- Terminology: "session" in all UI copy. Never "run" or "trace run".
+- A **session** spans every prompt sent to one workspace (see "Session and Conversation" in the
+  Conceptual model above); each individual prompt is its own **Conversation**, internally one
+  `runDispatchLoop` call. Neither "conversation" nor "run" is an implementation detail the UI needs
+  to expose — never show either term in the UI.
+- The session dropdown shows only sessions (date + query preview + Clear button). No run/conversation counts, no sub-items.
+- Terminology: "session" in all UI copy. Never "run", "conversation", or "trace run".
 
 **Layout**
 - The main layout is: chat panel (left, `--chat-width` CSS var, default 50%) | resize handle | files panel (right, flex: 1).
@@ -239,37 +264,12 @@ Argo's web UI is password-gated because central listens on all interfaces, not j
 - `bin/argo`'s CLI has no browser session, so it sends the password as an `X-Argo-Password` header instead (`acurl` wrapper) — `requireAuth` accepts either. `ensure_central` sources `~/.config/argo/env` into central's process env before launching it, which is also how `ARGO_PASSWORD` (and in principle other global settings) actually reach central's own `config` — `loadGlobalEnv()` alone only re-reads that file for worker container injection, not for central's own process.
 - `installAuth` is called unconditionally in `central.ts`, and only when `!config.inContainer` in `server.ts` — worker mode is reached exclusively through central's proxy (its own Docker-published port is bound to `127.0.0.1`, see `startWorker`), so it doesn't need its own copy of the password to check against.
 
-## How to add a new tool
-
-Three files to touch:
-
-### 1. `src/tools/my-tool.ts`
-```typescript
-import type { ToolResult } from '../types.js'
-
-export async function myTool(arg: string): Promise<ToolResult> {
-  try {
-    return { output: '...' }
-  } catch (err) {
-    return { output: '', error: String(err) }
-  }
-}
-```
-
-### 2. `src/tools/index.ts`
-- Add import
-- Add entry to `toolDefinitions` array (this is what Ollama sees — description quality matters)
-- Add case to `executeTool` switch
-
-### 3. `src/types.ts`
-- Add `'my_tool'` to the `ToolName` union
-
-tsx watch reloads automatically in `pnpm dev` — no restart needed. Run `argo rebuild` to bake changes into the Docker image.
+*How to add a new tool: see the `argo-add-tool` skill.*
 
 ## Tool output conventions
 
 - Always return `{ output: string, error?: string }` — never throw
-- Truncate long outputs to prevent context window overflow (see `MAX_OUTPUT` constants in each tool)
+- Truncate long outputs to prevent context window overflow (see `MAX_OUTPUT` constants in each tool, and `truncateOutput` in `src/tools/truncate.ts` for the standard head+tail shape — prefer it over a bare `.slice(0, N)`, which silently drops whatever's past the cutoff even when the useful part is at the end) — **except** `write_file`/`edit_file`, which echo the file's full resulting content back with no cap at all. The distinction: a tool result is only a truncation candidate when its content is external/uncontrolled-size and the tool didn't author it (`bash` output, a fetched page, an existing file `read_file` opens) — `write_file`/`edit_file`'s echo is the model's OWN just-produced text, and cutting it off leaves the model unsure what the back half of its own file says, which is exactly what produces an unnecessary follow-up read to check.
 - Errors go in `error` field, not output — argo loop shows them differently in the UI
 
 ## The bash tool pattern
@@ -286,14 +286,22 @@ For multi-line JS scripts, the model uses `write_file` with a path outside `/wor
 
 ## Session architecture
 
-A **session** = all agent runs (`chat()` calls) between two `POST /reset` calls, sharing the same conversation history.
+A **session** (see "Session and Conversation" above) = every Conversation between two `POST /reset`
+calls, sharing the persistent Dispatcher frame and its accumulated history.
 
-- Each `chat()` call writes one `.jsonl` + `.md` file (a "run"), stamped with a `sessionId`
-- `sessionId` is a timestamp string (`2024-01-15T14-30-00`), stored in `{LOGS_DIR}/current-session.txt`
-- `POST /reset` and `DELETE /logs` generate a new session ID and persist it to that file
-- `POST /resume/:sessionId` loads all messages from a past session back into agent history and switches to that session ID
-- `GET /logs` returns `SessionGroup[]` (runs grouped by sessionId, newest first) — not flat `LogMeta[]`
-- `LogMeta.sessionId` is optional — old log files without it fall into a `'legacy'` group
+- `sessionId` is a timestamp string (`2024-01-15T14-30-00`). The active one is
+  `.argo/sessions.json`'s `currentSessionId` field (`ledger.ts`'s `setCurrentSession`/
+  `getCurrentSession`) — there is no separate pointer file any more.
+- `POST /reset` and `DELETE /logs` mint a fresh session ID via `ledger.setCurrentSession`.
+- `POST /resume/:sessionId` just switches the `currentSessionId` pointer — the persistent
+  Dispatcher frame's own preload (its ledger file, keyed on frame id, not session id) is what
+  actually restores context the next time it's spawned; there's no separate "load history into the
+  shared agent" step.
+- `GET /logs` reconstructs each session's events straight from the ledger
+  (`reconstructSessionEvents`/`reconstructFrameEvents` in `server.ts`) — nothing writes a session
+  log file for this any more, it's rebuilt on read.
+- `DELETE /logs/:sessionId` removes that session's registry entry and every frame file it owns
+  (`ledger.deleteSession`).
 
 UI session dropdown shows: "New session" CTA, current live session ("Now"), then past sessions (date + last-query preview + Clear button), then "Clear all history". The live session is filtered from the past list using the session ID from `GET /status`.
 
@@ -301,10 +309,12 @@ UI session dropdown shows: "New session" CTA, current live session ("Now"), then
 
 ```
 agent.ts emitAndLog(event)
-  → logger.log(event)         writes to in-memory entries
-  → this.emit(event)          calls server.ts bus.emit('agent', event)
-    → all SSE clients get:    data: {JSON}\n\n
-logger.flush() at end         writes .jsonl + .md to logs/
+  → this.emit(event, seq)         dispatch.ts's tagEmit adds __frameId/__role, then
+                                   calls server.ts's emitEvent → bus.emit('agent', ...)
+    → all SSE clients get:        data: {JSON}\n\n
+  → this.traceLogger?.logEvent()  appends to this frame's Markdown trace file (al-logger.ts)
+pushCtx() (separately, per message pushed to history)
+  → ledger.recordMessage()        appends to .argo/frames/<frameId>.jsonl
 ```
 
 ## Config
@@ -334,74 +344,7 @@ Key details:
 - Uses `node ... & disown $!` (not nohup) to background the central server
 - JSON manipulation uses Python3 inline (available on macOS) to avoid jq dependency
 
-## Common debugging
-
-**`argo attach` behaves like an old version — bugs long since fixed still reproduce**
-→ `bin/argo`'s CLI flow runs `dist/index.js` (compiled) and `argo:latest` (a prebuilt Docker image) — neither updates automatically when `src/` changes. `pnpm dev` (tsx watch) is the only path that reflects source instantly; central/worker mode does not. After any change that matters for real usage, run `pnpm build` and `docker build -f docker/agent.Dockerfile -t argo:latest .` (or `argo rebuild` for just the image) before testing through the actual `argo` CLI — otherwise you're debugging against stale code and won't find anything.
-
-**Argo not calling tools / outputting JSON as text**
-→ Switch to `qwen3.6:latest` — the only model validated for agentic use in Argo. See README Models table for full findings per model.
-
-**Agent writes scripts but doesn't run them / declares done on empty output / poor multi-step reasoning**
-→ Model capability issue. Gemma3/4 models cannot follow the ReAct loop — they lose cause-and-effect across iterations and ignore the system prompt. `gemma3:12b` returns a hard Ollama error ("does not support tools"). Use `qwen3.6:latest`.
-
-**bash tool returning empty output**
-→ Standalone: check `docker ps` — container may be stopped. Run `docker start argo-sandbox`.
-→ Worker: check `docker ps | grep argo-` and `docker logs argo-{name}`.
-
-**browser_fetch failing**
-→ `docker exec argo-{name} node -e "require('playwright'); console.log('ok')"` to verify install.
-
-**`require('pkg')` not found in argo script**
-→ Must use `require()` not `import`. Verify `NODE_PATH`: `docker exec argo-{name} printenv NODE_PATH`.
-
-**Port conflict on startup**
-→ `lsof -ti :3000 | xargs kill -9`
-
-**Central server fails to start**
-→ `cat ~/.local/share/argo/server.log`
-
-**SSE "Connecting…" forever through the proxy**
-→ Two causes fixed in `proxyToWorker`: (1) For GET requests, use `proxy.end()` directly — don't use `req.pipe(proxy)` because `req` may have already emitted `end` (due to the `await loadRegistry()` before calling the proxy), and piping an already-ended stream never calls `proxy.end()` so the worker never gets a complete request and never sends headers. (2) Strip hop-by-hop headers (Connection, Transfer-Encoding, etc.) and set `accept-encoding: identity` on the proxied request to prevent the worker from gzip-encoding the SSE stream. Call `res.flushHeaders()` after `res.writeHead()` to send the 200 + SSE headers to the browser immediately.
-
-**ERR_TOO_MANY_REDIRECTS on /ws/:name/**
-→ `app.set('strict routing', true)` missing from the Express app in `startCentral()`.
-
-**Root URL serves index.html instead of workspaces.html**
-→ `express.static` must be called with `{ index: false }` in `startCentral()`.
-
-**pnpm install blocked in Dockerfile**
-→ Dockerfile uses `npm install --ignore-scripts` (not pnpm) — pnpm v11 blocks esbuild postinstall.
-
-## File paths to know
-
-| File | Purpose |
-|---|---|
-| `src/index.ts` | Entry point — routes to central, worker, or standalone |
-| `src/central.ts` | Central server: registry, Docker lifecycle, HTTP proxy |
-| `src/dispatch.ts` | The Orchestrator — Dispatcher/Planner/Implementer dispatch loop |
-| `src/frames.ts` | Per-role tool sets, iteration budgets, system-prompt suffixes |
-| `src/agent.ts` | ReAct loop + system prompt + auto-commit logic |
-| `src/eviction.ts` | Deterministic context eviction — no LLM summarization |
-| `src/loop.ts` | Loop-recovery ladder — repeat detection, cached replay, gate rejection counter |
-| `src/ledger.ts` | Append-only delegation/conclusion/episode audit trail |
-| `src/al-logger.ts` | Structured XML trace, one file per agent frame |
-| `src/tools/index.ts` | Tool registry — add new tools here |
-| `src/server.ts` | All HTTP routes + SSE (worker/standalone) |
-| `src/logger.ts` | Session log writing + `listSessions()`, `deleteAllLogs()`, `getSessionMessages()` |
-| `src/config.ts` | All env vars + mode flags |
-| `src/health.ts` | Ollama/Docker/git startup checks |
-| `docker/agent.Dockerfile` | Multi-stage: TS builder (node:22-alpine) + Ubuntu runtime |
-| `docker/sandbox.Dockerfile` | Legacy — used only with `pnpm dev` standalone mode |
-| `public/app.js` | All frontend logic |
-| `public/styles.css` | All styling |
-| `public/index.html` | Argo UI — served at `/ws/:name/` with `__WS__` injected |
-| `public/workspaces.html` | Workspace list — served at `/` |
-| `bin/argo` | CLI: attach, detach, list, stop, rebuild |
-| `~/.config/argo/env` | Global config (API keys, model) |
-| `~/.config/argo/workspaces.json` | Workspace registry |
-| `~/.local/share/argo/logs/{name}/` | Session logs per workspace (JSONL + MD per run, `history.json`, `current-session.txt`) |
-| `~/.local/share/argo/server.log` | Central server stdout/stderr |
+*Common debugging (symptom → cause/fix): see the `argo-troubleshooting` skill.*
 
 ## Nav dropdown positioning
 

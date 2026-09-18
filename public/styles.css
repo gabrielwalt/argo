@@ -30,6 +30,7 @@
   --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
   --chat-width: 50%;
   --tree-width: 240px;
+  --ctx-sidebar-width: 180px;
 }
 
 /* ── Animations ── */
@@ -326,13 +327,12 @@ body {
 .nav-drop-attach button:hover { opacity: .85; }
 .nav-drop-attach button:disabled { opacity: .4; }
 
-/* ── Combined context + status indicator ──────────────────────────────
+/* ── Combined status indicator ──────────────────────────────────────
    Lives in the header's CHAT section (#indicator-area), at the right end of
-   #toolbar-chat. HAL 9000-styled donut: three concentric rings (outer→inner
-   = Dispatcher/Planner/Implementer, each in its own AGENT_COLORS color)
-   show that role's own context usage; the solid glowing center core = agent
-   state (green/yellow/flashing-violet/red), like HAL's red eye. Precise
-   numbers + status/model text live in the dropdown (#ctx-dropdown). */
+   #toolbar-chat. A plain status-word trigger (was a per-role donut — that
+   per-agent detail now lives in the Context tab's sidebar instead, see
+   #ctx-sidebar below). Clicking it opens a small dropdown (#ctx-dropdown)
+   with "Model & parameters" and "Clear conversation". */
 #indicator-area {
   display: flex;
   align-items: center;
@@ -345,58 +345,17 @@ body {
 #token-counter {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  padding: 1px;
-  border-radius: 50%;
+  padding: 4px 10px;
+  border-radius: 4px;
   cursor: pointer;
-  line-height: 0;
+  font-size: 12px;
+  color: var(--text);
   transition: background .15s;
 }
 #token-counter:hover { background: rgba(201,162,39,.12); }
-#token-counter .ctx-donut { display: block; width: 40px; height: 40px; }
-
-/* Core (agent-state dot) — solid state color with a soft glow (same "shiny" quality
-   as the home screen's #status-dot, via the inline drop-shadow filter set in
-   renderDonut()). Pulses gently while busy ("running") or compacting; steady
-   (glow only, no motion) while ready/idle. */
-@keyframes ctx-core-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .4; transform: scale(.72); } }
-.ctx-core.running,
-.ctx-core.compacting { transform-box: fill-box; transform-origin: center; }
-.ctx-core.running { animation: ctx-core-pulse 1.4s ease-in-out infinite; }
-.ctx-core.compacting { animation: ctx-core-pulse 1s ease-in-out infinite; }
-@media (prefers-reduced-motion: reduce) {
-  .ctx-core.running, .ctx-core.compacting { animation: none; }
-}
 
 /* Context dropdown (reuses .nav-dropdown chrome) */
 #ctx-dropdown { min-width: 260px; }
-
-/* Non-clickable 2-line status readout at the top of the dropdown (see
-   buildCtxDropdown() in app.js) — plain info, not a .nav-drop-item, so it
-   gets no hover highlight and no pointer cursor. Line 1 = status word + model
-   (uppercase-ish muted label feel); line 2 = precise token usage in mono, or
-   a muted "No context yet" placeholder when there's nothing to show yet. */
-.ctx-status-head {
-  padding: 8px 12px 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  cursor: default;
-  user-select: none;
-}
-.ctx-status-line1 {
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: .04em;
-  color: var(--text);
-}
-.ctx-status-line2 {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--muted);
-}
-.ctx-status-line2.muted { opacity: .7; font-style: italic; }
 
 .nav-drop-item.disabled {
   opacity: .4;
@@ -1547,6 +1506,225 @@ button:disabled { opacity: .35; cursor: not-allowed; }
    diff-modal's #diff-content, just pre-formatted text instead of the
    per-line .code-line divs used for plain source. */
 #file-viewer-content.diff-view { white-space: pre; }
+
+/* ── Context tab — live per-agent context viewer ──────────────────────────
+   Takes over #files-panel-body's tree|viewer slot (see setFilesMode() in
+   app.js), but owns its OWN sidebar|messages split rather than reusing the
+   file tree/viewer panes — #ctx-sidebar lists agents (GET /frames), dragged
+   wider/narrower via #ctx-resize same as #tree-resize; #ctx-messages-pane
+   shows the selected agent's messages (GET /context?frame=<id>), polled
+   every 2s while this tab is open (see refreshCtxPanel/startCtxPolling). */
+/* .hidden (global, !important — see near the bottom of this file) already
+   forces display:none regardless of the flex rule below, same as every
+   other toggled pane in this layout (#file-tree-pane etc.) — no separate
+   #ctx-panel.hidden override needed. */
+#ctx-panel {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  min-width: 0;
+  height: 100%;
+}
+
+#ctx-sidebar {
+  width: var(--ctx-sidebar-width, 180px);
+  min-width: 120px;
+  max-width: 400px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+}
+
+#ctx-agent-list { padding: 6px 0; }
+
+.ctx-agent-empty {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 8px 10px;
+  font-style: italic;
+}
+
+/* One group per conversation (= session — GET /frames' `conversations`),
+   current conversation first, then past ones most-recent-first. Planner/
+   Implementer frames accumulate here across the conversation's whole life —
+   a new Implementer spawning never hides an earlier one. */
+.ctx-conv-group + .ctx-conv-group { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 4px; }
+.ctx-conv-label {
+  padding: 6px 10px 2px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted);
+}
+
+.ctx-agent-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  border-left: 2px solid transparent;
+  transition: background .15s, border-color .15s;
+}
+.ctx-agent-item:hover { background: rgba(255,255,255,.04); }
+.ctx-agent-item.selected {
+  background: rgba(255,255,255,.06);
+  border-left-color: var(--accent);
+}
+.ctx-agent-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ctx-agent-role {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Status dot — see app.js's renderCtxAgentRow for the three-way rule this
+   renders: .running (the ONE frame actually executing right now) pulses
+   green; .active-run (spawned this run, not the one executing) is a steady
+   orange; .past (a past conversation, or an earlier run of the still-current
+   one) is a steady grey. Only .running reuses the existing pulse-glow
+   animation — the others are deliberately still. */
+.ctx-agent-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.ctx-agent-dot.running { background: var(--green); animation: pulse-glow 1.6s ease-in-out infinite; }
+.ctx-agent-dot.active-run { background: var(--orange); }
+.ctx-agent-dot.past { background: var(--muted); }
+.ctx-agent-tokenbar {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+.ctx-agent-tokenbar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width .3s ease;
+}
+.ctx-agent-tokenlabel {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+#ctx-messages-pane {
+  flex: 1;
+  overflow-y: auto;
+  min-width: 0;
+  background: var(--bg);
+  padding: 8px;
+}
+
+.ctx-numctx {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  text-align: right;
+}
+
+/* One context message — long content collapses under a max-height, with a
+   dedicated "▼ Show all" button to expand it (buildCtxMsgEl() in app.js),
+   matching the chat panel's own trace-body expand pattern rather than a
+   click-anywhere toggle. */
+.ctx-msg-item {
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  margin-bottom: 6px;
+  padding: 6px 8px;
+  transition: opacity .3s, background .15s;
+}
+.ctx-msg-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+.ctx-msg-role {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--muted);
+}
+.ctx-msg-role.role-user      { color: var(--accent); }
+.ctx-msg-role.role-assistant { color: var(--green); }
+.ctx-msg-role.role-system    { color: var(--gold); }
+.ctx-msg-role.role-tool      { color: var(--blue); }
+.ctx-msg-chars {
+  color: var(--muted);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+.ctx-msg-preview {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* Same collapse mechanics as .trace-body/.trace-body.collapsed in the chat
+   panel (see addTraceItem()) — the full text is always in the DOM, only
+   .collapsed's max-height hides the overflow, so buildCtxMsgEl()'s dedicated
+   "▼ Show all" button just toggles a class, never re-renders content. Kept in
+   sync with that pattern intentionally: expanding a long message should look
+   and behave the same way in both places. */
+.ctx-msg-preview.collapsed { max-height: 60px; overflow: hidden; }
+
+/* New messages animate in as they arrive (see renderCtxMessages() diffing
+   against the previous poll's message list); the .new class is stripped
+   ~500ms later so the animation can retrigger on the next arrival. */
+@keyframes ctx-msg-enter {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: none; }
+}
+.ctx-msg-item.new { animation: ctx-msg-enter 0.3s ease; }
+
+/* Superseded/evicted/collapsed messages (content rewritten to a
+   "[superseded…]"/"[evicted…]"/"[collapsed…]" placeholder by compaction —
+   see isCtxSuperseded()) fade out in place rather than disappearing, so
+   it's visible that a message that used to be there was retired. */
+.ctx-msg-item.superseded {
+  opacity: 0.4;
+  font-style: italic;
+  transition: opacity .4s ease;
+}
+
+/* Fully-deleted messages (server.ts's mergeWithDeleted: a superseded call+
+   result pair, a spent failed-attempt pair, a replaced "[Reasoning]"
+   artifact — agent.ts splices these out of the agent's own live context
+   entirely, no placeholder left behind). Still shown here, greyed out, with
+   the full original content and an explicit badge — the point is to let a
+   human follow what actually happened, which the agent itself no longer has
+   any trace of. Dimmer than .superseded (opacity 0.4): that content is still
+   part of live context, just shortened; this content isn't part of it at all. */
+.ctx-msg-item.deleted {
+  opacity: 0.3;
+  filter: grayscale(1);
+}
+.ctx-msg-deleted-badge {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 5px;
+}
 
 /* ── VS Code-style Changes list (uncommitted changes + commit history) ──
    Renders into #files-tree (same container the file tree uses) when

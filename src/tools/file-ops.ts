@@ -301,33 +301,21 @@ export async function readFile(filePath: string, offset?: number, limit?: number
   }
 }
 
-export async function readFiles(paths: string[]): Promise<ToolResult> {
-  const sections: string[] = []
-  for (const filePath of paths) {
-    try {
-      const abs = await safePath(filePath)
-      const content = await fs.readFile(abs, 'utf-8')
-      if (content.length === 0) {
-        sections.push(`── ${filePath} ──\n(empty file)`)
-      } else {
-        sections.push(`── ${filePath} ──\n${truncateOutput(content, 8000)}`)
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      sections.push(`── ${filePath} ──\nError: ${msg}`)
-    }
-  }
-  return { output: sections.join('\n\n') }
-}
-
 export async function writeFile(filePath: string, content: string): Promise<ToolResult> {
   try {
     const abs = await safePath(filePath)
     await fs.mkdir(path.dirname(abs), { recursive: true })
     await fs.writeFile(abs, content, 'utf-8')
     const lines = content.split('\n').length
-    const bytes = Buffer.byteLength(content, 'utf-8')
-    return { output: `Wrote ${filePath} successfully (${lines} line${lines !== 1 ? 's' : ''}, ${bytes.toLocaleString()} bytes).\nThe file was created correctly and is verified to contain the content as supplied in this call.` }
+    const chars = content.length
+    // Echoed back IN FULL, never truncated — unlike read_file/bash/fetch_url
+    // (external, uncontrolled-size content this tool never authored, and
+    // genuinely could overwhelm context in one message), this content is the
+    // MODEL'S OWN just-written text. A truncated echo would leave the model
+    // unsure what the back half of its own file actually says — the opposite
+    // of what an authoritative confirmation is for, and exactly the kind of
+    // uncertainty that produces a follow-up "let me re-read it to check" call.
+    return { output: `Successfully wrote the file ${filePath} (${lines} line${lines !== 1 ? 's' : ''}, ${chars} characters).\n${content}` }
   } catch (err) {
     return { output: '', error: String(err) }
   }
@@ -519,8 +507,12 @@ export async function editFile(filePath: string, oldString: string, newString: s
     await fs.writeFile(abs, updated, 'utf-8')
     const n = replaceAll ? occurrences : 1
     const lines = updated.split('\n').length
-    const bytes = Buffer.byteLength(updated, 'utf-8')
-    return { output: truncateOutput(`Edited ${filePath} successfully — replaced ${n} occurrence${n === 1 ? '' : 's'} (${lines} line${lines !== 1 ? 's' : ''}, ${bytes.toLocaleString()} bytes now).\nThe file was updated correctly and is verified to reflect this edit as specified. Updated region:\n${editedRegion(updated, newString, matchIndex)}`, 4000) }
+    const chars = updated.length
+    // Echoed back IN FULL — see writeFile's identical comment. The model needs
+    // the true resulting state of the file it just edited, not a truncated
+    // guess at it; a cut-off echo here is exactly what produces an unnecessary
+    // follow-up read_file "to check what it actually looks like now."
+    return { output: `Successfully edited the file ${filePath} — replaced ${n} occurrence${n === 1 ? '' : 's'} (${lines} line${lines !== 1 ? 's' : ''}, ${chars} characters now).\n${updated}` }
   } catch (err) {
     return { output: '', error: String(err) }
   }

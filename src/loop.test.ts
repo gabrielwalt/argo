@@ -204,7 +204,7 @@ test('evaluateCall: the global blocks counter (and therefore L1/L2 timing) is un
   assert.deepEqual(kinds, ['replay', 'steer', 'compact', 'steer', 'steer', 'replan'])
 })
 
-// ── FIX 1 (/shared/argo-loopfix/REPORT.md, review defect 1): noteBashExecution
+// ── FIX 1 (post-review defect 1): noteBashExecution
 // invalidates every cached result, so a later no-progress repeat of a key whose
 // cache predates a `bash` call falls back to the plain steer instead of serving
 // stale content while claiming "nothing has changed" — the bash call itself might
@@ -260,7 +260,7 @@ test('noteBashExecution: clears every key\'s cache, not just one — a bash call
 // counts as a no-progress block (the escalation ladder must not be evadable this
 // way — that is the H20 fix this preserves) but must NOT be served the other
 // command's cached output, since they can produce genuinely different real bytes
-// (/shared/argo-review/REPORT.md defect 3: stdout/stderr interleaving order).
+// (post-review defect 3: stdout/stderr interleaving order).
 
 test('FIX 2: a normalised-equal but raw-different repeat (trailing 2>&1) is blocked but not replayed', () => {
   const state = createLoopState()
@@ -324,7 +324,7 @@ test('normalizeCallKey: doubled internal slashes in a path argument collapse', (
   assert.equal(a, b)
 })
 
-// FIX 3 (/shared/argo-review/REPORT.md's normalisation table): the trailing-slash
+// FIX 3 (post-review): the trailing-slash
 // rule was REMOVED because read_file('x/') can fail with an ENOTDIR-class error
 // where read_file('x') succeeds — collapsing them would hide a real success/
 // failure boundary, not just a spelling difference.
@@ -499,7 +499,7 @@ test('evaluateCall: a mutation resets the streak even after halt would otherwise
 // that never reach evaluateCall at all (agent.ts's tool-call loop `continue`s
 // past it on either gate). See loop.ts's H21 header note and noteGateRejection's
 // doc comment for the evidence (two Planner frames issuing 9 and 7 rejected
-// `bash` calls, all refused on role, DRIVER-LOG.md 2026-09-04 ~01:00) and for why
+// `bash` calls, all refused on role, captured live on 2026-09-04) and for why
 // keying on (call, reason) — not the call alone — is what keeps the plan/act
 // gate's legitimate retry-after-plan safe.
 

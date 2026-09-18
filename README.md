@@ -15,7 +15,7 @@ Every request goes through a **Dispatcher → Planner → Implementer** pipeline
 ## Setup
 
 ```bash
-cd ~/Sources/adobe/argo
+cd ~/Sources/private/argo
 pnpm install
 pnpm build
 ./install.sh          # symlinks bin/argo to /usr/local/bin/argo
@@ -63,7 +63,7 @@ Any model pulled via `ollama pull` appears in the UI dropdown automatically.
 | `fetch_url` | HTTP GET + HTML strip (no JS) |
 | `browser_fetch` | Playwright/Chromium (full JS) |
 | `web_search` | Tavily web search |
-| `ledger` | Query cross-agent message history, recover evicted content |
+| `ledger` | Query this agent's own message history, recover evicted content (no cross-agent visibility) |
 | `conclude` | End the current frame with status + message |
 
 Not every role gets every tool. Dispatcher and Planner are read-only (no `write_file`/`edit_file`). See `src/frames.ts`.
@@ -101,12 +101,13 @@ argo/
 │   ├── ledger.ts               # Append-only message ledger
 │   ├── server.ts               # Worker API, SSE, git/file endpoints
 │   ├── central.ts              # Workspace registry, Docker management, proxy
-│   ├── logger.ts               # Per-session JSONL log writer
+│   ├── logger.ts               # Legacy pre-ledger JSONL reader (read-only; nothing writes new ones)
 │   ├── al-logger.ts            # Markdown trace logger
 │   ├── config.ts               # Environment config
 │   ├── types.ts                # Shared types
 │   └── tools/                  # Tool implementations
 ├── docs/architecture.md        # Architecture overview
+├── docs/testing-gaps.md        # Where to add test coverage next
 ├── GLOSSARY.md                 # Terminology
 └── MEMORY.md                   # Persistent learnings
 ```

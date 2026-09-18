@@ -11,6 +11,7 @@ export interface ModelOptions {
   top_k?: number
   num_ctx?: number
   num_predict?: number
+  presence_penalty?: number
 }
 
 export type AgentEvent =
@@ -79,6 +80,8 @@ export interface FrameTag {
   __frameId?: string
   __role?: Role
   __parentFrameId?: string | null
+  // Mirrors FrameSpawnRequest.implementerIndex — see that field's own comment.
+  __implementerIndex?: number
 }
 
 export interface GitCommit {
@@ -110,6 +113,15 @@ export interface FrameSpawnRequest {
   // dispatcherFrameId). The frame is assumed to already be registered in the
   // session registry from a previous run, so spawnFrame skips registerFrame for it.
   persistentFrameId?: string
+  // 1-based display ordinal among the Implementer frames ONE Planner spawns for
+  // one objective (dispatch.ts's runObjectiveViaPlanner's own `taskNumber`) — set
+  // ONLY on Implementer requests spawned that way (never on a SIMPLE-mode
+  // Implementer, which is the only one for its request and needs no
+  // disambiguation). Harness-set, purely for display ("Implementer 2") — never
+  // seen by the model, never affects behavior. Threaded through tagEmit (FrameTag
+  // below) and ledger.registerFrame so both live events and session replay can
+  // show it.
+  implementerIndex?: number
 }
 
 export interface FrameResult {
@@ -175,6 +187,7 @@ export interface SessionRegistry {
         frameId: string     // e.g. "dispatcher-abc"
         role: Role          // dispatcher/planner/implementer
         parentFrameId: string | null
+        implementerIndex?: number   // see FrameSpawnRequest's own comment
       }>
     }>
   }>

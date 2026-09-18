@@ -173,9 +173,12 @@ export interface LiveFrame {
   startedAt: number
   // Last `token_usage` event this frame emitted, cached here because Agent.getContext()
   // does not carry it (see agent.ts) — this is what lets GET /frames' promptTokens/
-  // numCtx follow a running frame for the context donut. null until the frame's first
-  // completed Ollama call.
+  // numCtx follow a running frame for its context sidebar entry. null until the
+  // frame's first completed Ollama call.
   lastTokenUsage: { promptTokens: number; numCtx: number } | null
+  // See FrameSpawnRequest.implementerIndex's own comment — carried here so GET
+  // /frames' live path can surface it without a separate lookup.
+  implementerIndex: number | null
 }
 
 const liveFrames = new Map<string, LiveFrame>()
@@ -236,13 +239,16 @@ export interface SpawnedFrame {
 // Also the one hook point for the live registry's lastTokenUsage cache (read-only
 // observability only — this does not change what's emitted or sent to Ollama, it
 // just also stashes a copy of `token_usage` events already flowing through here).
-function tagEmit(emit: Emit, frameId: string, role: Role, parentFrameId: string | null) {
+function tagEmit(emit: Emit, frameId: string, role: Role, parentFrameId: string | null, implementerIndex?: number) {
   return (event: AgentEvent, seq?: number) => {
     if (event.type === 'token_usage') {
       const entry = liveFrames.get(frameId)
       if (entry) entry.lastTokenUsage = { promptTokens: event.prompt_tokens, numCtx: event.num_ctx }
     }
-    emit({ ...event, __frameId: frameId, __role: role, __parentFrameId: parentFrameId } as unknown as AgentEvent, seq)
+    emit({
+      ...event, __frameId: frameId, __role: role, __parentFrameId: parentFrameId,
+      ...(implementerIndex !== undefined ? { __implementerIndex: implementerIndex } : {}),
+    } as unknown as AgentEvent, seq)
   }
 }
 
@@ -252,7 +258,11 @@ function tagEmit(emit: Emit, frameId: string, role: Role, parentFrameId: string 
 // Deliberately not a FrameSpawnRequest field: a tool override is a harness decision
 // about ONE hardcoded checkpoint, never something a model-produced reply should be
 // able to request for itself.
-async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: ToolName[]): Promise<SpawnedFrame> {
+//
+// thinkOverride lets a specific call site force-disable thinking (think:false) for
+// a frame that would otherwise inherit the model preset's think:true — used by
+// runDispatcherTaskStart to keep the classification call fast and bounded.
+async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: ToolName[], thinkOverride?: boolean | 'high' | 'medium' | 'low' | undefined): Promise<SpawnedFrame> {
   checkAborted()
   // PERSISTENT FRAME (req.persistentFrameId, see types.ts): reuse the given frameId
   // instead of minting a new one, and treat it as already registered in
@@ -260,7 +270,7 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
   const isPersistent = !!req.persistentFrameId
   const frameId = req.persistentFrameId ?? ledger.newId(req.role)
 
-  const agent = new Agent(tagEmit(emit, frameId, req.role, req.parentFrameId), currentModel)
+  const agent = new Agent(tagEmit(emit, frameId, req.role, req.parentFrameId, req.implementerIndex), currentModel)
   agent.setUserQuery(currentUserQuery) // TraceLogger header title — see currentUserQuery's own comment above
   if (currentOptions) agent.setOptions(currentOptions)
   agent.setAllowedTools(toolOverride ?? ROLE_TOOLS[req.role])
@@ -270,6 +280,11 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
   agent.setRole(req.role) // also drives role-specific progress-check thresholds/messages
   agent.setFrameId(frameId)
   agent.setMaxIterations(req.maxIterations ?? ROLE_MAX_ITERATIONS[req.role])
+  // Override thinking mode when explicitly requested — the task-start classification
+  // checkpoint disables thinking to keep the call fast and bounded (think:true with
+  // tools can cause very long generation times that hold the iteration loop hostage).
+  // Only applied when thinkOverride is explicitly passed (not undefined).
+  if (thinkOverride !== undefined) agent.setThinkMode(thinkOverride)
   agent.setSessionId(frameId) // isolates history/eviction-state files per frame
 
   // PERSISTENT FRAME PRELOAD: this is a BRAND-NEW Agent instance (so every per-run
@@ -325,6 +340,13 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
     const previous = await ledger.readFrame(root(), frameId)
     const chatOnly = previous.filter(m => m.role === 'user' || m.role === 'assistant')
       .filter(m => !!m.content && !m.toolName)
+      // A "[Reasoning]" artifact (agent.ts's pushReasoningArtifact) is scratch
+      // continuity for the model's OWN next iteration, not a real reply worth
+      // replaying into a resumed frame's history — and agent.ts's own
+      // "at most one, replaced by the next" invariant (lastReasoningMsg) is
+      // reset on every loadHistory() call, so a reloaded one would never get
+      // cleaned up by a later replacement the way a live one does.
+      .filter(m => !m.content.startsWith('[Reasoning]'))
     agent.loadHistory(chatOnly.map(m => ({ role: m.role, content: m.content })))
   }
 
@@ -336,14 +358,19 @@ async function spawnFrame(req: FrameSpawnRequest, emit: Emit, toolOverride?: Too
   // that first minted this frameId; re-registering here would just append a
   // duplicate entry to this run's frame list under the same frameId.
   if (!isPersistent) {
-    await ledger.registerFrame(root(), currentSessionId, currentRunIndex, { frameId, role: req.role, parentFrameId: req.parentFrameId })
+    await ledger.registerFrame(root(), currentSessionId, currentRunIndex, {
+      frameId, role: req.role, parentFrameId: req.parentFrameId, implementerIndex: req.implementerIndex,
+    })
   }
 
   const assignment = await buildAssignment(root(), req)
   const startedAt = Date.now()
   // Registered BEFORE chat() runs (not after) — GET /frames/GET /context?frame= must
   // be able to see a frame while it is still executing, not just once it concludes.
-  liveFrames.set(frameId, { frameId, role: req.role, parentFrameId: req.parentFrameId, agent, startedAt, lastTokenUsage: null })
+  liveFrames.set(frameId, {
+    frameId, role: req.role, parentFrameId: req.parentFrameId, agent, startedAt, lastTokenUsage: null,
+    implementerIndex: req.implementerIndex ?? null,
+  })
   activeFrameAgent = agent
   activeFrameId = frameId
   const finalAnswer = await agent.chat(assignment)
@@ -638,7 +665,12 @@ async function runDispatcherTaskStart(userMessage: string, emit: Emit): Promise<
   // TASK_START_TOOLS (frames.ts), not ROLE_TOOLS.dispatcher — this checkpoint is
   // read-only classification, see that constant's comment for why and the incident
   // that forced it.
-  const { agent, result } = await spawnFrame(req, emit, TASK_START_TOOLS)
+  // think:false — classification doesn't need deep reasoning, and think:true with
+  // tools can cause very long generation times (thinking tokens flowing for minutes
+  // before any content/tool call) that hold the iteration loop hostage. The model
+  // still reasons through its content; it just doesn't use the separate thinking
+  // channel that burns num_predict budget before producing any visible output.
+  const { agent, result } = await spawnFrame(req, emit, TASK_START_TOOLS, false)
 
   // STRUCTURED CONCLUDE STATUS: the `conclude` tool now validates the Dispatcher's
   // status against ['ANSWER', 'SIMPLE', 'OBJECTIVE', 'SUMMARY']. A frame that
@@ -1015,9 +1047,23 @@ export async function runDispatchLoop(
   // frame rather than resuming a previous session's accumulated history; the SAME
   // sessionId across runs reuses the existing id, which is what lets spawnFrame's
   // persistentFrameId preload find and extend the right ledger file.
+  //
+  // REGISTERED RIGHT HERE, not in spawnFrame: spawnFrame's own registerFrame call
+  // is gated on `!isPersistent` (skip re-registering a persistent frame on its
+  // SUBSEQUENT spawns), but `isPersistent` is computed purely from
+  // `!!req.persistentFrameId` — which is ALWAYS true for the Dispatcher, including
+  // its very first-ever spawn (persistentFrameId is set immediately once minted,
+  // right here, before spawnFrame ever runs). Left as spawnFrame's own condition,
+  // the Dispatcher's frame would NEVER be registered in sessions.json, for any
+  // session — this is exactly that first-ever-spawn moment, so registering it
+  // here (once per session, exactly when the id is freshly minted) is the actual
+  // fix rather than trying to teach spawnFrame to tell "first" from "later" itself.
   if (dispatcherFrameSessionId !== currentSessionId) {
     dispatcherFrameId = ledger.newId('dispatcher')
     dispatcherFrameSessionId = currentSessionId
+    await ledger.registerFrame(root(), currentSessionId, currentRunIndex, {
+      frameId: dispatcherFrameId, role: 'dispatcher', parentFrameId: null,
+    })
   }
 
   // The dispatch run's own top-level narrative (start/objective/message/done) is no
@@ -1181,7 +1227,7 @@ async function runObjectiveViaPlanner(objective: string, emit: Emit): Promise<st
     // reports the failure to the user rather than a raw cap-hit string or an
     // indefinite retry loop.
     const implFrame = await spawnFrame(
-      { role: 'implementer', parentFrameId: plannerFrameId, assignment: implementerAssignment },
+      { role: 'implementer', parentFrameId: plannerFrameId, assignment: implementerAssignment, implementerIndex: taskNumber },
       emit,
     )
     commitAgent = implFrame.agent

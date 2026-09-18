@@ -7,7 +7,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { promises as fs } from 'fs'
 import type { Dirent } from 'fs'
-import { config } from './config.js'
+import { config, localTimestamp } from './config.js'
 import { Agent } from './agent.js'
 // LEGACY (pre-ledger) session log replay only — readLog/readLogEvents are the
 // only survivors of logger.ts's old writer actually used here (listLogs has no
@@ -16,10 +16,11 @@ import { Agent } from './agent.js'
 // imports below.
 import { readLog, readLogEvents, LOGS_DIR } from './logger.js'
 import * as ledger from './ledger.js'
-import type { AgentEvent, ModelOptions, Role } from './types.js'
+import type { AgentEvent, ModelOptions, Role, ToolName, LedgerMessage, SessionRegistry } from './types.js'
 import { checkEnvironment, logEnvironment, type EnvCheck } from './health.js'
 import { installAuth } from './auth.js'
 import { runDispatchLoop, abortDispatch, listLiveFrames, getLiveFrame, getActiveFrameId, type LiveFrame } from './dispatch.js'
+import { ROLE_MAX_ITERATIONS } from './frames.js'
 import { ensureWorkspaceId, workspaceHasContent, decideSessionResume, type SessionResumeReason } from './workspace-identity.js'
 
 const execAsync = promisify(exec)
@@ -72,7 +73,7 @@ function ledgerRoot(): string {
 }
 
 function makeSessionId(): string {
-  return new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  return localTimestamp()
 }
 
 let currentSessionId = makeSessionId()
@@ -175,8 +176,9 @@ app.get('/history', (req, res) => {
 })
 
 // ── Frame context (context viewer backend) ─────────────────────────
-// /shared/argo-ui/CONTEXT-VIEWER-CONTRACT.md is the authoritative shape for GET
-// /frames and GET /context?frame=<id>. The root cause this exists for: GET /context
+// This section defines the shape for GET /frames and GET /context?frame=<id> —
+// see ConversationSummary/FrameSummary below for the authoritative types. The root
+// cause this exists for: GET /context
 // used to only read the shared module-level `agent`, which /chat never actually
 // runs a turn on (dispatch.ts's runDispatchLoop drives scoped Agent instances of
 // its own instead) — so the real per-frame contexts were simply never reachable
@@ -209,18 +211,15 @@ export function frameIdFromHistoryFilename(filename: string): string | null {
   return m ? m[1] : null
 }
 
-// Mirrors agent.ts's getContext() MAX=4000 truncation exactly (contract: "the
-// identical 4000-char message truncation on both paths"). Duplicated rather than
-// imported/shared because agent.ts is out of scope for this change (dispatch.ts and
-// server.ts only) — if that constant ever moves, this one needs updating alongside it.
-const CONTEXT_MESSAGE_CHAR_CAP = 4000
-
+// Mirrors agent.ts's getContext(): content returned IN FULL, never truncated —
+// the context viewer's entire purpose is showing exactly what the model saw
+// (or, for a deleted entry, what it USED to see), so capping it here would
+// make the one place meant to show ground truth lie about it. Kept as a named
+// function (contract: "the identical no-truncation behavior on both paths")
+// rather than inlined at each call site, so a future change to this policy
+// only needs to happen once.
 function truncateContextMessage(full: string): { content: string; chars: number } {
-  const chars = full.length
-  const content = chars > CONTEXT_MESSAGE_CHAR_CAP
-    ? `${full.slice(0, CONTEXT_MESSAGE_CHAR_CAP)}…(+${chars - CONTEXT_MESSAGE_CHAR_CAP} more chars)`
-    : full
-  return { content, chars }
+  return { content: full, chars: full.length }
 }
 
 export interface DiskContextMessage {
@@ -248,6 +247,45 @@ export function buildDiskContextMessages(rawMessages: unknown): { messages: Disk
   return { messages, messageCount: messages.length, totalChars }
 }
 
+export interface ContextMessage {
+  id?: string
+  role: string
+  content: string
+  chars: number
+  ts: number | null
+  deleted: boolean
+}
+
+// GET /context's "show deleted messages too" pass: agent.ts's own splice-based
+// removals (a superseded call+result pair, a spent failed-attempt pair, an
+// out-of-date "[Reasoning]" artifact) leave nothing behind in the LIVE
+// this.history any more — by design, none of them write any ledger marker
+// either, so the ledger's plain per-id last-write IS still the message's full
+// original content (contrast agent.ts's manageContext, which DOES write a
+// follow-up `evicted: true` marker, so a collapsed/evicted-but-still-live
+// message already shows up here as its own stub, no special handling needed).
+// That means the full ledger record — `ledger.readFrame`, already
+// first-insertion-ordered with last-write-wins per id — is a strict SUPERSET
+// of the live context in the same relative order (removals only ever drop
+// entries, never reorder the survivors), so walking it once and checking each
+// id against the live set is enough to reconstruct "what the model saw, plus
+// everything it used to see," each message flagged so the UI can grey out
+// whatever's gone. `live` messages are used verbatim (already truncated, with
+// a real push timestamp); a `deleted` entry gets the same char-cap treatment
+// applied fresh here, and `ts: null` (dying entry never had one preserved).
+export function mergeWithDeleted(
+  ledgerMessages: LedgerMessage[],
+  liveMessages: Array<{ id?: string; role: string; content: string; chars: number; ts: number | null }>,
+): ContextMessage[] {
+  const liveById = new Map(liveMessages.filter(m => m.id).map(m => [m.id!, m]))
+  return ledgerMessages.map(lm => {
+    const live = liveById.get(lm.id)
+    if (live) return { ...live, deleted: false }
+    const { content, chars } = truncateContextMessage(lm.content)
+    return { id: lm.id, role: lm.role, content, chars, ts: null, deleted: true }
+  })
+}
+
 export interface FrameSummary {
   frameId: string
   role: Role
@@ -258,6 +296,11 @@ export interface FrameSummary {
   totalChars: number
   promptTokens: number | null
   numCtx: number | null
+  // 1-based ordinal among the Implementer frames one Planner spawned for one
+  // objective (types.ts's FrameSpawnRequest.implementerIndex) — null for every
+  // other frame (Dispatcher, Planner, and a SIMPLE-mode's lone Implementer, which
+  // needs no disambiguation).
+  implementerIndex: number | null
 }
 
 // Oldest-first merge of the live registry's summaries with disk-recovered ones —
@@ -290,13 +333,12 @@ export function chooseActiveFrame(liveActiveFrameId: string | null, liveFrames: 
 }
 
 // Disk-only candidates for GET /frames: every `history-<frameId>.json` in LOGS_DIR
-// not already covered by the live registry. NOT scoped to the current session
-// specifically — there is no persisted session→frameId index anywhere in this
-// codebase (frameId encodes no session, and the workspace-side ledger has no
-// sessionId field either), so this necessarily surfaces this WORKSPACE's frame
-// history broadly rather than one session's. Accepted limitation, documented in
-// FRAME-CONTEXT-BACKEND.md — the alternative (showing nothing for a resumed
-// session after a restart) is worse for the "post-run inspection" this exists for.
+// not already covered by the live registry. Unlike ledger-based frames (which DO
+// have a persisted session→frameId index now — `.argo/sessions.json`, read by
+// buildConversations below), these pre-ledger files carry no session association
+// at all (frameId encodes no session, and this legacy format has no sessionId
+// field either) — so they're surfaced as one trailing "legacy" group in GET
+// /frames rather than attributed to any real conversation.
 //
 // LEGACY SOURCE, POST-LEDGER-MIGRATION: Agent.loadHistory no longer writes
 // history-<frameId>.json as a side effect (session tracking has moved to the
@@ -322,7 +364,7 @@ async function scanDiskFrames(excludeIds: Set<string>): Promise<FrameSummary[]> 
     try {
       const raw = JSON.parse(await fs.readFile(path.join(LOGS_DIR, f), 'utf-8'))
       const { messageCount, totalChars } = buildDiskContextMessages(raw)
-      out.push({ frameId, role, parentFrameId: null, live: false, startedAt: null, messageCount, totalChars, promptTokens: null, numCtx: null })
+      out.push({ frameId, role, parentFrameId: null, live: false, startedAt: null, messageCount, totalChars, promptTokens: null, numCtx: null, implementerIndex: null })
     } catch {
       // Unreadable/corrupt history file — skip it, don't fail the whole listing.
     }
@@ -342,22 +384,124 @@ function liveFrameSummary(f: LiveFrame): FrameSummary {
     totalChars: ctx.totalChars,
     // Prefer the last real `token_usage` event over the Agent's configured
     // options.num_ctx (usually unset — see dispatch.ts's LiveFrame comment): this is
-    // what "last known values... lets the donut follow a frame" means, and it is
-    // deliberately NOT what GET /context's own (unchanged) numCtx field does below.
+    // what "last known values... lets the context sidebar's token bar follow a
+    // frame" means, and it is deliberately NOT what GET /context's own (unchanged)
+    // numCtx field does below.
     promptTokens: f.lastTokenUsage?.promptTokens ?? null,
     numCtx: f.lastTokenUsage?.numCtx ?? ctx.numCtx,
+    implementerIndex: f.implementerIndex,
   }
+}
+
+// Fallback for a REGISTERED frame (ledger.ts's SessionRegistry) that isn't in the
+// current process's liveFrames — a past conversation's frame, or an earlier run of
+// the still-current one (liveFrames is cleared at the start of every new run — see
+// dispatch.ts's LiveFrame comment). Reads the frame's own ledger file directly
+// (ledger.readFrame — the eviction-aware, deduplicated view) rather than the old
+// disk-scan's pre-ledger history-<frameId>.json, which this frame never has.
+// promptTokens/numCtx are recovered from whatever the ledger happened to capture
+// (see agent.ts's pushCtx: promptTokens is written on the model's own response
+// turn, modelOptions.num_ctx on the frame's opening [system] identity message) —
+// null when nothing was ever recorded (e.g. a frame that never got a model
+// response), same "unknown" convention as scanDiskFrames.
+async function summarizeLedgerFrame(
+  root: string, frameId: string, role: Role, parentFrameId: string | null, implementerIndex: number | null,
+): Promise<FrameSummary> {
+  const messages = await ledger.readFrame(root, frameId)
+  let totalChars = 0
+  let promptTokens: number | null = null
+  let numCtx: number | null = null
+  for (const m of messages) {
+    totalChars += m.content.length
+    if (m.promptTokens != null) promptTokens = m.promptTokens
+    if (numCtx === null && m.modelOptions?.num_ctx != null) numCtx = m.modelOptions.num_ctx
+  }
+  return {
+    frameId, role, parentFrameId, live: false, startedAt: null,
+    messageCount: messages.length, totalChars, promptTokens, numCtx, implementerIndex,
+  }
+}
+
+export interface ConversationSummary {
+  sessionId: string | null   // null only for the trailing legacy/pre-ledger group
+  current: boolean
+  startedAt: string | null   // ledger registry's runs[0].startedAt (ISO) — null for the legacy group
+  frames: FrameSummary[]
+}
+
+// One conversation (= session — see CLAUDE.md's "Session" definition) per ledger
+// registry entry, each holding EVERY frame ever spawned across that session's whole
+// life (the persistent Dispatcher, plus every Planner/Implementer any of its runs
+// spawned) — a session's frame list only ever grows, so a new Implementer spawning
+// never hides an earlier Planner/Implementer from the same conversation. Order:
+// first-seen across runs (oldest-first, matching registerFrame's own append order),
+// deduped by frameId — the ONE dedup that matters is the persistent Dispatcher,
+// registered once in run 0 but reused (never re-registered) by every later run of
+// the same session. Each frameId is resolved via the LIVE registry when possible
+// (current token/message counts) and the ledger file otherwise (summarizeLedgerFrame).
+async function buildConversations(root: string, currentSessionId: string): Promise<ConversationSummary[]> {
+  const registry = await ledger.getRegistry(root)
+  const conversations = await Promise.all(registry.sessions.map(async session => {
+    const seen = new Set<string>()
+    const frames: FrameSummary[] = []
+    for (const run of session.runs) {
+      for (const f of run.frames) {
+        if (seen.has(f.frameId)) continue
+        seen.add(f.frameId)
+        const live = getLiveFrame(f.frameId)
+        frames.push(
+          live
+            ? liveFrameSummary(live)
+            : await summarizeLedgerFrame(root, f.frameId, f.role, f.parentFrameId, f.implementerIndex ?? null),
+        )
+      }
+    }
+    return {
+      sessionId: session.id,
+      current: session.id === currentSessionId,
+      startedAt: session.runs[0]?.startedAt ?? null,
+      frames,
+    }
+  }))
+  // Current conversation first, then past ones most-recent-first.
+  conversations.sort((a, b) => {
+    if (a.current !== b.current) return a.current ? -1 : 1
+    return (b.startedAt ?? '').localeCompare(a.startedAt ?? '')
+  })
+  return conversations
 }
 
 // Frames of the current process's most recent dispatch run, oldest first — see
 // dispatch.ts's liveFrames registry comment for the retention policy (cleared at
 // the START of the next run, not the end, so the last run stays inspectable).
+// Grouped by conversation (ledger session) for the context sidebar (app.js's
+// renderCtxAgentList) — `active` is unchanged (still the single frameId actually
+// executing right now, dispatch.ts's own "no two LLM calls ever run concurrently"
+// rule), everything else is now nested under `conversations`.
 app.get('/frames', async (req, res) => {
   const liveSummaries = listLiveFrames().map(liveFrameSummary)
-  const diskOnly = await scanDiskFrames(new Set(liveSummaries.map(f => f.frameId)))
+  const conversations = await buildConversations(ledgerRoot(), currentSessionId)
+  // Legacy, pre-ledger frames (scanDiskFrames/mergeFrameSummaries — see their own
+  // comments) have no session mapping at all, so they can't join a real
+  // conversation group; keep them reachable as one trailing group instead of
+  // dropping them. Excludes anything a conversation group already covers.
+  const coveredIds = new Set(conversations.flatMap(c => c.frames.map(f => f.frameId)))
+  const diskOnly = await scanDiskFrames(new Set([...liveSummaries.map(f => f.frameId), ...coveredIds]))
+  const legacy = mergeFrameSummaries([], diskOnly)
   res.json({
-    active: chooseActiveFrame(getActiveFrameId(), liveSummaries),
-    frames: mergeFrameSummaries(liveSummaries, diskOnly),
+    // chooseActiveFrame's defensive fallback (most-recently-started still-live
+    // frame) exists for a genuine mid-run gap between two frame calls, where
+    // activeFrameId is momentarily null but a run IS in progress. Once the run
+    // is over, activeFrameId stays null forever (liveFrames is only cleared at
+    // the START of the next run — see dispatch.ts's own comment) and that same
+    // fallback would otherwise keep reporting the last frame that ran as
+    // "active" indefinitely, pulsing its status dot in the UI even though
+    // nothing is running. Gate the whole lookup on isBusy so idle always
+    // reports null, regardless of what's still sitting in the live registry.
+    active: isBusy ? chooseActiveFrame(getActiveFrameId(), liveSummaries) : null,
+    conversations: legacy.length
+      ? [...conversations, { sessionId: null, current: false, startedAt: null, frames: legacy }]
+      : conversations,
   })
 })
 
@@ -374,7 +518,19 @@ app.get('/context', async (req, res) => {
 
   const live = getLiveFrame(frameId)
   if (live) {
-    res.json({ ...live.agent.getContext(), frameId: live.frameId, role: live.role, live: true })
+    const ctx = live.agent.getContext()
+    // messages becomes the superset (live + deleted, see mergeWithDeleted's own
+    // comment) for display; messageCount/totalChars stay the LIVE-only figures
+    // from getContext() itself — they drive the context-usage-percent display,
+    // which must reflect what the model actually sees, not what a human
+    // reviewing the run can additionally see. Falls back to the live-only list
+    // if the ledger read fails for any reason — this is an additive display
+    // enhancement, never something that should break the context viewer.
+    let messages: ContextMessage[] | typeof ctx.messages = ctx.messages
+    try {
+      messages = mergeWithDeleted(await ledger.readFrame(ledgerRoot(), live.frameId), ctx.messages)
+    } catch { /* fall back to live-only messages */ }
+    res.json({ ...ctx, messages, frameId: live.frameId, role: live.role, live: true })
     return
   }
 
@@ -636,24 +792,219 @@ app.post('/api/workspace', express.json(), async (req, res) => {
   res.json({ ok: true, workspacePath: absPath })
 })
 
-// List all session logs. FORMAT NOTE (UI): this used to return logger.ts's
-// SessionGroup[] (`{id, startedAt, runs: LogMeta[]}`, one LogMeta per JSONL run
-// file, carrying model/options/filename/etc — see app.js's replaySessionRuns,
-// the one consumer). The ledger's registry has no equivalent per-run file
-// metadata (a frame's own ledger file has no model/options/filename fields at
-// all — see types.ts's SessionRegistry) — `runs` below is therefore always `[]`
-// for a session recorded purely by the ledger. This keeps the response shape
-// array-of-`{id, startedAt, runs}` compatible with the one existing consumer
-// (`sessions.find(s => s.id === ...)`, then iterating `.runs`), which simply
-// finds nothing to replay for a ledger-only session — the UI reading per-frame
-// ledger content directly is Phase 2, not this change.
+// ── Ledger-based session replay ─────────────────────────────────
+// Reconstructs AgentEvent[] for GET /logs directly from .argo/frames/*.jsonl,
+// since nothing writes the old per-run JSONL log files any more (see this
+// route's own comment below). Not a perfect replay — approximate iteration
+// boundaries and tool args parsed back out of the formatted call text — but
+// enough to restore the conversation, agent traces, and tool calls after a
+// page refresh, which is all the UI actually needs (see app.js's
+// replaySessionRuns/handleEventForSession, the consumers).
+
+// A tool call's args aren't stored on the ASSISTANT ledger entry (only
+// toolName is — see agent.ts's pushCtx call sites) but they ARE embedded in
+// its formatted content (formatToolCallContent's `<tool_call>{...}</tool_call>`
+// JSON), which is the only place to recover them from for replay.
+function parseToolCallArgs(content: string): Record<string, unknown> {
+  const m = content.match(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/)
+  if (!m) return {}
+  try {
+    const parsed = JSON.parse(m[1]) as { arguments?: unknown }
+    return (parsed.arguments && typeof parsed.arguments === 'object') ? parsed.arguments as Record<string, unknown> : {}
+  } catch {
+    return {}
+  }
+}
+
+// Splits ONE frame's full message log into per-chat()-call segments. Every
+// non-resumed chat() call pushes a fresh [system] identity message carrying
+// `model` (agent.ts's chat(), the `if (!resume)` branch) — for an ephemeral
+// (one-shot) frame there is exactly one such message and one segment; for a
+// PERSISTENT frame (the Dispatcher, reused across a whole session's runs —
+// see dispatch.ts's dispatcherFrameId) spawnFrame never passes `resume: true`,
+// so each of the session's runs appends its own fresh identity message,
+// making segment N of the Dispatcher's ledger line up with session.runs[N].
+function splitIntoSegments(messages: LedgerMessage[]): LedgerMessage[][] {
+  const segments: LedgerMessage[][] = []
+  let current: LedgerMessage[] = []
+  for (const m of messages) {
+    if (m.role === 'system' && m.model) {
+      if (current.length) segments.push(current)
+      current = [m]
+    } else {
+      current.push(m)
+    }
+  }
+  if (current.length) segments.push(current)
+  return segments
+}
+
+// Reconstructs one frame's own tagged AgentEvents from its (segment of)
+// ledger messages — see the mapping this follows in the task's own doc
+// comment above GET /logs. Iteration boundaries are approximate: a new
+// iteration is only detected at the first assistant entry following a
+// non-assistant one, so a turn that calls several tools with no visible
+// thought text between them is undercountable from the ledger alone (no
+// per-iteration marker survives for it) — acceptable for a replay whose job
+// is showing the conversation happened, not exact iteration accounting.
+function reconstructFrameEvents(
+  messages: LedgerMessage[],
+  frameId: string,
+  role: Role,
+  parentFrameId: string | null,
+  implementerIndex?: number,
+): AgentEvent[] {
+  const events: AgentEvent[] = []
+  let seq = 0
+  const tag = (e: AgentEvent) => {
+    seq++
+    return {
+      ...e, __frameId: frameId, __role: role, __parentFrameId: parentFrameId, __seq: seq,
+      ...(implementerIndex !== undefined ? { __implementerIndex: implementerIndex } : {}),
+    } as unknown as AgentEvent
+  }
+  let iteration = 0
+  let inGroup = false
+  let concludeArgs: Record<string, unknown> | null = null
+  for (const m of messages) {
+    if (m.role === 'system') {
+      inGroup = false
+      if (m.model) {
+        iteration = 0
+        events.push(tag({ type: 'start', model: m.model, query: '', options: m.modelOptions ?? {} }))
+      }
+      continue
+    }
+    if (m.role === 'user') {
+      inGroup = false
+      continue // this frame's own assignment text — handleFrameEvent swallows tagged 'message' events (see its own comment); the top-level run message is emitted separately by reconstructSessionEvents
+    }
+    if (m.role === 'assistant') {
+      if (!inGroup) {
+        iteration++
+        events.push(tag({ type: 'iteration', current: iteration, max: ROLE_MAX_ITERATIONS[role] }))
+        inGroup = true
+      }
+      if (m.toolName) {
+        const args = parseToolCallArgs(m.content)
+        events.push(tag({ type: 'tool_call', tool: m.toolName as ToolName, args }))
+        if (m.toolName === 'conclude') concludeArgs = args
+      } else if (m.content || m.thinking) {
+        events.push(tag({ type: 'thought', content: m.content || undefined, thinking: m.thinking }))
+      }
+      continue
+    }
+    if (m.role === 'tool') {
+      if (m.toolName) {
+        events.push(tag({
+          type: 'tool_result',
+          tool: m.toolName as ToolName,
+          output: m.error ? '' : m.content,
+          error: m.error ? m.content : undefined,
+          duration_ms: m.durationMs ?? 0,
+        }))
+      } else if (m.content && m.content !== 'Concluded.') {
+        // e.g. dispatch.ts's recordConclusionToParent "[Role concluded]\n..."
+        // report — no toolName, so it isn't a tool_result, but still worth
+        // surfacing as a text item in this frame's own card.
+        events.push(tag({ type: 'thought', content: m.content }))
+      }
+      continue
+    }
+  }
+  // 'done': only for a frame that actually concluded. Prefer the CLEAN full
+  // answer dispatch.ts's recordCleanAnswer appends right after 'Concluded.'
+  // for a persistent frame (untruncated) over the conclude call's own
+  // formatted args.message (agent.ts's formatToolCallContent truncates past
+  // 200 chars).
+  const concludeIdx = messages.findIndex(m => m.role === 'tool' && !m.toolName && m.content === 'Concluded.')
+  if (concludeIdx !== -1) {
+    const clean = messages[concludeIdx + 1]
+    const cleanAnswer = (clean && clean.role === 'assistant' && !clean.toolName) ? clean.content : null
+    const answer = cleanAnswer ?? (typeof concludeArgs?.message === 'string' ? concludeArgs.message : '')
+    if (answer) events.push(tag({ type: 'done', content: answer }))
+  }
+  return events
+}
+
+export interface ReconstructedRun {
+  startedAt: string
+  filename: string
+  model?: string
+  options?: ModelOptions
+  events: AgentEvent[]
+}
+
+// Reconstructs every run of ONE session from the ledger — see GET /logs'
+// own comment for why this exists. The session's PERSISTENT top frame (the
+// Dispatcher — the one registered frame with parentFrameId === null; see
+// dispatch.ts's dispatcherFrameId) spans every run in ONE ledger file, split
+// back into per-run segments by splitIntoSegments; every other frame
+// registered under a given run belongs wholly to that run (one-shot Planner/
+// Implementer instances — see dispatch.ts's spawnFrame).
+export async function reconstructSessionEvents(root: string, session: SessionRegistry['sessions'][number]): Promise<ReconstructedRun[]> {
+  const allFrames = new Map<string, { role: Role; parentFrameId: string | null; implementerIndex?: number }>()
+  for (const run of session.runs) {
+    for (const f of run.frames) {
+      if (!allFrames.has(f.frameId)) allFrames.set(f.frameId, { role: f.role, parentFrameId: f.parentFrameId, implementerIndex: f.implementerIndex })
+    }
+  }
+  const topEntry = [...allFrames.entries()].find(([, f]) => f.parentFrameId === null)
+  const topFrameId = topEntry?.[0] ?? null
+  const topFrameMeta = topEntry?.[1] ?? null
+  const topSegments = topFrameId ? splitIntoSegments(await ledger.readFrame(root, topFrameId)) : []
+
+  const runs: ReconstructedRun[] = []
+  for (let i = 0; i < session.runs.length; i++) {
+    const registryRun = session.runs[i]
+    const events: AgentEvent[] = []
+    let model: string | undefined
+    let options: ModelOptions | undefined
+    let finalAnswer = ''
+
+    const topSeg = topSegments[i]
+    if (topSeg && topFrameId && topFrameMeta) {
+      const identity = topSeg.find(m => m.role === 'system' && m.model)
+      model = identity?.model
+      options = identity?.modelOptions
+      const query = topSeg.find(m => m.role === 'user')?.content ?? ''
+      const frameEvents = reconstructFrameEvents(topSeg, topFrameId, topFrameMeta.role, topFrameMeta.parentFrameId, topFrameMeta.implementerIndex)
+      const doneEvent = frameEvents.find((e): e is Extract<AgentEvent, { type: 'done' }> => e.type === 'done')
+      finalAnswer = doneEvent?.content ?? ''
+      if (query) events.push({ type: 'message', role: 'user', content: query })
+      events.push({ type: 'start', model: model ?? '', query, options: options ?? {} })
+      events.push(...frameEvents)
+    }
+
+    for (const f of registryRun.frames) {
+      if (f.frameId === topFrameId) continue // already covered by topSeg above
+      const msgs = await ledger.readFrame(root, f.frameId)
+      events.push(...reconstructFrameEvents(msgs, f.frameId, f.role, f.parentFrameId, f.implementerIndex))
+    }
+
+    if (finalAnswer) {
+      events.push({ type: 'message', role: 'assistant', content: finalAnswer })
+      events.push({ type: 'done', content: finalAnswer })
+    }
+
+    runs.push({ startedAt: registryRun.startedAt, filename: `${session.id}-run${i}`, model, options, events })
+  }
+  return runs
+}
+
+// List all session logs, reconstructing each session's runs/events straight
+// from the ledger (.argo/frames/*.jsonl + .argo/sessions.json) — see
+// reconstructSessionEvents above. Nothing writes the old per-run JSONL log
+// files any more, so there is no other source for this; app.js's
+// replaySessionRuns already handles `run.events` inline (no separate
+// GET /logs/:filename fetch needed for these).
 app.get('/logs', async (req, res) => {
   const registry = await ledger.getRegistry(ledgerRoot())
-  const sessions = registry.sessions.map(s => ({
+  const sessions = await Promise.all(registry.sessions.map(async s => ({
     id: s.id,
     startedAt: s.runs[0]?.startedAt ?? s.id,
-    runs: [] as unknown[],
-  }))
+    runs: await reconstructSessionEvents(ledgerRoot(), s),
+  })))
   res.json(sessions)
 })
 

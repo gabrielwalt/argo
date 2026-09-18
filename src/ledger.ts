@@ -236,7 +236,7 @@ export async function registerFrame(
   root: string,
   sessionId: string,
   runIndex: number,
-  frame: { frameId: string; role: Role; parentFrameId: string | null },
+  frame: { frameId: string; role: Role; parentFrameId: string | null; implementerIndex?: number },
 ): Promise<void> {
   const registry = await readRegistry(root)
   let session = registry.sessions.find(s => s.id === sessionId)
@@ -247,7 +247,10 @@ export async function registerFrame(
   while (session.runs.length <= runIndex) {
     session.runs.push({ startedAt: new Date().toISOString(), frames: [] })
   }
-  session.runs[runIndex].frames.push({ frameId: frame.frameId, role: frame.role, parentFrameId: frame.parentFrameId })
+  session.runs[runIndex].frames.push({
+    frameId: frame.frameId, role: frame.role, parentFrameId: frame.parentFrameId,
+    implementerIndex: frame.implementerIndex,
+  })
   await writeRegistry(root, registry)
 }
 

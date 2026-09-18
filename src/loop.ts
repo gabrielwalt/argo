@@ -11,8 +11,8 @@
 // LLM, no Date, no randomness, and no mutation of anything outside the passed-in
 // `state`.
 //
-// 2026-09 redesign (H19/H20, MECHANISM-VERIFICATION.md §4.1, HYPOTHESIS-LEDGER.md):
-// two changes from the original version of this module.
+// 2026-09 redesign (H19/H20, from an internal mechanism-verification review of a
+// real log corpus): two changes from the original version of this module.
 //   1. The near-duplicate "same tool, any args" guard (formerly checkSameToolStreak)
 //      is DELETED outright. It fired 180 times across the full log corpus and
 //      changed the model's next action in exactly 0 of them (every sampled firing
@@ -27,16 +27,14 @@
 //      "append `2>&1`" (normalizeCallKey now closes this for the BLOCK decision —
 //      see its rule list below) and "switch `read_file` for `bash cat`". The
 //      latter is deliberately NOT closed and remains a known, still-open gap after
-//      this redesign — see "What this explicitly does NOT collapse" below for why,
-//      and /shared/argo-review/REPORT.md defect 2 for the adversarial review that
-//      flagged it as open rather than implicitly closed by the 46/143 figure above.
-//      Either way, a bare block gives the model nothing to act on besides "try
+//      this redesign — see "What this explicitly does NOT collapse" below for why
+//      an adversarial review flagged it as open rather than implicitly closed by
+//      the 46/143 figure above. Either way, a bare block gives the model nothing to act on besides "try
 //      something else" with no information about WHAT changed (an empty answer,
 //      since the plain answer is "nothing") — which is the other half of this
 //      redesign.
 //
-// 2026-09 FIX ROUND (post-review, /shared/argo-review/REPORT.md +
-// /shared/argo-loopfix/REPORT.md): two more changes, both narrowing when a CACHED
+// 2026-09 FIX ROUND (post-review): two more changes, both narrowing when a CACHED
 // RESULT may be replayed — never touching the allow-vs-block decision itself
 // (mutationCount's role there is unchanged by either fix).
 //   3. (FIX 1 / review defect 1) A cached result may only be replayed if no `bash`
@@ -92,9 +90,8 @@
 // goes (b) — and both stop the FRAME rather than adding a further, softer rung: a
 // harness that has refused the same thing 6+ times in a row has detected a real
 // failure, and reporting that plainly is better than burning the remaining
-// iteration budget to reach the same conclusion less legibly (see /shared/argo-
-// gateloop/REPORT.md for the full design rationale and the "never fail open"
-// constraint this observes).
+// iteration budget to reach the same conclusion less legibly (the "never fail
+// open" constraint this observes).
 
 export interface LoopConfig {
   // Consecutive no-progress blocks before an L1 compaction is triggered.
@@ -158,9 +155,9 @@ export interface LoopCachedResult {
 // safe to replay". Concretely: `cat -n X` and `cat -n X 2>&1` normalise to the
 // SAME loopKey (correctly recognised as a repeat, still blocked either way), but
 // they are NOT the same canonicalArgs, so the second is never served the first's
-// cached output — see the file-level FIX 2 note above and the adversarial pair in
-// /shared/argo-review/REPORT.md defect 3 (`2>&1` changes real stdout/stderr
-// interleaving order via tools/bash.ts's stream concatenation, not just spelling).
+// cached output — see the file-level FIX 2 note above (`2>&1` changes real
+// stdout/stderr interleaving order via tools/bash.ts's stream concatenation, not
+// just spelling).
 interface StoredResult extends LoopCachedResult {
   canonicalArgs: string
 }
@@ -228,8 +225,7 @@ export function noteMutation(state: LoopState): void {
   state.compactedForStreak = false
 }
 
-// FIX 1 (/shared/argo-loopfix/REPORT.md, /shared/argo-review/REPORT.md defect 1).
-// Call right after a `bash` call actually executed — success OR error, since a
+// FIX 1 (post-review defect 1). Call right after a `bash` call actually executed — success OR error, since a
 // command can mutate the filesystem before later failing (`sed -i ...; false`) and
 // its effect either way is unknowable without a shell parser. `isProjectMutation`
 // (agent.ts) only ever recognises edit_file/write_file, so a real change made via
@@ -252,8 +248,8 @@ export function noteMutation(state: LoopState): void {
 // compactedForStreak — invalidating a CACHE is not progress, and the allow-vs-
 // block decision (evaluateCall's `seen !== state.mutationCount` check) is exactly
 // as blind to bash mutations after this fix as it was before it (a real, separate,
-// documented gap — see /shared/argo-loopguard/REPORT.md's own Q2 — left for a
-// follow-up that can see inside `bash`, not patched over here by proxy). The one
+// documented gap — left for a follow-up that can see inside `bash`, not patched
+// over here by proxy). The one
 // visible cost is an occasional missed replay for a key that bash never actually
 // touched, which falls back to the plain L0 steer instead — the safe direction per
 // this module's own principle that a false collapse is worse than a missed one.
@@ -398,21 +394,21 @@ export function gateStopMessage(reason: GateReason, toolName: string, count: num
 //
 // What this explicitly does NOT collapse (by design, not oversight):
 //   - A trailing `/` on a `path` argument (`x/` vs `x`). Considered safe in the
-//     original version of this rule and REMOVED after adversarial review
-//     (/shared/argo-review/REPORT.md's normalisation table): if `x` is a plain
-//     file, `read_file('x/')` can fail with an ENOTDIR-class error where
-//     `read_file('x')` succeeds — collapsing the two hides a real success/failure
-//     boundary, not a spelling difference, which is exactly the false-collapse
-//     this module's own principle says is worse than a miss. `./x` and doubled
-//     internal `/` stay collapsed; only the trailing case was unsafe.
-//   - `bash cat X` vs `read_file X` — literally the model's own most common evasion
-//     (MECHANISM-VERIFICATION.md §4.1) but collapsing across TOOLS asserts the two
+//     original version of this rule and REMOVED after adversarial review: if `x`
+//     is a plain file, `read_file('x/')` can fail with an ENOTDIR-class error
+//     where `read_file('x')` succeeds — collapsing the two hides a real
+//     success/failure boundary, not a spelling difference, which is exactly the
+//     false-collapse this module's own principle says is worse than a miss.
+//     `./x` and doubled internal `/` stay collapsed; only the trailing case was
+//     unsafe.
+//   - `bash cat X` vs `read_file X` — literally the model's own most common
+//     evasion, but collapsing across TOOLS asserts the two
 //     tools are equivalent for every purpose (error text, size limits, permissions
 //     differ), which is not a "small, well-argued rule" — it is exactly the
 //     "clever fuzzy matcher" the mandate says to avoid. Left as a KNOWN, STILL-OPEN
-//     GAP (not implicitly closed by this redesign's other numbers — see
-//     /shared/argo-review/REPORT.md defect 2) — the cached-replay mechanism
-//     (below) helps here too, once, if the model happens to re-hit the SAME tool a
+//     GAP (not implicitly closed by this redesign's other numbers) — the
+//     cached-replay mechanism (below) helps here too, once, if the model happens
+//     to re-hit the SAME tool a
 //     second time, but not on the cross-tool switch itself.
 //   - `> real/path`, `>> real/path`, `| tee real/path` — anything that can write a
 //     real file is never touched, even though a model switching TO one of these as
@@ -489,13 +485,12 @@ function normalizeBashCommand(cmd: string): string {
 
   // Rule 1 — a trailing chain of stream redirections that MERGE or DISCARD an
   // already-produced stream, never write a real file: 2>&1, 1>&2, >/dev/null,
-  // 1>/dev/null, 2>/dev/null, &>/dev/null. This is the exact evasion measured in
-  // MECHANISM-VERIFICATION.md §4.1: `cat -n X` -> `cat -n X 2>&1`. Looped because
+  // 1>/dev/null, 2>/dev/null, &>/dev/null. This is the exact evasion measured
+  // against a real log corpus: `cat -n X` -> `cat -n X 2>&1`. Looped because
   // more than one can stack (`>/dev/null 2>&1`); re-trimmed after each removal.
   // Safe for the BLOCK decision (two commands differing only by this chain really
   // are "no progress" either way); NOT trusted for REPLAY (FIX 2 — see the
-  // `2>&1`-changes-interleaving-order case in canonicalArgsKey's doc comment and
-  // /shared/argo-review/REPORT.md defect 3).
+  // `2>&1`-changes-interleaving-order case in canonicalArgsKey's doc comment).
   const redir = /\s*(?:2>&1|1>&2|&>\s*\/dev\/null|[12]?>\s*\/dev\/null)\s*$/
   while (redir.test(s)) s = s.replace(redir, '').trimEnd()
 

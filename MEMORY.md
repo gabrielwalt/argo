@@ -14,6 +14,9 @@
 - `think: false` works for disabling thinking mode (must be TOP-LEVEL in request, not inside options).
 - `num_predict: 8192` caps per-turn generation (prevents thinking models from consuming entire context).
 
+## Context management gotcha
+- A flat chars-per-token constant is NOT reliable for deciding when to compact — confirmed live (2026-09-18): real usage hit 92% while the flat-3.5 estimate never crossed its own 60% trigger, so eviction never ran. It's blind to tool-schema overhead (never part of `this.history`) and to content-density swings (dense math/code tokenizes much denser than prose). Fixed by self-calibrating against real `prompt_eval_count` every turn (`agent.ts`'s `effectiveCharsPerToken`) instead of trusting a fixed ratio — see CLAUDE.md's "Context eviction" for the full mechanism.
+
 ## Dispatch gotchas
 - `Agent.setMaxIterations` has a hard floor of 10 — smaller values are silently clamped.
 - `autoCommit()` moves HEAD forward mid-run. Diff against a pre-run baseline ref, never bare HEAD.

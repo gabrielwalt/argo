@@ -38,7 +38,29 @@ export const config = {
   // more than 60s for prefill on the target hardware (Apple M5 Max, 48GB,
   // qwen3.6:latest loaded at 24GB, num_ctx=65536). 60s was never a safe margin
   // for this model/hardware/context-size combination — 180s is.
-  chatTimeoutMs:           parseInt(process.env.CHAT_TIMEOUT_MS ?? '180000', 10),
+  //
+  // Raised again, 180s -> 600s (2026-09-09): that 180s figure was tuned before
+  // two later, independent changes quietly invalidated it. `num_predict` was
+  // raised 8192 -> 16384 (commit b81ed38, "thinking-heavy tasks exhaust the
+  // budget" — 8192 was truncating a thinking model mid-thought) and the default
+  // model moved to qwen3.8 (`think: true`, same 16384 cap). Nobody re-checked
+  // chatTimeoutMs against the new, larger budget. Reproduced live: an
+  // Implementer on a genuinely hard task (dense canvas-drawing geometry) hit a
+  // SINGLE generation still climbing past 2400 tokens at ~20 tok/s with no sign
+  // of a tool call or stop, confirmed via Ollama's own server log (steady
+  // `print_timing` output, real progress, not a hang) — at that rate, a full
+  // 16384-token generation needs ~650-800s. The 180s cap (and its one retry)
+  // could only ever cut the model off mid-thought, discard everything generated
+  // so far (Ollama does not resume a cancelled GENERATION, only prefill), and
+  // inject "your request was lost, continue" — which then produces an equally
+  // long fresh thought that hits the exact same wall, forever, as a live
+  // production run confirmed (three-strikes hard cap never even reached because
+  // each attempt was independently re-timed-out). 600s is short of the full
+  // 16384-token worst case but comfortably covers the thinking depth a hard
+  // task actually needs in practice, without asking a user to wait the full
+  // ~800s on every call; the existing 3-consecutive-timeouts hard stop
+  // (agent.ts) remains the backstop for a genuinely pathological case.
+  chatTimeoutMs:           parseInt(process.env.CHAT_TIMEOUT_MS ?? '600000', 10),
   // Delay before the single automatic retry of a failed main per-iteration chat
   // call (see chatWithRetry in agent.ts). Two real incidents ended a whole run
   // with no retry: a 180s timeout, and Ollama's Go backend rejecting a malformed
@@ -52,4 +74,13 @@ export const config = {
   // flags above) so uncommitted changes stay visible in the Changes view until the user
   // (or an explicit toggle) decides to commit them. See Agent.autoCommit() in agent.ts.
   autoCommit:       ['1', 'true', 'yes', 'on'].includes((process.env.ARGO_AUTOCOMMIT ?? '').trim().toLowerCase()),
+}
+
+// Local-time timestamp for session IDs and trace filenames — so timestamps
+// match the user's clock, not UTC (the Docker container runs in UTC but the
+// user sees local time).
+export function localTimestamp(d = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+    `T${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`
 }

@@ -20,6 +20,7 @@ import fs from 'fs/promises'
 import path from 'path'
 import type { AgentEvent, ModelOptions } from './types.js'
 import { LOGS_DIR } from './logger.js'
+import { localTimestamp } from './config.js'
 
 // Markdown traces live directly in LOGS_DIR (no `traces/` subfolder) — same
 // directory as everything else logger.ts manages. append() below creates this on
@@ -68,6 +69,7 @@ function formatOptions(options: ModelOptions): string {
     options.top_p != null ? `top_p=${options.top_p}` : null,
     options.top_k != null ? `top_k=${options.top_k}` : null,
     options.num_ctx != null ? `ctx=${options.num_ctx}` : null,
+    options.presence_penalty != null ? `presence_penalty=${options.presence_penalty}` : null,
   ].filter((p): p is string => p !== null)
   return parts.join(' ')
 }
@@ -226,7 +228,7 @@ export class TraceLogger {
     sessionId?: string,
     frameId?: string,
   ) {
-    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+    const ts = localTimestamp()
     const seq = String(++alLogSeq).padStart(4, '0')
     this.filepath = path.join(AL_DIR, `${ts}_${seq}_${role}.md`)
 
@@ -373,6 +375,14 @@ export class TraceLogger {
       case 'warning': {
         const t = event.level ? 'progress_check' : 'warning'
         const lvl = event.level ? ` level=${event.level}` : ''
+        // A failed-request warning now carries a tail of whatever the model had
+        // already generated before the failure (agent.ts's chatWithRetry) — that
+        // makes the message multi-line, so it gets its own blockquote instead of
+        // being squashed onto one bullet line; a plain single-line warning is
+        // untouched, still inline after the label.
+        if (event.message.includes('\n')) {
+          return `- **[${t}]**${lvl}\n\n${blockquote(event.message)}`
+        }
         return `- **[${t}]**${lvl} ${escapeMd(event.message)}`
       }
       case 'error':

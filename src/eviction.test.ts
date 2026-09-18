@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { Message } from 'ollama'
-import { estimateTokens, estimateTokensForText, CHARS_PER_TOKEN } from './eviction.js'
+import { estimateTokens, estimateTokensForText, sumContentChars, CHARS_PER_TOKEN } from './eviction.js'
 
 function toolMsg(content: string): Message { return { role: 'tool', content } }
 function userMsg(content: string): Message { return { role: 'user', content } }
@@ -26,6 +26,21 @@ test('estimateTokensForText mirrors estimateTokens for a single string', () => {
   assert.equal(estimateTokensForText(content), 700 / CHARS_PER_TOKEN)
 })
 
-test('CHARS_PER_TOKEN is 3.5 (conservative estimate favoring more eviction, not less)', () => {
+test('CHARS_PER_TOKEN is 3.5 — the default/fallback used only until agent.ts has a real measurement to calibrate against', () => {
   assert.equal(CHARS_PER_TOKEN, 3.5)
+})
+
+test('sumContentChars sums raw content length with no division — the basis estimateTokens/estimateTokensForText build on', () => {
+  const messages: Message[] = [userMsg('x'.repeat(350)), toolMsg('y'.repeat(150)), { role: 'assistant', content: '' }]
+  assert.equal(sumContentChars(messages), 500)
+  assert.equal(sumContentChars([]), 0)
+})
+
+test('estimateTokens/estimateTokensForText accept an explicit charsPerToken, overriding the default', () => {
+  const messages: Message[] = [userMsg('x'.repeat(100))]
+  assert.equal(estimateTokens(messages, 1), 100)
+  assert.equal(estimateTokens(messages, 2), 50)
+  assert.equal(estimateTokensForText('y'.repeat(100), 1), 100)
+  // Omitting it still falls back to the module default, unchanged.
+  assert.equal(estimateTokens(messages), 100 / CHARS_PER_TOKEN)
 })

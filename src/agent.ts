@@ -16,7 +16,7 @@ import {
   // tool-call loop below). See loop.ts's H21 header note for the evidence.
   noteGateRejection, gateEscalationMessage, gateStopMessage, type GateReason,
 } from './loop.js'
-import { estimateTokens, estimateTokensForText } from './eviction.js'
+import { estimateTokens, estimateTokensForText, sumContentChars, CHARS_PER_TOKEN } from './eviction.js'
 import { recordMessage, newId as newLedgerId } from './ledger.js'
 
 // Parses tool calls that a model wrote as JSON code blocks in its text content
@@ -80,6 +80,19 @@ function extractToolCallsFromContent(content: string): Array<{ name: string; arg
   return results
 }
 
+// A chatCall failure (timeout, or the Ollama server rejecting a malformed
+// tool-call) can still carry whatever content/thinking had already streamed in
+// before the failure — the model may have spent its entire generation budget
+// reasoning right up to the cutoff. Attached in chatCall's catch block, read by
+// chatWithRetry (buildPartialAttempt) so that reasoning isn't silently discarded:
+// without this, a turn that ran out of budget mid-thought left literally no
+// trace anywhere except the human-facing Markdown log, and the very next
+// attempt re-sent the identical prompt with no memory of ever having tried.
+interface ChatCallError extends Error {
+  partialContent?: string
+  partialThinking?: string
+}
+
 // Wraps a promise with a hard timeout; rejects if the promise doesn't resolve in time.
 // The optional onTimeout callback fires exactly once, right before the timeout rejects —
 // used by chatCall to abort the underlying fetch (see its own comment) since Promise.race
@@ -124,6 +137,23 @@ export function buildFallbackCommitMessage(changedFiles: string[]): string {
   return `Agent: update ${changedFiles.length} files`
 }
 
+// Detects a no-tool-call turn whose content reads like a final answer/summary
+// the model believes it already delivered, without ever calling `conclude` —
+// the only mechanism that actually ends a session. Deliberately a cheap,
+// deterministic heuristic (no LLM call) — see CLAUDE.md's system-prompt
+// philosophy: a recurring failure gets fixed in the harness, not by asking the
+// model nicer in the prompt. Observed live (2026-09-18, test-wind hex-grid
+// run): the model wrote a fully-formed Markdown summary as plain content
+// THREE separate times in one run, each time apparently believing the session
+// had already ended, before finally calling conclude on the fourth attempt.
+export function looksLikeNarratedConclusion(content: string): boolean {
+  if (content.length < 80) return false // too short to be a real summary
+  return /\bimplementation (?:is|has been) (?:now )?complete\b/i.test(content)
+    || /\bsuccessfully (?:implemented|completed|created)\b/i.test(content)
+    || /\bhere'?s a summary\b/i.test(content)
+    || /^#{1,6}\s/m.test(content) // a markdown heading, e.g. "## What was created"
+}
+
 // UNIFIED CONTEXT MANAGEMENT (see manageContext, called from chatCall): a single
 // deterministic, no-LLM pass replaces the old two-mechanism split (a fixed
 // "keep the N most recent tool results verbatim" collapse pass, plus a
@@ -132,12 +162,49 @@ export function buildFallbackCommitMessage(changedFiles: string[]): string {
 // Not exported: nothing outside this file (including tests) references these.
 const CONTEXT_TRIGGER_PCT = 0.6 // manageContext runs once usage crosses this fraction of num_ctx
 const CONTEXT_VERBATIM_PCT = 0.4 // newest assistant/tool messages kept verbatim, up to this fraction of num_ctx
-const CONTEXT_COLLAPSE_PCT = 0.1 // next-oldest slice collapsed (stub + first 200 chars) up to this fraction of num_ctx
-const COLLAPSE_PREVIEW_CHARS = 200
+const CONTEXT_COLLAPSE_PCT = 0.1 // next-oldest slice collapsed (head+placeholder+tail preview) up to this fraction of num_ctx
+// Head/tail sizes for a COLLAPSE-tier stub's preview: the first COLLAPSE_HEAD_CHARS,
+// then the `[collapsed ...]` placeholder, then the last COLLAPSE_TAIL_CHARS —
+// eliding the middle instead of the old head-only cut, so whatever conclusion a
+// long message ended on (often the most useful part) survives collapse too.
+const COLLAPSE_HEAD_CHARS = 150
+const COLLAPSE_TAIL_CHARS = 150
 // Harness-injected system messages (progress checks, stall/reground steers,
 // timeout errors, thinking-turn nudges) older than this many assistant turns are
 // pruned entirely from this.history by manageContext — see its own comment.
-const HARNESS_MESSAGE_MAX_ITERATION_AGE = 20
+// Harness-injected system messages (progress checks, nudges, reground steers,
+// timeout errors) are ephemeral: they steer the immediately following model call
+// and should not persist beyond that. Age = 1 means "remove once at least 1
+// assistant message has appeared after the harness message" — i.e. the model has
+// responded to it, so it can be discarded before the next call.
+const HARNESS_MESSAGE_MAX_ITERATION_AGE = 1
+
+// Per-model parameter presets. When a model is selected, these override the
+// defaults — based on the model vendor's own generation_config.json and Ollama
+// modelfile defaults. The harness applies the first matching prefix.
+const MODEL_PRESETS: Array<{ match: string; options: ModelOptions; think?: boolean | 'high' | 'medium' | 'low' }> = [
+  {
+    match: 'qwen3.8',
+    options: { temperature: 0.7, top_p: 0.8, top_k: 20, presence_penalty: 0, num_predict: 16384, num_ctx: 65536 },
+    // FALSE, not true (2026-09-09) — reproduced directly against this model/
+    // Ollama build: with think:true (or 'low' — tested, no improvement) qwen3.8
+    // spent 120s+ of a real Implementer prompt (a genuinely hard hex-grid/
+    // canvas task) entirely in the thinking channel — coherent, on-topic
+    // reasoning, not a garbled loop, but zero content and zero tool calls the
+    // whole time, which is what was actually timing out and forcing the
+    // discard-and-restart cycle (see config.ts's chatTimeoutMs comment for the
+    // full incident). The SAME prompt with think:false replied correctly in
+    // under a second, twice, consistently. qwen3.6 is untouched here — the
+    // user's own report is that it works fine there, and nothing here tested
+    // otherwise.
+    think: false,
+  },
+  {
+    match: 'qwen3.6',
+    options: { temperature: 0.6, top_p: 0.95, top_k: 20, presence_penalty: 0, num_predict: 16384, num_ctx: 65536 },
+    think: true,
+  },
+]
 
 // Short human-readable summary of a call's key arguments — included in the loop
 // detection warning so the reader can verify WHICH call was repeated, not just that
@@ -244,7 +311,13 @@ export class Agent {
   // tokens of thinking before producing any content, which intermittently hangs
   // Ollama's MLX runner on Apple M5 (ollama/ollama#17426). 8192 is generous for any
   // single tool-calling turn (thinking + content + tool call JSON).
-  private options: ModelOptions = { temperature: 0.6, top_p: 0.95, top_k: 20, num_predict: 16384 }
+  private options: ModelOptions = {}
+  // Keys explicitly set by the model preset (applyModelPreset) — these are the
+  // model vendor's own recommended sampling parameters and must NOT be overridden
+  // by stale UI-cached options (the browser may still hold qwen3.6's temp=0.6/
+  // top_p=0.95 after a switch to qwen3.8). setOptions() skips any key in this set.
+  private presetKeys: Set<string> = new Set()
+  private thinkMode: boolean | 'high' | 'medium' | 'low' | undefined
   private autoCommitEnabled = config.autoCommit
   private maxIterations: number = config.maxIterations
   private sessionId = ''
@@ -263,6 +336,25 @@ export class Agent {
   // object reference. Purely a UI concern for the context viewer (getContext) —
   // NEVER read by the model call path, so it cannot affect what is sent to Ollama.
   private historyTs = new WeakMap<object, number>()
+  // Marks a pushed `system`-role message as a harness-injected, ephemeral
+  // one — a stall/PROGRESS-CHECK nudge, a "no tool calls" reminder, a
+  // reground steer, or an injected timeout error (the 5 pushCtx call sites
+  // that pass `ephemeral: true`) — eligible for pruneHarnessMessages to drop
+  // once stale. Keyed on the message object itself, same pattern as
+  // historyTs, so it survives an eviction splice/rebuild. This is the ONLY
+  // signal pruneHarnessMessages uses to pick candidates: it used to infer
+  // "harness-injected" from position (a system message with at least one
+  // assistant message before it in history), which wrongly caught the
+  // Dispatcher/Planner's own permanent ROLE_INSTRUCTIONS message too — that
+  // role's opening sequence pushes the AGENTS.md/MEMORY.md injected-read
+  // assistant/tool pairs BEFORE ROLE_INSTRUCTIONS (see chat()'s opening
+  // messages), so by the position heuristic's own logic ROLE_INSTRUCTIONS
+  // already had assistant messages ahead of it and looked exactly like a
+  // stale nudge once enough turns passed — silently pruning the role's own
+  // task instructions out of a long-running frame's context. An explicit
+  // flag, set only at the 5 real injection sites, cannot mis-tag anything
+  // else no matter how history is shaped.
+  private ephemeralSystemMessages = new WeakSet<object>()
   // Wall-clock time the most recent eviction pass finished, for the context viewer's
   // ledger box. null until the first eviction of this Agent instance.
   private lastCompactedAt: number | null = null
@@ -299,6 +391,22 @@ export class Agent {
   // eventually converged.
   private loopSteerEscalated = false // true once evaluateCall ever returns compact(L1) or replan(L2)
   private ollamaRetryCount = 0
+  // Serializes pushCtx's fire-and-forget ledger writes so they land on disk in
+  // push order — see pushCtx's own comment for the race this closes.
+  private ledgerWriteChain: Promise<void> = Promise.resolve()
+  // Diagnostic-only state for the CURRENT/most recent chatCall() attempt — never
+  // read by any behavior path, only surfaced into a timeout's own error message
+  // (see chatWithRetry) so a future "did not respond within Xs" incident can be
+  // told apart at a glance: never got past `ollama.chat()` itself (request likely
+  // never reached Ollama — a networking issue, not a slow model) vs. connected but
+  // zero chunks ever arrived vs. chunks were genuinely still flowing when the
+  // budget ran out. Investigated a real incident (2026-09-08, qwen3.8, an
+  // Implementer timeout) where Ollama's own server log showed ZERO trace of the
+  // request across the entire wait — model load itself took 5.78s and keep_alive
+  // was already Ollama's 5m default, so neither was the bottleneck; this is what
+  // would have made that distinction obvious without needing to cross-reference
+  // Ollama's server log by hand.
+  private lastChatAttempt: { startedAt: number; streamObtainedAt: number | null; chunkCount: number; lastChunkAt: number | null } | null = null
   // MULTI-AGENT ARCHITECTURE. A call frame is one scoped Agent instance:
   // allowedTools restricts which tools are offered to Ollama AND accepted by the
   // tool-dispatch loop — always set via setAllowedTools before a frame's chat() runs
@@ -358,6 +466,54 @@ export class Agent {
   private toolResultCount = 0
   private lastCommandOutput = ''
   private actionTrace: string[] = []
+  // The single live "[Reasoning]" artifact SLOT (pushReasoningArtifact), if
+  // any — object references, not indices, so they survive manageContext/
+  // supersede reshuffling this.history. Normally one message; a no-tool-call
+  // turn that carried BOTH real `thinking` and its own separate `content`
+  // pushes a PAIR (real reasoning, then the regular content — see that call
+  // site) that must be superseded together, so this is an array, not a single
+  // reference. At most one slot's worth (1 or 2 messages) exists at a time:
+  // pushing a new artifact always removes every message currently in the slot
+  // first. Must be an instance field, not scoped to one chat() call — a
+  // resumed frame's history (and therefore any reasoning artifact still
+  // sitting in it) persists across separate chat() calls, and losing track of
+  // it on resume would let an old artifact linger alongside a new one instead
+  // of being replaced.
+  private lastReasoningSlot: Message[] = []
+  // See the INITIAL INSPECTION CLEANUP comment at its call site. undefined =
+  // no tool call has executed yet this frame's life; null = determined, but
+  // the first call wasn't investigatory (e.g. it was itself a write) so
+  // there's nothing to ever remove; the object = the pending first
+  // investigatory call, awaiting removal once real work starts.
+  // The harness's own auto-injected "what's already here?" project listing
+  // (pushed directly in chat()'s setup code, never through the model's own
+  // tool-dispatch loop) — tracked here so it can be removed the instant real
+  // work starts. null once already removed (or never injected, e.g. resumed
+  // turns).
+  private injectedListingCall: { assistantMsg: Message; toolMsg: Message } | null = null
+  // Self-calibrating chars-per-token ratio for THIS frame's own content —
+  // replaces eviction.ts's flat CHARS_PER_TOKEN constant everywhere it would
+  // otherwise be used, for both manageContext's "should this even run" trigger
+  // AND its internal per-message verbatim/collapse/evict budget walk (see
+  // estimateCurrentTokens/recalibrateCharsPerToken). Starts at the shared
+  // default and is corrected after every real Ollama response against the
+  // ACTUAL prompt_eval_count — the only ground truth available. A flat
+  // constant is not reliable on its own: confirmed live (2026-09-18,
+  // test-wind hex-grid run) that real usage crossed 90% while the constant's
+  // own estimate never reached its 60% trigger even once in a 13-turn run,
+  // both because dense coordinate/math content tokenizes far more densely
+  // than the constant assumes, and because the constant is structurally blind
+  // to the tool-schema definitions sent with every request (never part of
+  // this.history at all — the calibrated ratio absorbs that fixed overhead
+  // for free, since it's derived from the real total, not a content-only sum).
+  private effectiveCharsPerToken = CHARS_PER_TOKEN
+  // The real prompt_eval_count and this.history's exact char total AT THE
+  // MOMENT that request was sent — nothing mutates history during the network
+  // round-trip, so "chars now" at response-arrival time IS "chars that were
+  // sent" for that exact measurement. null until the first real measurement
+  // of this frame's life (or after a reload — see reset()/loadHistory()).
+  private lastKnownPromptTokens: number | null = null
+  private lastKnownHistoryChars = 0
 
   // ollama is injectable only so tests can drive the loop deterministically
   // without a live model; production always uses the default client.
@@ -368,14 +524,54 @@ export class Agent {
   ) {
     this.model = model ?? config.model
     this.ollama = ollama ?? new Ollama({ host: config.ollamaHost })
+    this.applyModelPreset()
   }
 
   setModel(model: string) {
     this.model = model
+    this.applyModelPreset()
   }
 
   setOptions(opts: ModelOptions) {
-    this.options = { ...this.options, ...opts }
+    // Never let externally-supplied options (typically the browser's cached
+    // sampling params) override keys the model preset explicitly set — those
+    // are the model vendor's own recommended values and a stale UI cache must
+    // not silently replace them (the root cause of the qwen3.6→qwen3.8
+    // migration hang: temp=0.6/top_p=0.95 from the old model's cache
+    // overwrote the new model's preset every time).
+    const filtered: ModelOptions = {}
+    for (const [k, v] of Object.entries(opts)) {
+      if (!this.presetKeys.has(k)) {
+        (filtered as Record<string, unknown>)[k] = v
+      }
+    }
+    this.options = { ...this.options, ...filtered }
+  }
+
+  // Look up the first MODEL_PRESETS entry whose `match` is a prefix of this.model
+  // and apply it AUTHORITATIVELY — preset values override whatever was in
+  // this.options before (including stale UI-cached params from a previous model),
+  // and are recorded in this.presetKeys so that a subsequent setOptions() call
+  // cannot silently overwrite them. This is the fix for the qwen3.6→qwen3.8
+  // migration hang: without it, setOptions(browserCache) would replace the new
+  // model's sampling params with the old model's cached values every time.
+  private applyModelPreset(): void {
+    const preset = MODEL_PRESETS.find(p => this.model.startsWith(p.match))
+    this.presetKeys = new Set()
+    if (preset) {
+      // Preset wins over any prior value — this is a MODEL SWITCH, not a merge.
+      this.options = { ...this.options, ...preset.options }
+      for (const k of Object.keys(preset.options)) this.presetKeys.add(k)
+      this.thinkMode = preset.think
+    }
+  }
+
+  // Override the think mode for this agent. Used by dispatch.ts to disable
+  // thinking for the task-start classification checkpoint (fast classification
+  // doesn't need deep reasoning and think:true can cause very long generation
+  // times that hold the iteration loop hostage).
+  setThinkMode(mode: boolean | 'high' | 'medium' | 'low' | undefined) {
+    this.thinkMode = mode
   }
 
   setMaxIterations(n: number) {
@@ -523,17 +719,43 @@ export class Agent {
   // totalDurationMs. Kept as a separate parameter (not folded into Message, which
   // is the `ollama` package's own type and isn't ours to extend) purely so pushCtx
   // stays the ONE call site that talks to ledger.recordMessage.
-  private pushCtx(m: Message, id?: string, uiMeta?: Omit<LedgerMessage, 'id' | 'role' | 'content'>): void {
+  // `ephemeral: true` marks a harness-injected `system` message (a stall
+  // nudge, a "no tool calls" reminder, a reground steer, an injected timeout
+  // error) as eligible for pruneHarnessMessages to later drop once stale —
+  // see ephemeralSystemMessages's own comment for why this must be an
+  // explicit flag at the call site, not inferred from history shape.
+  private pushCtx(m: Message, id?: string, uiMeta?: Omit<LedgerMessage, 'id' | 'role' | 'content'>, ephemeral?: boolean): void {
     // Never push an empty assistant message — these are structural noise that
     // confuses the model and wastes context space.
     if (m.role === 'assistant' && !m.content) return
+    if (typeof m.content === 'string' && m.content.includes('fd . -t f')) {
+    }
     this.history.push(m)
     this.historyTs.set(m, Date.now())
+    if (ephemeral) this.ephemeralSystemMessages.add(m)
     const msgId = id ?? newLedgerId('msg')
     this.historyMsgIds.push(msgId)
     const role = m.role === 'system' || m.role === 'user' || m.role === 'assistant' || m.role === 'tool' ? m.role : 'tool'
     const content = typeof m.content === 'string' ? m.content : String(m.content ?? '')
-    recordMessage(config.workspacePath || '/workspace', this.frameId, {
+    // Chained onto ledgerWriteChain, not fired directly — recordMessage's own
+    // `fs.mkdir` + `fs.appendFile` are each real async I/O, and two pushCtx
+    // calls issued back-to-back (e.g. the injected ls -la's assistant+tool
+    // pair, always pushed with no await between them) raced: whichever
+    // recordMessage's fs calls happened to resolve first won, so the SECOND
+    // pushCtx call (tool) could land on disk BEFORE the first (assistant) —
+    // reproduced directly, on-disk ledger order didn't match push order.
+    // this.history (what the model actually sees) was never affected — that's
+    // a synchronous array push, unlike the ledger write — but the ON-DISK
+    // ledger (session replay, the `ledger` tool's own `messages`/`expand`,
+    // context-viewer disk recovery) is the record's only claim to being an
+    // accurate log, so a corrupted write order there is a real bug even
+    // though it can't desync the live conversation. Chaining preserves the
+    // "fire-and-forget from the caller's perspective" contract (pushCtx still
+    // returns immediately, still never throws) while guaranteeing writes land
+    // in push order — `write` always resolves (its own .catch), so the chain
+    // itself never rejects and a later write is never skipped by an earlier
+    // one's failure.
+    const write = () => recordMessage(config.workspacePath || '/workspace', this.frameId, {
       id: msgId,
       role,
       content,
@@ -541,6 +763,7 @@ export class Agent {
     }).catch(err => {
       console.error('[ledger] recordMessage failed (continuing):', err)
     })
+    this.ledgerWriteChain = this.ledgerWriteChain.then(write)
   }
 
   // The ledger message id assigned to this.history[index] by pushCtx, if any —
@@ -550,6 +773,87 @@ export class Agent {
   // always assigns one) or for an out-of-range index.
   private msgIdAt(index: number): string | undefined {
     return this.historyMsgIds[index]
+  }
+
+  // THE ONLY way anything should ever remove entries from this.history — keeps
+  // this.historyMsgIds in lockstep AND corrects alLastMessageCount (the
+  // al-logger trace cursor). Every prior splice site rolled its own
+  // `history.splice`/`historyMsgIds.splice` pair and left alLastMessageCount
+  // untouched, relying on chatCall's own clamp (`if (alLastMessageCount >
+  // history.length) ...`) — which only helps when a splice shrinks history
+  // below the cursor's own value, NOT when it removes entries strictly BEFORE
+  // the cursor while leaving history longer than it. That case is exactly what
+  // pruneHarnessMessages and supersedeOlderCalls do on every call: the cursor
+  // stayed put while everything after the removed range shifted left, so the
+  // next beginTurn's `history.slice(alLastMessageCount)` silently skipped real,
+  // never-before-shown messages (found via message-count arithmetic on a real
+  // trace, 2026-09-18 — a supersede mid-run made the al-logger MD trace quietly
+  // drop the model's own reasoning and tool-call-description messages for one
+  // turn, even though this.history and the ledger both had them correctly).
+  private spliceHistory(idx: number, count: number): void {
+    this.history.splice(idx, count)
+    this.historyMsgIds.splice(idx, count)
+    if (idx < this.alLastMessageCount) {
+      // If the removed range straddles the cursor (idx + count > cursor),
+      // everything from idx onward that used to be "old" no longer lines up
+      // 1:1 with its former position — resetting the cursor to idx means the
+      // next trace over-reports rather than under-reports, the safer failure
+      // direction for a human-facing log.
+      this.alLastMessageCount = Math.max(idx, this.alLastMessageCount - count)
+    }
+  }
+
+  // Pushes the harness's reinjection of a turn's own scratch output as one or
+  // more `[Reasoning]`-labeled artifacts — every text passed becomes its own
+  // separate assistant message, pushed in array order. Callers pass ONE text
+  // for a turn that produced only `thinking` OR only `content` with no tool
+  // call, or when a tool call followed and carried `thinking` alongside it
+  // (that `content` half stays a normal, permanent push at its own call site
+  // — see the `hasCalls` branch — since it accompanies a real, kept action,
+  // unlike scratch reasoning). Callers pass TWO texts, real reasoning first,
+  // for a no-tool-call turn that carried BOTH `thinking` and its own separate
+  // `content` — that turn's `content` is not a real reply either (nothing was
+  // concluded and no tool ran), so it is ALSO reasoning-labeled and pushed as
+  // the tail of the SAME pair, not treated as permanent, kept content — but
+  // it must never cause ITS OWN pairmate (the real reasoning half just pushed
+  // a moment earlier as part of this same call) to be superseded: the slot
+  // replacement below happens ONCE, before pushing any of the given texts,
+  // not per-text.
+  //
+  // A turn's own `content` was previously exempted from this treatment only
+  // when a tool call also happened, on the theory that content alongside a
+  // tool call is real and content-less turns aside from `thinking` were rare
+  // — but a turn's own visible `content` is exactly as disposable as its
+  // `thinking` whenever NO tool call happened (nothing was concluded either
+  // way), and relying on the `Message.thinking` field alone to resurface a
+  // tool-call turn's own reasoning on the next turn does not work: it never
+  // renders as visible `content` in the prompt actually sent, and the model
+  // reported the loss directly (2026-09-18) — reasoning attached that way
+  // silently failed to reach the next turn's context whenever real `content`
+  // was also present. Explicit `[Reasoning]` content is the only channel
+  // proven to survive into the next turn's own request.
+  //
+  // Deliberately no positional wording in the label ("before this tool call",
+  // "before the cutoff"): a label implying adjacency to whatever comes next
+  // can go stale the moment that neighbor is later superseded or spliced away
+  // entirely, leaving a dangling reference. At most ONE slot (1 or 2
+  // messages) ever lives in history: pushing a new one immediately and fully
+  // removes every message this.lastReasoningSlot still pointed to — no stub,
+  // no msg_id, same "never worth recovering" reasoning as
+  // supersedeOlderCalls's own full removal. Safe even if manageContext
+  // already collapsed/evicted an old artifact into a stub in the meantime
+  // (mutates content in place, never replaces the message object, so the
+  // indexOf lookup below still finds it).
+  private pushReasoningArtifact(texts: string[], uiMeta: Omit<LedgerMessage, 'id' | 'role' | 'content'>): void {
+    for (const old of this.lastReasoningSlot) {
+      const idx = this.history.indexOf(old)
+      if (idx !== -1) this.spliceHistory(idx, 1)
+    }
+    this.lastReasoningSlot = texts.map(text => {
+      const m = { role: 'assistant', content: `[Reasoning]\n${text}` } as Message
+      this.pushCtx(m, undefined, uiMeta)
+      return m
+    })
   }
 
   // UNIFIED REJECTION SURFACING. A harness-level block (a role-restricted tool
@@ -634,6 +938,42 @@ export class Agent {
     return message
   }
 
+  // Shared tail of a successful conclusion — extracted from the real `conclude`
+  // tool handler so autoConclude (below) can end the run identically without
+  // duplicating the commit/event/phase bookkeeping. Callers push whatever
+  // "<Tool> called:"/tool-result messages fit their own case BEFORE calling
+  // this; it only handles the parts common to both a model-issued and a
+  // harness-synthesized conclusion.
+  private async finishWithConclude(status: string, answer: string, emitAndLog: (e: AgentEvent) => void): Promise<string> {
+    this.lastConcludeStatus = status
+    emitAndLog({ type: 'message', role: 'assistant', content: answer })
+    emitAndLog({ type: 'done', content: answer })
+    if (this.autoCommitEnabled) await this.autoCommit(emitAndLog)
+    this.phase = 'idle'
+    return answer
+  }
+
+  // HARNESS-TRIGGERED COMPLETION for looksLikeNarratedConclusion's failure mode
+  // (the model believes it is done and writes a conclusion-shaped summary as
+  // plain content instead of calling `conclude`) — fires on the SECOND such
+  // occurrence in a run rather than nudging toward a third. Pushes the exact
+  // same assistant "<Tool> called:" + tool-result shape a real conclude call
+  // gets (formatToolCallContent) so the trace/ledger read the same way
+  // structurally, plus an explicit warning that this was harness-synthesized,
+  // not model-initiated, for anyone debugging the run later. Always SUCCESS:
+  // looksLikeNarratedConclusion's own patterns are inherently success-shaped
+  // ("implementation is complete", "successfully implemented", ...) — a model
+  // narrating an actual failure this way is not the case this guards against.
+  private async autoConclude(answer: string, emitAndLog: (e: AgentEvent) => void): Promise<string> {
+    const args = { status: 'SUCCESS', message: answer }
+    emitAndLog({ type: 'warning', message: 'The model narrated a final answer without calling conclude, for the 2nd time this run — auto-concluding with its own text instead of nudging again.' })
+    emitAndLog({ type: 'tool_call', tool: 'conclude', args })
+    this.pushCtx({ role: 'assistant', content: formatToolCallContent('conclude', args) }, undefined, { toolName: 'conclude' })
+    emitAndLog({ type: 'tool_result', tool: 'conclude', output: 'Concluded (auto-completed by the harness).', duration_ms: 0 })
+    this.pushCtx({ role: 'tool', content: 'Concluded (auto-completed by the harness — no conclude call was made).' })
+    return await this.finishWithConclude('SUCCESS', answer, emitAndLog)
+  }
+
   // LOOP-RECOVERY LADDER, L0 cached-replay form. Unlike rejectToolCall above —
   // which deliberately frames a block as an ERROR so the model can't tell a
   // harness rejection from a real failure — a replay is telling the model
@@ -713,6 +1053,74 @@ export class Agent {
   // as an additive pass — unrelated to the token budget above, but bundled into
   // the same "keep this.history clean" call so chatCall only needs to call one
   // method.
+
+  // Called once per response that reports prompt_eval_count (chat()'s main
+  // loop), BEFORE that response's own content is pushed into this.history —
+  // realPromptTokens is the exact count for exactly this.history's CURRENT
+  // content, so the char total taken here is guaranteed to correspond to it.
+  //
+  // Recalibrates from the DELTA since the last measurement, not the running
+  // total: total_chars/total_tokens is contaminated by the (roughly constant)
+  // tool-schema overhead baked into every real count but never present in
+  // this.history, which would make the derived ratio look artificially dense
+  // early in a frame's life (when overhead is a large fraction of the total)
+  // and then wrongly apply that same skew to later, much larger content. A
+  // delta between two real measurements cancels that constant term out — it
+  // isolates the ratio for whatever content was actually ADDED between them,
+  // an honest per-turn sample rather than an overhead-polluted average. Falls
+  // back to the plain (overhead-polluted, but better than the bare default)
+  // total only for the very first measurement of a frame's life, when there's
+  // no prior checkpoint to take a delta against.
+  private recalibrateCharsPerToken(realPromptTokens: number): void {
+    const currentChars = sumContentChars(this.history)
+    if (this.lastKnownPromptTokens != null) {
+      const deltaChars = currentChars - this.lastKnownHistoryChars
+      const deltaTokens = realPromptTokens - this.lastKnownPromptTokens
+      // Only a genuine, unambiguous growth-vs-growth sample is trustworthy —
+      // a non-positive delta (a splice/collapse net-shrank the char total
+      // since last time, or nothing changed) can't isolate a per-char cost,
+      // so leave the existing ratio alone rather than corrupt it with a
+      // meaningless or divide-by-noise result.
+      if (deltaChars > 0 && deltaTokens > 0) {
+        const measuredRatio = deltaChars / deltaTokens
+        // Exponential moving average, not a hard snap to the newest sample —
+        // one unusually dense/sparse single turn (e.g. one giant code dump)
+        // shouldn't whipsaw every other message's estimate; still heavily
+        // weighted toward the latest real signal since content density
+        // genuinely does shift over a task's life (prose investigation ->
+        // dense code/math).
+        const ALPHA = 0.5
+        const blended = this.effectiveCharsPerToken * (1 - ALPHA) + measuredRatio * ALPHA
+        // Clamp to a sane range so one edge-case measurement can never send
+        // every subsequent estimate off a cliff.
+        this.effectiveCharsPerToken = Math.max(1, Math.min(6, blended))
+      }
+    } else if (currentChars > 0 && realPromptTokens > 0) {
+      this.effectiveCharsPerToken = Math.max(1, Math.min(6, currentChars / realPromptTokens))
+    }
+    this.lastKnownPromptTokens = realPromptTokens
+    this.lastKnownHistoryChars = currentChars
+  }
+
+  // The aggregate token estimate manageContext's trigger check uses — anchored
+  // to the last REAL measurement (recalibrateCharsPerToken) plus the
+  // (calibrated-ratio) estimate for whatever's been added to this.history
+  // since then, rather than re-estimating the WHOLE history from scratch every
+  // time. This bounds the error to just "how much has been added since the
+  // last real number," instead of compounding the estimate's own error across
+  // however many turns have passed since the frame started — the root cause
+  // of the bug this replaces (a from-scratch char estimate silently drifted
+  // to ~28% "estimated" while the real figure was 92%, so the 60% trigger
+  // never fired once in a 13-turn run).
+  private estimateCurrentTokens(): number {
+    const currentChars = sumContentChars(this.history)
+    if (this.lastKnownPromptTokens == null) {
+      return currentChars / this.effectiveCharsPerToken
+    }
+    const deltaChars = Math.max(0, currentChars - this.lastKnownHistoryChars)
+    return this.lastKnownPromptTokens + deltaChars / this.effectiveCharsPerToken
+  }
+
   private manageContext(
     contextUsagePct: number,
     emitAndLog: (e: AgentEvent) => void,
@@ -722,7 +1130,7 @@ export class Agent {
     const numCtx = this.options.num_ctx ?? 65536
     const prunedCount = this.pruneHarnessMessages()
 
-    const tokensBefore = estimateTokens(this.history)
+    const tokensBefore = this.estimateCurrentTokens()
     const triggerTokens = numCtx * CONTEXT_TRIGGER_PCT
     if (!opts.force && tokensBefore <= triggerTokens) {
       return { compacted: prunedCount > 0 }
@@ -745,7 +1153,7 @@ export class Agent {
     let splitPos = eligible.length // index INTO `eligible`, not into this.history
     for (let k = eligible.length - 1; k >= 0; k--) {
       const content = this.history[eligible[k]].content
-      const tokens = typeof content === 'string' ? estimateTokensForText(content) : 0
+      const tokens = typeof content === 'string' ? estimateTokensForText(content, this.effectiveCharsPerToken) : 0
       if (spent + tokens > verbatimBudget && spent > 0) { splitPos = k + 1; break }
       spent += tokens
       splitPos = k
@@ -758,14 +1166,14 @@ export class Agent {
       if (prunedCount === 0) return { compacted: false }
     } else {
       // Of the older slice, walk OLDEST TO NEWEST: the first ~CONTEXT_COLLAPSE_PCT
-      // worth gets collapsed (keeps a 200-char preview); the rest gets fully
+      // worth gets collapsed (keeps a head+tail preview); the rest gets fully
       // evicted (stub only). Both groups get ledger markers the same way.
       let collapseSpent = 0
       let collapseEnd = 0 // index INTO toShorten — [0, collapseEnd) collapses, [collapseEnd, end) evicts
       for (; collapseEnd < toShorten.length; collapseEnd++) {
         const idx = toShorten[collapseEnd]
         const content = this.history[idx].content
-        const tokens = typeof content === 'string' ? estimateTokensForText(content) : 0
+        const tokens = typeof content === 'string' ? estimateTokensForText(content, this.effectiveCharsPerToken) : 0
         if (collapseSpent >= collapseBudget) break
         collapseSpent += tokens
       }
@@ -778,7 +1186,7 @@ export class Agent {
         if (typeof c !== 'string') continue
         // Already shortened by an earlier pass — skip so we never produce a
         // stub-of-a-stub.
-        if (c.startsWith('[collapsed') || c.startsWith('[evicted')) continue
+        if (c.startsWith('[collapsed') || c.startsWith('[evicted') || c.startsWith('[superseded')) continue
 
         const msgId = this.msgIdAt(idx)
         // "msg_id" here MUST match the `ledger` tool's actual expand parameter
@@ -788,8 +1196,18 @@ export class Agent {
         const recovery = msgId ? `; msg_id "${msgId}" to recover` : ''
         const isCollapse = k < collapseEnd
         const stub = isCollapse
-          ? `[collapsed — ${c.length} chars${recovery}]\n${c.slice(0, COLLAPSE_PREVIEW_CHARS).replace(/\s+/g, ' ')}…`
+          ? (c.length <= COLLAPSE_HEAD_CHARS + COLLAPSE_TAIL_CHARS
+              ? null // too short for a head+tail split to mean anything at all
+              : `${c.slice(0, COLLAPSE_HEAD_CHARS)}\n[collapsed — ${c.length} chars${recovery}]\n${c.slice(-COLLAPSE_TAIL_CHARS)}`)
           : `[evicted — ${c.length} chars${recovery}]`
+        // A message already shorter than whatever shortening it would produce
+        // gains nothing — observed live: a 17-char tool result ("(empty
+        // workspace)") "collapsed" into itself plus a ~55-char marker, ending
+        // up LONGER than the original; a 110-char bash tool-call description
+        // suffered the same fate. Leave it completely untouched instead — it
+        // keeps costing exactly what it always cost, which is strictly better
+        // than costing MORE after being "shortened."
+        if (stub === null || stub.length >= c.length) continue
         m.content = stub
         if (isCollapse) collapsedCount++
         else evictedCount++
@@ -822,7 +1240,7 @@ export class Agent {
     }
 
     this.lastCompactedAt = Date.now()
-    const tokensAfter = estimateTokens(this.history)
+    const tokensAfter = estimateTokens(this.history, this.effectiveCharsPerToken)
     emitAndLog({
       type: 'compact',
       summary: `context management: collapsed ${collapsedCount}, evicted ${evictedCount} message(s)` +
@@ -840,44 +1258,51 @@ export class Agent {
 
   // Removes stale harness-injected `system`-role messages from this.history —
   // thinking-turn nudges, PROGRESS CHECK/STALL messages, reground steers, and
-  // injected timeout errors (all pushed via pushCtx with `role: 'system'` from
-  // the main iteration loop below, NOT by the model) — once they are more than
+  // injected timeout errors — once they are more than
   // HARNESS_MESSAGE_MAX_ITERATION_AGE assistant turns old. These accumulate as
   // pure noise on a long run: each was only ever useful in the turn or two right
   // after it fired.
   //
-  // The frame's OPENING system messages (ROLE_IDENTITY and, if present,
-  // ROLE_INSTRUCTIONS — both pushed once at the top of chat(), before any
-  // assistant message exists) are never candidates: this walk only considers a
-  // system message that has at least one assistant message BEFORE it in
-  // this.history, which the two opening messages never do (nothing has run yet
-  // when they're pushed). Removes matching entries from this.history AND the
-  // parallel this.historyMsgIds (same index) in one pass, working from the end
-  // backwards so earlier indices stay valid as later ones are spliced out.
+  // Candidacy is read STRAIGHT OFF ephemeralSystemMessages — the WeakSet
+  // pushCtx populates only at its 5 `ephemeral: true` call sites (see that
+  // field's own comment). This used to be inferred from position instead (a
+  // system message counted as removable once any assistant message appeared
+  // before it in history) — which silently misfired for the Dispatcher/
+  // Planner's own permanent ROLE_INSTRUCTIONS message: those roles' opening
+  // sequence pushes injected AGENTS.md/MEMORY.md read_file assistant/tool
+  // pairs BEFORE ROLE_INSTRUCTIONS, so by that old heuristic it already
+  // looked exactly like a stale nudge and eventually got pruned right out of
+  // the frame's context. An explicit flag has no such blind spot: only a
+  // message actually pushed as ephemeral can ever be removed here. Removes
+  // matching entries from this.history AND the parallel this.historyMsgIds
+  // (same index) in one pass, working from the end backwards so earlier
+  // indices stay valid as later ones are spliced out.
   private pruneHarnessMessages(): number {
-    // Forward pass to classify: a system message is a REMOVAL CANDIDATE only if
-    // at least one assistant message appears strictly BEFORE it — the frame's
-    // opening system messages (ROLE_IDENTITY/ROLE_INSTRUCTIONS) are pushed before
-    // any assistant turn has happened, so this excludes them by construction,
-    // with no special-casing of "the first few messages" required.
-    let assistantsSoFar = 0
-    const isCandidate: boolean[] = this.history.map(m => {
-      if (m.role === 'assistant') { assistantsSoFar++; return false }
-      return m.role === 'system' && assistantsSoFar > 0
-    })
     // Age of a candidate = how many assistant messages appear AFTER it — computed
     // with a backward running total, then removed oldest-safe (highest index
     // first) so earlier indices stay valid as later ones are spliced out.
+    //
+    // The ephemeral check MUST run before the assistant-role increment below,
+    // using the count of assistant messages seen so far (i.e. strictly AFTER
+    // this index, never including this index itself). Originally this
+    // unconditionally `continue`d past every role==='assistant' message before
+    // ever checking ephemeralSystemMessages — harmless while every ephemeral
+    // message was system-role (the branch never applied to them), but it meant
+    // an ephemeral ASSISTANT message (a failed-attempt pair's own call half —
+    // see pushFailedAttempt) could never be pruned: reaching its own index,
+    // role==='assistant', would increment assistantsAfter to count ITSELF and
+    // then immediately trip the age check on the same pass it was created,
+    // deleting it before the retry it exists to inform ever saw it.
     let assistantsAfter = 0
     let removed = 0
     for (let i = this.history.length - 1; i >= 0; i--) {
-      if (this.history[i].role === 'assistant') { assistantsAfter++; continue }
-      if (!isCandidate[i]) continue
-      if (assistantsAfter > HARNESS_MESSAGE_MAX_ITERATION_AGE) {
-        this.history.splice(i, 1)
-        this.historyMsgIds.splice(i, 1)
+      const m = this.history[i]
+      if (this.ephemeralSystemMessages.has(m) && assistantsAfter >= HARNESS_MESSAGE_MAX_ITERATION_AGE) {
+        this.spliceHistory(i, 1)
         removed++
+        continue
       }
+      if (m.role === 'assistant') assistantsAfter++
     }
     return removed
   }
@@ -897,6 +1322,11 @@ export class Agent {
     // unconditionally here (rather than gating on a pre-computed usage estimate)
     // is cheap and always safe.
     this.manageContext(0, emitAndLog)
+    // pruneHarnessMessages (inside manageContext) may have spliced out ephemeral
+    // system messages, shrinking this.history. Clamp alLastMessageCount so the
+    // trace logger's "new messages" slice doesn't re-show old messages or go
+    // negative.
+    if (this.alLastMessageCount > this.history.length) this.alLastMessageCount = this.history.length
     // The frame's opening [system]/[user]/[system] messages (ROLE_IDENTITY,
     // userMessage, ROLE_INSTRUCTIONS — see chat()) are already IN this.history by
     // the time chatCall runs, pushed there directly instead of being assembled
@@ -953,25 +1383,56 @@ export class Agent {
     // stream:false call — detect which shape came back and branch: a real
     // AbortableAsyncIterator has a Symbol.asyncIterator method; a mocked plain
     // response does not.
+    const attempt = { startedAt: Date.now(), streamObtainedAt: null as number | null, chunkCount: 0, lastChunkAt: null as number | null }
+    this.lastChatAttempt = attempt
     const streamPromise = (async (): Promise<ChatResponse> => {
+      // Declared before the try so the catch below can still see whatever
+      // streamed in prior to a mid-stream failure (see ChatCallError's comment).
+      let content = ''
+      let thinking = ''
+      try {
       const result = await this.ollama.chat({
         model: this.model,
         messages,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         tools: offeredTools as any[],
         stream: true,
+        think: this.thinkMode,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         options: this.options as any,
       })
+      attempt.streamObtainedAt = Date.now()
       if (!(result && typeof (result as AsyncIterable<ChatResponse>)[Symbol.asyncIterator] === 'function')) {
         // Mocked non-streaming shape (tests) — already the complete response.
         return result as unknown as ChatResponse
       }
       let final: ChatResponse | null = null
-      let content = ''
-      let thinking = ''
       let toolCalls: ChatResponse['message']['tool_calls'] | undefined
+      // REMOVED (2026-09-09): this used to also arm a "no chunk for 60s = the
+      // server is stuck" idle timer, reset on every chunk. Reproduced directly
+      // why that's wrong: a tool call is one atomic JSON structure — Ollama
+      // cannot stream `write_file`'s `content` argument incrementally, so it
+      // withholds EVERY chunk until the entire call (file content included) is
+      // ready, then emits it as the one and only chunk. Captured a real
+      // `write_file` this way: exactly 1 chunk, 127s elapsed, a complete and
+      // correct call — 67s past where the old 60s idle timer already aborted
+      // it in production, discarding real, correct, finished work every time
+      // the argument took over a minute to generate (qwen3.6 apparently ran
+      // fast/terse enough to usually land under 60s here; qwen3.8 often
+      // doesn't, hence "this worked with 3.6, not with 3.8" despite nothing
+      // about the harness being model-specific). "chunks keep arriving during
+      // thinking" (the removed comment's own premise) is true for the
+      // thinking/content channels, which DO stream incrementally — it was
+      // simply never true for tool_calls, the one channel that actually goes
+      // quiet for a long, legitimate stretch. The generation-time cap just
+      // below (checked on whatever chunk DOES arrive, however delayed) already
+      // bounds total stream duration against config.chatTimeoutMs; the outer
+      // withTimeout bounds the "zero chunks ever" case the same way. Neither
+      // has this blind spot.
+      const streamStartTime = Date.now()
       for await (const chunk of result as AsyncIterable<ChatResponse>) {
+        attempt.chunkCount++
+        attempt.lastChunkAt = Date.now()
         content += chunk.message?.content ?? ''
         thinking += chunk.message?.thinking ?? ''
         // tool_calls arrive on a NON-TERMINAL chunk (measured: chunk N-1 carries
@@ -983,9 +1444,26 @@ export class Agent {
         // overwriting so the last chunk wins for everything except the
         // accumulators above.
         final = chunk
+        // Generation-time cap: if the stream has been producing chunks for
+        // longer than the overall chatTimeout, abort proactively rather than
+        // waiting for the outer withTimeout (which races the ENTIRE
+        // streamPromise, not individual chunks — a continuously-flowing stream
+        // of thinking tokens would keep streamPromise pending forever, and the
+        // outer timeout would fire only once, not per-chunk).
+        if (Date.now() - streamStartTime > config.chatTimeoutMs) {
+          try { (result as { abort?: () => void }).abort?.() } catch { /* best effort */ }
+          throw new Error(`Ollama did not respond within ${config.chatTimeoutMs / 1000}s (stream still producing tokens)`)
+        }
       }
       if (!final) throw new Error('Empty stream response from Ollama')
       return { ...final, message: { ...final.message, content, thinking: thinking || undefined, tool_calls: toolCalls ?? final.message?.tool_calls } }
+      } catch (err) {
+        if (err instanceof Error && (content || thinking)) {
+          (err as ChatCallError).partialContent = content
+          ;(err as ChatCallError).partialThinking = thinking
+        }
+        throw err
+      }
     })()
     return withTimeout(streamPromise, config.chatTimeoutMs, () => { try { this.ollama.abort() } catch { /* best effort */ } })
   }
@@ -1004,14 +1482,66 @@ export class Agent {
   // both the original call and the retry timed out — the iteration loop injects this as
   // context for the agent and continues rather than killing the run. Non-timeout errors
   // (e.g. malformed response, connection refused) are still rethrown to the outer catch.
+  // Diagnostic suffix for a timeout error message — see lastChatAttempt's own
+  // comment for why this exists. Only meaningful for a "did not respond within Xs"
+  // failure; callers gate on isTimeout before appending this.
+  private diagnoseTimeout(): string {
+    const a = this.lastChatAttempt
+    if (!a) return ''
+    if (a.streamObtainedAt === null) {
+      return ` [never received any response from Ollama — the request may not have reached it; check networking/Ollama's own server log for this window]`
+    }
+    if (a.chunkCount === 0) {
+      return ` [connected after ${a.streamObtainedAt - a.startedAt}ms but received zero chunks before timing out]`
+    }
+    return ` [${a.chunkCount} chunks received, last one ${Date.now() - (a.lastChunkAt ?? a.streamObtainedAt)}ms before timing out]`
+  }
+
+  // Whatever content/thinking had already streamed in before a chatCall
+  // failure (ChatCallError's own comment) — untruncated: manageContext's own
+  // collapse/evict budget is what trims this later if the live context
+  // actually needs the room, not a fixed char cap here. Prefers content (more
+  // likely to hold a fumbled tool-call fragment) over thinking, since a model
+  // that got as far as emitting content had already moved past pure
+  // deliberation.
+  private buildPartialAttempt(err: unknown): string {
+    const e = err as ChatCallError
+    return (e?.partialContent || e?.partialThinking || '').trim()
+  }
+
+  // Pushes a failed chatCall attempt as the EXACT same assistant+tool shape a
+  // genuine executed tool call gets (see rejectToolCall's identical rationale)
+  // — the assistant half is just the raw attempted output, with no harness
+  // narration wrapper, so it is structurally indistinguishable from a real
+  // call; the tool half is `Error: <reason>`, same prefix a real tool failure
+  // uses. This lets the model see exactly what it tried and why it failed,
+  // instead of forgetting the attempt outright. Both pushes are ephemeral:
+  // pruneHarnessMessages (see its own comment on the counting-order fix) drops
+  // this pair again after exactly one further model turn — a failed attempt is
+  // relevant to the very next retry and nothing beyond it, and unlike
+  // manageContext's collapse/evict stubs, nothing is left behind to recover.
+  // toolName: '__failed_attempt__' is a sentinel (not a real ToolName) that
+  // dispatch.ts's persistent-frame preload and getChatHistory() both use to
+  // exclude this from a "clean" view, the same way a real "<Tool> called:"
+  // message is excluded.
+  private pushFailedAttempt(attempt: string, errMsg: string): void {
+    this.pushCtx(
+      { role: 'assistant', content: attempt || '(no output was generated before the request failed)' } as Message,
+      undefined, { toolName: '__failed_attempt__' }, true,
+    )
+    this.pushCtx({ role: 'tool', content: `Error: ${errMsg}` }, undefined, undefined, true)
+  }
+
   private async chatWithRetry(emitAndLog: (e: AgentEvent) => void) {
     const isTimeout = (e: unknown) => e instanceof Error && e.message.includes('did not respond within')
     try {
       return await this.chatCall(emitAndLog)
     } catch (err) {
       this.ollamaRetryCount++
-      const msg = err instanceof Error ? err.message : String(err)
-      emitAndLog({ type: 'warning', message: `Ollama request failed (${msg}) — retrying once` })
+      const msg = (err instanceof Error ? err.message : String(err)) + (isTimeout(err) ? this.diagnoseTimeout() : '')
+      const attempt = this.buildPartialAttempt(err)
+      emitAndLog({ type: 'warning', message: `Ollama request failed (${msg}) — retrying once.` + (attempt ? ` Before failing, it had generated:\n"${attempt}"` : '') })
+      this.pushFailedAttempt(attempt, msg)
       await new Promise(resolve => setTimeout(resolve, this.chatRetryDelayMs))
       if (this.aborted) return null
       try {
@@ -1021,9 +1551,11 @@ export class Agent {
         // context so the model can adapt — XML parse errors, timeouts, and other
         // transient Ollama failures are all recoverable since temperature > 0
         // means the next iteration gets a fresh generation attempt.
-        const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
-        emitAndLog({ type: 'warning', message: `Ollama retry also failed (${retryMsg}) — injecting error and continuing` })
-        return { timeoutError: `The model request failed (${retryMsg}). Your previous request was lost. Continue from where you left off — re-issue your last tool call or take a different approach.` }
+        const retryMsg = (retryErr instanceof Error ? retryErr.message : String(retryErr)) + (isTimeout(retryErr) ? this.diagnoseTimeout() : '')
+        const retryAttempt = this.buildPartialAttempt(retryErr)
+        emitAndLog({ type: 'warning', message: `Ollama retry also failed (${retryMsg}) — injecting error and continuing.` + (retryAttempt ? ` Before failing, it had generated:\n"${retryAttempt}"` : '') })
+        this.pushFailedAttempt(retryAttempt, retryMsg)
+        return { timeoutError: `The model request failed (${retryMsg}).` }
       }
     }
   }
@@ -1127,7 +1659,7 @@ export class Agent {
 
       // INJECTED CONTEXT — the ordering differs by role:
       //
-      // Implementer:  identity → user → instructions → ls -la
+      // Implementer:  identity → instructions → user → ls -la
       // Disp/Planner: identity → AGENTS.md → MEMORY.md → user → instructions → ls -la
       const ws = config.workspacePath || '/workspace'
       const instructions = ROLE_INSTRUCTIONS[this.roleTag] ?? ''
@@ -1151,21 +1683,36 @@ export class Agent {
         }
       }
 
-      // User assignment + instructions
-      this.pushCtx({ role: 'user', content: userMessage })
-      if (instructions) this.pushCtx({ role: 'system', content: instructions })
+      // User assignment + instructions.
+      // Implementer: instructions BEFORE the objective — the objective is the
+      // last thing the model sees before it starts working, so it anchors on
+      // the task rather than the meta-instructions.
+      // Dispatcher/Planner: objective first, then instructions (unchanged).
+      if (this.roleTag === 'implementer') {
+        if (instructions) this.pushCtx({ role: 'system', content: instructions })
+        this.pushCtx({ role: 'user', content: userMessage })
+      } else {
+        this.pushCtx({ role: 'user', content: userMessage })
+        if (instructions) this.pushCtx({ role: 'system', content: instructions })
+      }
 
-      // All agents get a project file listing after instructions.
+      // All agents get a project file listing after instructions. Useful for
+      // exactly one decision (what to look at first) and stale the moment
+      // real work begins — see injectedListingCall's own removal below, in
+      // the per-call tool-dispatch loop.
       try {
         const listCmd = 'fd . -t f -d 2 -E .git -E .argo | head -100'
         const lsResult = await bash(listCmd, ws)
         const lsContent = (lsResult.output && lsResult.output !== NO_OUTPUT) ? lsResult.output : '(empty workspace)'
-        this.pushCtx({
+        const assistantMsg: Message = {
           role: 'assistant',
           content: formatToolCallContent('bash', { command: listCmd }),
           tool_calls: [{ function: { name: 'bash', arguments: { command: listCmd } } }],
-        } as Message)
-        this.pushCtx({ role: 'tool', content: lsContent })
+        } as Message
+        this.pushCtx(assistantMsg)
+        const toolMsg: Message = { role: 'tool', content: lsContent }
+        this.pushCtx(toolMsg)
+        this.injectedListingCall = { assistantMsg, toolMsg }
       } catch { /* injected context is best-effort */ }
     } else {
       // RESUMED turn — just push the follow-up message, no identity/instructions/injection
@@ -1179,6 +1726,12 @@ export class Agent {
     // means "since the last real action," not "since the run started."
     let consecutiveThinkingTurns = 0
     let consecutiveNudges = 0
+    // Count of looksLikeNarratedConclusion hits THIS chat() run — deliberately
+    // NOT reset by an intervening real tool call (unlike consecutiveThinkingTurns):
+    // the underlying failure (the model believes it's done and narrates a
+    // conclusion instead of calling `conclude`) is the same recurring problem
+    // whether or not it ran a verification command in between. See autoConclude.
+    let narratedConclusionCount = 0
     let consecutiveTimeouts = 0
     // How this turn ends is decided by whichever exit path below runs; assume the good
     // case so a normal final answer needs no bookkeeping, and overwrite on the cap /
@@ -1306,7 +1859,7 @@ export class Agent {
           if (idx !== -1) {
             const stall = roleProgressMessages[idx]
             emitAndLog({ type: 'warning', message: stall })
-            this.pushCtx({ role: 'system', content: stall })
+            this.pushCtx({ role: 'system', content: stall }, undefined, undefined, true)
             consecutiveNudges = 0 // progress check resets nudge ceiling
           }
         } else if (stallCheckpoints.includes(iterNum)) {
@@ -1334,7 +1887,7 @@ export class Agent {
               ? `STALL: ${iterNum} iterations without finishing — your approach is not converging. Call conclude NOW with your best verdict/answer given what you have found so far, or take one genuinely different action — do not repeat what has not worked.`
               : `PROGRESS CHECK: ${iterNum} iterations in and not finished. Objective: "${objective}". State what you have confirmed so far, then either call conclude with your verdict/answer or take the single most important remaining action — do not keep re-checking the same thing.`
             emitAndLog({ type: 'warning', message: stall })
-            this.pushCtx({ role: 'system', content: stall })
+            this.pushCtx({ role: 'system', content: stall }, undefined, undefined, true)
             consecutiveNudges = 0 // progress check resets nudge ceiling
           }
         }
@@ -1370,8 +1923,9 @@ export class Agent {
             this.phase = 'idle'
             return capMsg
           }
+          // chatWithRetry already pushed the failed-attempt pair itself
+          // (pushFailedAttempt) — nothing more to inject into context here.
           emitAndLog({ type: 'warning', message: response.timeoutError })
-          this.pushCtx({ role: 'system', content: `Error: ${response.timeoutError}` })
           continue iterations
         }
         consecutiveTimeouts = 0 // reset on any successful response
@@ -1399,6 +1953,11 @@ export class Agent {
 
         const numCtx = this.options.num_ctx ?? 65536
         if (response.prompt_eval_count != null) {
+          // Recalibrate BEFORE the trigger check below — this.history at this
+          // exact point is precisely what produced this exact real count (see
+          // recalibrateCharsPerToken's own comment), so the trigger check
+          // that follows gets the freshest possible ratio.
+          this.recalibrateCharsPerToken(response.prompt_eval_count)
           this.traceLogger?.logContext(response.prompt_eval_count, numCtx)
           emitAndLog({
             type: 'token_usage',
@@ -1422,7 +1981,13 @@ export class Agent {
           if (usagePct >= CONTEXT_TRIGGER_PCT) {
             try {
               this.phase = 'compacting'
-              this.manageContext(usagePct, emitAndLog)
+              // force: true — this usagePct IS the real, just-measured figure
+              // (not an estimate), so there's no question of whether to act;
+              // don't let manageContext's own internal estimate (now
+              // recalibrated to agree with this exact number anyway, but
+              // this removes any dependency on that agreement holding) veto
+              // action we already know is warranted.
+              this.manageContext(usagePct, emitAndLog, { force: true })
               this.phase = 'running'
             } catch (err) {
               // Deliberately falls through to the next normal iteration rather than
@@ -1477,17 +2042,64 @@ export class Agent {
         // path, and it is unchanged. So this branch is just "keep the model's
         // reasoning in context and nudge it toward an explicit next move."
         if (!hasCalls) {
-          // Only push a THINKING turn's message into history when it actually says
-          // something. A turn with no tool calls and no content (an entirely empty
-          // assistant message — thinking models occasionally emit exactly this)
-          // adds nothing for a later turn to read and, left in history, is what
-          // produced the empty "#### Content"/"#### Thinking" sections al-logger.ts
-          // used to render for it. The hasCalls branch below has its own separate
-          // parent-turn requirement — every tool call gets its OWN dedicated
-          // "<Tool> called:" assistant message (formatToolCallContent), which is
-          // never empty, so Ollama's strict assistant/tool alternation is preserved
-          // there regardless of whether the model's own content was empty.
-          if (msg.content) this.pushCtx({ role: 'assistant', content: msg.content, thinking: msg.thinking } as Message, undefined, assistantUiMeta)
+          // Push a THINKING turn's message into history whenever it said
+          // anything — content when present, otherwise a bounded tail of the
+          // thinking channel. A turn that burns its ENTIRE token budget on pure
+          // reasoning (num_predict exhausted mid-thought, common on a genuinely
+          // hard task) used to leave literally nothing behind here: pushCtx was
+          // never called, so this.history — and the ledger — had no record the
+          // turn ever happened, and the NEXT iteration re-sent the byte-identical
+          // prompt with no memory of the reasoning already done (confirmed
+          // 2026-09-18, test-wind hex-grid run: three separate turns each spent
+          // 170-210s / their full 16384-token budget re-deriving the same
+          // edge-sharing proof from scratch because the previous attempt's
+          // reasoning was invisible to the next one). Only a truly EMPTY
+          // response (no content, no thinking — thinking models occasionally
+          // emit exactly this) still pushes nothing; the hasCalls branch below
+          // has its own separate parent-turn requirement — every tool call gets
+          // its OWN dedicated "<Tool> called:" assistant message
+          // (formatToolCallContent), which is never empty, so Ollama's strict
+          // assistant/tool alternation is preserved there regardless of whether
+          // the model's own content was empty.
+          if (msg.content) {
+            // AUTO-CONCLUDE: the model believes it has finished and has written
+            // a conclusion-shaped summary as plain content, without calling the
+            // one tool that actually ends the session — twice now this run.
+            // Nudging a third time (below) has already been tried once and
+            // failed to correct it (that's what "twice" means here); auto-
+            // completing with the model's own text is cheaper than burning
+            // another full turn on a fourth narrated summary. See autoConclude.
+            // Checked BEFORE the single-slot push below — an auto-concluding
+            // message ends the run entirely, so it must never itself become a
+            // disposable, replaceable artifact.
+            if (looksLikeNarratedConclusion(msg.content)) {
+              narratedConclusionCount++
+              if (narratedConclusionCount >= 2) {
+                return await this.autoConclude(msg.content, emitAndLog)
+              }
+            }
+          }
+          // A "no tool call" turn is a thinking turn by definition — its
+          // output (whichever channel or channels carried it) is scratch/
+          // exploratory the same way, regardless of whether the model routed
+          // it through `content`, `thinking`, or both. Observed live
+          // (2026-09-18, test-wind hex-grid run): a turn with no tool call
+          // put ~19,500 characters of pure "reasoning out loud" into
+          // `content` instead of `thinking` — invisible to an old content-
+          // only exemption, so it sat fully live for the rest of the run
+          // (57% of the final context) instead of being replaced the instant
+          // a newer thinking turn superseded it, the way an equivalent
+          // `thinking`-channel dump already was. When BOTH are present, real
+          // `thinking` goes first and `content` second — same order
+          // pushReasoningArtifact's own doc comment describes for a paired
+          // artifact — so the model's most recently voiced text still sits
+          // at the tail of context, closest to whatever comes next.
+          const reasoningTexts: string[] = []
+          if (msg.thinking) reasoningTexts.push(msg.thinking)
+          if (msg.content) reasoningTexts.push(msg.content)
+          if (reasoningTexts.length > 0) {
+            this.pushReasoningArtifact(reasoningTexts, assistantUiMeta)
+          }
           consecutiveThinkingTurns++
           // Only nudge from the 2nd consecutive thinking turn on — the model gets one
           // free turn to reason/plan without being told to hurry up; a SECOND turn in
@@ -1503,7 +2115,7 @@ export class Agent {
           if (consecutiveThinkingTurns >= 2) {
             const nudge = 'Your turn produced no tool calls. To call a tool, wrap the call in <tool_call> tags.\nTo finish, call conclude with your final answer. To keep working, make your next tool call.'
             emitAndLog({ type: 'warning', message: nudge })
-            this.pushCtx({ role: 'system', content: nudge })
+            this.pushCtx({ role: 'system', content: nudge }, undefined, undefined, true)
           }
           continue
         }
@@ -1511,15 +2123,28 @@ export class Agent {
         consecutiveThinkingTurns = 0
         consecutiveNudges = 0
 
-        // If the model produced thinking or visible text alongside its tool
-        // calls, push that as its own assistant message first (the reasoning
-        // step) — distinct from the dedicated "<Tool> called:" message pushed
-        // for EACH tool call below. The raw `msg` (with its native tool_calls
-        // field) is deliberately NOT pushed to this.history any more: it's used
-        // below only to derive callsToRun for dispatch, and is replaced in
-        // history by the explicit per-call assistant messages that follow.
+        // Real `thinking` alongside a tool call is pushed as its own
+        // single-slot `[Reasoning]` artifact FIRST — never attached only as
+        // the Message.thinking field the way it used to be: that field does
+        // not reliably survive into the next turn's own request (confirmed
+        // live, 2026-09-18 — reasoning attached that way silently vanished
+        // from context whenever real `content` was also present on the same
+        // turn), where explicit `[Reasoning]` content is the one channel
+        // proven to. Then, if the model also produced visible `content`
+        // alongside its tool call, push THAT as its own permanent assistant
+        // message, at the tail — distinct from the dedicated "<Tool> called:"
+        // message pushed for EACH tool call below, and NOT reasoning-labeled
+        // or single-slotted: unlike a no-tool-call turn's own content (see
+        // above), this accompanies a real, kept action, so it stays exactly
+        // as before. The raw `msg` (with its native tool_calls field) is
+        // deliberately NOT pushed to this.history any more: it's used below
+        // only to derive callsToRun for dispatch, and is replaced in history
+        // by the explicit per-call assistant messages that follow.
+        if (msg.thinking) {
+          this.pushReasoningArtifact([msg.thinking], assistantUiMeta)
+        }
         if (msg.content) {
-          this.pushCtx({ role: 'assistant', content: msg.content, thinking: msg.thinking } as Message, undefined, assistantUiMeta)
+          this.pushCtx({ role: 'assistant', content: msg.content } as Message, undefined, assistantUiMeta)
         }
 
         const callsToRun = nativeCalls.length > 0
@@ -1558,16 +2183,10 @@ export class Agent {
                 continue
               }
             }
-            this.lastConcludeStatus = status
-
             // All gates passed — genuinely done.
             emitAndLog({ type: 'tool_result', tool: name, output: 'Concluded.', duration_ms: 0 })
             this.pushCtx({ role: 'tool', content: 'Concluded.' })
-            emitAndLog({ type: 'message', role: 'assistant', content: answer })
-            emitAndLog({ type: 'done', content: answer })
-            if (this.autoCommitEnabled) await this.autoCommit(emitAndLog)
-            this.phase = 'idle'
-            return answer
+            return await this.finishWithConclude(status, answer, emitAndLog)
           }
           // H21: the normalised identity of this call, computed ONCE and shared by
           // both the gate rejection path and the ladder's own loopKey further down
@@ -1601,18 +2220,28 @@ export class Agent {
           // a replay — the block/escalation decision below is still keyed on
           // loopKey alone.
           const action = evaluateCall(this.loopState, loopKey, args, { toolName: name, recite, callSummary: summarizeCall(name, args) })
-          // H21(b): 'halt' is handled SEPARATELY from the other non-allow kinds
-          // below — it has no `level` field (it fires only after L2 has already
-          // been reported once for this streak, see loop.ts's LoopAction doc
-          // comment), and unlike every other rung it must END THE FRAME rather
-          // than `continue`.
+          // Non-null exactly for the ladder rungs that DON'T fabricate a
+          // rejection any more (steer/compact/replan/halt, below) — the call
+          // still actually runs and the model still gets the real tool
+          // result; this only carries the ladder's own steering prose to be
+          // appended as a SEPARATE, ephemeral system message once the real
+          // result has been pushed (see the duplicateWarning push further
+          // down). Nothing here has failed — a duplicate call is a legitimate
+          // repeat the harness has flagged as making no progress, not a
+          // broken one — so the wording is a warning, never an "Error:".
+          let duplicateWarning: string | null = null
+          // H21(b): 'halt' must END THE FRAME after this call, unlike every
+          // other rung — deferred to haltAfterThisCall so the call below
+          // still runs for real and gets its normal bookkeeping tail (the
+          // frame is ending regardless, but there is no reason to fabricate a
+          // SKIPPED error for its very last recorded action either).
+          let haltAfterThisCall = false
           if (action.kind === 'halt') {
             this.loopSteerEscalated = true
             emitAndLog({ type: 'warning', message: action.message, level: 'L2' })
-            this.rejectToolCall(name, args, `SKIPPED — identical to a call already run with nothing new since. ${action.message}`, emitAndLog)
-            return this.endFrameStalled(action.message, emitAndLog)
-          }
-          if (action.kind !== 'allow') {
+            duplicateWarning = action.message
+            haltAfterThisCall = true
+          } else if (action.kind !== 'allow') {
             if (action.kind === 'compact' || action.kind === 'replan') this.loopSteerEscalated = true
             if (action.kind === 'compact') {
               try {
@@ -1629,10 +2258,19 @@ export class Agent {
             emitAndLog({ type: 'warning', message: action.message, level: action.level })
             if (action.kind === 'replay') {
               this.replayToolCall(name, args, action.cached, action.message, emitAndLog)
-            } else {
-              this.rejectToolCall(name, args, `SKIPPED — identical to a call already run with nothing new since. ${action.message}`, emitAndLog)
+              continue
             }
-            continue
+            // steer/compact/replan: fall through to the normal execution path
+            // below instead of skipping the call — re-running a duplicate
+            // bash/read_file/etc. call costs nothing, and a fabricated
+            // SKIPPED error leaves the model with no information at all once
+            // the earlier real result has aged out of context (evicted,
+            // collapsed, or superseded away) — exactly the failure mode this
+            // replaces. supersedeOlderCalls (below, unconditional on success)
+            // still removes whatever OLDER identical call this one duplicates
+            // from context, same as any other real execution of the same
+            // resource.
+            duplicateWarning = action.message
           }
 
           emitAndLog({ type: 'tool_call', tool: name, args })
@@ -1645,7 +2283,8 @@ export class Agent {
           // uiMeta marks it as a call-description turn, not the model's own
           // conversational reply — see rejectToolCall's identical comment for why
           // dispatch.ts's preload / getChatHistory() need to tell the two apart.
-          this.pushCtx({ role: 'assistant', content: formatToolCallContent(name, args) }, undefined, { toolName: name })
+          const assistantMsg: Message = { role: 'assistant', content: formatToolCallContent(name, args) }
+          this.pushCtx(assistantMsg, undefined, { toolName: name })
 
           const start = Date.now()
           // The `ledger` tool needs to know WHICH FRAME is calling it, so it reads
@@ -1701,12 +2340,77 @@ export class Agent {
           // replayToolCall push their own identical assistant+tool pair for a
           // blocked/replayed call, and this path never runs for `conclude`
           // (intercepted earlier, above this executeTool call).
-          this.pushCtx({
+          const toolMsg: Message = {
             role: 'tool',
             content: result.error
               ? `Error: ${result.error}\n${result.output}`
               : result.output,
-          }, msgId, { toolName: name, toolArgs: args, durationMs: duration_ms, error: !!result.error })
+          }
+          this.pushCtx(toolMsg, msgId, { toolName: name, toolArgs: args, durationMs: duration_ms, error: !!result.error })
+
+          // Duplicate-call notice — pushed AFTER the real tool result (not
+          // merged into it, and not in place of it — see duplicateWarning's
+          // own comment above). Ephemeral (pruneHarnessMessages,
+          // HARNESS_MESSAGE_MAX_ITERATION_AGE=1): it exists to inform ONLY
+          // the very next model turn that this was a repeat; left in context
+          // any longer it would go on describing a call as "just repeated"
+          // long after real progress has made that stale and misleading.
+          if (duplicateWarning) {
+            this.pushCtx({ role: 'system', content: duplicateWarning }, undefined, undefined, true)
+          }
+
+          // Supersede older tool-call pairs that the new result makes stale
+          // (e.g. a fresh read_file replaces every prior read/write/edit of the
+          // same path).  Only when the new call succeeded — an error result
+          // should not evict earlier good state.
+          if (!result.error) this.supersedeOlderCalls(name, args)
+
+          // Once the model recovers a collapsed/evicted stub's full original
+          // content via `ledger`'s get_msg_id action, that content is now
+          // sitting fresh at the top of history (the tool result just pushed
+          // above) — the OLD stub, still sitting wherever the message
+          // originally lived, now only duplicates it for no benefit. Remove it
+          // entirely rather than leaving two copies of the same information in
+          // context at once. Safe to look up unconditionally: if nothing in
+          // history still carries this id (already spliced away by something
+          // else, or the recovery genuinely found nothing), indexOf simply
+          // returns -1 and this is a no-op.
+          if (name === 'ledger' && args.action === 'get_msg_id') {
+            const recoveredId = typeof args.msg_id === 'string' ? args.msg_id : ''
+            if (recoveredId) {
+              const idx = this.historyMsgIds.indexOf(recoveredId)
+              if (idx !== -1) this.spliceHistory(idx, 1)
+            }
+          }
+
+          // INJECTED LISTING CLEANUP. The harness's own auto-injected `fd`
+          // project listing (chat()'s setup code, never the model's own call)
+          // is useful for exactly one decision (what to look at first) and
+          // permanently stale the moment real work begins, since the model by
+          // then has far more current information than that one-time snapshot
+          // ever could. Removed entirely — no stub, "not worth recovering",
+          // same reasoning as supersedeOlderCalls's own full removal — the
+          // instant real work starts: any bash call (even this very one, if
+          // it's the model's first — running bash at all means the model has
+          // moved past the initial look-around), or a successful
+          // write_file/edit_file.
+          if (this.injectedListingCall) {
+            const realWorkStarted = name === 'bash'
+              || ((name === 'write_file' || name === 'edit_file') && !result.error)
+            if (realWorkStarted) {
+              const pending = this.injectedListingCall
+              this.injectedListingCall = null
+              // Independent lookups, not an assumed-adjacent pair — safe even
+              // if something else already touched either message's content
+              // (manageContext mutates in place, never removes, so both
+              // object references stay find-able either way).
+              const indices = [this.history.indexOf(pending.assistantMsg), this.history.indexOf(pending.toolMsg)]
+                .filter(i => i !== -1)
+                .sort((a, b) => b - a)
+              for (const idx of indices) this.spliceHistory(idx, 1)
+            }
+          }
+
           if (name === 'edit_file' || name === 'write_file') {
             const p = typeof args.path === 'string' ? args.path : ''
             if (p && !this.editedPaths.includes(p)) this.editedPaths.push(p)
@@ -1739,8 +2443,20 @@ export class Agent {
               noProgressSteers++
               const rg = regroundSteer(userMessage, `${callsSinceMutation} tool calls without changing any file`)
               emitAndLog({ type: 'warning', message: rg })
-              this.pushCtx({ role: 'system', content: rg })
+              this.pushCtx({ role: 'system', content: rg }, undefined, undefined, true)
             }
+          }
+
+          // H21(b) 'halt' — deferred from the ladder branch above so this
+          // call's real result and duplicate-notice still get pushed and
+          // recorded normally first; the frame ends now regardless of what
+          // this call returned.
+          if (haltAfterThisCall) {
+            // duplicateWarning is always set alongside haltAfterThisCall (see
+            // the ladder branch above) — non-null assertion just avoids
+            // re-deriving it from `action`, which TS can no longer narrow to
+            // the 'halt' arm this far past the branch that checked it.
+            return this.endFrameStalled(duplicateWarning!, emitAndLog)
           }
         }
       }
@@ -1776,11 +2492,24 @@ export class Agent {
   reset() {
     this.history = []
     this.historyMsgIds = []
+    this.lastReasoningSlot = []
+    this.injectedListingCall = null
+    this.effectiveCharsPerToken = CHARS_PER_TOKEN
+    this.lastKnownPromptTokens = null
+    this.lastKnownHistoryChars = 0
   }
 
   loadHistory(messages: Array<{ role: string; content: string }>) {
     this.history = messages as Message[]
     this.historyMsgIds = messages.map(() => undefined) // raw transcript load — no ledger ids
+    this.lastReasoningSlot = []
+    this.injectedListingCall = null
+    // A reload has no fresh calibration data for the reloaded content — fall
+    // back to the shared default until the next real measurement recalibrates
+    // it, rather than keeping a ratio derived from a DIFFERENT frame's history.
+    this.effectiveCharsPerToken = CHARS_PER_TOKEN
+    this.lastKnownPromptTokens = null
+    this.lastKnownHistoryChars = 0
   }
 
   getChatHistory(): Array<{ role: string; content: string }> {
@@ -1801,7 +2530,21 @@ export class Agent {
           // content shape instead: a JSON object with a `name` field (the raw
           // tool call format formatToolCallContent produces).
           const isToolCallDescription = typeof msg.content === 'string' && msg.content.startsWith('<tool_call>')
-          return !isToolCallDescription
+          if (isToolCallDescription) return false
+          // A failed-attempt pair's assistant half (pushFailedAttempt) is raw
+          // model output with no distinctive content shape of its own (it may
+          // or may not happen to start with `<tool_call>`) — but it IS always
+          // pushed with `ephemeral: true`, so membership in
+          // ephemeralSystemMessages (keyed by object identity) reliably
+          // excludes it here too, for the narrow window before
+          // pruneHarnessMessages removes it from this.history outright.
+          if (this.ephemeralSystemMessages.has(msg)) return false
+          // A "[Reasoning]" artifact (pushReasoningArtifact) is harness-
+          // preserved scratch content for the model's own continuity, not a
+          // reply meant for a human reading chat history — exclude it the
+          // same way, keyed on its own stable label prefix.
+          if (typeof msg.content === 'string' && msg.content.startsWith('[Reasoning]')) return false
+          return true
         }
         return false
       })
@@ -1813,27 +2556,37 @@ export class Agent {
   // by the context/compaction UI. Defensive: coerces non-string content, caps
   // per-message content so the payload stays bounded, and never throws.
   getContext(): {
-    messages: Array<{ role: string; content: string; chars: number; ts: number | null }>
+    messages: Array<{ id: string | undefined; role: string; content: string; chars: number; ts: number | null }>
     messageCount: number
     totalChars: number
     numCtx: number | null
     compaction: string | null
     compactionTs: number | null
   } {
-    const MAX = 4000
     let totalChars = 0
     // Every assistant message in this.history now carries real content — either
     // the model's own reasoning/response, or a dedicated "<Tool> called:"
     // description (formatToolCallContent) pushed just before its tool result —
     // so there's no longer an empty-assistant-message case to filter out here.
+    // `id` (this.historyMsgIds, parallel to this.history) is what lets
+    // server.ts's GET /context cross-reference this LIVE set against the full
+    // ledger and show messages that were fully removed (supersede,
+    // failed-attempt, superseded reasoning artifact) as "deleted" rather than
+    // silently absent — see server.ts's mergeWithDeleted.
+    //
+    // content is returned IN FULL, never truncated — this is the context
+    // viewer's entire purpose (showing exactly what the model sees), so
+    // capping it here would make the one place meant to show ground truth lie
+    // about it. Also matches the tools/file-ops.ts stance: a cap only belongs
+    // where content is external/uncontrolled-size, never on something already
+    // being displayed in full elsewhere for a reason. Argo is local-only —
+    // this payload never leaves the machine, so there's no bandwidth-cost
+    // argument for capping it either.
     const messages = this.history
-      .map(m => {
-        const full = typeof m.content === 'string' ? m.content : String(m.content ?? '')
-        totalChars += full.length
-        const content = full.length > MAX
-          ? `${full.slice(0, MAX)}…(+${full.length - MAX} more chars)`
-          : full
-        return { role: m.role, content, chars: full.length, ts: this.historyTs.get(m) ?? null }
+      .map((m, i) => {
+        const content = typeof m.content === 'string' ? m.content : String(m.content ?? '')
+        totalChars += content.length
+        return { id: this.historyMsgIds[i], role: m.role, content, chars: content.length, ts: this.historyTs.get(m) ?? null }
       })
 
     return {
@@ -1843,6 +2596,90 @@ export class Agent {
       numCtx: this.options.num_ctx ?? null,
       compaction: null,
       compactionTs: this.lastCompactedAt,
+    }
+  }
+
+  // Supersede older tool-call pairs for the same target (file path or URL).
+  // Called after a successful tool result is pushed. Fully REMOVES both
+  // messages of a superseded pair from live history — no stub, no msg_id
+  // recovery hint. Unlike manageContext's collapse/evict (which exist for
+  // context-PRESSURE reasons and must stay recoverable), a superseded
+  // read/write/edit of a path that has since been read/written/edited again
+  // has no value even to look back at — a small model has no realistic
+  // scenario where re-fetching a stale prior read of the same path helps it.
+  //
+  // Supersession rules:
+  //   - write_file / edit_file / read_file on path P supersedes ALL earlier
+  //     write_file / edit_file / read_file pairs targeting the same P.
+  //   - fetch_url on URL U supersedes ALL earlier fetch_url pairs for U.
+  private supersedeOlderCalls(name: string, args: Record<string, unknown>): void {
+    const FILE_OPS = new Set(['read_file', 'write_file', 'edit_file'])
+    const isFileOp = FILE_OPS.has(name)
+    const isFetch = name === 'fetch_url'
+    if (!isFileOp && !isFetch) return
+
+    const target: string | undefined = isFileOp
+      ? (typeof args.path === 'string' ? args.path : undefined)
+      : (typeof args.url === 'string' ? args.url : undefined)
+    if (!target) return
+
+    // The current pair is at the END: tool result = history[len-1],
+    // assistant call-description = history[len-2]. Scan everything before,
+    // collecting matches WITHOUT mutating anything yet — removal below
+    // splices two entries per match, which would invalidate later i+1
+    // lookups if done inline during this scan.
+    const endIdx = this.history.length - 2
+    const matchIndices: number[] = [] // assistantIdx values, ascending as found
+
+    for (let i = 0; i < endIdx; i++) {
+      const m = this.history[i]
+      if (m.role !== 'assistant') continue
+      const c = m.content
+      // Must look like a tool-call message. This alone already excludes a
+      // message manageContext has since collapsed/evicted into a stub (stub
+      // text never starts with `<tool_call>`) — no separate prefix check needed.
+      if (typeof c !== 'string' || !c.startsWith('<tool_call>')) continue
+
+      // Extract JSON from between the tags.
+      let parsed: { name?: string; arguments?: Record<string, unknown> }
+      try {
+        const jsonStr = c.slice('<tool_call>\n'.length, c.lastIndexOf('\n</tool_call>'))
+        parsed = JSON.parse(jsonStr)
+      } catch {
+        continue
+      }
+      const oldName = parsed.name
+      const oldArgs = parsed.arguments
+      if (!oldName || !oldArgs) continue
+
+      // Check whether this old call targets the same resource.
+      let oldTarget: string | undefined
+      if (isFileOp && FILE_OPS.has(oldName)) {
+        oldTarget = typeof oldArgs.path === 'string' ? oldArgs.path : undefined
+      } else if (isFetch && oldName === 'fetch_url') {
+        oldTarget = typeof oldArgs.url === 'string' ? oldArgs.url : undefined
+      }
+      if (oldTarget !== target) continue
+
+      // The next message (i+1) should be the tool result for this call.
+      // Only supersede if the tool result exists, did NOT error, and isn't
+      // already a manageContext collapse/evict stub (which has nothing left
+      // worth removing twice).
+      const toolMsg = this.history[i + 1]
+      if (!toolMsg || toolMsg.role !== 'tool') continue
+      const tc = toolMsg.content
+      if (typeof tc !== 'string') continue
+      if (tc.startsWith('Error:') || tc.startsWith('[collapsed') || tc.startsWith('[evicted')) continue
+
+      matchIndices.push(i)
+    }
+
+    if (matchIndices.length === 0) return
+
+    // Remove BOTH messages of each matched pair entirely, highest index first
+    // so earlier matches' indices stay valid as later ones are spliced out.
+    for (let k = matchIndices.length - 1; k >= 0; k--) {
+      this.spliceHistory(matchIndices[k], 2)
     }
   }
 
