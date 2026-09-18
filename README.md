@@ -97,7 +97,7 @@ argo/
 │   ├── agent.ts                # ReAct loop, Ollama streaming, tool execution
 │   ├── frames.ts               # Per-role tools, budgets, prompts
 │   ├── loop.ts                 # Loop-recovery ladder (L0→L1→L2→Halt)
-│   ├── eviction.ts             # Deterministic context eviction
+│   ├── eviction.ts             # Shared token-estimation helper (context management itself lives in agent.ts's manageContext)
 │   ├── ledger.ts               # Append-only message ledger
 │   ├── server.ts               # Worker API, SSE, git/file endpoints
 │   ├── central.ts              # Workspace registry, Docker management, proxy
